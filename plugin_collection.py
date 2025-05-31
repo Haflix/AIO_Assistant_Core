@@ -25,6 +25,12 @@ class PluginCollection(object):
         self.plugin_package = plugin_package
         self.reload_plugins()
         
+        if host:
+            # NOTE: This instance is the main host
+            pass
+        else:
+            # connect to host
+            pass
         # TODO: Add mqtt stuff
         # NOTE: if host false then ip etc of host in kwargs
 
@@ -54,7 +60,6 @@ class PluginCollection(object):
 
     def kill_everything(self):
         raise NotImplementedError
-
 
 
     def walk_package(self, package) -> None:
@@ -112,11 +117,11 @@ class PluginCollection(object):
     
     
     
-    def create_request(self, author: str, target: str, args, timeout=30):
+    def create_request(self, author: str, target: str, args, timeout=None) -> Request:
         """Create a new request and returns it."""
         
         # Create the request and add it to the dict
-        request = Request(self.hostname, author, target, args, timeout)
+        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
         with self.request_lock:
             self.requests[request.id] = request
         self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
@@ -126,11 +131,11 @@ class PluginCollection(object):
         
         return request
     
-    def create_request_wait(self, author, target, args, timeout=30)  -> Request:
+    def create_request_wait(self, author, target, args, timeout=None)  -> Request:
         """Create a new request, wait for its result via threading, and return it."""
         
         # Create the request and add it to the dict
-        request = Request(self.hostname, author, target, args, timeout)
+        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
         with self.request_lock:
             self.requests[request.id] = request
         self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
@@ -153,7 +158,7 @@ class PluginCollection(object):
     
     def _process_request(self, request: Request):
         """Process the request by passing it to the appropriate plugin."""
-        # NOTE: send request to right host via mqtt (maybe even in create_request)
+        # NOTE: send request to right host via mqtt (maybe even in create_request) but i think it should be better here in _process_request ()
         
         # Extract name of plugin and function
         plugin_name, function_name = request.target.split(".")
@@ -178,6 +183,12 @@ class PluginCollection(object):
         except Exception as e:
             self._logger.error(f"Error processing request from {request.author} to {request.target}({request.args}) ({request.id}): {e}")
             request.set_result(str(e), error=True)
+            
+            
+    def _process_request_external(self, request: Request):
+        """Process the request by passing it to the appropriate sub-host with the plugin."""
+        # NOTE: THIS METHOD IS A PLACEHOLDER
+        pass
     
     
             
@@ -202,7 +213,7 @@ class PluginCollection(object):
                     self.cleanup_requests()
                     )
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(10)
                   
     
     def cleanup_requests(self):
