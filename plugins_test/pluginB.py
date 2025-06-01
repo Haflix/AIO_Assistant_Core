@@ -9,7 +9,6 @@ class PluginB(Plugin):
         super().__init__(logger, plugin_collection_c)
         self.description = "None"
         self.plugin_name = "PluginB"
-        self.asynced = True
 
     async def calculate_square(self, number):
         """Calculate the square of a number asynchronously."""
