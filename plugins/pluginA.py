@@ -23,4 +23,4 @@ class PluginA(plugin_collection.Plugin):
             timeout=5
         )
         
-        return request.result
+        return request.get_result()

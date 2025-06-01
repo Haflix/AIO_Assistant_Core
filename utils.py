@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 import sys
 from logging import Logger, StreamHandler, DEBUG
@@ -7,14 +6,6 @@ from typing import Union
 import threading
 from uuid import uuid4
 import time
-from cryptography.hazmat.primitives import hashes, hmac
-import pickle
-
-class MQTTLogHandler(logging.Handler):
-    def emit(self, record):
-        log_entry = self.format(record)
-        self.mqtt_client.publish(f"devices/{self.hostname}/logs", log_entry)
-
 
 class LogUtil(Logger):
     """Logging class
@@ -61,9 +52,6 @@ class Event_ts(asyncio.Event):
             return True
         except asyncio.TimeoutError:
             return False
-
-
-
 
 
 class Request:
@@ -219,57 +207,6 @@ class Request:
                 else:
                     self.__condition.wait()  # Wait for notification
         return self.__result, self.error, self.timeout
+
     
-    def __getstate__(self):
-        """Custom pickling to remove non-pickleable objects"""
-        state = self.__dict__.copy()
-        # Remove thread-related objects
-        del state['_Request__lock']
-        del state['_Request__condition']
-        del state['_Request__request_lock']
-        return state
-
-    def __setstate__(self, state):
-        """Custom unpickling to recreate thread objects"""
-        self.__dict__.update(state)
-        # Recreate thread-related objects
-        self.__lock = threading.Lock()
-        self.__condition = threading.Condition(self.__lock)
-        self.__request_lock = threading.Lock()
-
-
-class SecureRequest:
-    def __init__(self, author_host, author, target, args, secret, timeout=None):
-        self.id = uuid4().hex
-        self.author_host = author_host
-        self.author = author
-        self.target = target
-        self.args = args
-        self.timeout = timeout
-        self.response_topic = f"responses/{self.id}"
-        self.result = None
-        self.error = None
-        self.complete_event = threading.Event()
-        self.hmac_digest = self._create_hmac(secret)
-
-    def _create_hmac(self, secret):
-        data = f"{self.id}{self.target}{self.args}".encode()
-        return hmac.new(secret.encode(), data, hashlib.sha256).hexdigest()
-
-    def verify(self, secret):
-        data = f"{self.id}{self.target}{self.args}".encode()
-        expected = hmac.new(secret.encode(), data, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(self.hmac_digest, expected)
-
-    def set_result(self, result, error=None):
-        self.result = result
-        self.error = error
-        self.complete_event.set()
-
-    def wait_for_result(self, timeout=None):
-        if not self.complete_event.wait(timeout=self.timeout if timeout is None else timeout):
-            raise TimeoutError("Request timed out")
-        if self.error:
-            raise Exception(self.error)
-        return self.result
     
