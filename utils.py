@@ -5,7 +5,8 @@ from logging import Logger, StreamHandler, DEBUG
 from typing import Union
 from uuid import uuid4
 import time
-#from plugin_collection import PluginCollection
+from typing import Any, Optional, Tuple, Union
+from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
 
 
@@ -39,263 +40,136 @@ class LogUtil(Logger):
         return logger
 
 
-class Plugin(object):
-    """Base class that each plugin must inherit from. This class sets standard variables and functions that each plugin must have.
-    """
-    #from plugin_collection import PluginCollection
-    def __init__(self, logger: Logger, plugin_collection_c):
+class Plugin:
+    """Base class for all plugins."""
+    
+    def __init__(self, logger: Logger, plugin_collection):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self._logger = logger
-        self._plugin_collection = plugin_collection_c
-        self.asynced = False
+        self._plugin_collection = plugin_collection
+        self.asynced = False  # Set to True for async plugins
         self.loop_running = False
-        self.loop_req = False
-        self.event_loop = asyncio.get_event_loop()
+        self.loop_req = False  # Set to True if the plugin needs a loop
+        self.event_loop = plugin_collection.main_event_loop
     
-    def comm_layer(self, function, *args):
-        """The method that makes it possible for synchronous and asynchronous methods to call methods from plugins
+    @async_handle_errors(default_return=None)
+    async def execute(self, target: str, args: Any = None, timeout: Optional[float] = None) -> Any:
         """
-        try:
-            if self.asynced:
-                if asyncio.iscoroutinefunction(function):  # Check if function is async
-                    return self.event_loop.run_until_complete(function(*args))  # Now safe
-                else:
-                    self._logger.error(f"Function {function.__name__} is not async but called in async mode!")
-                    return function(*args)  # Just call it normally
-                
-            else:
-                # Sync plugin: Run async functions in the event loop
-                if asyncio.iscoroutinefunction(function):
-                    return self.event_loop.run_until_complete(function(*args))
-                else:
-                    return function(*args)
-        except Exception as e:
-            self._logger.error(f"Error in comm_layer: {e}")
-            return None
+        One-liner to call another plugin's method asynchronously with error handling.
+        
+        Args:
+            target: Target plugin and method (format: "PluginName.method_name")
+            args: Arguments to pass to the method
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the target method or None if an error occurs
+        """
+        return await self._plugin_collection.execute(target, args, self.plugin_name, timeout)
     
-    async def comm_layer_async(self, function, *args):
-        """The method that makes it possible for synchronous and asynchronous methods to call methods from plugins
+    @handle_errors(default_return=None)
+    def execute_sync(self, target: str, args: Any = None, timeout: Optional[float] = None) -> Any:
         """
-        try:
-            if self.asynced:
-                if asyncio.iscoroutinefunction(function):  # Check if function is async
-                    return self.event_loop.run_until_complete(function(*args))  # Now safe
-                else:
-                    self._logger.error(f"Function {function.__name__} is not async but called in async mode!")
-                    return function(*args)  # Just call it normally
-            else:
-                return function(*args)
-        except Exception as e:
-            self._logger.error(f"Error in comm_layer: {e}")
-            return None
+        One-liner to call another plugin's method synchronously with error handling.
+        
+        Args:
+            target: Target plugin and method (format: "PluginName.method_name")
+            args: Arguments to pass to the method
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the target method or None if an error occurs
+        """
+        return self._plugin_collection.execute_sync(target, args, self.plugin_name, timeout)
     
     def loop_start(self):
-        """The method that we expect all plugins, which need a loop, to implement. This is the
-            method that starts the needed loops
-        """
+        """Override this method to implement plugin loop functionality."""
         raise NotImplementedError
     
-    def loop(self):
-        pass
-    
-    
-    
     def perform_operation(self, argument):
-        """The method that we expect all plugins to implement. This is the
-            basic method
-        """
+        """Override this method to implement plugin operations."""
         raise NotImplementedError
 
 class Request:
-    """Carries the information about a request and
-    waits for result to be returned
-    """
+    """Represents a request from one plugin to another."""
     
-    @property
-    def author_host(self):
-        return self.__author_host
-
-    @author_host.setter
-    def author_host(self, value):
-        self.__author_host = value
-
-    @property
-    def author(self):
-        return self.__author
-
-    @author.setter
-    def author(self, value):
-        self.__author = value
-
-    @property
-    def id(self):
-        return self.__id
-
-    @id.setter
-    def id(self, value):
-        self.__id = value
-
-    @property
-    def target(self):
-        return self.__target
-
-    @target.setter
-    def target(self, value):
-        self.__target = value
-
-    @property
-    def args(self):
-        return self.__args
-
-    @args.setter
-    def args(self, value):
-        self.__args = value
-
-    @property
-    def collected(self):
-        return self.__collected
-
-    @collected.setter
-    def collected(self, value):
-        self.__collected = value
-
-    @property
-    def timeout(self):
-        return self.__timeout
-
-    @timeout.setter
-    def timeout(self, value):
-        self.__timeout = value
-
-    @property
-    def ready(self):
-        return self.__ready
-
-    @ready.setter
-    def ready(self, value):
-        self.__ready = value
-
-    @property
-    def error(self):
-        return self.__error
-
-    @error.setter
-    def error(self, value):
-        self.__error = value
-
-    @property
-    def result(self):
-        return self.__result
-
-    @result.setter
-    def result(self, value):
-        self.__result = value
-
-    @property
-    def created_at(self):
-        return self.__created_at
-
-    @created_at.setter
-    def created_at(self, value):
-        self.__created_at = value
-
-    @property
-    def timeout_duration(self):
-        return self.__timeout_duration
-
-    @timeout_duration.setter
-    def timeout_duration(self, value):
-        self.__timeout_duration = value
-
-    def __init__(self, author_host, author, target, args, timeout=None) -> None:
-        self.__author_host = author_host
-        self.__author = author  # Creator of the request
-        self.__id = uuid4().hex  # Unique ID for each request
-        self.__target = target  # Plugin and function name
-        self.__args = args  #
-        self.__collected = False
-        self.__timeout = False
-        self.__ready = False
-        self.__error = False
-        self.__result = None
-        self.__created_at = time.time()
-        self.__timeout_duration = timeout
-        self._future = asyncio.get_event_loop().create_future()
-        
-#        self.__lock = threading.Lock()
-#        self.__condition = threading.Condition(self.lock)  # Condition for waiting and notifying
-
-    def set_result(self, result, error=False) -> None:
-        """Sets the result of the request and marks it as collected."""
+    def __init__(self, 
+                author_host: str, 
+                author: str, 
+                target: str, 
+                args: Any = None, 
+                timeout: Optional[float] = None, 
+                event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        self.author_host = author_host
+        self.author = author
+        self.id = uuid4().hex
+        self.target = target
+        self.args = args
+        self.collected = False
+        self.timeout = False
+        self.ready = False
+        self.error = False
+        self.result = None
+        self.created_at = time.time()
+        self.timeout_duration = timeout
+        self.event_loop = event_loop or asyncio.get_event_loop()
+        self._future = self.event_loop.create_future()
+    
+    def set_result(self, result: Any, error: bool = False) -> None:
+        """Set the result of the request."""
         if not self._future.done():
             self.error = error
-            self.__result = result
+            self.result = result
             self._future.set_result((result, error, False))
             self.ready = True
-
-#    def set_result(self, result, error=False) -> None:
-#        """Sets the result of the request and notifies 
-#           waiting threads
-#        """
-#        with self.__condition:  # Acquire lock and notify waiting threads
-#            self.__result = result
-#            self.__error = error
-#            self.__ready = True
-#            self.__condition.notify_all()  # Notify all waiting threads
-
-    def set_collected(self):
-        self.__collected = True
-
-#    def get_result(self):
-#        with self.__request_lock:
-#            self.set_collected()
-#            if self.__error:
-#                raise Exception(self.__result)
-#            else:
-#                return self.__result
-
-    def get_result_sync(self):
-        """Synchronous wrapper to retrieve the result (for backward compatibility)."""
-        loop = asyncio.get_event_loop()
-        result, error, timed_out = loop.run_until_complete(self.wait_for_result_async())
+    
+    def set_collected(self) -> None:
+        """Mark the request as collected for cleanup."""
+        self.collected = True
+    
+    def get_result_sync(self) -> Any:
+        """Get the result synchronously."""
+        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
         try:
+            result, error, timed_out = future.result()
             if error:
-                raise Exception(self._result)
-            return self._result
-        finally:
-            self.set_collected()
-
-    async def wait_for_result_async(self):
-        """Waits asynchronously until the result is available, with an optional timeout."""
+                raise Exception(f"Request failed: {self.result}")
+            return self.result
+        except Exception as e:
+            raise e
+        
+    async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
+        """Wait for the result asynchronously."""
         try:
-            if self.timeout_duration and self.timeout_duration + self.created_at > time.time():
-                result, error, timed_out = await asyncio.wait_for(self._future, timeout=self.timeout_duration)
+            if self.result is not None:
+                return self.result, self.error, False
+            
+            # Check if we need to apply a timeout
+            if self.timeout_duration:
+                remaining_time = self.timeout_duration - (time.time() - self.created_at)
+                if remaining_time <= 0:
+                    # Already timed out
+                    self.result = f"Request {self.id} timed out"
+                    self.error = True
+                    self.ready = True
+                    self.timeout = True
+                    return self.result, True, True
+                
+                # Wait with timeout
+                try:
+                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
+                    return result, error, timed_out
+                except asyncio.TimeoutError:
+                    self.result = f"Request {self.id} timed out"
+                    self.error = True
+                    self.ready = True
+                    self.timeout = True
+                    return self.result, True, True
             else:
+                # Wait indefinitely
                 result, error, timed_out = await self._future
-            return result, error, timed_out
-        except asyncio.TimeoutError:
-            self.__result = f"Error: The Request({self.id}) timed out"
-            self.error = True
-            self.ready = True
-            self.timeout = True
-            return self.__result, True, True
-
-#    def wait_for_result(self):
-#        """Waits until the result is made
-#        """
-#        with self.__condition:  # Acquire lock
-#            while not self.__ready and not self.__timeout:
-#                if self.__timeout_duration != None:
-#                    remaining_time = self.__timeout_duration - (time.time() - self.__created_at)
-#                    if remaining_time <= 0:
-#                        self.__timeout = True
-#                        break
-#                    self.__condition.wait(timeout=remaining_time)  # Wait for notification or timeout
-#                else:
-#                    self.__condition.wait()  # Wait for notification
-#        return self.__result, self.error, self.timeout
-
-    
-    
+                return result, error, timed_out
+        except Exception as e:
+            return str(e), True, False

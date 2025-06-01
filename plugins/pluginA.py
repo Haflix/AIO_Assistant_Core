@@ -22,6 +22,6 @@ class PluginA(Plugin):
             timeout=5
         )
         # Use the async context manager to await the result with cleanup.
-        async with self._plugin_collection.request_context(request) as result:
+        async with self._plugin_collection.request_context_async(request) as result:
             # Use the result safely.
             return result

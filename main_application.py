@@ -1,58 +1,47 @@
-"""Main applicatoin that demonstrates the functionality of
-the dynamic plugins and the PluginCollection class
-"""
-
-from plugin_collection import PluginCollection
-import time
 import asyncio
+from plugin_collection import PluginCollection
+from decorators import async_log_errors
 
+@async_log_errors
 async def main():
-    """main function that runs the application
-    """
+    """Main function to demonstrate the plugin system."""
+    # Initialize the plugin collection
     plugin_collection = PluginCollection('plugins_test')
     
+    # Wait for plugins to be loaded
     await plugin_collection.wait_until_ready()
     
-    asyncio.create_task(plugin_collection.loop())
+    # Start the maintenance loop
+    asyncio.create_task(plugin_collection.running_loop())
     
-    #await asyncio.sleep(5)
+    # Example of using the one-liner execute method
+    result1 = await plugin_collection.execute("PluginA.perform_operation", 3)
+    print(f"Result from PluginA: {result1}")
     
-    request = await plugin_collection.create_request(
-            author="main",
-            target="PluginA.perform_operation",
-            args=int(3),
-            timeout=3
-        )
-    async with plugin_collection.request_context(request) as result:
-            # Use the result safely.
-            print(result)
+    result2 = await plugin_collection.execute("PluginC.perform_operation", 4)
+    print(f"Result from PluginC: {result2}")
     
-    #request = await plugin_collection.create_request(
-    #        author="main",
-    #        target="PluginC.perform_operation",
-    #        args=int(4),
-    #        timeout=None
-    #    )
-    #async with plugin_collection.request_context(request) as result:
-    #        # Use the result safely.
-    #        print(result)
-    #
-    #request = await plugin_collection.create_request(
-    #        author="main",
-    #        target="PluginD.perform_operation",
-    #        args=int(4),
-    #        timeout=None
-    #    )
-    #async with plugin_collection.request_context(request) as result:
-    #        # Use the result safely.
-    #        print(result)
-    
-    #asyncio.create_task(plugin_collection.loop())
-    #print("Ende")
+    # Attempt to call a non-existent plugin - will return None due to error handling
+    result3 = await plugin_collection.execute("PluginD.perform_operation", 4)
+    print(f"Result from non-existent PluginD: {result3}")
 
+async def shutdown(loop, signal=None):
+    """Cleanup tasks tied to the service's shutdown."""
+    if signal:
+        print(f"Received exit signal {signal.name}...")
+    
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    [task.cancel() for task in tasks]
+    
+    print(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
 
-if __name__ == '__main__':
-    #main()
-    #asyncio.run(main())
-    asyncio.ensure_future(main())
-    asyncio.get_event_loop().run_forever()
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    try:
+        loop.create_task(main())
+        loop.run_forever()
+    finally:
+        print("Successfully shutdown the service.")
+        loop.close()
