@@ -9,9 +9,6 @@ __pycache__/
 # VS-Code
 .vscode/
 
-# Personal things
-notes.txt
-
 # Distribution / packaging
 .Python
 build/

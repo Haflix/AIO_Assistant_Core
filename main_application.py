@@ -6,7 +6,7 @@ from decorators import async_log_errors
 async def main():
     """Main function to demonstrate the plugin system."""
     # Initialize the plugin collection
-    plugin_collection = PluginCollection('plugins_test')
+    plugin_collection = PluginCollection('config.yml')
     
     # Wait for plugins to be loaded
     await plugin_collection.wait_until_ready()

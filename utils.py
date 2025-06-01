@@ -39,6 +39,67 @@ class LogUtil(Logger):
         logger.setLevel(log_level)
         return logger
 
+class DummyMQTTClient:
+    """
+    # Example usage
+def sample_callback(topic, message):
+    print(f"Received message on {topic}: {message}")
+
+mqtt_client = DummyMQTTClient()
+mqtt_client.connect()
+mqtt_client.subscribe("test/topic", sample_callback)
+mqtt_client.publish("test/topic", "Hello, MQTT!")
+mqtt_client.simulate_incoming_message("test/topic", "Simulated message")
+mqtt_client.disconnect()
+"""
+    def __init__(self, client_id="dummy_client"):
+        self.client_id = client_id
+        self.connected = False
+        self.subscriptions = {}
+
+    def connect(self, host="localhost", port=1883):
+        """Simulates connecting to an MQTT broker."""
+        self.connected = True
+        print(f"[{self.client_id}] Connected to {host}:{port}")
+
+    def disconnect(self):
+        """Simulates disconnecting from the MQTT broker."""
+        self.connected = False
+        print(f"[{self.client_id}] Disconnected from broker")
+
+    def subscribe(self, topic, callback):
+        """Simulates subscribing to a topic."""
+        if not self.connected:
+            print(f"[{self.client_id}] Cannot subscribe, not connected")
+            return
+        self.subscriptions[topic] = callback
+        print(f"[{self.client_id}] Subscribed to topic: {topic}")
+
+    def unsubscribe(self, topic):
+        """Simulates unsubscribing from a topic."""
+        if topic in self.subscriptions:
+            del self.subscriptions[topic]
+            print(f"[{self.client_id}] Unsubscribed from topic: {topic}")
+        else:
+            print(f"[{self.client_id}] Not subscribed to topic: {topic}")
+
+    def publish(self, topic, message):
+        """Simulates publishing a message to a topic."""
+        if not self.connected:
+            print(f"[{self.client_id}] Cannot publish, not connected")
+            return
+        print(f"[{self.client_id}] Published to {topic}: {message}")
+        # Simulate message reception if subscribed
+        if topic in self.subscriptions:
+            self.subscriptions[topic](topic, message)
+
+    def simulate_incoming_message(self, topic, message):
+        """Simulates receiving a message on a subscribed topic."""
+        if topic in self.subscriptions:
+            print(f"[{self.client_id}] Simulating incoming message on {topic}: {message}")
+            self.subscriptions[topic](topic, message)
+        else:
+            print(f"[{self.client_id}] No subscription found for topic: {topic}")
 
 class Plugin:
     """Base class for all plugins."""

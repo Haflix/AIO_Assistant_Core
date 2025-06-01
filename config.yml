@@ -1,0 +1,36 @@
+plugins:
+  - name: PluginA
+    enabled: True
+    path: ./plugins_test/PluginA.py
+    description: A testplugin for ... testing :D
+    version: 0.0.1
+    asynced: True
+    loop_req: False
+    arguments: 
+
+  - name: PluginB
+    enabled: True
+    path: ./plugins_test/PluginB.py
+    description: A testplugin for ... testing :D (again)
+    version: 0.0.1
+    asynced: True
+    loop_req: False
+  	arguments: 
+
+  - name: PluginC
+    enabled: True
+    path: ./plugins_test/PluginC.py
+    description: A testplugin for ... testing :D (again but sync)
+    version: 0.0.1
+    asynced: False
+    loop_req: False
+    arguments: 
+
+mqtt:
+    enabled: False
+    hostname: "yoooo"
+    broker_ip: 192.69.69.69
+    port: 12345
+
+general:
+    log_path: 
