@@ -1,10 +1,11 @@
+import functools
 import inspect
 import os
 import pkgutil
 from uuid import uuid4
-from utils import LogUtil, Request
+from utils import LogUtil, Request, Plugin
 from logging import Logger
-import threading
+from contextlib import asynccontextmanager
 import asyncio
 import socket
 
@@ -14,56 +15,62 @@ class PluginCollection(object):
     """
     _logger = Logger
 
-    def __init__(self, plugin_package, hostname=socket.gethostname(), host=False, **kwargs):
-        self.hostname = hostname + uuid4().hex
-        
-        self._logger = LogUtil.create("DEBUG")
-        
-        self.requests = {}  # Dictionary to store ongoing requests
-        self.request_lock = threading.Lock()
-        self.thread_list = []
-        
-        self.plugin_package = plugin_package
-        self.reload_plugins()
-        
-        if host:
-            # NOTE: This instance is the main host
-            pass
-        else:
-            # connect to host
-            pass
-        # TODO: Add mqtt stuff
-        # NOTE: if host false then ip etc of host in kwargs
+    def __init__(self, plugin_package: str, hostname: str=socket.gethostname()):
+        try:
+            self.hostname = hostname + uuid4().hex
 
+            self._logger = LogUtil.create("DEBUG")
 
+            self.requests = {}  # Dictionary to store ongoing requests
+            self.request_lock = asyncio.Lock()
+            self.task_list = []
 
-    def reload_plugins(self):
+            self.plugin_package = plugin_package
+            
+            self._init_task = asyncio.create_task(self.reload_plugins())
+            
+        except Exception as e:
+            self._logger.critical(f"Critical Error while initializing: {e.with_traceback()}")
+
+    async def wait_until_ready(self):
+        """Wait until the plugins have been reloaded."""
+        await self._init_task
+
+    async def reload_plugins(self) -> None:
         """Clears all plugins and loads them again
         """
         self.plugins = []
         self.seen_paths = []
         
         self._logger.debug(f'Looking for plugins under package {self.plugin_package}')
-        self.walk_package(self.plugin_package)
-        self.start_loops()
+        await self.walk_package(self.plugin_package)
+        await self.start_loops()
         
 
 
-    def start_loops(self):
+    async def start_loops(self) -> None:
+        plugin: Plugin
         for plugin in self.plugins: 
             if plugin.loop_req and plugin.loop_running == False:
                 try:
-                    self.thread_list.append(threading.Thread(target=plugin.comm_layer, kwargs={"function":plugin.loop_start}, daemon=True).start())
+                    if plugin.asynced:
+                        task = asyncio.create_task(plugin.comm_layer(plugin.loop_start))
+                        self.task_list.append(task)
+                    else:
+                        # For sync plugins, offload to an executor.
+                        task = asyncio.create_task(self.sync_call(plugin.comm_layer, plugin.loop_start))
+                        self.task_list.append(task)
                 except Exception as e:
                     self._logger.error(f"Error starting loop of '{plugin.plugin_name}': {e}")
                 
 
 
-    def kill_everything(self):
+    async def kill_everything(self):
         raise NotImplementedError
 
 
-    def walk_package(self, package) -> None:
+
+    async def walk_package(self, package) -> None:
         """Recursively walk the supplied package to retrieve all plugins
         """
         
@@ -114,50 +121,80 @@ class PluginCollection(object):
 
                 # Recursively call walk_package on each sub-package.
                 for child_pkg in child_pkgs:
-                    self.walk_package(package + '.' + child_pkg)
+                    await self.walk_package(package + '.' + child_pkg)
     
     
     
-    def create_request(self, author: str, target: str, args, timeout=None) -> Request:
-        """Create a new request and returns it."""
+#    async def create_request(self, author: str, target: str, args, timeout=None) -> Request:
+#        """Create a new request and returns it."""
+#        
+#        # Create the request and add it to the dict
+#        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
+#        with self.request_lock:
+#            self.requests[request.id] = request
+#        self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
+#        
+#        # Start thread for the processing of the request
+#        self.thread_list.append(threading.Thread(target=self._process_request, args=(request,), daemon=True).start())
+#        
+#        return request
+    
+    @asynccontextmanager
+    async def request_context(self, request):
+        """
+        An async context manager to handle waiting for a request's result and ensure cleanup.
+        """
+        try:
+            # Wait for the result asynchronously.
+            result, error, timed_out = await request.wait_for_result_async()
+            if error:
+                raise Exception(f"Request {request.id} failed with result: {request.result}")
+            yield result
+        except Exception as e:
+            # Optionally log the error or handle it here.
+            self._logger.error(e)
+            raise e
+        finally:
+            # Always mark the request as collected.
+            request.set_collected()
+    
+    
+    async def create_request(self, author: str, target: str, args, timeout=None) -> Request:
+        """Create a new request and start its processing asynchronously."""
         
-        # Create the request and add it to the dict
-        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
-        with self.request_lock:
+        request = Request(self.hostname, author, target, args, timeout)
+        async with self.request_lock:
             self.requests[request.id] = request
         self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
         
-        # Start thread for the processing of the request
-        self.thread_list.append(threading.Thread(target=self._process_request, args=(request,), daemon=True).start())
+        task = asyncio.create_task(self._process_request(request))
+        self.task_list.append(task)
         
         return request
     
-    def create_request_wait(self, author, target, args, timeout=None)  -> Request:
-        """Create a new request, wait for its result via threading, and return it."""
+    
+#    async def create_request_wait(self, author, target, args, timeout=None)  -> object:
+#        """Create a new request, wait for its result via threading, and return it."""
+#        
+#        # Create the request and add it to the dict
+#        request = await self.create_request(author, target, args, timeout)
+#
+#        # Wait for the result or timeout
+#        result, error, timed_out = await request.wait_for_result_async()
+#        
+#        
+#        if timed_out:
+#            self._logger.warning(f"Request {request.id} timed out.") 
+#        elif error:
+#            self._logger.error(f"Request {request.id} failed with an error: {result}")
+#        else:
+#            self._logger.info(f"Request {request.id} completed successfully.")
+#            return request.get_result()  # Return the completed request object
         
-        # Create the request and add it to the dict
-        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
-        with self.request_lock:
-            self.requests[request.id] = request
-        self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
-        
-        # Start the processing thread
-        self.thread_list.append(threading.Thread(target=self._process_request, args=(request,), daemon=True).start())
-
-        # Wait for the result or timeout
-        result, error, timed_out = request.wait_for_result()
-        if timed_out:
-            self._logger.warning(f"Request {request.id} timed out.")
-        elif error:
-            self._logger.error(f"Request {request.id} failed with an error.")
-        else:
-            self._logger.info(f"Request {request.id} completed successfully.")
-        
-        return request  # Return the completed request object
     
     
     
-    def _process_request(self, request: Request):
+    async def _process_request(self, request: Request) -> None:
         """Process the request by passing it to the appropriate plugin."""
         # NOTE: send request to right host via mqtt (maybe even in create_request) but i think it should be better here in _process_request ()
         
@@ -168,100 +205,46 @@ class PluginCollection(object):
         plugin: Plugin = next((p for p in self.plugins if p.plugin_name == plugin_name), None)
         
         if not plugin:
-            request.set_result(f"Plugin {plugin_name} not found", error=True)
+            await self.sync_call(request.set_result, f"Plugin {plugin_name} not found", True)
             return
         
         # Check if function exists in the plugin
         try:
             func = getattr(plugin, function_name, None)
             if not callable(func):
-                request.set_result(f"Function {function_name} not found in plugin {plugin_name}", error=True)
+                await self.sync_call(request.set_result, f"Function {function_name} not found in plugin {plugin_name}", True)
                 return
             # Call the function with arguments
-            result = plugin.comm_layer(func, request.args)
+            result = await self.sync_call(plugin.comm_layer, func, request.args)
+            
             #result = func(request.args)
-            request.set_result(result)
+            await self.sync_call(request.set_result, result)
+            
         except Exception as e:
             self._logger.error(f"Error processing request from {request.author} to {request.target}({request.args}) ({request.id}): {e}")
-            request.set_result(str(e), error=True)
-            
-            
-    def _process_request_external(self, request: Request):
-        """Process the request by passing it to the appropriate sub-host with the plugin."""
-        # NOTE: THIS METHOD IS A PLACEHOLDER
-        pass
-    
-    
-            
-    
+            await self.sync_call(request.set_result, str(e), True)
+
+
+    async def sync_call(self, func, *args):
+        """Calls a sync function asynchronously and returns its result."""
+        #NOTE: Was wenn keine args?
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, functools.partial(func, *args))
+        
     
     
     async def loop(self):
-        """Loop for the program to stay alive while scripts are running"""
+        """Keep the application running, cleaning up tasks and requests periodically."""
         while True:
-            
-            # Iterate over the threads to check if theyre done
-            for t in self.thread_list:
-                if not t.is_alive():
-                    t.handled = True
-                    
-                    
-            # Fill list
-            self.thread_list = [t for t in self.thread_list if not t.handled or any]
-            
-            await asyncio.get_event_loop(
-                ).create_task(
-                    self.cleanup_requests()
-                    )
-            
+            # Remove completed tasks.
+            self.task_list = [t for t in self.task_list if not t.done()]
+            await self.cleanup_requests()
             await asyncio.sleep(10)
                   
     
-    def cleanup_requests(self):
+    async def cleanup_requests(self):
         """Remove completed requests."""
-        with self.request_lock:
+        async with self.request_lock:
             self.requests = {rid: req for rid, req in self.requests.items() if not req.collected}
 
 
-class Plugin(object):
-    """Base class that each plugin must inherit from. This class sets standard variables and functions that each plugin must have.
-    """
-
-    def __init__(self, logger: Logger, plugin_collection_c: PluginCollection):
-        self.description = "UNKNOWN"
-        self.plugin_name = "UNKNOWN"
-        self.version = "0.0.0"
-        self._logger = logger
-        self._plugin_collection = plugin_collection_c
-        self.asynced = False
-        self.loop_running = False
-        self.loop_req = False
-        self.event_loop = None
-    
-    def comm_layer(self, function, *args):
-        """The method that makes it possible for synchronous and asynchronous methods to call methods from plugins
-        """
-        try:
-            if self.asynced:
-                if asyncio.iscoroutinefunction(function):  # Check if function is async
-                    return self.event_loop.run_until_complete(function(*args))  # Now safe
-                else:
-                    self._logger.error(f"Function {function.__name__} is not async but called in async mode!")
-                    return function(*args)  # Just call it normally
-            else:
-                return function(*args)
-        except Exception as e:
-            self._logger.error(f"Error in comm_layer: {e}")
-            return None
-    
-    def loop_start(self):
-        """The method that we expect all plugins, which need a loop, to implement. This is the
-            method that starts the needed loops
-        """
-        raise NotImplementedError
-    
-    def perform_operation(self, argument):
-        """The method that we expect all plugins to implement. This is the
-            basic method
-        """
-        raise NotImplementedError

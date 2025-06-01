@@ -8,7 +8,6 @@ class PluginA(Plugin):
         super().__init__(logger, plugin_collection_c)
         self.description = "None"
         self.plugin_name = "PluginA"
-        self.asynced = True
 
     async def perform_operation(self, argument):
         """Simulate a request to PluginB."""
@@ -22,6 +21,6 @@ class PluginA(Plugin):
             timeout=5
         )
         # Use the async context manager to await the result with cleanup.
-        async with self._plugin_collection.request_context(request) as result:
+        with self._plugin_collection.request_context(request) as result:
             # Use the result safely.
             return result
