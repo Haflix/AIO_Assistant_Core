@@ -22,6 +22,7 @@ mqtt:
     hostname: ""
     broker_ip: 192.168.1.100
     port: 1883
+    tls: true
 
 general:
     ident_name: ""

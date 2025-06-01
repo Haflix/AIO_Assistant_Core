@@ -1,6 +1,5 @@
-for this version:
-- config
-|--> which plugins should get loaded + optional args for starting the plugins
+for this and following versions:
+- MQTT
 
 
 try:
