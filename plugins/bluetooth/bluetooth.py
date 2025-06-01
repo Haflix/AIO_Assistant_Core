@@ -23,7 +23,7 @@ class Bluetooth(plugin_collection.Plugin):
             self._logger.debug(f"Starting loop of '{self.plugin_name}'")
             asyncio.run(self.main())
         except Exception as e:
-            self._logger.error(f"Error starting loop of '{self.plugin_name}': {e}")
+            self._logger.error(f"Error starting loop of '{self.plugin_name}': {type(e).__name__}; {e}")
         self.loop_running = True
     
     async def main(self):

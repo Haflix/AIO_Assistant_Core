@@ -19,5 +19,5 @@ class PluginB(Plugin):
             self._logger.info(f"Calculated square of {number}: {result}")
             return result
         except Exception as e:
-            self._logger.error(f"Error calculating square: {e}")
+            self._logger.error(f"Error calculating square: {type(e).__name__}; {e}")
             raise

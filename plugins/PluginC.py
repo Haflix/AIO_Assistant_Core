@@ -12,9 +12,9 @@ class PluginC(Plugin):
         """Simulate a request to PluginB and use the context manager to handle errors and cleanup."""
         target = "PluginB.calculate_square"
         # Create the request asynchronously.
-        request = self._plugin_collection.create_request("PluginC", target, argument, timeout=5)
+        request = self._plugin_collection.create_request_sync("PluginC", target, argument, timeout=5)
         
         # Use the async context manager to await the result with cleanup.
-        with self._plugin_collection.request_context(request) as result:
+        with self._plugin_collection.request_context_sync(request) as result:
             # Use the result safely.
             return result

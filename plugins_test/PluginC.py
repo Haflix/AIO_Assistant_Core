@@ -1,20 +1,23 @@
-from utils import *
-from logging import Logger
+from utils import Plugin
+from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+import asyncio
 
 class PluginC(Plugin):
-    """"""
-    def __init__(self, logger: Logger, plugin_collection_c):
-        super().__init__(logger, plugin_collection_c)
-        self.description = "None"
+    """Example of a synchronous plugin that calls an async plugin."""
+    
+    def __init__(self, logger, plugin_collection):
+        super().__init__(logger, plugin_collection)
+        self.description = "Example sync plugin"
         self.plugin_name = "PluginC"
-        
+        self.asynced = False  # This is a sync plugin
+    
+    @log_errors
     def perform_operation(self, argument):
-        """Simulate a request to PluginB and use the context manager to handle errors and cleanup."""
-        target = "PluginB.calculate_square"
-        # Create the request asynchronously.
-        request = self._plugin_collection.create_request("PluginC", target, argument, timeout=5)
+        """Call an async plugin from a sync plugin using the one-liner."""
+        # One-liner with automatic error handling
+        result = self.execute_sync("PluginB.calculate_square", argument)
         
-        # Use the async context manager to await the result with cleanup.
-        with self._plugin_collection.request_context(request) as result:
-            # Use the result safely.
-            return result
+        if result is None:
+            return f"Error calling PluginB.calculate_square with {argument}"
+        
+        return result

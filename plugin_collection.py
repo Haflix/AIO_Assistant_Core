@@ -1,250 +1,270 @@
+import contextlib
 import functools
 import inspect
 import os
 import pkgutil
 from uuid import uuid4
-from utils import LogUtil, Request, Plugin
-from logging import Logger
-from contextlib import asynccontextmanager
 import asyncio
 import socket
+from typing import Any, Optional, Callable, Union, Dict, List
 
+from utils import LogUtil, Request, Plugin
+from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
-class PluginCollection(object):
-    """ Manages all the plugins and requests
-    """
-    _logger = Logger
-
-    def __init__(self, plugin_package: str, hostname: str=socket.gethostname()):
-        try:
-            self.hostname = hostname + uuid4().hex
-
-            self._logger = LogUtil.create("DEBUG")
-
-            self.requests = {}  # Dictionary to store ongoing requests
-            self.request_lock = asyncio.Lock()
-            self.task_list = []
-
-            self.plugin_package = plugin_package
-            
-            self._init_task = asyncio.create_task(self.reload_plugins())
-            
-        except Exception as e:
-            self._logger.critical(f"Critical Error while initializing: {e.with_traceback()}")
-
+class PluginCollection:
+    """Manages all plugins and facilitates communication between them."""
+    
+    def __init__(self, plugin_package: str, hostname: str = socket.gethostname()):
+        self.hostname = hostname + uuid4().hex
+        self._logger = LogUtil.create("DEBUG")
+        self.requests = {}
+        self.request_lock = asyncio.Lock()
+        self.task_list = []
+        self.plugin_package = plugin_package
+        self.main_event_loop = asyncio.get_event_loop()
+        self.plugins = []
+        self.seen_paths = []
+        
+        # Start initialization
+        self._init_task = asyncio.create_task(self.reload_plugins())
+    
     async def wait_until_ready(self):
         """Wait until the plugins have been reloaded."""
         await self._init_task
-
+    
+    @async_log_errors
     async def reload_plugins(self) -> None:
-        """Clears all plugins and loads them again
-        """
+        """Reload all plugins from the specified package."""
         self.plugins = []
         self.seen_paths = []
         
         self._logger.debug(f'Looking for plugins under package {self.plugin_package}')
         await self.walk_package(self.plugin_package)
         await self.start_loops()
-        
-
-
-    async def start_loops(self) -> None:
-        plugin: Plugin
-        for plugin in self.plugins: 
-            if plugin.loop_req and plugin.loop_running == False:
-                try:
-                    if plugin.asynced:
-                        task = asyncio.create_task(plugin.comm_layer(plugin.loop_start))
-                        self.task_list.append(task)
-                    else:
-                        # For sync plugins, offload to an executor.
-                        task = asyncio.create_task(self.sync_call(plugin.comm_layer, plugin.loop_start))
-                        self.task_list.append(task)
-                except Exception as e:
-                    self._logger.error(f"Error starting loop of '{plugin.plugin_name}': {e}")
-                
-
-
-    async def kill_everything(self):
-        raise NotImplementedError
-
-
-
+    
+    @async_log_errors
     async def walk_package(self, package) -> None:
-        """Recursively walk the supplied package to retrieve all plugins
-        """
-        
-        # Import the specified package dynamically. 
-        # The fromlist=[''] ensures that the imported_package is returned as the 
-        # actual package object and not just the top-level module.
+        """Recursively walk the supplied package to retrieve all plugins."""
         imported_package = __import__(package, fromlist=[''])
-
-        # Iterate over all modules in the specified package using pkgutil.iter_modules.
-        # This returns a tuple for each module: (module loader, module name, is package flag).
+        
         for _, pluginname, ispkg in pkgutil.iter_modules(imported_package.__path__, imported_package.__name__ + '.'):
-            
-            # Skip packages (directories) and only process regular modules (files).
-            
             if not ispkg:
-                # Dynamically import the module by name.
                 plugin_module = __import__(pluginname, fromlist=[''])
-                
-                # Retrieve all classes defined in the module using inspect.getmembers.
                 clsmembers = inspect.getmembers(plugin_module, inspect.isclass)
                 
                 for (_, c) in clsmembers:
-                    # Only add classes that are a sub class of the main Plugin class, but NOT the Plugin class itself
                     if issubclass(c, Plugin) & (c is not Plugin):
-                        # Log the discovered plugin class.
                         self._logger.debug(f'    Found plugin class: {c.__module__}.{c.__name__}')
-                        
-                        # Instantiate the plugin class and add it to the plugins list.
                         self.plugins.append(c(self._logger, self))
-
-
-        # Retrieve all paths associated with the current package. 
-        # A package's __path__ can be a single string or an iterable of paths.
+        
         all_current_paths = []
         if isinstance(imported_package.__path__, str):
             all_current_paths.append(imported_package.__path__)
         else:
             all_current_paths.extend([x for x in imported_package.__path__])
-
-        # Recursively traverse sub-packages.
+        
         for pkg_path in all_current_paths:
-            if pkg_path not in self.seen_paths:  # Avoid revisiting already-seen paths.
+            if pkg_path not in self.seen_paths:
                 self.seen_paths.append(pkg_path)
-
-                # Identify all subdirectories in the current package path. 
-                # These subdirectories are potential sub-packages.
                 child_pkgs = [p for p in os.listdir(pkg_path) if os.path.isdir(os.path.join(pkg_path, p))]
-
-                # Recursively call walk_package on each sub-package.
+                
                 for child_pkg in child_pkgs:
                     await self.walk_package(package + '.' + child_pkg)
     
+    @async_log_errors
+    async def start_loops(self) -> None:
+        """Start all plugin loops."""
+        for plugin in self.plugins:
+            if plugin.loop_req and not plugin.loop_running:
+                task = asyncio.create_task(self._start_plugin_loop(plugin))
+                self.task_list.append(task)
     
+    @async_handle_errors(None)
+    async def _start_plugin_loop(self, plugin: Plugin):
+        """Helper method to start a plugin's loop."""
+        if plugin.asynced:
+            await plugin.loop_start()
+        else:
+            await self.main_event_loop.run_in_executor(None, plugin.loop_start)
     
-#    async def create_request(self, author: str, target: str, args, timeout=None) -> Request:
-#        """Create a new request and returns it."""
-#        
-#        # Create the request and add it to the dict
-#        request = Request(self.hostname, author, target, args, self.request_lock, timeout)
-#        with self.request_lock:
-#            self.requests[request.id] = request
-#        self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
-#        
-#        # Start thread for the processing of the request
-#        self.thread_list.append(threading.Thread(target=self._process_request, args=(request,), daemon=True).start())
-#        
-#        return request
-    
-    @asynccontextmanager
-    async def request_context(self, request):
+    @async_log_errors
+    async def call(self, 
+                  target: str, 
+                  args: Any = None, 
+                  author: str = "system", 
+                  timeout: Optional[float] = None) -> Any:
         """
-        An async context manager to handle waiting for a request's result and ensure cleanup.
+        Simplified method to call a plugin method and get its result.
+        
+        Args:
+            target: The plugin and method in format "PluginName.method_name"
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method
         """
+        request = await self.create_request(author, target, args, timeout)
+        async with self.request_context_async(request) as result:
+            return result
+    
+    @log_errors
+    def call_sync(self, 
+                 target: str, 
+                 args: Any = None, 
+                 author: str = "system", 
+                 timeout: Optional[float] = None) -> Any:
+        """
+        Synchronous version of call method.
+        
+        Args:
+            target: Target plugin and method (format: "PluginName.method_name")
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method
+        """
+        request = self.create_request_sync(author, target, args, timeout)
+        with self.request_context_sync(request) as result:
+            return result
+    
+    @contextlib.asynccontextmanager
+    async def request_context_async(self, request: Request):
+        """Async context manager to handle requests."""
         try:
-            # Wait for the result asynchronously.
             result, error, timed_out = await request.wait_for_result_async()
             if error:
-                raise Exception(f"Request {request.id} failed with result: {request.result}")
+                raise Exception(f"Request {request.id} failed: {request.result}")
             yield result
-        except Exception as e:
-            # Optionally log the error or handle it here.
-            self._logger.error(e)
-            raise e
         finally:
-            # Always mark the request as collected.
             request.set_collected()
     
+    @contextlib.contextmanager
+    def request_context_sync(self, request: Request):
+        """Sync context manager to handle requests."""
+        try:
+            result = request.get_result_sync()
+            if request.error:
+                raise Exception(f"Request failed: {request.result}")
+            yield result
+        finally:
+            request.set_collected()
     
-    async def create_request(self, author: str, target: str, args, timeout=None) -> Request:
-        """Create a new request and start its processing asynchronously."""
-        
-        request = Request(self.hostname, author, target, args, timeout)
+    @async_log_errors
+    async def create_request(self, 
+                           author: str, 
+                           target: str, 
+                           args: Any = None, 
+                           timeout: Optional[float] = None) -> Request:
+        """Create a new request asynchronously."""
+        request = Request(self.hostname, author, target, args, timeout, self.main_event_loop)
         async with self.request_lock:
             self.requests[request.id] = request
-        self._logger.info(f"Request {request.id} created by {author} targeting {target} with args ({args})")
         
+        self._logger.info(f"Request {request.id} created by {author} targeting {target}")
         task = asyncio.create_task(self._process_request(request))
         self.task_list.append(task)
         
         return request
     
+    @log_errors
+    def create_request_sync(self, 
+                          author: str, 
+                          target: str, 
+                          args: Any = None, 
+                          timeout: Optional[float] = None) -> Request:
+        """Create a new request synchronously."""
+        coro = self.create_request(author, target, args, timeout)
+        future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
+        return future.result()
     
-#    async def create_request_wait(self, author, target, args, timeout=None)  -> object:
-#        """Create a new request, wait for its result via threading, and return it."""
-#        
-#        # Create the request and add it to the dict
-#        request = await self.create_request(author, target, args, timeout)
-#
-#        # Wait for the result or timeout
-#        result, error, timed_out = await request.wait_for_result_async()
-#        
-#        
-#        if timed_out:
-#            self._logger.warning(f"Request {request.id} timed out.") 
-#        elif error:
-#            self._logger.error(f"Request {request.id} failed with an error: {result}")
-#        else:
-#            self._logger.info(f"Request {request.id} completed successfully.")
-#            return request.get_result()  # Return the completed request object
-        
-    
-    
-    
+    @async_handle_errors(None)
     async def _process_request(self, request: Request) -> None:
-        """Process the request by passing it to the appropriate plugin."""
-        # NOTE: send request to right host via mqtt (maybe even in create_request) but i think it should be better here in _process_request ()
-        
-        # Extract name of plugin and function
+        """Process a request by invoking the target plugin method."""
         plugin_name, function_name = request.target.split(".")
         
-        # Get plugin from self.plugins if it exists
-        plugin: Plugin = next((p for p in self.plugins if p.plugin_name == plugin_name), None)
+        plugin = next((p for p in self.plugins if p.plugin_name == plugin_name), None)
         
         if not plugin:
-            await self.sync_call(request.set_result, f"Plugin {plugin_name} not found", True)
+            await self._set_request_result(request, f"Plugin {plugin_name} not found", True)
             return
         
-        # Check if function exists in the plugin
-        try:
-            func = getattr(plugin, function_name, None)
-            if not callable(func):
-                await self.sync_call(request.set_result, f"Function {function_name} not found in plugin {plugin_name}", True)
-                return
-            # Call the function with arguments
-            result = await self.sync_call(plugin.comm_layer, func, request.args)
-            
-            #result = func(request.args)
-            await self.sync_call(request.set_result, result)
-            
-        except Exception as e:
-            self._logger.error(f"Error processing request from {request.author} to {request.target}({request.args}) ({request.id}): {e}")
-            await self.sync_call(request.set_result, str(e), True)
-
-
-    async def sync_call(self, func, *args):
-        """Calls a sync function asynchronously and returns its result."""
-        #NOTE: Was wenn keine args?
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, functools.partial(func, *args))
+        func = getattr(plugin, function_name, None)
+        if not callable(func):
+            await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
+            return
         
+        if plugin.asynced or asyncio.iscoroutinefunction(func):
+            result = await func(request.args)
+        else:
+            result = await self.main_event_loop.run_in_executor(None, func, request.args)
+        
+        await self._set_request_result(request, result)
     
+    @async_handle_errors(None)
+    async def _set_request_result(self, request: Request, result: Any, error: bool = False) -> None:
+        """Set the result of a request."""
+        if isinstance(result, asyncio.Future):
+            result = await result
+        request.set_result(result, error)
     
-    async def loop(self):
-        """Keep the application running, cleaning up tasks and requests periodically."""
+    async def running_loop(self):
+        """Maintenance loop that cleans up tasks and requests."""
         while True:
-            # Remove completed tasks.
             self.task_list = [t for t in self.task_list if not t.done()]
             await self.cleanup_requests()
             await asyncio.sleep(10)
-                  
     
+    @async_log_errors
     async def cleanup_requests(self):
-        """Remove completed requests."""
+        """Remove collected requests."""
         async with self.request_lock:
             self.requests = {rid: req for rid, req in self.requests.items() if not req.collected}
-
-
+    
+    # One-liner methods for plugin communication
+    @async_handle_errors(default_return=None)
+    async def execute(self, target: str, args: Any = None, author: str = "system", timeout: Optional[float] = None) -> Any:
+        """
+        One-liner to execute a plugin method and get its result with built-in error handling.
+        This combines request creation, processing, and result retrieval in one method.
+        
+        Args:
+            target: The plugin and method in format "PluginName.method_name"
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method or None if any error occurs
+        """
+        request = await self.create_request(author, target, args, timeout)
+        result, error, _ = await request.wait_for_result_async()
+        request.set_collected()  # Mark for cleanup
+        
+        if error:
+            self._logger.warning(f"Error executing {target}: {result}")
+            return None
+        return result
+    
+    @handle_errors(default_return=None)
+    def execute_sync(self, target: str, args: Any = None, author: str = "system", timeout: Optional[float] = None) -> Any:
+        """
+        Synchronous one-liner to execute a plugin method with built-in error handling.
+        
+        Args:
+            target: The plugin and method in format "PluginName.method_name"
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method or None if any error occurs
+        """
+        future = asyncio.run_coroutine_threadsafe(
+            self.execute(target, args, author, timeout),
+            self.main_event_loop
+        )
+        return future.result()
