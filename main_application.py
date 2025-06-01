@@ -9,7 +9,7 @@ import asyncio
 async def main():
     """main function that runs the application
     """
-    plugin_collection = PluginCollection('plugins')
+    plugin_collection = PluginCollection('plugins', host=True)
     #request = plugin_collection.create_request_wait( # NOTE: works but blocks the loop entirely
     #        author="main",
     #        target="PluginA.perform_operation",
