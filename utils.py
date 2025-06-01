@@ -5,6 +5,7 @@ import json
 import logging
 import logging.handlers
 import os
+import pickle
 import sys
 from logging import FileHandler, Logger, StreamHandler, DEBUG
 from typing import Union
@@ -15,23 +16,22 @@ from typing import Any, Optional, Tuple, Union
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
 
-
-
 class LogUtil(logging.Logger):
     __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
+
     def __init__(
-            self,
-            name: str,
-            log_format: str = __FORMATTER,
-            level: Union[int, str] = DEBUG,
-            *args,
-            **kwargs
+        self,
+        name: str,
+        log_format: str = __FORMATTER,
+        level: Union[int, str] = DEBUG,
+        *args,
+        **kwargs,
     ) -> None:
         super().__init__(name, level)
         self.formatter = logging.Formatter(log_format)
 
     @staticmethod
-    def create(log_level: str = 'DEBUG') -> logging.Logger:
+    def create(log_level: str = "DEBUG") -> logging.Logger:
         """Create and configure the root logger."""
         logging.setLoggerClass(LogUtil)
         root_logger = logging.getLogger()
@@ -68,21 +68,22 @@ class LogUtil(logging.Logger):
 
 class AsyncMQTTClient:
     """
-    # Example usage
-def sample_callback(topic, message):
-    print(f"Received message on {topic}: {message}")
+        # Example usage
+    def sample_callback(topic, message):
+        print(f"Received message on {topic}: {message}")
 
-mqtt_client = DummyMQTTClient()
-mqtt_client.connect()
-mqtt_client.subscribe("test/topic", sample_callback)
-mqtt_client.publish("test/topic", "Hello, MQTT!")
-mqtt_client.simulate_incoming_message("test/topic", "Simulated message")
-mqtt_client.disconnect()
-"""
+    mqtt_client = DummyMQTTClient()
+    mqtt_client.connect()
+    mqtt_client.subscribe("test/topic", sample_callback)
+    mqtt_client.publish("test/topic", "Hello, MQTT!")
+    mqtt_client.simulate_incoming_message("test/topic", "Simulated message")
+    mqtt_client.disconnect()
+    """
+
     def __init__(self, config, logger: LogUtil):
-        #NOTE: Add on_message etc
-        #NOTE: connect, disconnect, subscribe, unsubscribe, 
-        #NOTE: on_connect, on_message, on_connect_fail, on_disconnect
+        # NOTE: Add on_message etc
+        # NOTE: connect, disconnect, subscribe, unsubscribe,
+        # NOTE: on_connect, on_message, on_connect_fail, on_disconnect
         self.mqttC = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self._logger = logger
         self._logger.setLevel(logging.DEBUG)
@@ -90,60 +91,99 @@ mqtt_client.disconnect()
         self.connected = False
         self.loop = asyncio.get_event_loop()
         self.pending_requests = {}
-        
+
         self.ack_timeout = 2  # Seconds to wait for ACK
         self.max_ack_attempts = 3
-        
+
         # Configure credentials
         if config.get("username"):
             self.mqttC.username_pw_set(config["username"], config["password"])
-        
+
         # Configure TLS if needed
         if config.get("tls", True):
             self.mqttC.tls_set()
-        
-        
+
         self.configureCallbacks()
-        
-        
+
     def configureCallbacks(self):
-        self.mqttC.on_connect = self._on_connect 
-        self.mqttC.on_connect_fail = self._on_connect_fail #FIXME
-        
-        self.mqttC.on_disconnect = self._on_disconnect #FIXME
-        
-        self.mqttC.on_log = self._logger.debug #NOTE: Idk if it works
-        
-        self.mqttC.on_pre_connect #FIXME
-    
-        self.mqttC.on_message = self._on_message 
-        
-    
+        self.mqttC.on_connect = self._on_connect
+        self.mqttC.on_connect_fail = self._on_connect_fail  # FIXME
+
+        self.mqttC.on_disconnect = self._on_disconnect  # FIXME
+
+        self.mqttC.on_log = self._logger.debug  # NOTE: Idk if it works
+
+        self.mqttC.on_pre_connect  # FIXME
+
+        self.mqttC.on_message = self._on_message
+
     async def connect(self):
-        self.mqttC.connect_async(
-            self.config["broker_ip"],
-            self.config["port"]
-        )
-        self.mqttC.loop_start()    
-    
+        self.mqttC.connect_async(self.config["broker_ip"], self.config["port"])
+        self.mqttC.loop_start()
+
     def _on_connect(self, mqttC, userdata, flags, reason_code, properties):
         if reason_code == 0:
-            self.logger.info("Connected to MQTT broker")
+            self._logger.info("Connected to MQTT broker")  # Fixed: self._logger
             self.connected = True
-            # Subscribe to necessary topics
             mqttC.subscribe(f"devices/{self.config['hostname']}/execute")
             mqttC.subscribe("devices/+/heartbeat")
             mqttC.subscribe(f"devices/{self.config['hostname']}/response/+")
         else:
-            self.logger.error(f"Connection failed: {mqtt.connack_string(reason_code)}")
+            self._logger.error(
+                f"Connection failed: {mqtt.connack_string(reason_code)}"
+            )  # Fixed
 
     def _on_message(self, mqttC, userdata, msg):
         self.loop.call_soon_threadsafe(
-            self._handle_async_message,
-            msg.topic,
-            msg.payload.decode()
+            self._handle_async_message, msg.topic, msg.payload.decode()
         )
-        
+
+    @async_handle_errors(default_return=False)
+    async def publish(
+        self, topic: str, payload: Any, qos: int = 0, retain: bool = False
+    ) -> bool:
+        """
+        Publish data with automatic serialization
+
+        Args:
+            topic: MQTT topic to publish to
+            payload: Data to send (any type, will be serialized)
+            qos: Quality of Service level (0-2)
+            retain: Whether to retain the message
+
+        Returns:
+            True if successful, False on error
+        """
+        try:
+            # Serialize the payload
+            serialized = self._serialize(payload)
+
+            # Convert to bytes if needed (Paho MQTT requirement)
+            if isinstance(serialized, str):
+                serialized = serialized.encode("utf-8")
+
+            # Create a future for async operation
+            future = self.loop.create_future()
+
+            # Publish using thread-safe method
+            def _publish():
+                result = self.mqttC.publish(topic, serialized, qos, retain)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    future.set_result(True)
+                else:
+                    future.set_exception(
+                        mqtt.MQTTException(
+                            f"Publish failed: {mqtt.error_string(result.rc)}"
+                        )
+                    )
+
+            await self.loop.run_in_executor(None, _publish)
+            return await future
+
+        except Exception as e:
+            self._logger.error(f"Publish failed to {topic}: {str(e)}")
+            return False
+
     async def _handle_async_message(self, topic, payload):
         if topic.startswith("devices/") and "/execute" in topic:
             await self._handle_execute_request(topic, payload)
@@ -151,72 +191,96 @@ mqtt_client.disconnect()
             self._handle_heartbeat(topic, payload)
         elif "/response/" in topic:
             self._handle_response(topic, payload)
-            
+
     def _handle_heartbeat(self, topic, payload):
         """Update host registry with heartbeat data"""
         host = topic.split("/")[1]
         data = json.loads(payload)
         self.host_registry[host] = {
             "last_seen": time.time(),
-            "plugins": data["plugins"]
-        } 
+            "plugins": data["plugins"],
+        }
 
     async def _handle_execute_request(self, topic, payload):
         """Process incoming requests with ACK mechanism"""
         try:
             data = self._deserialize(payload)
-            request_id = data['request_id']
-            sender_host = topic.split('/')[1]
+            request_id = data["request_id"]
+            sender_host = topic.split("/")[1]
 
             # Send ACK immediately
             ack_topic = f"devices/{sender_host}/ack/{request_id}"
-            self.client.publish(ack_topic, self._serialize({
-                'status': 'received',
-                'receiver': self.config['hostname']
-            }))
+            self.publish(
+                ack_topic, {"status": "received", "receiver": self.config["hostname"]}
+            )
 
             # Process request
             result = await self._process_request_locally(data)
-            
+
             # Send response
-            response_topic = data['response_topic']
-            self.client.publish(response_topic, self._serialize(result))
-            
+            response_topic = data["response_topic"]
+            self.publish(response_topic, result)
+
         except Exception as e:
             self.logger.error(f"Request handling failed: {str(e)}")
 
     async def _process_request_locally(self, data):
         """Execute the requested plugin method locally"""
-        plugin = self._plugin_collection.get_plugin(data['plugin'])
+        plugin = self._plugin_collection.get_plugin(data["plugin"])
         if not plugin:
             raise ValueError(f"Plugin {data['plugin']} not found")
-        return await getattr(plugin, data['method'])(data['args'])
-    
+        return await getattr(plugin, data["method"])(data["args"])
+
     def _serialize(self, data):
-        """Handle binary data and complex types"""
+        """Handle complex types with explicit type markers"""
         if isinstance(data, bytes):
-            return json.dumps({
-                '_type': 'bytes',
-                'data': base64.b64encode(data).decode('utf-8')
-            })
-        return json.dumps(data)
+            return json.dumps(
+                {"_type": "bytes", "data": base64.b64encode(data).decode("utf-8")}
+            )
+        elif isinstance(data, (dict, list)):
+            return json.dumps(data)
+        elif isinstance(data, (int, float, str, bool, type(None))):
+            return json.dumps({"value": data})
+        else:
+            # Handle custom objects
+            return json.dumps(
+                {
+                    "_type": "custom",
+                    "data": base64.b64encode(pickle.dumps(data)).decode("utf-8"),
+                }
+            )
 
     def _deserialize(self, payload):
         """Convert received payload back to original format"""
         try:
             data = json.loads(payload)
-            if isinstance(data, dict) and data.get('_type') == 'bytes':
-                return base64.b64decode(data['data'])
+            if isinstance(data, dict):
+                # Handle bytes
+                if data.get("_type") == "bytes":
+                    return base64.b64decode(data["data"])
+                # Handle custom objects
+                elif data.get("_type") == "custom":
+                    return pickle.loads(base64.b64decode(data["data"]))
+                # Handle primitives wrapped in {'value': ...}
+                elif "value" in data:
+                    return data["value"]
+                # Return the dictionary as-is if no special handling
+                return data
+            # Return lists or other JSON structures directly
             return data
         except json.JSONDecodeError:
+            # Return raw payload if not JSON (e.g., plain string)
             return payload
 
 
 class Plugin:
     """Base class for all plugins."""
+
     def __init__(self, logger: LogUtil, plugin_collection):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
+        self.uid = uuid4().hex
+        # self.
         self.version = "0.0.0"
         self._logger = logger
         self._logger.setLevel(logging.DEBUG)
@@ -225,55 +289,82 @@ class Plugin:
         self.loop_running = False
         self.loop_req = False
         self.event_loop = plugin_collection.main_event_loop
-    
+
     @async_handle_errors(default_return=None)
-    async def execute(self, target: str, args: Any = None, timeout: Optional[float] = None) -> Any:
+    async def execute(
+        self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: Optional[str] = "",
+        timeout: Optional[float] = None,
+    ) -> Any:
         """
         One-liner to call another plugin's method asynchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        return await self._plugin_collection.execute(target, args, self.plugin_name, timeout)
-    
+        return await self._plugin_collection.execute(
+            plugin, method, args, plugin_id, host, self.plugin_name, self.uid, timeout
+        )
+
     @handle_errors(default_return=None)
-    def execute_sync(self, target: str, args: Any = None, timeout: Optional[float] = None) -> Any:
+    def execute_sync(
+        self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: Optional[str] = "",
+        timeout: Optional[float] = None,
+    ) -> Any:
         """
         One-liner to call another plugin's method synchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        return self._plugin_collection.execute_sync(target, args, self.plugin_name, timeout)
-    
+        return self._plugin_collection.execute_sync(
+            plugin, method, args, plugin_id, host, self.plugin_name, self.uid, timeout
+        )
+
+    def checkCompatibility(self, *args, **kwargs):
+        """Override this method to add checks for plugincompatibility"""
+        return True
+
     def loop_start(self):
         """Override this method to implement plugin loop functionality."""
         raise NotImplementedError
-    
+
     def perform_operation(self, argument):
         """Override this method to implement plugin operations."""
         raise NotImplementedError
 
+
 class Request:
     """Represents a request from one plugin to another."""
-    
-    def __init__(self, 
-                author_host: str, 
-                author: str, 
-                target: str, 
-                args: Any = None, 
-                timeout: Optional[float] = None, 
-                event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+
+    def __init__(
+        self,
+        author_host: str,
+        author: str,
+        target: str,
+        args: Any = None,
+        timeout: Optional[float] = None,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
         self.author_host = author_host
         self.author = author
         self.id = uuid4().hex
@@ -288,7 +379,7 @@ class Request:
         self.timeout_duration = timeout
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
-    
+
     def set_result(self, result: Any, error: bool = False) -> None:
         """Set the result of the request."""
         if not self._future.done():
@@ -296,14 +387,16 @@ class Request:
             self.result = result
             self._future.set_result((result, error, False))
             self.ready = True
-    
+
     def set_collected(self) -> None:
         """Mark the request as collected for cleanup."""
         self.collected = True
-    
+
     def get_result_sync(self) -> Any:
         """Get the result synchronously."""
-        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self.wait_for_result_async(), self.event_loop
+        )
         try:
             result, error, timed_out = future.result()
             if error:
@@ -311,13 +404,13 @@ class Request:
             return self.result
         except Exception as e:
             raise e
-        
+
     async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
         """Wait for the result asynchronously."""
         try:
             if self.result is not None:
                 return self.result, self.error, False
-            
+
             # Check if we need to apply a timeout
             if self.timeout_duration:
                 remaining_time = self.timeout_duration - (time.time() - self.created_at)
@@ -328,10 +421,12 @@ class Request:
                     self.ready = True
                     self.timeout = True
                     return self.result, True, True
-                
+
                 # Wait with timeout
                 try:
-                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
+                    result, error, timed_out = await asyncio.wait_for(
+                        self._future, timeout=remaining_time
+                    )
                     return result, error, timed_out
                 except asyncio.TimeoutError:
                     self.result = f"Request {self.id} timed out"

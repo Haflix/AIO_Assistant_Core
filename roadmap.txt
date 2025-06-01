@@ -14,6 +14,8 @@ to be added:
 - descriptions, code comments etc, documentation, complete class docstring and all other docstrings, uml usw maybe? https://realpython.com/documenting-python-code/
 - kill everything before reloading
 - log to file
+- find_matching_plugin : There to identify if a compatible plugin exists and where it exists 
+- execute : !!! Needs to add the new arguments (find_matching_plugin needs to be made for this)  
 
 
 ideas:

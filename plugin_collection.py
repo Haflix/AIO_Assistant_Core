@@ -13,6 +13,7 @@ import socket
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
+from exceptions import ConfigException, RequestException
 from utils import LogUtil, Request, Plugin, AsyncMQTTClient
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
@@ -87,7 +88,7 @@ class PluginCollection:
     async def _heartbeat_task(self):
         """Regularly publish heartbeat messages"""
         while True:
-            self.mqtt.mqttC.publish(
+            await self.mqtt.publish(
                 f"devices/{self.local_hostname}/heartbeat",
                 json.dumps({
                     "plugins": [p.plugin_name for p in self.plugins],
@@ -109,12 +110,12 @@ class PluginCollection:
         # Check required sections
         for section in ["plugins", "mqtt", "general"]:
             if section not in self.yaml_config:
-                self._logger.critical(f"Missing config section: {section}")
+                raise ConfigException(f"Missing config section: {section}")
 
         # Validate plugins
         for plugin in self.yaml_config.get("plugins", []):
             if "name" not in plugin or "enabled" not in plugin:
-                self._logger.critical("Plugin entry missing name/enabled field")
+                raise ConfigException("Plugin entry missing name/enabled field")
 
             # Warn if path is empty but plugin_package isn't configured
             if not plugin.get("path") and "plugin_package" not in self.yaml_config.get("general", {}):
@@ -123,7 +124,7 @@ class PluginCollection:
         # Validate MQTT if enabled
         if self.yaml_config.get("mqtt", {}).get("enabled", False):
             if not self.yaml_config["mqtt"].get("broker_ip"):
-                self._logger.critical("MQTT enabled but missing broker_ip")
+                raise ConfigException("MQTT enabled but missing broker_ip")
                     
             
     @log_errors       
@@ -158,6 +159,10 @@ class PluginCollection:
         
         asyncio.create_task(self.running_loop())
     
+    def resolve_plugin_path(self, plugin_config, base_package):
+        return os.path.abspath(plugin_config.get("path") or os.path.join(base_package, plugin_config["name"]))
+
+    
     @async_log_errors
     async def reload_plugins(self) -> None:
         self.plugins = []
@@ -172,8 +177,9 @@ class PluginCollection:
             arguments = plugin_entry.get("arguments") or None
 
             # Resolve plugin directory
-            path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
-            path = os.path.abspath(path)
+            path = self.resolve_plugin_path(plugin_entry, self.plugin_package)
+            #path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
+            #path = os.path.abspath(path)
 
             if not os.path.exists(path):
                 self._logger.error(f"Plugin directory missing: {name} ({path})")
@@ -199,8 +205,7 @@ class PluginCollection:
                 continue
 
             # Dynamic import
-            #try:
-            if 1 == 1:
+            try:
                 module_path = os.path.join(path, "plugin.py")
                 spec = importlib.util.spec_from_file_location(name, module_path)
                 module = importlib.util.module_from_spec(spec)
@@ -226,9 +231,9 @@ class PluginCollection:
                 
                 self._logger.info(f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})")
 
-            #except Exception as e:
-            #    self._logger.error(f"Failed loading {name}: {e}")
-            #    continue
+            except Exception as e:
+                self._logger.error(f"Failed loading {name}: {e}")
+                continue
 
         await self.start_loops()
     
@@ -419,6 +424,10 @@ class PluginCollection:
             self.requests = {rid: req for rid, req in self.requests.items() if not req.collected}
     
     
+    @async_handle_errors(default_return=None)
+    async def find_matching_plugin(self):
+        pass
+    
     # One-liner methods for plugin communication
     @async_handle_errors(default_return=None)
     async def execute(
@@ -426,8 +435,10 @@ class PluginCollection:
         plugin: str,
         method: str,
         args: Any = None,
-        host: str = "local",  # "any", "remote", "local", or hostname
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
+        author_id: str = "system",
         timeout: Optional[float] = None
     ) -> Any:
         # Determine target host
@@ -518,7 +529,7 @@ class PluginCollection:
 
             # Send to specific host
             topic = f"devices/{target_host}/execute"
-            self.mqtt.client.publish(topic, payload)
+            await self.mqtt.publish(topic, payload)
             
             # Wait for ACK
             try:
@@ -544,15 +555,24 @@ class PluginCollection:
                 data = self.mqtt._deserialize(payload)
                 future.set_result(data)
                 
-        self.mqtt.client.message_callback_add(ack_topic, ack_handler)
+        self.mqtt.mqttC.message_callback_add(ack_topic, ack_handler)
         try:
             return await future
         finally:
-            self.mqtt.client.message_callback_remove(ack_topic)
+            self.mqtt.mqttC.message_callback_remove(ack_topic)
 
     
     @handle_errors(default_return=None)
-    def execute_sync(self, target: str, args: Any = None, author: str = "system", timeout: Optional[float] = None) -> Any:
+    def execute_sync(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+    ):
         """
         Synchronous one-liner to execute a plugin method with built-in error handling.
         
@@ -567,7 +587,7 @@ class PluginCollection:
         """
         
         future = asyncio.run_coroutine_threadsafe(
-            self.execute(target, args, author, timeout),
+            self.execute(plugin, method, args, plugin_id, host, author, author_id, timeout),
             self.main_event_loop
         )
         return future.result()
