@@ -1,36 +1,29 @@
 plugins:
-  - name: PluginA
-    enabled: True
-    path: ./plugins_test/PluginA.py
-    description: A testplugin for ... testing :D
+  - name: PluginA      
+    enabled: true
+    path: ./plugins_test/pluginA_v1  # Explicit path
     version: 0.0.1
-    asynced: True
-    loop_req: False
-    arguments: 
-
-  - name: PluginB
-    enabled: True
-    path: ./plugins_test/PluginB.py
-    description: A testplugin for ... testing :D (again)
-    version: 0.0.1
-    asynced: True
-    loop_req: False
-  	arguments: 
 
   - name: PluginC
-    enabled: True
-    path: ./plugins_test/PluginC.py
-    description: A testplugin for ... testing :D (again but sync)
+    enabled: true
     version: 0.0.1
-    asynced: False
-    loop_req: False
-    arguments: 
+    arguments:
+        variable: test argument
+
+  - name: PluginB
+    enabled: true      # No path - auto-resolve to plugin_package/PluginB
+    version: 0.0.1    # Optional version check
+
+
+
 
 mqtt:
-    enabled: False
-    hostname: "yoooo"
-    broker_ip: 192.69.69.69
-    port: 12345
+    enabled: false
+    hostname: ""
+    broker_ip: 192.168.1.100
+    port: 1883
 
 general:
-    log_path: 
+    ident_name: ""
+    log_folder: ./logs
+    plugin_package: plugins_test  # Base directory for plugins if path is omitted

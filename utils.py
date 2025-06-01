@@ -1,7 +1,10 @@
 import asyncio
+import datetime
 import logging
+import logging.handlers
+import os
 import sys
-from logging import Logger, StreamHandler, DEBUG
+from logging import FileHandler, Logger, StreamHandler, DEBUG
 from typing import Union
 from uuid import uuid4
 import time
@@ -10,11 +13,58 @@ from decorators import log_errors, handle_errors, async_log_errors, async_handle
 
 
 
-class LogUtil(Logger):
-    """Logging class
-    """
-    __FORMATTER = "%(asctime)s — %(name)s — %(levelname)s — %(module)s.%(funcName)s:%(lineno)d — %(message)s"
-
+#class LogUtil(logging.Logger):
+#    __FORMATTER = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+#    def __init__(
+#            self,
+#            name: str,
+#            log_format: str = __FORMATTER,
+#            level: Union[int, str] = DEBUG,
+#            log_file: Optional[str] = None,  # Path to the log file
+#            *args,
+#            **kwargs
+#    ) -> None:
+#        super().__init__(name, level)
+#        self.formatter = logging.Formatter(log_format)
+#
+#        # Add a console handler if not already added
+#        if not self.handlers:
+#            self.addHandler(self.__get_stream_handler())
+#
+#        # Add a file handler if a log file is specified
+#        if log_file:
+#            file_handler = self.__get_file_handler(log_file)
+#            self.addHandler(file_handler)
+#
+#    def __get_stream_handler(self) -> StreamHandler:
+#        """Create and return a console handler."""
+#        handler = StreamHandler(sys.stdout)
+#        handler.setFormatter(self.formatter)
+#        return handler
+#
+#    def __get_file_handler(self, log_file: str) -> FileHandler:
+#        """Create and return a file handler."""
+#        handler = FileHandler(log_file)
+#        handler.setFormatter(self.formatter)
+#        return handler
+#
+#    @staticmethod
+#    def create(log_level: str = 'DEBUG', log_file: Optional[str] = None) -> logging.Logger:
+#        """Create and configure the root logger."""
+#        logging.setLoggerClass(LogUtil)
+#        logger = logging.getLogger('AIO_AI')
+#        
+#        # Prevent duplicate handlers
+#        if not logger.hasHandlers():
+#            logger.setLevel(log_level)
+#            if log_file:
+#                # Add the file handler to the root logger if specified
+#                file_handler = LogUtil.__get_file_handler(logger, log_file)
+#                logger.addHandler(file_handler)
+#        
+#        return logger
+class LogUtil(logging.Logger):
+    __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
     def __init__(
             self,
             name: str,
@@ -25,19 +75,42 @@ class LogUtil(Logger):
     ) -> None:
         super().__init__(name, level)
         self.formatter = logging.Formatter(log_format)
-        self.addHandler(self.__get_stream_handler())
-
-    def __get_stream_handler(self) -> StreamHandler:
-        handler = StreamHandler(sys.stdout)
-        handler.setFormatter(self.formatter)
-        return handler
 
     @staticmethod
-    def create(log_level: str = 'DEBUG') -> Logger:
+    def create(log_level: str = 'DEBUG') -> logging.Logger:
+        """Create and configure the root logger."""
         logging.setLoggerClass(LogUtil)
-        logger = logging.getLogger('AIO_AI')
-        logger.setLevel(log_level)
-        return logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+
+        # Remove existing handlers to avoid duplicates
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+
+        # Create logs directory if it doesn't exist
+        logs_dir = "logs"
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # Generate log filename with current timestamp
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_filename = f"AIO_AI_{timestamp}.log"
+        log_file_path = os.path.join(logs_dir, log_filename)
+
+        formatter = logging.Formatter(LogUtil.__FORMATTER)
+
+        # Add console handler
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
+
+        # Add file handler
+        file_handler = logging.FileHandler(log_file_path)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
+        return root_logger
+
 
 class DummyMQTTClient:
     """
@@ -101,18 +174,33 @@ mqtt_client.disconnect()
         else:
             print(f"[{self.client_id}] No subscription found for topic: {topic}")
 
+#class Plugin:
+#    """Base class for all plugins."""
+#    
+#    def __init__(self, logger: LogUtil, plugin_collection):
+#        self.description = "UNKNOWN"
+#        self.plugin_name = "UNKNOWN"
+#        self.version = "0.0.0"
+#        self._logger = logger
+#        self._logger.propagate = False
+#        self._logger.setLevel(logging.DEBUG)
+#        self._plugin_collection = plugin_collection
+#        self.asynced = False  # Set to True for async plugins
+#        self.loop_running = False
+#        self.loop_req = False  # Set to True if the plugin needs a loop
+#        self.event_loop = plugin_collection.main_event_loop
 class Plugin:
     """Base class for all plugins."""
-    
-    def __init__(self, logger: Logger, plugin_collection):
+    def __init__(self, logger: LogUtil, plugin_collection):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self._logger = logger
+        self._logger.setLevel(logging.DEBUG)
         self._plugin_collection = plugin_collection
-        self.asynced = False  # Set to True for async plugins
+        self.asynced = False
         self.loop_running = False
-        self.loop_req = False  # Set to True if the plugin needs a loop
+        self.loop_req = False
         self.event_loop = plugin_collection.main_event_loop
     
     @async_handle_errors(default_return=None)

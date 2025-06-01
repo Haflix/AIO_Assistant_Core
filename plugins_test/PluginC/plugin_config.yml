@@ -1,0 +1,4 @@
+description: Example sync plugin
+version: 0.0.1
+asynced: false
+loop_req: false
