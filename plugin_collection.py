@@ -1,50 +1,140 @@
 import contextlib
 import functools
 import inspect
+import json
 import os
+from pathlib import Path
 import pkgutil
 from uuid import uuid4
 import asyncio
 import socket
 from typing import Any, Optional, Callable, Union, Dict, List
+import yaml
 
 from utils import LogUtil, Request, Plugin
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
 class PluginCollection:
-    """Manages all plugins and facilitates communication between them."""
+    """Manages all plugins and facilitates communication between them.
     
-    def __init__(self, plugin_package: str, hostname: str = socket.gethostname()):
-        self.hostname = hostname + uuid4().hex
+    Attributes
+    ----------
+    abc : str
+        (TEXT NOT FINISHED)
+        
+    Methods
+    -------
+    async wait_until_ready()
+        Waits until the plugins have been loaded. 
+    """
+    # TODO: complete here
+    
+    def __init__(self, config_path: str):
+        """
+        Parameters
+        ----------
+        config_path : str
+            The path of the config.yaml
+        """
         self._logger = LogUtil.create("DEBUG")
+        
+        
+        self.mqtt = None
+        self.yaml_config = None
+        self.load_config_yaml(config_path)
+        self.apply_configvalues()
+        
+        
         self.requests = {}
         self.request_lock = asyncio.Lock()
         self.task_list = []
-        self.plugin_package = plugin_package
+        
         self.main_event_loop = asyncio.get_event_loop()
         self.plugins = []
         self.seen_paths = []
         
         # Start initialization
         self._init_task = asyncio.create_task(self.reload_plugins())
+        
+    @log_errors
+    def load_config_yaml(self, config_path: str):
+        """
+        {'plugins': [{'name': 'PluginA', 'enabled': True, 'path': './plugins_test/PluginA.py', 'plugin_config': {'description': 'A testplugin for ... testing :D', 'version': '0.0.1', 'asynced': True, 'loop_req': False}, 'arguments': None}, {'name': 'PluginB', 'enabled': True, 'path': './plugins_test/PluginB.py', 'plugin_config': {'description': 'A testplugin for ... testing :D (again)', 'version': '0.0.1', 'asynced': True, 'loop_req': False}, 'arguments': None}, {'name': 'PluginC', 'enabled': True, 'path': './plugins_test/PluginC.py', 'plugin_config': {'description': 'A testplugin for ... testing :D (again but sync)', 'version': '0.0.1', 'asynced': False, 'loop_req': False}, 'arguments': None}], 'mqtt': {'enabled': False, 'hostname': 'yoooo', 'broker_ip': '192.69.69.69', 'port': 12345}, 'general': {'log_path': None}}
+        """
+        self.yaml_config: dict = yaml.safe_load(Path(config_path).read_text())
+        self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# FIXME: This line is just for debug
+        
+        self.check_config_integrity()
+        # NOTE: Add check if neccessary stuff exists
+        
+    @log_errors
+    def check_config_integrity(self):
+        necessary = ["plugins", "mqtt", "general"] # Need to exist and cant be None
+        for item in necessary:
+            if item not in list(self.yaml_config.keys()):
+                self._logger.critical(f"Config lacks key/item: '{item}'")
+        
+        plugin: dict
+        necessary = {"name": str, "enabled": bool, "path": str, "description": Union[str, None], "version": str, "asynced": bool, "loop_req": bool}
+        for plugin in self.yaml_config["plugins"]:
+            for item in list(necessary.keys()):
+                if item not in list(self.yaml_config.keys()):
+                    self._logger.critical(f"A plugin in config lacks key/item: '{item}'")
+                    
+            
+    @log_errors       
+    def apply_configvalues(self):
+        with self.yaml_config['mqtt']['hostname'] as hostname:
+            if hostname != None:
+                self.hostname = hostname + uuid4().hex
+            else:
+                self.hostname = socket.gethostname()# + uuid4().hex
+            self._logger.info(f"Hostname set to {self.hostname}")
+        with self.yaml_config['general']['plugin_package'] as plugin_package:
+            self.plugin_package = plugin_package
+        
+            
+            
+    def manage_mqtt(self, ):
+        pass # Start or stop mqtt / handle mqtt?    
+    
     
     async def wait_until_ready(self):
-        """Wait until the plugins have been reloaded."""
+        """Wait until the plugins have been loaded.
+        """
+        
+        # awaits the 
         await self._init_task
+        
+        asyncio.create_task(self.running_loop())
     
     @async_log_errors
     async def reload_plugins(self) -> None:
-        """Reload all plugins from the specified package."""
+        """Reload all plugins from the specified package.
+        """
+        
+        # Reset both arrays to be empty
         self.plugins = []
         self.seen_paths = []
         
         self._logger.debug(f'Looking for plugins under package {self.plugin_package}')
+        # Load plugins from given path
         await self.walk_package(self.plugin_package)
+        
+        # Start loops for plugins that need it
         await self.start_loops()
+    
+    
+    @async_handle_errors
+    async def load_plugin_from(self, TEMPATTRIBUTE):
+        pass
+    
     
     @async_log_errors
     async def walk_package(self, package) -> None:
-        """Recursively walk the supplied package to retrieve all plugins."""
+        """Recursively walk the supplied package to retrieve all plugins.
+        """
+        
         imported_package = __import__(package, fromlist=[''])
         
         for _, pluginname, ispkg in pkgutil.iter_modules(imported_package.__path__, imported_package.__name__ + '.'):
@@ -71,9 +161,12 @@ class PluginCollection:
                 for child_pkg in child_pkgs:
                     await self.walk_package(package + '.' + child_pkg)
     
+    
     @async_log_errors
     async def start_loops(self) -> None:
-        """Start all plugin loops."""
+        """Start all plugin loops.
+        """
+        
         for plugin in self.plugins:
             if plugin.loop_req and not plugin.loop_running:
                 task = asyncio.create_task(self._start_plugin_loop(plugin))
@@ -81,7 +174,9 @@ class PluginCollection:
     
     @async_handle_errors(None)
     async def _start_plugin_loop(self, plugin: Plugin):
-        """Helper method to start a plugin's loop."""
+        """Helper method to start a plugin's loop.
+        """
+        
         if plugin.asynced:
             await plugin.loop_start()
         else:
@@ -105,6 +200,7 @@ class PluginCollection:
         Returns:
             The result from the plugin method
         """
+        
         request = await self.create_request(author, target, args, timeout)
         async with self.request_context_async(request) as result:
             return result
@@ -127,13 +223,16 @@ class PluginCollection:
         Returns:
             The result from the plugin method
         """
+        
         request = self.create_request_sync(author, target, args, timeout)
         with self.request_context_sync(request) as result:
             return result
     
     @contextlib.asynccontextmanager
-    async def request_context_async(self, request: Request):
-        """Async context manager to handle requests."""
+    async def request_context_async(self, request: Request):   
+        """Async context manager to handle requests.
+        """
+        
         try:
             result, error, timed_out = await request.wait_for_result_async()
             if error:
@@ -144,7 +243,9 @@ class PluginCollection:
     
     @contextlib.contextmanager
     def request_context_sync(self, request: Request):
-        """Sync context manager to handle requests."""
+        """Sync context manager to handle requests.
+        """
+        
         try:
             result = request.get_result_sync()
             if request.error:
@@ -159,7 +260,9 @@ class PluginCollection:
                            target: str, 
                            args: Any = None, 
                            timeout: Optional[float] = None) -> Request:
-        """Create a new request asynchronously."""
+        """Create a new request asynchronously.
+        """
+        
         request = Request(self.hostname, author, target, args, timeout, self.main_event_loop)
         async with self.request_lock:
             self.requests[request.id] = request
@@ -176,14 +279,18 @@ class PluginCollection:
                           target: str, 
                           args: Any = None, 
                           timeout: Optional[float] = None) -> Request:
-        """Create a new request synchronously."""
+        """Create a new request synchronously.
+        """
+        
         coro = self.create_request(author, target, args, timeout)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         return future.result()
     
     @async_handle_errors(None)
     async def _process_request(self, request: Request) -> None:
-        """Process a request by invoking the target plugin method."""
+        """Process a request by invoking the target plugin method.
+        """
+        
         plugin_name, function_name = request.target.split(".")
         
         plugin = next((p for p in self.plugins if p.plugin_name == plugin_name), None)
@@ -206,13 +313,17 @@ class PluginCollection:
     
     @async_handle_errors(None)
     async def _set_request_result(self, request: Request, result: Any, error: bool = False) -> None:
-        """Set the result of a request."""
+        """Set the result of a request.
+        """
+        
         if isinstance(result, asyncio.Future):
             result = await result
         request.set_result(result, error)
     
     async def running_loop(self):
-        """Maintenance loop that cleans up tasks and requests."""
+        """Maintenance loop that cleans up tasks and requests.
+        """
+        
         while True:
             self.task_list = [t for t in self.task_list if not t.done()]
             await self.cleanup_requests()
@@ -220,7 +331,9 @@ class PluginCollection:
     
     @async_log_errors
     async def cleanup_requests(self):
-        """Remove collected requests."""
+        """Remove collected requests.
+        """
+        
         async with self.request_lock:
             self.requests = {rid: req for rid, req in self.requests.items() if not req.collected}
     
@@ -240,6 +353,7 @@ class PluginCollection:
         Returns:
             The result from the plugin method or None if any error occurs
         """
+        
         request = await self.create_request(author, target, args, timeout)
         result, error, _ = await request.wait_for_result_async()
         request.set_collected()  # Mark for cleanup
@@ -263,6 +377,7 @@ class PluginCollection:
         Returns:
             The result from the plugin method or None if any error occurs
         """
+        
         future = asyncio.run_coroutine_threadsafe(
             self.execute(target, args, author, timeout),
             self.main_event_loop

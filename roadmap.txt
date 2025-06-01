@@ -1,0 +1,33 @@
+for this version:
+- config
+|--> which plugins should get loaded + optional args for starting the plugins
+
+
+try:
+- process_request with no args
+
+
+potential problems:
+- process_request -> if plugin.asynced or coroutine -> what if theres a sync method in an async plugin?
+
+
+to be added:
+- descriptions, code comments etc, documentation, complete class docstring and all other docstrings, uml usw maybe? https://realpython.com/documenting-python-code/
+- kill everything before reloading
+- log to file
+
+
+ideas:
+- storagemanager? so that plugins can save stuff in an universal way
+- return special error class as result if request fails?
+- add functionality to reload plugins to kill all and maybe block everything during reload?
+- restart single plugin? or load single plugin while running? 
+- maybe paths of plugins into config file? instead of greedy search in package
+- check if plugin has all needed attributes
+- plugins can declare their role in mqtt (for example if all should run via this node for this plugin)
+
+
+for mqtt:
+- how to target specific node? 
+|--> maybe as requesttarget = "{host}.{pluginname}.{method}" : host can be set to "any"(Sends to only one or can be done locally), "all"(to all nodes with self), "all_other"(to all other nodes), {name of specific node}
+    |--> add hostname cant be set to these
