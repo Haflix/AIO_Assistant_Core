@@ -1,90 +1,21 @@
 YAML for config
 
 errorchecks:
-- empty strings
 - check if all enabled plugins got loaded
 - check if plugin with same name exists already
 - check if plugin exists in given path
 - check if all things are given (especially asynced etc)
 |--> e.g.: args = plugin.get("arguments") or {}  # Default to an empty dict if None
 
+!!!:
+- sub-attributes define 
+
 
 Questions:
 - How to save login data securely?
 - Role for plugins? (for example: if it can receive or not)
-- (package: every plugin should have its own folder with its own config (description, asynced, loop_req, version (the ones that you dont need to change in the main config)))
-main_config --> name, enabled, path(maybe optional?), version(compare with config of plugin if correct), arguments
-plugin_config --> version, asynced, loop_req
-
-config.yml:::
-plugins:
-  - name: str
-    enabled: boolean
-    path: str | Empty
-    version: str | Empty so it doesnt check for version
-    arguments: 
-        [Any] | Empty
-
-  - name: str
-    enabled: boolean
-    path: str | Empty
-    version: str | Empty
-    arguments: 
-        [Any] | Empty
-
-mqtt:
-    enabled: boolean
-    hostname: str | Empty for standard
-    broker_ip: str
-    port: int
-
-general:
-    ident_name: str | Empty for same as hostname
-    log_path: str | Empty to disable
-    plugin_package: str
+- Maybe add an "init after config" parameter that triggers functions which need all plugins to be loaded first
 
 
 
-plugin_config.yml:::(in folder with its plugin. every plugin should have its own folder)
 
-description: str
-version: str
-asynced: boolean
-loop_req: boolean
-
-
-outdated structure before the change:::
-
-plugins:
-  - name: str
-    enabled: boolean
-    path: str
-    description: str
-    version: str
-    asynced: boolean
-    loop_req: boolean
-    arguments: 
-        [Any] | Leave empty
-
-  - name: str
-    enabled: boolean
-    path: str
-    description: str
-    version: str
-    asynced: boolean
-    loop_req: boolean
-    arguments: 
-        [Any] | Leave empty
-
-mqtt:
-    enabled: boolean
-    hostname: str | Empty for standard
-    broker_ip: str
-    port: int
-
-general:
-    ident_name: str | Empty for same as hostname
-    log_path: str | Empty to disable
-
-
-    
