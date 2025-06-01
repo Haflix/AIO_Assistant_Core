@@ -1,0 +1,35 @@
+config.yml:::
+plugins:
+  - name: str
+    enabled: boolean
+    path: str | Empty
+    version: str | Empty so it doesnt check for version
+    arguments: 
+        [Any] | Empty
+
+  - name: str
+    enabled: boolean
+    path: str | Empty
+    version: str | Empty
+    arguments: 
+        [Any] | Empty
+
+mqtt:
+    enabled: boolean
+    hostname: str | Empty for standard
+    broker_ip: str
+    port: int
+
+general:
+    ident_name: str | Empty for same as hostname
+    log_path: str | Empty to disable
+    plugin_package: str
+
+
+
+plugin_config.yml:::(in folder with its plugin. every plugin should have its own folder)
+
+description: str
+version: str
+asynced: boolean
+loop_req: boolean

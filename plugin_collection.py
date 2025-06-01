@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import importlib
 import inspect
 import json
 import os
@@ -58,108 +59,170 @@ class PluginCollection:
         
     @log_errors
     def load_config_yaml(self, config_path: str):
-        """
-        {'plugins': [{'name': 'PluginA', 'enabled': True, 'path': './plugins_test/PluginA.py', 'plugin_config': {'description': 'A testplugin for ... testing :D', 'version': '0.0.1', 'asynced': True, 'loop_req': False}, 'arguments': None}, {'name': 'PluginB', 'enabled': True, 'path': './plugins_test/PluginB.py', 'plugin_config': {'description': 'A testplugin for ... testing :D (again)', 'version': '0.0.1', 'asynced': True, 'loop_req': False}, 'arguments': None}, {'name': 'PluginC', 'enabled': True, 'path': './plugins_test/PluginC.py', 'plugin_config': {'description': 'A testplugin for ... testing :D (again but sync)', 'version': '0.0.1', 'asynced': False, 'loop_req': False}, 'arguments': None}], 'mqtt': {'enabled': False, 'hostname': 'yoooo', 'broker_ip': '192.69.69.69', 'port': 12345}, 'general': {'log_path': None}}
-        """
         self.yaml_config: dict = yaml.safe_load(Path(config_path).read_text())
-        self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# FIXME: This line is just for debug
+        self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# NOTE: This line is just for debug
         
         self.check_config_integrity()
-        # NOTE: Add check if neccessary stuff exists
         
     @log_errors
     def check_config_integrity(self):
-        necessary = ["plugins", "mqtt", "general"] # Need to exist and cant be None
-        for item in necessary:
-            if item not in list(self.yaml_config.keys()):
-                self._logger.critical(f"Config lacks key/item: '{item}'")
-        
-        plugin: dict
-        necessary = {"name": str, "enabled": bool, "path": str, "description": Union[str, None], "version": str, "asynced": bool, "loop_req": bool}
-        for plugin in self.yaml_config["plugins"]:
-            for item in list(necessary.keys()):
-                if item not in list(self.yaml_config.keys()):
-                    self._logger.critical(f"A plugin in config lacks key/item: '{item}'")
+        # Check required sections
+        for section in ["plugins", "mqtt", "general"]:
+            if section not in self.yaml_config:
+                self._logger.critical(f"Missing config section: {section}")
+
+        # Validate plugins
+        for plugin in self.yaml_config.get("plugins", []):
+            if "name" not in plugin or "enabled" not in plugin:
+                self._logger.critical("Plugin entry missing name/enabled field")
+
+            # Warn if path is empty but plugin_package isn't configured
+            if not plugin.get("path") and "plugin_package" not in self.yaml_config.get("general", {}):
+                self._logger.warning("No path or plugin_package - plugins may not load")
+
+        # Validate MQTT if enabled
+        if self.yaml_config.get("mqtt", {}).get("enabled", False):
+            if not self.yaml_config["mqtt"].get("broker_ip"):
+                self._logger.critical("MQTT enabled but missing broker_ip")
                     
             
     @log_errors       
     def apply_configvalues(self):
-        with self.yaml_config['mqtt']['hostname'] as hostname:
-            if hostname != None:
-                self.hostname = hostname + uuid4().hex
-            else:
-                self.hostname = socket.gethostname()# + uuid4().hex
-            self._logger.info(f"Hostname set to {self.hostname}")
-        with self.yaml_config['general']['plugin_package'] as plugin_package:
-            self.plugin_package = plugin_package
-        
-            
-            
-    def manage_mqtt(self, ):
-        pass # Start or stop mqtt / handle mqtt?    
+        # Handle MQTT hostname (empty string or None)
+        mqtt_config = self.yaml_config.get('mqtt', {})
+        hostname = mqtt_config.get('hostname')
+        if not hostname:  # Covers None and empty string
+            hostname = socket.gethostname()
+        self.hostname = hostname
+        self._logger.info(f"Network hostname: {self.hostname}")
+
+        # Handle general ident_name (empty string or None)
+        general_config = self.yaml_config.get('general', {})
+        ident_name = general_config.get('ident_name')
+        self.ident_name = ident_name if ident_name else self.hostname
+        self._logger.info(f"Identifier name: {self.ident_name}")
+
+        # Plugin base directory
+        self.plugin_package = general_config.get('plugin_package', 'plugins')
+        self._logger.info(f"Plugin base directory: {self.plugin_package}")
+          
     
     
     async def wait_until_ready(self):
         """Wait until the plugins have been loaded.
         """
         
-        # awaits the 
+        # awaits the plugins loading
         await self._init_task
         
         asyncio.create_task(self.running_loop())
     
     @async_log_errors
     async def reload_plugins(self) -> None:
-        """Reload all plugins from the specified package.
-        """
-        
-        # Reset both arrays to be empty
         self.plugins = []
-        self.seen_paths = []
-        
-        self._logger.debug(f'Looking for plugins under package {self.plugin_package}')
-        # Load plugins from given path
-        await self.walk_package(self.plugin_package)
-        
-        # Start loops for plugins that need it
+
+        for plugin_entry in self.yaml_config.get("plugins", []):
+            # Skip disabled plugins
+            if not plugin_entry.get("enabled"):
+                continue
+
+            name = plugin_entry["name"]
+            expected_version = plugin_entry.get("version")
+            arguments = plugin_entry.get("arguments") or None
+
+            # Resolve plugin directory
+            path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
+            path = os.path.abspath(path)
+
+            if not os.path.exists(path):
+                self._logger.error(f"Plugin directory missing: {name} ({path})")
+                continue
+
+            # Load plugin config
+            try:
+                with open(os.path.join(path, "plugin_config.yml"), "r") as f:
+                    plugin_config = yaml.safe_load(f)
+            except Exception as e:
+                self._logger.error(f"Failed loading config for {name}: {e}")
+                continue
+
+            # Validate plugin config
+            for field in ["description", "version", "asynced", "loop_req"]:
+                if field not in plugin_config:
+                    self._logger.error(f"{name} missing {field} in plugin_config.yml")
+                    continue
+
+            # Version check (only if specified in main config)
+            if expected_version and plugin_config["version"] != expected_version:
+                self._logger.error(f"{name} version mismatch: {expected_version}≠{plugin_config['version']}")
+                continue
+
+            # Dynamic import
+            #try:
+            if 1 == 1:
+                module_path = os.path.join(path, "plugin.py")
+                spec = importlib.util.spec_from_file_location(name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                # Find first Plugin subclass
+                plugin_class = next(
+                    cls for _, cls in inspect.getmembers(module, inspect.isclass)
+                    if issubclass(cls, Plugin) and cls != Plugin
+                )
+
+                # Instantiate with config
+                plugin = plugin_class(
+                    self._logger.getChild(name),
+                    self,
+                    *arguments if isinstance(arguments, (list, tuple)) else [],  # Unpack list/tuple if applicable
+                    **arguments if isinstance(arguments, dict) else {}  # Unpack dict if applicable
+                )
+                plugin.plugin_name = name  # Set name from main config
+                plugin.version = plugin_config["version"]
+                plugin.asynced = plugin_config["asynced"]
+                self.plugins.append(plugin)
+                
+                self._logger.info(f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})")
+
+            #except Exception as e:
+            #    self._logger.error(f"Failed loading {name}: {e}")
+            #    continue
+
         await self.start_loops()
+
     
     
-    @async_handle_errors
-    async def load_plugin_from(self, TEMPATTRIBUTE):
-        pass
-    
-    
-    @async_log_errors
-    async def walk_package(self, package) -> None:
-        """Recursively walk the supplied package to retrieve all plugins.
-        """
-        
-        imported_package = __import__(package, fromlist=[''])
-        
-        for _, pluginname, ispkg in pkgutil.iter_modules(imported_package.__path__, imported_package.__name__ + '.'):
-            if not ispkg:
-                plugin_module = __import__(pluginname, fromlist=[''])
-                clsmembers = inspect.getmembers(plugin_module, inspect.isclass)
-                
-                for (_, c) in clsmembers:
-                    if issubclass(c, Plugin) & (c is not Plugin):
-                        self._logger.debug(f'    Found plugin class: {c.__module__}.{c.__name__}')
-                        self.plugins.append(c(self._logger, self))
-        
-        all_current_paths = []
-        if isinstance(imported_package.__path__, str):
-            all_current_paths.append(imported_package.__path__)
-        else:
-            all_current_paths.extend([x for x in imported_package.__path__])
-        
-        for pkg_path in all_current_paths:
-            if pkg_path not in self.seen_paths:
-                self.seen_paths.append(pkg_path)
-                child_pkgs = [p for p in os.listdir(pkg_path) if os.path.isdir(os.path.join(pkg_path, p))]
-                
-                for child_pkg in child_pkgs:
-                    await self.walk_package(package + '.' + child_pkg)
+#    @async_log_errors
+#    async def walk_package(self, package) -> None:
+#        """Recursively walk the supplied package to retrieve all plugins.
+#        """
+#        
+#        imported_package = __import__(package, fromlist=[''])
+#        
+#        for _, pluginname, ispkg in pkgutil.iter_modules(imported_package.__path__, imported_package.__name__ + '.'):
+#            if not ispkg:
+#                plugin_module = __import__(pluginname, fromlist=[''])
+#                clsmembers = inspect.getmembers(plugin_module, inspect.isclass)
+#                
+#                for (_, c) in clsmembers:
+#                    if issubclass(c, Plugin) & (c is not Plugin):
+#                        self._logger.debug(f'    Found plugin class: {c.__module__}.{c.__name__}')
+#                        self.plugins.append(c(self._logger, self))
+#        
+#        all_current_paths = []
+#        if isinstance(imported_package.__path__, str):
+#            all_current_paths.append(imported_package.__path__)
+#        else:
+#            all_current_paths.extend([x for x in imported_package.__path__])
+#        
+#        for pkg_path in all_current_paths:
+#            if pkg_path not in self.seen_paths:
+#                self.seen_paths.append(pkg_path)
+#                child_pkgs = [p for p in os.listdir(pkg_path) if os.path.isdir(os.path.join(pkg_path, p))]
+#                
+#                for child_pkg in child_pkgs:
+#                    await self.walk_package(package + '.' + child_pkg)
     
     
     @async_log_errors
