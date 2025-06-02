@@ -1,11 +1,14 @@
 import asyncio
 import base64
+import contextlib
 import datetime
 import json
 import logging
 import logging.handlers
 import os
+from pathlib import Path
 import pickle
+import socket
 import sys
 from logging import FileHandler, Logger, StreamHandler, DEBUG
 from typing import Union
@@ -13,8 +16,18 @@ from uuid import uuid4
 import time
 import paho.mqtt.client as mqtt
 from typing import Any, Optional, Tuple, Union
-from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
+import yaml
+from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+from exceptions import RequestException, ConfigException
+
+async def execute_local_request(plugin_collection, plugin: str, method: str, args: Any, author: str, timeout: float):
+    request = await plugin_collection.create_request(author, f"{plugin}.{method}", args, timeout)
+    async with plugin_collection.request_context_async(request) as result:
+        return result
+
+def resolve_plugin_path(plugin_config: dict, base_package: str) -> str:
+    return os.path.abspath(plugin_config.get("path") or os.path.join(base_package, plugin_config["name"]))
 
 class LogUtil(logging.Logger):
     __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
@@ -67,18 +80,6 @@ class LogUtil(logging.Logger):
 
 
 class AsyncMQTTClient:
-    """
-        # Example usage
-    def sample_callback(topic, message):
-        print(f"Received message on {topic}: {message}")
-
-    mqtt_client = DummyMQTTClient()
-    mqtt_client.connect()
-    mqtt_client.subscribe("test/topic", sample_callback)
-    mqtt_client.publish("test/topic", "Hello, MQTT!")
-    mqtt_client.simulate_incoming_message("test/topic", "Simulated message")
-    mqtt_client.disconnect()
-    """
 
     def __init__(self, config, logger: LogUtil):
         # NOTE: Add on_message etc
@@ -156,7 +157,7 @@ class AsyncMQTTClient:
         """
         try:
             # Serialize the payload
-            serialized = self._serialize(payload)
+            serialized = DataUtil._serialize(payload)
 
             # Convert to bytes if needed (Paho MQTT requirement)
             if isinstance(serialized, str):
@@ -204,7 +205,7 @@ class AsyncMQTTClient:
     async def _handle_execute_request(self, topic, payload):
         """Process incoming requests with ACK mechanism"""
         try:
-            data = self._deserialize(payload)
+            data = DataUtil._deserialize(payload)
             request_id = data["request_id"]
             sender_host = topic.split("/")[1]
 
@@ -231,6 +232,10 @@ class AsyncMQTTClient:
             raise ValueError(f"Plugin {data['plugin']} not found")
         return await getattr(plugin, data["method"])(data["args"])
 
+    
+
+class DataUtil:
+    @staticmethod
     def _serialize(self, data):
         """Handle complex types with explicit type markers"""
         if isinstance(data, bytes):
@@ -249,7 +254,7 @@ class AsyncMQTTClient:
                     "data": base64.b64encode(pickle.dumps(data)).decode("utf-8"),
                 }
             )
-
+    @staticmethod
     def _deserialize(self, payload):
         """Convert received payload back to original format"""
         try:
@@ -273,6 +278,83 @@ class AsyncMQTTClient:
             return payload
 
 
+
+class ConfigUtil:
+    @staticmethod
+    @log_errors
+    def load_config(config_path: str) -> dict:
+        config = yaml.safe_load(Path(config_path).read_text())
+        # Add validation logic here
+        return config
+    
+    @staticmethod
+    @log_errors
+    def check_config_integrity(yaml_config, _logger):
+        # Check required sections
+        for section in ["plugins", "mqtt", "general"]:
+            if section not in yaml_config:
+                raise ConfigException(f"Missing config section: {section}")
+
+        # Validate plugins
+        for plugin in yaml_config.get("plugins", []):
+            if "name" not in plugin or "enabled" not in plugin:
+                raise ConfigException("Plugin entry missing name/enabled field")
+
+            # Warn if path is empty but plugin_package isn't configured
+            if not plugin.get("path") and "plugin_package" not in yaml_config.get("general", {}):
+                _logger.warning("No path or plugin_package - plugins may not load")
+
+        # Validate MQTT if enabled
+        if yaml_config.get("mqtt", {}).get("enabled", False):
+            if not yaml_config["mqtt"].get("broker_ip"):
+                raise ConfigException("MQTT enabled but missing broker_ip")
+    
+    @staticmethod
+    @log_errors       
+    def apply_configvalues(plugin_collection):
+        # Handle MQTT hostname (empty string or None)
+        mqtt_config = plugin_collection.yaml_config.get('mqtt', {})
+        hostname = mqtt_config.get('hostname')
+        if not hostname:  # Covers None and empty string
+            hostname = socket.gethostname()
+            plugin_collection.yaml_config['mqtt']['hostname'] = hostname
+        plugin_collection.hostname = hostname
+        plugin_collection._logger.info(f"Network hostname: {plugin_collection.hostname}")
+
+        # Handle general ident_name (empty string or None)
+        general_config = plugin_collection.yaml_config.get('general', {})
+        ident_name = general_config.get('ident_name')
+        plugin_collection.ident_name = ident_name if ident_name else plugin_collection.hostname
+        plugin_collection._logger.info(f"Identifier name: {plugin_collection.ident_name}")
+
+        # Plugin base directory
+        plugin_collection.plugin_package = general_config.get('plugin_package', 'plugins')
+        plugin_collection._logger.info(f"Plugin base directory: {plugin_collection.plugin_package}")
+
+class HostManager:
+    def __init__(self, host_registry: dict, local_hostname: str, host_timeout: int):
+        self.host_registry = host_registry
+        self.local_hostname = local_hostname
+        self.host_timeout = host_timeout
+
+    def _has_local_plugin(self, plugin_name: str) -> bool:
+        #FIXME: Needs support for search with ID
+        return any(p.plugin_name == plugin_name for p in self.plugins)  # Requires plugin list injection
+
+    def _get_eligible_hosts(self, plugin_name: str, host_mode: str) -> list:
+        now = time.time()
+        eligible = []
+        for host, info in self.host_registry.items():
+            if (now - info['last_seen']) > self.host_timeout:
+                continue
+            if host_mode == "remote" and host == self.local_hostname:
+                continue
+            if plugin_name in info['plugins']:
+                eligible.append(host)
+        return eligible
+
+
+
 class Plugin:
     """Base class for all plugins."""
 
@@ -280,7 +362,6 @@ class Plugin:
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.uid = uuid4().hex
-        # self.
         self.version = "0.0.0"
         self._logger = logger
         self._logger.setLevel(logging.DEBUG)
@@ -440,3 +521,23 @@ class Request:
                 return result, error, timed_out
         except Exception as e:
             return str(e), True, False
+        
+    @contextlib.asynccontextmanager
+    async def request_context_async(self):   
+        try:
+            result, error, timed_out = await self.wait_for_result_async()
+            if error:
+                raise RequestException(f"Request {self.id} failed: {self.result}")
+            yield result
+        finally:
+            self.set_collected()
+
+    @contextlib.contextmanager
+    def request_context_sync(self):
+        try:
+            result = self.get_result_sync()
+            if self.error:
+                raise RequestException(f"Request failed: {self.result}")
+            yield result
+        finally:
+            self.set_collected()

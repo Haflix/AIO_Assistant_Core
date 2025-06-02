@@ -14,7 +14,7 @@ from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
 from exceptions import ConfigException, RequestException
-from utils import LogUtil, Request, Plugin, AsyncMQTTClient
+from utils import *#LogUtil, Request, Plugin, AsyncMQTTClient, resolve_plugin_path
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
 class PluginCollection:
@@ -45,7 +45,6 @@ class PluginCollection:
         self.mqtt = None
         self.yaml_config = None
         self.load_config_yaml(config_path)
-        self.apply_configvalues()
         
         
         self.requests = {}
@@ -100,53 +99,12 @@ class PluginCollection:
     
     @log_errors
     def load_config_yaml(self, config_path: str):
-        self.yaml_config: dict = yaml.safe_load(Path(config_path).read_text())
+        self.yaml_config: dict = ConfigUtil.load_config(config_path)
         self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# NOTE: This line is just for debug
         
-        self.check_config_integrity()
+        ConfigUtil.check_config_integrity(self.yaml_config, self._logger)
         
-    @log_errors
-    def check_config_integrity(self):
-        # Check required sections
-        for section in ["plugins", "mqtt", "general"]:
-            if section not in self.yaml_config:
-                raise ConfigException(f"Missing config section: {section}")
-
-        # Validate plugins
-        for plugin in self.yaml_config.get("plugins", []):
-            if "name" not in plugin or "enabled" not in plugin:
-                raise ConfigException("Plugin entry missing name/enabled field")
-
-            # Warn if path is empty but plugin_package isn't configured
-            if not plugin.get("path") and "plugin_package" not in self.yaml_config.get("general", {}):
-                self._logger.warning("No path or plugin_package - plugins may not load")
-
-        # Validate MQTT if enabled
-        if self.yaml_config.get("mqtt", {}).get("enabled", False):
-            if not self.yaml_config["mqtt"].get("broker_ip"):
-                raise ConfigException("MQTT enabled but missing broker_ip")
-                    
-            
-    @log_errors       
-    def apply_configvalues(self):
-        # Handle MQTT hostname (empty string or None)
-        mqtt_config = self.yaml_config.get('mqtt', {})
-        hostname = mqtt_config.get('hostname')
-        if not hostname:  # Covers None and empty string
-            hostname = socket.gethostname()
-            self.yaml_config['mqtt']['hostname'] = hostname
-        self.hostname = hostname
-        self._logger.info(f"Network hostname: {self.hostname}")
-
-        # Handle general ident_name (empty string or None)
-        general_config = self.yaml_config.get('general', {})
-        ident_name = general_config.get('ident_name')
-        self.ident_name = ident_name if ident_name else self.hostname
-        self._logger.info(f"Identifier name: {self.ident_name}")
-
-        # Plugin base directory
-        self.plugin_package = general_config.get('plugin_package', 'plugins')
-        self._logger.info(f"Plugin base directory: {self.plugin_package}")
+        ConfigUtil.apply_configvalues(self)#self.apply_configvalues()
           
     
     
@@ -158,9 +116,7 @@ class PluginCollection:
         await self._init_task
         
         asyncio.create_task(self.running_loop())
-    
-    def resolve_plugin_path(self, plugin_config, base_package):
-        return os.path.abspath(plugin_config.get("path") or os.path.join(base_package, plugin_config["name"]))
+
 
     
     @async_log_errors
@@ -177,7 +133,7 @@ class PluginCollection:
             arguments = plugin_entry.get("arguments") or None
 
             # Resolve plugin directory
-            path = self.resolve_plugin_path(plugin_entry, self.plugin_package)
+            path = resolve_plugin_path(plugin_entry, self.plugin_package)
             #path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
             #path = os.path.abspath(path)
 
@@ -280,7 +236,7 @@ class PluginCollection:
         """
         
         request = await self.create_request(author, target, args, timeout)
-        async with self.request_context_async(request) as result:
+        async with request.request_context_async(request) as result:
             return result
     
     
@@ -304,36 +260,11 @@ class PluginCollection:
         """
         
         request = self.create_request_sync(author, target, args, timeout)
-        with self.request_context_sync(request) as result:
+        with request.request_context_sync(request) as result:
             return result
     
     
-    @contextlib.asynccontextmanager
-    async def request_context_async(self, request: Request):   
-        """Async context manager to handle requests.
-        """
-        
-        try:
-            result, error, timed_out = await request.wait_for_result_async()
-            if error:
-                raise Exception(f"Request {request.id} failed: {request.result}")
-            yield result
-        finally:
-            request.set_collected()
     
-    
-    @contextlib.contextmanager
-    def request_context_sync(self, request: Request):
-        """Sync context manager to handle requests.
-        """
-        
-        try:
-            result = request.get_result_sync()
-            if request.error:
-                raise Exception(f"Request failed: {request.result}")
-            yield result
-        finally:
-            request.set_collected()
     
     
     @async_log_errors
@@ -443,15 +374,11 @@ class PluginCollection:
     ) -> Any:
         # Determine target host
         if host == "local":
-            return await self._execute_local(plugin, method, args, author, timeout)
+            return await execute_local_request(plugin, method, args, author, timeout)
         else:
             return await self._execute_remote(plugin, method, args, host, author, timeout)
 
-    async def _execute_local(self, plugin, method, args, author, timeout):
-        """Original local execution logic"""
-        request = await self.create_request(author, f"{plugin}.{method}", args, timeout)
-        async with self.request_context_async(request) as result:
-            return result
+    
 
     async def _execute_remote(self, plugin, method, args, host, author, timeout):
         """Enhanced remote execution with host filtering"""
@@ -459,7 +386,7 @@ class PluginCollection:
         if host in ["any", "remote"] and self._has_local_plugin(plugin):
             if host == "any":
                 self._logger.info(f"Using local instance of {plugin}")
-                return await self._execute_local(plugin, method, args, author, timeout)
+                return await execute_local_request(plugin, method, args, author, timeout)
             if host == "remote":
                 self._logger.debug("Skipping local instance for remote request")
 

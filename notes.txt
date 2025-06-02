@@ -4,12 +4,27 @@ Notes:
 - add tls to config
 - add on_{all the mqtt events}
 - PROCESS REQUEST OUTDATED
+- handle errors on execute may be
 
 Add:
 - takes only one from list
-- multi?
+- serialize 
+- multi? like processing with all of the instances of a plugin
 - acknowledge
-- serialize
+- FUNCTION TO SELECT THE PLUGIN + HOST WITH PARAMS
+ -> version usw in description dingens? 
+ -> Works as the mentioned roles thing
+ -> Can be given as parameters 
+ -> plugins have a callback to determine if the plugin is viable (self.checkCompatibility) or something like that
+ -> maybe no dict as it makes codestructure worse but dict on init can be turned into the vars
+- EXCEPTIONCLASS FOR FAILED REQUESTS
+
+
+Updates needed:
+- PluginCollection.reload_plugins
+- All execute methods and its steps (They still use the old patterns)
+- Functionality so that plugin-instances can be targeted with their uid else just use the name to find a plugin with the other steps
+
 
 Errorhandling:
 - same hostnames
@@ -25,6 +40,10 @@ Things that should be added:
 - Use another function than publish, that first calls serialization or deserialization when receiving based on the scenario. 
 
 
+MQTT:
+- Pluginspecific stuff share
+- identname and maybe uuid for hosts
+- Needs to write the plugin hosts etc WITH LOCK
 
 
 Questions:
