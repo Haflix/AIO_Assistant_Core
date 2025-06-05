@@ -1,19 +1,12 @@
-import contextlib
-import functools
 import importlib
 import inspect
-import json
 import os
 from pathlib import Path
-import pkgutil
-import time
-from uuid import uuid4
 import asyncio
-import socket
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
-from utils import LogUtil, Request, Plugin, AsyncMQTTClient
+from utils import ConfigUtil, LogUtil, Request, Plugin
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
 class PluginCollection:
@@ -66,86 +59,95 @@ class PluginCollection:
         # Start initialization
         self._init_task = asyncio.create_task(self.reload_plugins())
         
-    def _init_mqtt(self):
-        """Initialize MQTT connection and subscriptions"""
         
-        self.mqtt = AsyncMQTTClient(
-                config={
-                    "broker_ip": self.yaml_config["mqtt"]["broker_ip"],
-                    "port": self.yaml_config["mqtt"]["port"],
-                    "username": self.yaml_config["mqtt"].get("username"),
-                    "password": self.yaml_config["mqtt"].get("password"),
-                    "tls": self.yaml_config["mqtt"].get("tls", False),
-                    "hostname": self.hostname
-                },
-                logger=self._logger
-            )
-        asyncio.create_task(self.mqtt.connect())
-        asyncio.create_task(self._heartbeat_task())
-        
-    
-    async def _heartbeat_task(self):
-        """Regularly publish heartbeat messages"""
-        while True:
-            self.mqtt.mqttC.publish(
-                f"devices/{self.local_hostname}/heartbeat",
-                json.dumps({
-                    "plugins": [p.plugin_name for p in self.plugins],
-                    "timestamp": time.time()
-                })
-            )
-            await asyncio.sleep(30)   
-        
-    
     @log_errors
     def load_config_yaml(self, config_path: str):
-        self.yaml_config: dict = yaml.safe_load(Path(config_path).read_text())
+        self.yaml_config: dict = ConfigUtil.load_config(config_path)
         self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# NOTE: This line is just for debug
         
-        self.check_config_integrity()
+        ConfigUtil.check_config_integrity(self.yaml_config, self._logger)
         
-    @log_errors
-    def check_config_integrity(self):
-        # Check required sections
-        for section in ["plugins", "mqtt", "general"]:
-            if section not in self.yaml_config:
-                self._logger.critical(f"Missing config section: {section}")
-
-        # Validate plugins
-        for plugin in self.yaml_config.get("plugins", []):
-            if "name" not in plugin or "enabled" not in plugin:
-                self._logger.critical("Plugin entry missing name/enabled field")
-
-            # Warn if path is empty but plugin_package isn't configured
-            if not plugin.get("path") and "plugin_package" not in self.yaml_config.get("general", {}):
-                self._logger.warning("No path or plugin_package - plugins may not load")
-
-        # Validate MQTT if enabled
-        if self.yaml_config.get("mqtt", {}).get("enabled", False):
-            if not self.yaml_config["mqtt"].get("broker_ip"):
-                self._logger.critical("MQTT enabled but missing broker_ip")
-                    
-            
-    @log_errors       
-    def apply_configvalues(self):
-        # Handle MQTT hostname (empty string or None)
-        mqtt_config = self.yaml_config.get('mqtt', {})
-        hostname = mqtt_config.get('hostname')
-        if not hostname:  # Covers None and empty string
-            hostname = socket.gethostname()
-            self.yaml_config['mqtt']['hostname'] = hostname
-        self.hostname = hostname
-        self._logger.info(f"Network hostname: {self.hostname}")
-
-        # Handle general ident_name (empty string or None)
-        general_config = self.yaml_config.get('general', {})
-        ident_name = general_config.get('ident_name')
-        self.ident_name = ident_name if ident_name else self.hostname
-        self._logger.info(f"Identifier name: {self.ident_name}")
-
-        # Plugin base directory
-        self.plugin_package = general_config.get('plugin_package', 'plugins')
-        self._logger.info(f"Plugin base directory: {self.plugin_package}")
+        ConfigUtil.apply_configvalues(self)#self.apply_configvalues()
+#    def _init_mqtt(self):
+#        """Initialize MQTT connection and subscriptions"""
+#        
+#        self.mqtt = AsyncMQTTClient(
+#                config={
+#                    "broker_ip": self.yaml_config["mqtt"]["broker_ip"],
+#                    "port": self.yaml_config["mqtt"]["port"],
+#                    "username": self.yaml_config["mqtt"].get("username"),
+#                    "password": self.yaml_config["mqtt"].get("password"),
+#                    "tls": self.yaml_config["mqtt"].get("tls", False),
+#                    "hostname": self.hostname
+#                },
+#                logger=self._logger
+#            )
+#        asyncio.create_task(self.mqtt.connect())
+#        asyncio.create_task(self._heartbeat_task())
+#        
+#    
+#    async def _heartbeat_task(self):
+#        """Regularly publish heartbeat messages"""
+#        while True:
+#            self.mqtt.mqttC.publish(
+#                f"devices/{self.local_hostname}/heartbeat",
+#                json.dumps({
+#                    "plugins": [p.plugin_name for p in self.plugins],
+#                    "timestamp": time.time()
+#                })
+#            )
+#            await asyncio.sleep(30)   
+        
+    
+#    @log_errors
+#    def load_config_yaml(self, config_path: str):
+#        self.yaml_config: dict = yaml.safe_load(Path(config_path).read_text())
+#        self._logger.info(self.yaml_config)#json.dumps(self.yaml_config, indent=2))# NOTE: This line is just for debug
+#        
+#        self.check_config_integrity()
+#        
+#    @log_errors
+#    def check_config_integrity(self):
+#        # Check required sections
+#        for section in ["plugins", "mqtt", "general"]:
+#            if section not in self.yaml_config:
+#                self._logger.critical(f"Missing config section: {section}")
+#
+#        # Validate plugins
+#        for plugin in self.yaml_config.get("plugins", []):
+#            if "name" not in plugin or "enabled" not in plugin:
+#                self._logger.critical("Plugin entry missing name/enabled field")
+#
+#            # Warn if path is empty but plugin_package isn't configured
+#            if not plugin.get("path") and "plugin_package" not in self.yaml_config.get("general", {}):
+#                self._logger.warning("No path or plugin_package - plugins may not load")
+#
+#        # Validate MQTT if enabled
+#        if self.yaml_config.get("mqtt", {}).get("enabled", False):
+#            if not self.yaml_config["mqtt"].get("broker_ip"):
+#                self._logger.critical("MQTT enabled but missing broker_ip")
+#                    
+#            
+#    @log_errors       
+#    def apply_configvalues(self):
+#        # Handle MQTT hostname (empty string or None)
+#        mqtt_config = self.yaml_config.get('mqtt', {})
+#        hostname = mqtt_config.get('hostname')
+#        if not hostname:  # Covers None and empty string
+#            hostname = socket.gethostname()
+#            self.yaml_config['mqtt']['hostname'] = hostname
+#        self.hostname = hostname
+#        self._logger.info(f"Network hostname: {self.hostname}")
+#
+#        # Handle general ident_name (empty string or None)
+#        general_config = self.yaml_config.get('general', {})
+#        ident_name = general_config.get('ident_name')
+#        self.ident_name = ident_name if ident_name else self.hostname
+#        self._logger.info(f"Identifier name: {self.ident_name}")
+#
+#        # Plugin base directory
+#        self.plugin_package = general_config.get('plugin_package', 'plugins')
+#        self._logger.info(f"Plugin base directory: {self.plugin_package}")
           
     
     
@@ -255,80 +257,80 @@ class PluginCollection:
             await self.main_event_loop.run_in_executor(None, plugin.loop_start)
     
     
-    @async_log_errors
-    async def call(self, 
-                  target: str, 
-                  args: Any = None, 
-                  author: str = "system", 
-                  timeout: Optional[float] = None) -> Any:
-        """
-        Simplified method to call a plugin method and get its result.
-        
-        Args:
-            target: The plugin and method in format "PluginName.method_name"
-            args: Arguments to pass to the method
-            author: The name of the caller (defaults to "system")
-            timeout: Optional timeout in seconds
-            
-        Returns:
-            The result from the plugin method
-        """
-        
-        request = await self.create_request(author, target, args, timeout)
-        async with self.request_context_async(request) as result:
-            return result
+#    @async_log_errors
+#    async def call(self, 
+#                  target: str, 
+#                  args: Any = None, 
+#                  author: str = "system", 
+#                  timeout: Optional[float] = None) -> Any:
+#        """
+#        Simplified method to call a plugin method and get its result.
+#        
+#        Args:
+#            target: The plugin and method in format "PluginName.method_name"
+#            args: Arguments to pass to the method
+#            author: The name of the caller (defaults to "system")
+#            timeout: Optional timeout in seconds
+#            
+#        Returns:
+#            The result from the plugin method
+#        """
+#        
+#        request = await self.create_request(author, target, args, timeout)
+#        async with self.request_context_async(request) as result:
+#            return result
+#    
+#    
+#    @log_errors
+#    def call_sync(self, 
+#                 target: str, 
+#                 args: Any = None, 
+#                 author: str = "system", 
+#                 timeout: Optional[float] = None) -> Any:
+#        """
+#        Synchronous version of call method.
+#        
+#        Args:
+#            target: Target plugin and method (format: "PluginName.method_name")
+#            args: Arguments to pass to the method
+#            author: The name of the caller (defaults to "system")
+#            timeout: Optional timeout in seconds
+#            
+#        Returns:
+#            The result from the plugin method
+#        """
+#        
+#        request = self.create_request_sync(author, target, args, timeout)
+#        with self.request_context_sync(request) as result:
+#            return result
     
     
-    @log_errors
-    def call_sync(self, 
-                 target: str, 
-                 args: Any = None, 
-                 author: str = "system", 
-                 timeout: Optional[float] = None) -> Any:
-        """
-        Synchronous version of call method.
-        
-        Args:
-            target: Target plugin and method (format: "PluginName.method_name")
-            args: Arguments to pass to the method
-            author: The name of the caller (defaults to "system")
-            timeout: Optional timeout in seconds
-            
-        Returns:
-            The result from the plugin method
-        """
-        
-        request = self.create_request_sync(author, target, args, timeout)
-        with self.request_context_sync(request) as result:
-            return result
-    
-    
-    @contextlib.asynccontextmanager
-    async def request_context_async(self, request: Request):   
-        """Async context manager to handle requests.
-        """
-        
-        try:
-            result, error, timed_out = await request.wait_for_result_async()
-            if error:
-                raise Exception(f"Request {request.id} failed: {request.result}")
-            yield result
-        finally:
-            request.set_collected()
-    
-    
-    @contextlib.contextmanager
-    def request_context_sync(self, request: Request):
-        """Sync context manager to handle requests.
-        """
-        
-        try:
-            result = request.get_result_sync()
-            if request.error:
-                raise Exception(f"Request failed: {request.result}")
-            yield result
-        finally:
-            request.set_collected()
+#    @contextlib.asynccontextmanager
+#    async def request_context_async(self, request: Request):   
+#        """Async context manager to handle requests.
+#        """
+#        
+#        try:
+#            result, error, timed_out = await request.wait_for_result_async()
+#            if error:
+#                raise Exception(f"Request {request.id} failed: {request.result}")
+#            yield result
+#        finally:
+#            request.set_collected()
+#    
+#    
+#    @contextlib.contextmanager
+#    def request_context_sync(self, request: Request):
+#        """Sync context manager to handle requests.
+#        """
+#        
+#        try:
+#            result = request.get_result_sync()
+#            if request.error:
+#                raise Exception(f"Request failed: {request.result}")
+#            yield result
+#        finally:
+#            request.set_collected()
     
     
     @async_log_errors
@@ -421,138 +423,39 @@ class PluginCollection:
     
     # One-liner methods for plugin communication
     @async_handle_errors(default_return=None)
-    async def execute(
-        self,
+    async def execute(self,
         plugin: str,
         method: str,
         args: Any = None,
-        host: str = "local",  # "any", "remote", "local", or hostname
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+        ) -> Any:
+        
+        # Determine target host
+        #TODO: Add the plugin finding
+        #TODO: Add exception if plugin couldnt be found
+        #NOTE: Plugin gotta be searchable by name (where the id will be retrieved) and then sends to process or whatever
+        return "yay"
+#        if host == "local":
+#            return await self._execute_local(plugin, method, args, author, timeout)
+#        else:
+#            return await self._execute_remote(plugin, method, args, host, author, timeout)
+
+
+    @handle_errors(default_return=None)
+    def execute_sync(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
         timeout: Optional[float] = None
     ) -> Any:
-        # Determine target host
-        if host == "local":
-            return await self._execute_local(plugin, method, args, author, timeout)
-        else:
-            return await self._execute_remote(plugin, method, args, host, author, timeout)
-
-    async def _execute_local(self, plugin, method, args, author, timeout):
-        """Original local execution logic"""
-        request = await self.create_request(author, f"{plugin}.{method}", args, timeout)
-        async with self.request_context_async(request) as result:
-            return result
-
-    async def _execute_remote(self, plugin, method, args, host, author, timeout):
-        """Enhanced remote execution with host filtering"""
-        # First check local plugins if appropriate
-        if host in ["any", "remote"] and self._has_local_plugin(plugin):
-            if host == "any":
-                self._logger.info(f"Using local instance of {plugin}")
-                return await self._execute_local(plugin, method, args, author, timeout)
-            if host == "remote":
-                self._logger.debug("Skipping local instance for remote request")
-
-        # Find suitable hosts
-        candidates = self._get_eligible_hosts(plugin, host)
-        if not candidates:
-            self._logger.warning("No eligible hosts found")
-            return None
-
-        request_id = str(uuid4())
-        response_topic = f"devices/{self.local_hostname}/response/{request_id}"
-        
-        payload = self.mqtt._serialize({
-            "request_id": request_id,
-            "plugin": plugin,
-            "method": method,
-            "args": args,
-            "author": author,
-            "response_topic": response_topic
-        })
-
-        # Send request with ACK verification
-        future = asyncio.Future()
-        self.mqtt.pending_requests[request_id] = {
-            "future": future,
-            "attempts": 0,
-            "candidates": candidates.copy()
-        }
-
-        await self._send_request_with_ack(request_id, payload, candidates)
-        return await future
-
-    def _has_local_plugin(self, plugin_name):
-        return any(p.plugin_name == plugin_name for p in self.plugins)
-
-    def _get_eligible_hosts(self, plugin_name, host_mode):
-        """Get hosts that have the plugin and are online"""
-        now = time.time()
-        eligible = []
-        
-        for host, info in self.host_registry.items():
-            # Skip if offline
-            if (now - info['last_seen']) > self.host_timeout:
-                continue
-                
-            # Skip local host for remote requests
-            if host_mode == "remote" and host == self.local_hostname:
-                continue
-                
-            # Check plugin availability
-            if plugin_name in info['plugins']:
-                eligible.append(host)
-                
-        return eligible
-
-    async def _send_request_with_ack(self, request_id, payload, candidates):
-        """Send request and wait for ACK with retries"""
-        request_info = self.mqtt.pending_requests[request_id]
-        
-        while request_info['attempts'] < self.mqtt.max_ack_attempts:
-            request_info['attempts'] += 1
-            target_host = self._select_target_host(candidates)
-            
-            if not target_host:
-                request_info['future'].set_exception(ValueError("No available hosts"))
-                return
-
-            # Send to specific host
-            topic = f"devices/{target_host}/execute"
-            self.mqtt.client.publish(topic, payload)
-            
-            # Wait for ACK
-            try:
-                ack = await asyncio.wait_for(
-                    self._wait_for_ack(request_id, target_host),
-                    timeout=self.mqtt.ack_timeout
-                )
-                if ack:
-                    return  # Success, exit retry loop
-                    
-            except asyncio.TimeoutError:
-                self._logger.warning(f"No ACK from {target_host}, attempt {request_info['attempts']}/{self.mqtt.max_ack_attempts}")
-                candidates.remove(target_host)
-
-        request_info['future'].set_exception(TimeoutError("No ACK received after retries"))
-
-    async def _wait_for_ack(self, request_id, target_host):
-        ack_topic = f"devices/{target_host}/ack/{request_id}"
-        future = asyncio.Future()
-        
-        def ack_handler(topic, payload):
-            if topic == ack_topic:
-                data = self.mqtt._deserialize(payload)
-                future.set_result(data)
-                
-        self.mqtt.client.message_callback_add(ack_topic, ack_handler)
-        try:
-            return await future
-        finally:
-            self.mqtt.client.message_callback_remove(ack_topic)
-
-    
-    @handle_errors(default_return=None)
-    def execute_sync(self, target: str, args: Any = None, author: str = "system", timeout: Optional[float] = None) -> Any:
         """
         Synchronous one-liner to execute a plugin method with built-in error handling.
         
@@ -567,7 +470,122 @@ class PluginCollection:
         """
         
         future = asyncio.run_coroutine_threadsafe(
-            self.execute(target, args, author, timeout),
+            self.execute(plugin, method, args, plugin_id, host, author, author_id, timeout),
             self.main_event_loop
         )
         return future.result()
+#    async def _execute_local(self, plugin, method, args, author, timeout):
+#        """Original local execution logic"""
+#        request = await self.create_request(author, f"{plugin}.{method}", args, timeout)
+#        async with self.request_context_async(request) as result:
+#            return result
+#
+#    async def _execute_remote(self, plugin, method, args, host, author, timeout):
+#        """Enhanced remote execution with host filtering"""
+#        # First check local plugins if appropriate
+#        if host in ["any", "remote"] and self._has_local_plugin(plugin):
+#            if host == "any":
+#                self._logger.info(f"Using local instance of {plugin}")
+#                return await self._execute_local(plugin, method, args, author, timeout)
+#            if host == "remote":
+#                self._logger.debug("Skipping local instance for remote request")
+#
+#        # Find suitable hosts
+#        candidates = self._get_eligible_hosts(plugin, host)
+#        if not candidates:
+#            self._logger.warning("No eligible hosts found")
+#            return None
+#
+#        request_id = str(uuid4())
+#        response_topic = f"devices/{self.local_hostname}/response/{request_id}"
+#        
+#        payload = self.mqtt._serialize({
+#            "request_id": request_id,
+#            "plugin": plugin,
+#            "method": method,
+#            "args": args,
+#            "author": author,
+#            "response_topic": response_topic
+#        })
+#
+#        # Send request with ACK verification
+#        future = asyncio.Future()
+#        self.mqtt.pending_requests[request_id] = {
+#            "future": future,
+#            "attempts": 0,
+#            "candidates": candidates.copy()
+#        }
+#
+#        await self._send_request_with_ack(request_id, payload, candidates)
+#        return await future
+#
+#    def _has_local_plugin(self, plugin_name):
+#        return any(p.plugin_name == plugin_name for p in self.plugins)
+#
+#    def _get_eligible_hosts(self, plugin_name, host_mode):
+#        """Get hosts that have the plugin and are online"""
+#        now = time.time()
+#        eligible = []
+#        
+#        for host, info in self.host_registry.items():
+#            # Skip if offline
+#            if (now - info['last_seen']) > self.host_timeout:
+#                continue
+#                
+#            # Skip local host for remote requests
+#            if host_mode == "remote" and host == self.local_hostname:
+#                continue
+#                
+#            # Check plugin availability
+#            if plugin_name in info['plugins']:
+#                eligible.append(host)
+#                
+#        return eligible
+
+#    async def _send_request_with_ack(self, request_id, payload, candidates):
+#        """Send request and wait for ACK with retries"""
+#        request_info = self.mqtt.pending_requests[request_id]
+#        
+#        while request_info['attempts'] < self.mqtt.max_ack_attempts:
+#            request_info['attempts'] += 1
+#            target_host = self._select_target_host(candidates)
+#            
+#            if not target_host:
+#                request_info['future'].set_exception(ValueError("No available hosts"))
+#                return
+#
+#            # Send to specific host
+#            topic = f"devices/{target_host}/execute"
+#            self.mqtt.client.publish(topic, payload)
+#            
+#            # Wait for ACK
+#            try:
+#                ack = await asyncio.wait_for(
+#                    self._wait_for_ack(request_id, target_host),
+#                    timeout=self.mqtt.ack_timeout
+#                )
+#                if ack:
+#                    return  # Success, exit retry loop
+#                    
+#            except asyncio.TimeoutError:
+#                self._logger.warning(f"No ACK from {target_host}, attempt {request_info['attempts']}/{self.mqtt.max_ack_attempts}")
+#                candidates.remove(target_host)
+#
+#        request_info['future'].set_exception(TimeoutError("No ACK received after retries"))
+#
+#    async def _wait_for_ack(self, request_id, target_host):
+#        ack_topic = f"devices/{target_host}/ack/{request_id}"
+#        future = asyncio.Future()
+#        
+#        def ack_handler(topic, payload):
+#            if topic == ack_topic:
+#                data = self.mqtt._deserialize(payload)
+#                future.set_result(data)
+#                
+#        self.mqtt.client.message_callback_add(ack_topic, ack_handler)
+#        try:
+#            return await future
+#        finally:
+#            self.mqtt.client.message_callback_remove(ack_topic)
+
+    
