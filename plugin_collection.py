@@ -33,11 +33,10 @@ class PluginCollection:
         """
         self._logger = LogUtil.create("DEBUG")
         
-        
         self.mqtt = None
         self.yaml_config = None
         self.load_config_yaml(config_path)
-        self.apply_configvalues()
+        #self.apply_configvalues()
         
         
         self.requests = {}
