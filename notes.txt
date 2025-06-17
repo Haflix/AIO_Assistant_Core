@@ -1,37 +1,5 @@
-MQTT
-
-Notes:
-- add tls to config
-- add on_{all the mqtt events}
-- PROCESS REQUEST OUTDATED
-
-Add:
-- takes only one from list
-- multi?
-- acknowledge
-- serialize
-
-Errorhandling:
-- same hostnames
-- wait for bigger requests to upload (because if nobody responds in time, the request could get timed out) (! Send the request via MQTT without the big contents and send the contents on other ways)
-
-
-
-
-Things that should be added:
-- Acknowledge packets when receiving a request for example
-- Only one instance should process a request when using remote or any. Before making it a remote request with execute_remote, the PluginCollection should check the host_registry and check its own plugins
-- Dont send packets to a host which wasnt seen in over 70s
-- Use another function than publish, that first calls serialization or deserialization when receiving based on the scenario. 
-
-
-
-
-Questions:
-- How to save login data securely?
-- Role for plugins? (for example: if it can receive or not)
-- Maybe add an "init after config" parameter that triggers functions which need all plugins to be loaded first
-
-
-
+plugins:
+- on_enable
+- on_disable
+- on_(i forgot)
 
