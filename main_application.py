@@ -15,14 +15,14 @@ async def main():
     asyncio.create_task(plugin_collection.running_loop())
     
     # Example of using the one-liner execute method
-    result1 = await plugin_collection.execute("PluginA.perform_operation", 3)
+    result1 = await plugin_collection.execute("PluginA", "perform_operation", 3)
     print(f"Result from PluginA: {result1}")
     
-    result2 = await plugin_collection.execute("PluginC.perform_operation", 4)
+    result2 = await plugin_collection.execute("PluginC", "perform_operation", 6)
     print(f"Result from PluginC: {result2}")
     
     # Attempt to call a non-existent plugin - will return None due to error handling
-    result3 = await plugin_collection.execute("PluginD.perform_operation", 4)
+    result3 = await plugin_collection.execute("PluginD", "perform_operation")
     print(f"Result from non-existent PluginD: {result3}")
 
 async def shutdown(loop, signal=None):

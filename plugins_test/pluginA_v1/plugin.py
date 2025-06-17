@@ -13,7 +13,7 @@ class PluginA(Plugin):
     async def perform_operation(self, argument):
         """Simplified example showing how to call another plugin using the one-liner."""
         
-        result = await self.execute("PluginB.calculate_square", argument)
+        result = await self.execute("PluginB", "calculate_square", argument)
         
         if result is None:
             return f"Error calling PluginB.calculate_square with {argument}"
