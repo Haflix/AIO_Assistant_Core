@@ -1,21 +1,18 @@
 import asyncio
-import contextlib
 import datetime
-import yaml
 import logging
 import os
 from pathlib import Path
 import socket
 import sys
-from logging import FileHandler, Logger, StreamHandler, DEBUG
+from logging import Logger, StreamHandler, DEBUG
 from typing import Union
 from uuid import uuid4
 import time
-from exceptions import RequestException, ConfigException
-import paho.mqtt.client as mqtt
+import yaml
 from typing import Any, Optional, Tuple, Union
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
-
+from exceptions import RequestException, ConfigException
 
 
 
@@ -93,10 +90,7 @@ class ConfigUtil:
             if not plugin.get("path") and "plugin_package" not in yaml_config.get("general", {}):
                 _logger.warning("No path or plugin_package - plugins may not load")
 
-        # Validate MQTT if enabled
-        if yaml_config.get("mqtt", {}).get("enabled", False):
-            if not yaml_config["mqtt"].get("broker_ip"):
-                raise ConfigException("MQTT enabled but missing broker_ip")
+        #TODO: Add validations for future networking
     
     @staticmethod
     @log_errors       
@@ -107,7 +101,7 @@ class ConfigUtil:
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
             plugin_collection.yaml_config['mqtt']['hostname'] = hostname
-        plugin_collection.hostname = hostname
+        plugin_collection.hostname = hostname + uuid4().hex
         plugin_collection._logger.info(f"Network hostname: {plugin_collection.hostname}")
 
         # Handle general ident_name (empty string or None)
@@ -121,169 +115,32 @@ class ConfigUtil:
         plugin_collection._logger.info(f"Plugin base directory: {plugin_collection.plugin_package}")
 
 
-#class AsyncMQTTClient:
-#    """
-#    # Example usage
-#def sample_callback(topic, message):
-#    print(f"Received message on {topic}: {message}")
-#
-#mqtt_client = DummyMQTTClient()
-#mqtt_client.connect()
-#mqtt_client.subscribe("test/topic", sample_callback)
-#mqtt_client.publish("test/topic", "Hello, MQTT!")
-#mqtt_client.simulate_incoming_message("test/topic", "Simulated message")
-#mqtt_client.disconnect()
-#"""
-#    def __init__(self, config, logger: LogUtil):
-#        #NOTE: Add on_message etc
-#        #NOTE: connect, disconnect, subscribe, unsubscribe, 
-#        #NOTE: on_connect, on_message, on_connect_fail, on_disconnect
-#        self.mqttC = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-#        self._logger = logger
-#        self._logger.setLevel(logging.DEBUG)
-#        self.config = config
-#        self.connected = False
-#        self.loop = asyncio.get_event_loop()
-#        self.pending_requests = {}
-#        
-#        self.ack_timeout = 2  # Seconds to wait for ACK
-#        self.max_ack_attempts = 3
-#        
-#        # Configure credentials
-#        if config.get("username"):
-#            self.mqttC.username_pw_set(config["username"], config["password"])
-#        
-#        # Configure TLS if needed
-#        if config.get("tls", True):
-#            self.mqttC.tls_set()
-#        
-#        
-#        self.configureCallbacks()
-#        
-#        
-#    def configureCallbacks(self):
-#        self.mqttC.on_connect = self._on_connect 
-#        self.mqttC.on_connect_fail = self._on_connect_fail #FIXME
-#        
-#        self.mqttC.on_disconnect = self._on_disconnect #FIXME
-#        
-#        self.mqttC.on_log = self._logger.debug #NOTE: Idk if it works
-#        
-#        self.mqttC.on_pre_connect #FIXME
-#    
-#        self.mqttC.on_message = self._on_message 
-#        
-#    
-#    async def connect(self):
-#        self.mqttC.connect_async(
-#            self.config["broker_ip"],
-#            self.config["port"]
-#        )
-#        self.mqttC.loop_start()    
-#    
-#    def _on_connect(self, mqttC, userdata, flags, reason_code, properties):
-#        if reason_code == 0:
-#            self.logger.info("Connected to MQTT broker")
-#            self.connected = True
-#            # Subscribe to necessary topics
-#            mqttC.subscribe(f"devices/{self.config['hostname']}/execute")
-#            mqttC.subscribe("devices/+/heartbeat")
-#            mqttC.subscribe(f"devices/{self.config['hostname']}/response/+")
-#        else:
-#            self.logger.error(f"Connection failed: {mqtt.connack_string(reason_code)}")
-#
-#    def _on_message(self, mqttC, userdata, msg):
-#        self.loop.call_soon_threadsafe(
-#            self._handle_async_message,
-#            msg.topic,
-#            msg.payload.decode()
-#        )
-#        
-#    async def _handle_async_message(self, topic, payload):
-#        if topic.startswith("devices/") and "/execute" in topic:
-#            await self._handle_execute_request(topic, payload)
-#        elif "heartbeat" in topic:
-#            self._handle_heartbeat(topic, payload)
-#        elif "/response/" in topic:
-#            self._handle_response(topic, payload)
-#            
-#    def _handle_heartbeat(self, topic, payload):
-#        """Update host registry with heartbeat data"""
-#        host = topic.split("/")[1]
-#        data = json.loads(payload)
-#        self.host_registry[host] = {
-#            "last_seen": time.time(),
-#            "plugins": data["plugins"]
-#        } 
-#
-#    async def _handle_execute_request(self, topic, payload):
-#        """Process incoming requests with ACK mechanism"""
-#        try:
-#            data = self._deserialize(payload)
-#            request_id = data['request_id']
-#            sender_host = topic.split('/')[1]
-#
-#            # Send ACK immediately
-#            ack_topic = f"devices/{sender_host}/ack/{request_id}"
-#            self.client.publish(ack_topic, self._serialize({
-#                'status': 'received',
-#                'receiver': self.config['hostname']
-#            }))
-#
-#            # Process request
-#            result = await self._process_request_locally(data)
-#            
-#            # Send response
-#            response_topic = data['response_topic']
-#            self.client.publish(response_topic, self._serialize(result))
-#            
-#        except Exception as e:
-#            self.logger.error(f"Request handling failed: {str(e)}")
-#
-#    async def _process_request_locally(self, data):
-#        """Execute the requested plugin method locally"""
-#        plugin = self._plugin_collection.get_plugin(data['plugin'])
-#        if not plugin:
-#            raise ValueError(f"Plugin {data['plugin']} not found")
-#        return await getattr(plugin, data['method'])(data['args'])
-#    
-#    def _serialize(self, data):
-#        """Handle binary data and complex types"""
-#        if isinstance(data, bytes):
-#            return json.dumps({
-#                '_type': 'bytes',
-#                'data': base64.b64encode(data).decode('utf-8')
-#            })
-#        return json.dumps(data)
-#
-#    def _deserialize(self, payload):
-#        """Convert received payload back to original format"""
-#        try:
-#            data = json.loads(payload)
-#            if isinstance(data, dict) and data.get('_type') == 'bytes':
-#                return base64.b64decode(data['data'])
-#            return data
-#        except json.JSONDecodeError:
-#            return payload
-
-
 class Plugin:
     """Base class for all plugins."""
-    def __init__(self, logger: LogUtil, plugin_collection):
+    
+    def __init__(self, logger: Logger, plugin_collection):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
         self._logger = logger
-        self._logger.setLevel(logging.DEBUG)
         self._plugin_collection = plugin_collection
-        self.asynced = False
+        self.asynced = False  # Set to True for async plugins
         self.loop_running = False
-        self.loop_req = False
+        self.loop_req = False  # Set to True if the plugin needs a loop
         self.event_loop = plugin_collection.main_event_loop
     
-    @async_handle_errors(default_return=None)
-    async def execute(self, plugin: str, method: str, args: Any = None, target_plugin_id: str = None, host: str = "any", timeout: Optional[float] = None) -> Any:
+    @async_log_errors
+    async def execute(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+        ) -> Any:
         """
         One-liner to call another plugin's method asynchronously with error handling.
         
@@ -295,12 +152,19 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        #TODO: Update the description
-        
-        return await self._plugin_collection.execute(plugin, method, args, target_plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
-
-    @handle_errors(default_return=None)
-    def execute_sync(self, plugin: str, method: str, args: Any = None, target_plugin_id: str = None, host: str = "any", timeout: Optional[float] = None) -> Any:
+        return await self._plugin_collection.execute(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+    
+    @log_errors
+    def execute_sync(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_id: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+    ) -> Any:
         """
         One-liner to call another plugin's method synchronously with error handling.
         
@@ -312,7 +176,7 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        return self._plugin_collection.execute_sync(plugin, method, args, target_plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+        return self._plugin_collection.execute_sync(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
     
     def loop_start(self):
         """Override this method to implement plugin loop functionality."""
@@ -324,18 +188,32 @@ class Plugin:
 
 class Request:
     """Represents a request from one plugin to another."""
-    
+    #def __init__(self, 
+    #            author_host: str, 
+    #            author: str, 
+    #            target: str, 
+    #            args: Any = None, 
+    #            timeout: Optional[float] = None, 
+    #            event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
     def __init__(self, 
                 author_host: str, 
-                author: str, 
-                target: str, 
+                plugin: str,
+                method: str, 
                 args: Any = None, 
+                plugin_id: Optional[str] = "",
+                target_host: str = "any",
+                author: str = "system",
+                author_id: str = "system",
                 timeout: Optional[float] = None, 
                 event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.author_host = author_host
         self.author = author
+        self.author_id = author_id
         self.id = uuid4().hex
-        self.target = target
+        self.target_plugin = plugin
+        self.target_method = method
+        self.target_plugin_id = plugin_id
+        self.target_host = target_host
         self.args = args
         self.collected = False
         self.timeout = False
@@ -403,23 +281,3 @@ class Request:
                 return result, error, timed_out
         except Exception as e:
             return str(e), True, False
-    
-    @contextlib.asynccontextmanager
-    async def request_context_async(self):   
-        try:
-            result, error, timed_out = await self.wait_for_result_async()
-            if error:
-                raise RequestException(f"Request {self.id} failed: {self.result}")
-            yield result
-        finally:
-            self.set_collected()
-
-    @contextlib.contextmanager
-    def request_context_sync(self):
-        try:
-            result = self.get_result_sync()
-            if self.error:
-                raise RequestException(f"Request failed: {self.result}")
-            yield result
-        finally:
-            self.set_collected()

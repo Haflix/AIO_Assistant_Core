@@ -1,7 +1,7 @@
 # Feature: Networking
 
 ## 1. Summary
-<Brief description of what the feature is and why it was added>
+Handling networking between nodes
 
 ## 2. Requirements
 - [ ] Core behaviors the feature must support
@@ -33,3 +33,5 @@
 
 
 ## 9. Other Notes
+Connect multiple devices
+Acknowledge and

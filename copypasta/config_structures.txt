@@ -14,11 +14,6 @@ plugins:
     arguments: 
         [Any] | Empty
 
-mqtt:
-    enabled: boolean
-    hostname: str | Empty for standard
-    broker_ip: str
-    port: int
 
 general:
     ident_name: str | Empty for same as hostname

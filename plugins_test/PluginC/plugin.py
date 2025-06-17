@@ -14,10 +14,10 @@ class PluginC(Plugin):
 
     
     @log_errors()
-    def perform_operation(self, argument):
+    def perform_operation(self, argument: int):
         """Call an async plugin from a sync plugin using the one-liner."""
 
-        result = self.execute_sync("PluginB.calculate_square", argument)
+        result = self.execute_sync("PluginB", "calculate_square", argument)
         
         if result is None:
             return f"Error calling PluginB.calculate_square with {argument}"
