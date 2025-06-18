@@ -18,6 +18,7 @@ plugins:
 
 
 general:
+    hostname: ""
     ident_name: ""
     log_folder: ./logs
     plugin_package: plugins_test  # Base directory for plugins if path is omitted
