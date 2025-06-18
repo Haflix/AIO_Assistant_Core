@@ -77,7 +77,7 @@ class ConfigUtil:
     @log_errors
     def check_config_integrity(yaml_config, _logger):
         # Check required sections
-        for section in ["plugins", "mqtt", "general"]:
+        for section in ["plugins", "general"]:
             if section not in yaml_config:
                 raise ConfigException(f"Missing config section: {section}")
 
@@ -96,16 +96,18 @@ class ConfigUtil:
     @log_errors       
     def apply_configvalues(plugin_collection):
         # Handle MQTT hostname (empty string or None)
-        mqtt_config = plugin_collection.yaml_config.get('mqtt', {})
-        hostname = mqtt_config.get('hostname')
-        if not hostname:  # Covers None and empty string
-            hostname = socket.gethostname()
-            plugin_collection.yaml_config['mqtt']['hostname'] = hostname
-        plugin_collection.hostname = hostname + uuid4().hex
-        plugin_collection._logger.info(f"Network hostname: {plugin_collection.hostname}")
+        
 
         # Handle general ident_name (empty string or None)
         general_config = plugin_collection.yaml_config.get('general', {})
+        
+        hostname = general_config.get('hostname')
+        if not hostname:  # Covers None and empty string
+            hostname = socket.gethostname()
+            plugin_collection.yaml_config['general']['hostname'] = hostname
+        plugin_collection.hostname = hostname + uuid4().hex
+        plugin_collection._logger.info(f"Network hostname: {plugin_collection.hostname}")
+        
         ident_name = general_config.get('ident_name')
         plugin_collection.ident_name = ident_name if ident_name else plugin_collection.hostname
         plugin_collection._logger.info(f"Identifier name: {plugin_collection.ident_name}")
