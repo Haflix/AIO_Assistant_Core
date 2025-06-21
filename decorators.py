@@ -36,7 +36,7 @@ def log_errors(logger: Optional[logging.Logger] = None):
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in {func_name} at {file_name}:{line_no}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 raise  # Re-raise the exception
         
@@ -82,7 +82,7 @@ def handle_errors(default_return: Any = None, logger: Optional[logging.Logger] =
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in {func_name} at {file_name}:{line_no}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 
                 # Return the default value
@@ -114,7 +114,7 @@ def async_log_errors(func):
             
             # Log the error with the correct source information
             if _logger:
-                _logger.error(f"Error in async {func_name} at {file_name}:{line_no}: {type(e).__name__}: {e}")
+                _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
                 _logger.debug(f"Traceback: {traceback.format_exc()}")
             raise  # Re-raise the exception
     
@@ -151,7 +151,7 @@ def async_handle_errors(default_return=None):
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in async {func_name} at {file_name}:{line_no}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 
                 # Return the default value
