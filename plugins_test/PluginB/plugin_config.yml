@@ -1,4 +1,2 @@
 description: idk plugin B
 version: 0.0.1
-asynced: true
-loop_req: false

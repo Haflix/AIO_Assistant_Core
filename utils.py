@@ -1,8 +1,10 @@
 import asyncio
 import datetime
 import logging
+from logging.handlers import QueueHandler, QueueListener
 import os
 from pathlib import Path
+import queue
 import socket
 import sys
 from logging import Logger, StreamHandler, DEBUG
@@ -16,52 +18,116 @@ from exceptions import RequestException, ConfigException
 
 
 
+#class LogUtil(logging.Logger):
+#    __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
+#    def __init__(
+#            self,
+#            name: str,
+#            log_format: str = __FORMATTER,
+#            level: Union[int, str] = DEBUG,
+#            *args,
+#            **kwargs
+#    ) -> None:
+#        super().__init__(name, level)
+#        self.formatter = logging.Formatter(log_format)
+#
+#    @staticmethod
+#    def create(log_level: str = 'DEBUG') -> logging.Logger:
+#        """Create and configure the root logger."""
+#        logging.setLoggerClass(LogUtil)
+#        root_logger = logging.getLogger()
+#        root_logger.setLevel(log_level)
+#
+#        # Remove existing handlers to avoid duplicates
+#        for handler in root_logger.handlers[:]:
+#            root_logger.removeHandler(handler)
+#
+#        # Create logs directory if it doesn't exist
+#        logs_dir = "logs"
+#        os.makedirs(logs_dir, exist_ok=True)
+#
+#        # Generate log filename with current timestamp
+#        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+#        log_filename = f"AIO_AI_{timestamp}.log"
+#        log_file_path = os.path.join(logs_dir, log_filename)
+#
+#        formatter = logging.Formatter(LogUtil.__FORMATTER)
+#
+#        # Add console handler
+#        stream_handler = logging.StreamHandler(sys.stdout)
+#        stream_handler.setFormatter(formatter)
+#        root_logger.addHandler(stream_handler)
+#
+#        # Add file handler
+#        file_handler = logging.FileHandler(log_file_path)
+#        file_handler.setFormatter(formatter)
+#        root_logger.addHandler(file_handler)
+#
+#        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
+#        return root_logger
 class LogUtil(logging.Logger):
     __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
+    
     def __init__(
-            self,
-            name: str,
-            log_format: str = __FORMATTER,
-            level: Union[int, str] = DEBUG,
-            *args,
-            **kwargs
+        self,
+        name: str,
+        log_format: str = __FORMATTER,
+        level: Union[int, str] = logging.DEBUG,
+        *args,
+        **kwargs
     ) -> None:
         super().__init__(name, level)
         self.formatter = logging.Formatter(log_format)
 
     @staticmethod
     def create(log_level: str = 'DEBUG') -> logging.Logger:
-        """Create and configure the root logger."""
+        """Create and configure the root logger with non-blocking I/O"""
         logging.setLoggerClass(LogUtil)
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
 
-        # Remove existing handlers to avoid duplicates
+        # Remove existing handlers
         for handler in root_logger.handlers[:]:
             root_logger.removeHandler(handler)
 
-        # Create logs directory if it doesn't exist
+        # Create thread-safe queue and listener
+        log_queue = queue.Queue(-1)  # Unlimited size
+        queue_handler = QueueHandler(log_queue)
+        root_logger.addHandler(queue_handler)
+
+        # Create actual I/O handlers
+        formatter = logging.Formatter(LogUtil.__FORMATTER)
+        
+        # Console handler
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        
+        # File handler
         logs_dir = "logs"
         os.makedirs(logs_dir, exist_ok=True)
-
-        # Generate log filename with current timestamp
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_filename = f"AIO_AI_{timestamp}.log"
         log_file_path = os.path.join(logs_dir, log_filename)
-
-        formatter = logging.Formatter(LogUtil.__FORMATTER)
-
-        # Add console handler
-        stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setFormatter(formatter)
-        root_logger.addHandler(stream_handler)
-
-        # Add file handler
         file_handler = logging.FileHandler(log_file_path)
         file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
 
-        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
+        # Create and start listener
+        listener = QueueListener(
+            log_queue,
+            stream_handler,
+            file_handler,
+            respect_handler_level=True
+        )
+        listener.start()
+
+        # Ensure proper shutdown
+        def stop_listener():
+            listener.stop()
+            root_logger.removeHandler(queue_handler)
+        import atexit
+        atexit.register(stop_listener)
+
+        root_logger.info(f"Non-blocking logging initialized. Log file: {log_file_path}")
         return root_logger
 
 
@@ -94,43 +160,44 @@ class ConfigUtil:
     
     @staticmethod
     @log_errors       
-    def apply_configvalues(plugin_collection):
-        # Handle MQTT hostname (empty string or None)
-        
+    def apply_configvalues(plugin_core):
 
         # Handle general ident_name (empty string or None)
-        general_config = plugin_collection.yaml_config.get('general', {})
+        general_config = plugin_core.yaml_config.get('general', {})
         
         hostname = general_config.get('hostname')
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
-            plugin_collection.yaml_config['general']['hostname'] = hostname
-        plugin_collection.hostname = hostname + uuid4().hex
-        plugin_collection._logger.info(f"Network hostname: {plugin_collection.hostname}")
+            plugin_core.yaml_config['general']['hostname'] = hostname
+        plugin_core.hostname = hostname + uuid4().hex
+        plugin_core._logger.info(f"Network hostname: {plugin_core.hostname}")
         
         ident_name = general_config.get('ident_name')
-        plugin_collection.ident_name = ident_name if ident_name else plugin_collection.hostname
-        plugin_collection._logger.info(f"Identifier name: {plugin_collection.ident_name}")
+        plugin_core.ident_name = ident_name if ident_name else plugin_core.hostname
+        plugin_core._logger.info(f"Identifier name: {plugin_core.ident_name}")
 
         # Plugin base directory
-        plugin_collection.plugin_package = general_config.get('plugin_package', 'plugins')
-        plugin_collection._logger.info(f"Plugin base directory: {plugin_collection.plugin_package}")
+        plugin_core.plugin_package = general_config.get('plugin_package', 'plugins')
+        plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
 
 
 class Plugin:
     """Base class for all plugins."""
     
-    def __init__(self, logger: Logger, plugin_collection):
+    def __init__(self, logger: Logger, plugin_core, arguments):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
         self._logger = logger
-        self._plugin_collection = plugin_collection
-        self.asynced = False  # Set to True for async plugins
-        self.loop_running = False
-        self.loop_req = False  # Set to True if the plugin needs a loop
-        self.event_loop = plugin_collection.main_event_loop
+        self._plugin_core = plugin_core
+        self.enabled = False
+        self.event_loop = plugin_core.main_event_loop
+        
+        self.on_load(
+            *arguments if isinstance(arguments, (list, tuple)) else [],  # Unpack list/tuple if applicable
+            **arguments if isinstance(arguments, dict) else {}  # Unpack dict if applicable
+        )
     
     @async_log_errors
     async def execute(self,
@@ -154,7 +221,7 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        return await self._plugin_collection.execute(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+        return await self._plugin_core.execute(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
     
     @log_errors
     def execute_sync(self,
@@ -178,10 +245,21 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        return self._plugin_collection.execute_sync(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+        return self._plugin_core.execute_sync(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
     
-    def loop_start(self):
-        """Override this method to implement plugin loop functionality."""
+    @log_errors
+    def on_load(self):
+        """Override this method to implement functionality that needs to happen while the plugin gets loaded."""
+        raise NotImplementedError
+    
+    @async_log_errors
+    async def on_enable(self):
+        """Override this method to implement plugin starting functionality. All loops and so on should be started here."""
+        raise NotImplementedError
+    
+    @async_log_errors
+    async def on_disable(self):
+        """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
     
     def perform_operation(self, argument):

@@ -26,5 +26,3 @@ plugin_config.yml:::(in folder with its plugin. every plugin should have its own
 
 description: str
 version: str
-asynced: boolean
-loop_req: boolean

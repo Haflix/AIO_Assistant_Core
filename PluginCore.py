@@ -1,18 +1,16 @@
 import contextlib
-import functools
 import importlib
 import inspect
 import os
-import pkgutil
-from uuid import uuid4
 import asyncio
-import socket
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
+
+from exceptions import RequestException
 from utils import LogUtil, Request, Plugin, ConfigUtil
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 
-class PluginCollection:
+class PluginCore:
     """Manages all plugins and facilitates communication between them."""
     
     def __init__(self, config_path: str):
@@ -29,18 +27,25 @@ class PluginCollection:
         
         
         self.main_event_loop = asyncio.get_event_loop()
-        self.plugins = {}
+        self.plugins = {} #TODO: Add lock --> when reloading / deleting, it should lock it so that in that time, it cant tell wrong info
+        self.plugin_lock = asyncio.Lock()
         self.seen_paths = []
+        
+        self.request_cleaner = asyncio.create_task(self.running_loop())
         
         # Start initialization
         self._init_task = asyncio.create_task(self.load_plugins())
     
+    
     async def wait_until_ready(self):
         """Wait until the plugins have been reloaded."""
         await self._init_task
+        #NOTE: Wait for enabled?
+    
     
     @log_errors
     def load_config_yaml(self, config_path: str):
+        self._logger.info(f"Loading config from config_path: {config_path}")
         self.yaml_config: dict = ConfigUtil.load_config(config_path)
         self._logger.info(self.yaml_config)
         
@@ -48,101 +53,195 @@ class PluginCollection:
         
         ConfigUtil.apply_configvalues(self)
     
+    
     @async_log_errors
-    async def load_plugins(self) -> None:
-        self.plugins = {}
-
+    async def load_plugins(self):
+        # Load the plugins
+        await self.get_plugins()
+        
+        # Enable them
+        await self.start_plugins()
+    
+    
+    @async_log_errors
+    async def get_plugins(self) -> None:
+        
         for plugin_entry in self.yaml_config.get("plugins", []):
-            # Skip disabled plugins
-            if not plugin_entry.get("enabled"):
-                continue
+            
+            # Load and initiate the pluginclass
+            await self.load_plugin_with_conf(plugin_entry)
 
-            name = plugin_entry["name"]
-            expected_version = plugin_entry.get("version")
-            arguments = plugin_entry.get("arguments") or None
-
-            # Resolve plugin directory
-            path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
-            path = os.path.abspath(path)
-
-            if not os.path.exists(path):
-                self._logger.error(f"Plugin directory missing: {name} ({path})")
-                continue
-
-            # Load plugin config
-            try:
-                with open(os.path.join(path, "plugin_config.yml"), "r") as f:
-                    plugin_config = yaml.safe_load(f)
-            except Exception as e:
-                self._logger.error(f"Failed loading config for {name}: {e}")
-                continue
-
-            # Validate plugin config
-            for field in ["description", "version", "asynced", "loop_req"]:
-                if field not in plugin_config:
-                    self._logger.error(f"{name} missing {field} in plugin_config.yml")
-                    continue
-
-            # Version check (only if specified in main config)
-            if expected_version and plugin_config["version"] != expected_version:
-                self._logger.error(f"{name} version mismatch: {expected_version}≠{plugin_config['version']}")
-                continue
-
-            # Dynamic import
-            #try:
-            if 1 == 1:
-                module_path = os.path.join(path, "plugin.py")
-                spec = importlib.util.spec_from_file_location(name, module_path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-
-                # Find first Plugin subclass
-                plugin_class = next(
-                    cls for _, cls in inspect.getmembers(module, inspect.isclass)
-                    if issubclass(cls, Plugin) and cls != Plugin
-                )
-
-                # Instantiate with config
-                plugin = plugin_class(
-                    self._logger.getChild(name),
-                    self,
-                    *arguments if isinstance(arguments, (list, tuple)) else [],  # Unpack list/tuple if applicable
-                    **arguments if isinstance(arguments, dict) else {}  # Unpack dict if applicable
-                )
-                plugin.plugin_name = name  # Set name from main config
-                plugin.version = plugin_config["version"]
-                plugin.asynced = plugin_config["asynced"]
-                self.plugins[name] = plugin
-                
-                self._logger.info(f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})")
-
-            #except Exception as e:
-            #    self._logger.error(f"Failed loading {name}: {e}")
-            #    continue
-
-        await self.start_loops()
     
     
     @async_log_errors
-    async def start_loops(self) -> None:
+    async def start_plugins(self) -> None:
         """Start all plugin loops.
         """
-        
+
         for plugin in self.plugins.values():
-            if plugin.loop_req and not plugin.loop_running:
-                task = asyncio.create_task(self._start_plugin_loop(plugin))
-                self.task_list.append(task)
+            if not plugin.enabled:
+                try:
+                    await self._enable_plugin(plugin.plugin_name)
+                except Exception as error:
+                    self._logger.warning(f"Error occured while enabling plugin with name \"{plugin.plugin_name}\": {type(error).__name__}: {error}")
+                #task = asyncio.create_task(self._enable_plugin(plugin.plugin_name))
+                #self.task_list.append(task)
     
     
+    @async_log_errors
+    async def load_plugin_with_conf(self, plugin_entry: list) -> None:
+
+        # Get values
+        name = plugin_entry["name"]
+        expected_version = plugin_entry.get("version")
+        arguments = plugin_entry.get("arguments") or None
+        
+        
+        if not plugin_entry.get("enabled"):
+            self._logger.debug(f"Plugin \"{plugin_entry.name}\" wont be loaded due to it being disabled")
+            await self.pop_plugin(name)
+            return
+        
+        if name in list(self.plugins.keys()):
+            self._logger.info(f"Plugin \"{plugin_entry.name}\" has an old instance, that will be overwritten")
+            await self.pop_plugin(name)
+            
+        
+        
+        # Resolve plugin directory
+        path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
+        path = os.path.abspath(path)
+        if not os.path.exists(path):
+            self._logger.error(f"Plugin directory missing: {name} ({path})")
+            await self.pop_plugin(name)
+            return
+        
+        
+        
+        # Load plugin config
+        try:
+            with open(os.path.join(path, "plugin_config.yml"), "r") as f:
+                plugin_config = yaml.safe_load(f)
+        except Exception as e:
+            self._logger.error(f"Failed loading config for {name}: {e}")
+            await self.pop_plugin(name)
+            return
+        
+        # Validate plugin config
+        for field in ["description", "version"]:
+            if field not in plugin_config:
+                self._logger.error(f"{name} missing {field} in plugin_config.yml")
+                await self.pop_plugin(name)
+                continue
+            
+        # Version check (only if specified in main config)
+        if expected_version and plugin_config["version"] != expected_version:
+            self._logger.error(f"{name} version mismatch: {expected_version}≠{plugin_config['version']}")
+            await self.pop_plugin(name)
+            return
+        
+        
+        # Dynamic import
+        module_path = os.path.join(path, "plugin.py")
+        spec = importlib.util.spec_from_file_location(name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        
+        # Find first Plugin subclass
+        plugin_class = next(
+            cls for _, cls in inspect.getmembers(module, inspect.isclass)
+            if issubclass(cls, Plugin) and cls != Plugin
+        )
+        
+        
+        # Instantiate with config
+        plugin = plugin_class(
+            self._logger.getChild(name),
+            self,
+            arguments=arguments if isinstance(arguments, (list, dict, tuple)) else None
+        )
+        plugin.plugin_name = name  # Set name from main config
+        plugin.version = plugin_config["version"]
+        
+        async with self.plugin_lock:
+            self.plugins[name] = plugin
+        
+        self._logger.info(f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})")
+    
+
+    @async_log_errors
+    async def pop_plugin(self, plugin_name: str) -> None:
+        self._logger.info(f"Popping plugin: {plugin_name}")
+        try:
+            if plugin_name in list(self.plugins.keys()):
+                if self.plugins[plugin_name].enabled:
+                    await self._disable_plugin(plugin_name)
+                async with self.plugin_lock:
+                    self.plugins.pop(plugin_name) 
+            else:
+                self._logger.warning(f"Plugin with name \"{plugin_name}\" doesnt exist")   
+        except Exception as error:
+            raise Exception(f"Error while popping plugin \"{plugin_name}\": {error}")
+    
+    
+    @async_log_errors
+    async def purge_plugins(self):
+        self._logger.info("Purging plugins")
+        try:
+            for plugin_name in list(self.plugins.keys()):
+                await self._disable_plugin(plugin_name)
+            async with self.plugin_lock:
+                self.plugins.clear()
+            self._logger.info("Purged all plugins")
+        except Exception as error:
+            raise Exception(f"Error while purging plugins: {error}")
+
+
     @async_handle_errors(None)
-    async def _start_plugin_loop(self, plugin: Plugin):
-        """Helper method to start a plugin's loop.
+    async def _enable_plugin(self, plugin_name: str):
+        """Method to enable a plugin.
+        """
+        async with self.plugin_lock:
+            plugin = self.plugins[plugin_name]
+            if not plugin.enabled:
+                if asyncio.iscoroutinefunction(plugin.on_enable):
+                    await plugin.on_enable()
+                else:
+                    await self.main_event_loop.run_in_executor(None, plugin.on_enable)  
+                plugin.enabled = True
+    
+    
+    @async_log_errors
+    async def _disable_plugin(self, plugin_name: str):
+        """#TODO: Write this
+        """
+        async with self.plugin_lock:
+            plugin = self.plugins[plugin_name]
+            if plugin.enabled:
+                if asyncio.iscoroutinefunction(plugin.on_disable):
+                    await plugin.on_disable()
+                else:
+                    await self.main_event_loop.run_in_executor(None, plugin.on_disable) 
+                plugin.enabled = False
+                
+                
+                
+    @async_handle_errors(None)
+    async def _reload_plugin(self, plugin_name: str):
+        """#TODO: Write this
         """
         
-        if plugin.asynced:
-            await plugin.loop_start()
-        else:
-            await self.main_event_loop.run_in_executor(None, plugin.loop_start)
+        #async with self.plugin_lock:
+        #plugin = self.plugins[plugin_name]
+            
+        #TODO: Check if plugin is already enabled
+        
+        self.pop_plugin(plugin_name)
+        
+        self.load_plugin_with_conf(self.yaml_config["plugins"][plugin_name])
+
+    
     
     @contextlib.asynccontextmanager
     async def request_context_async(self, request: Request):
@@ -184,22 +283,22 @@ class PluginCollection:
         async with self.request_lock:
             self.requests[request.id] = request
         
-        self._logger.info(f"Request {request.id} created by {author} targeting {plugin}.{method}")
+        self._logger.debug(f"Request {request.id} created by {author} targeting {plugin}.{method}")
         task = asyncio.create_task(self._process_request(request))
         self.task_list.append(task)
         
         return request
     
-#    @log_errors
-#    def create_request_sync(self, 
-#                          author: str, 
-#                          target: str, 
-#                          args: Any = None, 
-#                          timeout: Optional[float] = None) -> Request:
-#        """Create a new request synchronously."""
-#        coro = self.create_request(author, target, args, timeout)
-#        future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
-#        return future.result()
+    @log_errors
+    def create_request_sync(self, 
+                          author: str, 
+                          target: str, 
+                          args: Any = None, 
+                          timeout: Optional[float] = None) -> Request:
+        """Create a new request synchronously."""
+        coro = self.create_request(author, target, args, timeout)
+        future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
+        return future.result()
     
     @async_log_errors
     async def find_plugin(self, name: str) -> Plugin:
@@ -208,7 +307,7 @@ class PluginCollection:
         for plugin in self.plugins.values():
             if plugin.plugin_name == name:
                 plg = plugin
-                self._logger.info("Found " + plg.plugin_name)
+
         return plg
     
     @async_handle_errors(None)
@@ -223,13 +322,16 @@ class PluginCollection:
             await self._set_request_result(request, f"Plugin {plugin_name} not found", True)
             return
         
+        self._logger.debug(f"Found {plugin.plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id}")
+        
+        
         func = getattr(plugin, function_name, None)
         if not callable(func):
             await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
             return
         
         
-        if plugin.asynced or asyncio.iscoroutinefunction(func):
+        if asyncio.iscoroutinefunction(func):
             result = await func(request.args)
         else:
             result = await self.main_event_loop.run_in_executor(None, func, request.args)
@@ -288,8 +390,8 @@ class PluginCollection:
         request.set_collected()  # Mark for cleanup
         
         if error:
-            self._logger.warning(f"Error executing {plugin}.{method}: {result}")
-            return None
+            self._logger.warning(f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}. You can check the logs for this Req-ID.")
+            raise RequestException(result)
         return result
     
     @handle_errors(default_return=None)

@@ -4,16 +4,25 @@ from decorators import log_errors, handle_errors, async_log_errors, async_handle
 class PluginC(Plugin):
     """Example of a synchronous plugin that calls an async plugin."""
     
-    def __init__(self, logger, plugin_collection, *args, **kwargs):
-        super().__init__(logger, plugin_collection)
-        self.example_args = args
-        self.example_kwargs = kwargs
-        
+    def __init__(self, logger, plugin_core, arguments):
+        super().__init__(logger, plugin_core, arguments)
+
+
+    @log_errors
+    def on_load(self, *args, **kwargs):
+        self._logger.debug(f"on_load")
         self._logger.debug(f"args sum({args}): {sum(args)}")
         self._logger.debug(f"kwargs ({kwargs}): {kwargs.get('variable')}")
 
+    @log_errors
+    def on_enable(self):
+        self._logger.debug(f"on_enable")
+        
+    @log_errors
+    def on_disable(self):
+        self._logger.debug(f"on_disable")
     
-    @log_errors()
+    @log_errors
     def perform_operation(self, argument: int):
         """Call an async plugin from a sync plugin using the one-liner."""
 

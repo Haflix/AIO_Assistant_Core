@@ -1,4 +1,4 @@
-# Feature: PluginCollection
+# Feature: PluginCore
 
 ## 1. Summary
 Main class that loads and manages plugins and requests
