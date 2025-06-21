@@ -1,29 +1,52 @@
 import asyncio
-from plugin_collection import PluginCollection
+from PluginCore import PluginCore
 from decorators import async_log_errors
 
 @async_log_errors
 async def main():
     """Main function to demonstrate the plugin system."""
     # Initialize the plugin collection
-    plugin_collection = PluginCollection('config.yml')
+    plugin_core = PluginCore('config.yml')
     
     # Wait for plugins to be loaded
-    await plugin_collection.wait_until_ready()
+    await plugin_core.wait_until_ready()
     
     # Start the maintenance loop
-    asyncio.create_task(plugin_collection.running_loop())
+    #asyncio.create_task(plugin_core.running_loop())
     
     # Example of using the one-liner execute method
-    result1 = await plugin_collection.execute("PluginA", "perform_operation", 3)
-    print(f"Result from PluginA: {result1}")
+    result1 = await plugin_core.execute("PluginA", "perform_operation", 3)
+    plugin_core._logger.info(f"Result from PluginA: {result1}")
     
-    result2 = await plugin_collection.execute("PluginC", "perform_operation", 6)
-    print(f"Result from PluginC: {result2}")
+    result2 = await plugin_core.execute("PluginC", "perform_operation", 6)
+    plugin_core._logger.info(f"Result from PluginC: {result2}")
     
     # Attempt to call a non-existent plugin - will return None due to error handling
-    result3 = await plugin_collection.execute("PluginD", "perform_operation")
-    print(f"Result from non-existent PluginD: {result3}")
+    result3 = await plugin_core.execute("PluginD", "perform_operation")
+    plugin_core._logger.info(f"Result from non-existent PluginD: {result3}")
+    
+    
+    plugin_core._logger.info(plugin_core.plugins)
+    
+    await plugin_core.purge_plugins()
+    
+    plugin_core._logger.info(plugin_core.plugins)
+    
+    await plugin_core.get_plugins()
+    
+    plugin_core._logger.info(plugin_core.plugins)
+    
+    await plugin_core.start_plugins()
+    
+    plugin_core._logger.info(plugin_core.plugins)
+    
+    result1 = await plugin_core.execute("PluginA", "perform_operation", 4)
+    plugin_core._logger.info(f"Result from PluginA: {result1}")
+    
+    await plugin_core.pop_plugin("PluginB")
+    
+    result1 = await plugin_core.execute("PluginC", "perform_operation")
+    plugin_core._logger.info(f"Result from PluginC: {result1}")
 
 async def shutdown(loop, signal=None):
     """Cleanup tasks tied to the service's shutdown."""

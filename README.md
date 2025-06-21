@@ -5,4 +5,4 @@ This is the core of an All-In-One (Home-) Assistant. It is supposed to load all 
 ## Feature Documentation
 
 - [Explanation of documentation](docs/docs_structure/README.md)
-- [PluginCollection](docs/features/PluginCollection.md)
+- [PluginCore](docs/features/PluginCore.md)

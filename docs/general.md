@@ -24,11 +24,11 @@ This is for the overall progress of the project
 - **Output**: based on plugins
 
 ## 4. Architecture & Flow
-1. main loads PluginCollection
-2. PluginCollection loads plugins based on config
+1. main loads PluginCore
+2. PluginCore loads plugins based on config
 3. main calls a method via execute
-4. PluginCollection creates a Request 
-5. PluginCollection looks for the plugin locally
+4. PluginCore creates a Request 
+5. PluginCore looks for the plugin locally
 6. Performs the action if requirements are met
 7. Returns output (error or normal output) to main
 

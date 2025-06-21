@@ -1,4 +1,2 @@
 description: Example async plugin
 version: 0.0.1
-asynced: true
-loop_req: false
