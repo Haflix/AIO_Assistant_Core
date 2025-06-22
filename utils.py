@@ -85,6 +85,8 @@ class LogUtil(logging.Logger):
         logging.setLoggerClass(LogUtil)
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
+        
+        logging.root.setLevel(log_level) #NOTE: FOR TESTING
 
         # Remove existing handlers
         for handler in root_logger.handlers[:]:
@@ -101,6 +103,7 @@ class LogUtil(logging.Logger):
         # Console handler
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(log_level)
         
         # File handler
         logs_dir = "logs"
@@ -110,6 +113,7 @@ class LogUtil(logging.Logger):
         log_file_path = os.path.join(logs_dir, log_filename)
         file_handler = logging.FileHandler(log_file_path)
         file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
 
         # Create and start listener
         listener = QueueListener(

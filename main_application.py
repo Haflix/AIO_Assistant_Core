@@ -6,13 +6,13 @@ from decorators import async_log_errors
 async def main():
     """Main function to demonstrate the plugin system."""
     # Initialize the plugin collection
-    plugin_core = PluginCore('config.yml')
+    plugin_core = PluginCore('config.yml', "DEBUG")
     
     # Wait for plugins to be loaded
     await plugin_core.wait_until_ready()
-    
-    # Start the maintenance loop
-    #asyncio.create_task(plugin_core.running_loop())
+
+    nodes = await plugin_core.network.discover_nodes()
+    print("Discovered nodes:", nodes)
     
     # Example of using the one-liner execute method
     result1 = await plugin_core.execute("PluginA", "perform_operation", 3)
