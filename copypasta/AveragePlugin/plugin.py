@@ -7,18 +7,20 @@ class PluginA(Plugin):
     
     def __init__(self, logger, plugin_core, arguments):
         super().__init__(logger, plugin_core, arguments)
+        
     
     @log_errors
     def on_load(self, *args, **kwargs):
-        self._logger.info("idk")
+        self._logger.debug(f"on_load")
 
     @async_log_errors
     async def on_enable(self):
-        self._logger.info("YOOOO")
+        self._logger.debug(f"on_enable")
         
     @async_log_errors
     async def on_disable(self):
-        self._logger.info("YOOOO")
+        self._logger.debug(f"on_disable")
+    
     
     @async_log_errors
     async def perform_operation(self, argument):

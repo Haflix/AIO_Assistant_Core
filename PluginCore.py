@@ -9,12 +9,13 @@ import yaml
 from exceptions import RequestException
 from utils import LogUtil, Request, Plugin, ConfigUtil
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+from networking import NetworkManager
 
 class PluginCore:
     """Manages all plugins and facilitates communication between them."""
     
-    def __init__(self, config_path: str):
-        self._logger = LogUtil.create("DEBUG")
+    def __init__(self, config_path: str, log_level: Union[int, str] = "DEBUG"):
+        self._logger = LogUtil.create(log_level)
         
         
         self.yaml_config = None
@@ -35,13 +36,23 @@ class PluginCore:
         
         # Start initialization
         self._init_task = asyncio.create_task(self.load_plugins())
+        
+        if True:#FIXME: This will be a toggle in the config later
+            self.network = NetworkManager(
+                self, 
+                self._logger.getChild("networking"),
+                port=2510 #FIXME: from config as well
+                )
+            asyncio.create_task(self.network.start())
     
     
     async def wait_until_ready(self):
         """Wait until the plugins have been reloaded."""
         await self._init_task
+        if True: #FIXME: Will be replaced by something like self.config["networking"]["enabled"]: boolean
+            pass
+            #await self._init_network_task
         #NOTE: Wait for enabled?
-    
     
     @log_errors
     def load_config_yaml(self, config_path: str):

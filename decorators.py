@@ -29,14 +29,17 @@ def log_errors(logger: Optional[logging.Logger] = None):
                 return func(*args, **kwargs)
             except Exception as e:
                 # Get useful information about where the error occurred
-                frame = inspect.currentframe().f_back
-                file_name = frame.f_code.co_filename
-                line_no = frame.f_lineno
-                func_name = frame.f_code.co_name
+                func_name = func.__name__
+                file_name = func.__code__.co_filename
+                line_no = func.__code__.co_firstlineno
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in (async) {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}", extra={
+                        'func_name': func_name,
+                        'file_name': file_name,
+                        'line_no': line_no
+                    })
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 raise  # Re-raise the exception
         
@@ -75,14 +78,17 @@ def handle_errors(default_return: Any = None, logger: Optional[logging.Logger] =
                 return func(*args, **kwargs)
             except Exception as e:
                 # Get useful information about where the error occurred
-                frame = inspect.currentframe().f_back
-                file_name = frame.f_code.co_filename
-                line_no = frame.f_lineno
-                func_name = frame.f_code.co_name
+                func_name = func.__name__
+                file_name = func.__code__.co_filename
+                line_no = func.__code__.co_firstlineno
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in (async) {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}", extra={
+                        'func_name': func_name,
+                        'file_name': file_name,
+                        'line_no': line_no
+                    })
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
                 
                 # Return the default value
@@ -102,19 +108,24 @@ def async_log_errors(func):
         _logger = None
         if args and hasattr(args[0], '_logger'):
             _logger = args[0]._logger
+        elif hasattr(func, '_logger'):
+            _logger = func._logger
         
         try:
             return await func(*args, **kwargs)
         except Exception as e:
             # Get useful information about where the error occurred
-            frame = inspect.currentframe().f_back
-            file_name = frame.f_code.co_filename
-            line_no = frame.f_lineno
-            func_name = frame.f_code.co_name
+            func_name = func.__name__
+            file_name = func.__code__.co_filename
+            line_no = func.__code__.co_firstlineno
             
             # Log the error with the correct source information
             if _logger:
-                _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
+                _logger.error(f"Error in (async) {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}", extra={
+                    'func_name': func_name,
+                    'file_name': file_name,
+                    'line_no': line_no
+                })
                 _logger.debug(f"Traceback: {traceback.format_exc()}")
             raise  # Re-raise the exception
     
@@ -139,22 +150,27 @@ def async_handle_errors(default_return=None):
             _logger = None
             if args and hasattr(args[0], '_logger'):
                 _logger = args[0]._logger
-            
+            elif hasattr(func, '_logger'):
+                _logger = func._logger
+                
             try:
                 return await func(*args, **kwargs)
+            
             except Exception as e:
                 # Get useful information about where the error occurred
-                frame = inspect.currentframe().f_back
-                file_name = frame.f_code.co_filename
-                line_no = frame.f_lineno
-                func_name = frame.f_code.co_name
+                func_name = func.__name__
+                file_name = func.__code__.co_filename
+                line_no = func.__code__.co_firstlineno
                 
                 # Log the error with the correct source information
                 if _logger:
-                    _logger.error(f"Error in async {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}")
+                    _logger.error(f"Error in (async) {func_name}:{line_no} at {file_name}: {type(e).__name__}: {e}", extra={
+                        'func_name': func_name,
+                        'file_name': file_name,
+                        'line_no': line_no
+                    })
                     _logger.debug(f"Traceback: {traceback.format_exc()}")
-                
-                # Return the default value
+                    
                 return default_return
         
         return wrapper
