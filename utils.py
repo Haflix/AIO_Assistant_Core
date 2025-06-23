@@ -140,14 +140,23 @@ class ConfigUtil:
     @log_errors
     def load_config(config_path: str) -> dict:
         config = yaml.safe_load(Path(config_path).read_text())
-        # Add validation logic here
         return config
     
     @staticmethod
     @log_errors
-    def check_config_integrity(yaml_config, _logger):
+    def quickget_config(config_path: str, fallback_value: Any = None) -> dict:
+        config = yaml.safe_load(Path(config_path).read_text())
+        try:
+            ConfigUtil.check_config_integrity(config)
+            return config
+        except:
+            return fallback_value
+    
+    @staticmethod
+    @log_errors
+    def check_config_integrity(yaml_config: dict, _logger):
         # Check required sections
-        for section in ["plugins", "general"]:
+        for section in ["plugins", "general", "networking"]:
             if section not in yaml_config:
                 raise ConfigException(f"Missing config section: {section}")
 
@@ -160,13 +169,21 @@ class ConfigUtil:
             if not plugin.get("path") and "plugin_package" not in yaml_config.get("general", {}):
                 _logger.warning("No path or plugin_package - plugins may not load")
 
+        general = list(yaml_config.get("general", {}).keys())
+        for key in ["hostname", "plugin_package", "console_log_level"]:
+            if key not in general:
+                _logger.warning(f"Missing config section (Default value will be used): /general/{key}")
+        
+        networking = list(yaml_config.get("networking", {}).keys())
+        for key in ["enabled", "network_ip", "port"]:
+            if key not in networking:
+                _logger.warning(f"Missing config key (Default value will be used): /networking/{key}")
         #TODO: Add validations for future networking
     
     @staticmethod
     @log_errors       
     def apply_configvalues(plugin_core):
 
-        # Handle general ident_name (empty string or None)
         general_config = plugin_core.yaml_config.get('general', {})
         
         hostname = general_config.get('hostname')
@@ -175,14 +192,25 @@ class ConfigUtil:
             plugin_core.yaml_config['general']['hostname'] = hostname
         plugin_core.hostname = hostname + uuid4().hex
         plugin_core._logger.info(f"Network hostname: {plugin_core.hostname}")
-        
-        ident_name = general_config.get('ident_name')
-        plugin_core.ident_name = ident_name if ident_name else plugin_core.hostname
-        plugin_core._logger.info(f"Identifier name: {plugin_core.ident_name}")
 
         # Plugin base directory
         plugin_core.plugin_package = general_config.get('plugin_package', 'plugins')
         plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
+        
+        
+        networking_config = plugin_core.yaml_config.get('networking')
+        
+        plugin_core.networking_enabled = networking_config.get('enabled', False)
+        plugin_core._logger.info(f"Network enabling: {plugin_core.networking_enabled}")
+        
+        
+        plugin_core.networking_network_ip = networking_config.get('network_ip', socket.gethostbyname(socket.gethostname()))
+        plugin_core._logger.info(f"Networking IP: {plugin_core.networking_network_ip}")
+        
+        plugin_core.networking_port = networking_config.get('port', 2510)
+        plugin_core._logger.info(f"Networking Port: {plugin_core.networking_port}")
+        
+        
 
 
 class Plugin:

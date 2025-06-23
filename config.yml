@@ -19,6 +19,11 @@ plugins:
 
 general:
     hostname: ""
-    ident_name: ""
-    log_folder: ./logs
     plugin_package: plugins_test  # Base directory for plugins if path is omitted
+    console_log_level: "DEBUG"
+
+
+networking:
+    enabled: True
+    network_ip: "172.23.245.220"
+    port: 2510

@@ -14,12 +14,20 @@ from networking import NetworkManager
 class PluginCore:
     """Manages all plugins and facilitates communication between them."""
     
-    def __init__(self, config_path: str, log_level: Union[int, str] = "DEBUG"):
-        self._logger = LogUtil.create(log_level)
+    def __init__(self, config_path: str):
+        self._logger = LogUtil.create(
+                                    ConfigUtil.quickget_config(
+                                                    config_path, 
+                                                    {"general":
+                                                        {"console_log_level": "DEBUG"}
+                                                    }
+                                                )["general"]["console_log_level"]
+                                        )
         
         
         self.yaml_config = None
-        self.load_config_yaml(config_path)
+        self.config_path = config_path
+        self.load_config_yaml(self.config_path)
         
         
         self.requests = {}
@@ -37,11 +45,12 @@ class PluginCore:
         # Start initialization
         self._init_task = asyncio.create_task(self.load_plugins())
         
-        if True:#FIXME: This will be a toggle in the config later
+        if self.networking_enabled:
             self.network = NetworkManager(
                 self, 
                 self._logger.getChild("networking"),
-                port=2510 #FIXME: from config as well
+                network_ip=self.networking_network_ip,#FIXME: from config as well
+                port=self.networking_port #FIXME: from config as well
                 )
             asyncio.create_task(self.network.start())
     
