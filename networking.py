@@ -9,9 +9,10 @@ from decorators import *
 
 
 class NetworkManager:
-    def __init__(self, plugin_core, logger: Logger, port=2510):
+    def __init__(self, plugin_core, logger: Logger, network_ip: str = socket.gethostbyname(socket.gethostname()), port=2510):
         self.plugin_core = plugin_core
         self._logger = logger
+        self.network_ip = network_ip
         self.port = port
         self.nodes = []
         self.app = FastAPI()
@@ -108,9 +109,9 @@ class NetworkManager:
 
     async def discover_nodes(self, cidr_range=None):
         if cidr_range is None:
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            networks = [ipaddress.ip_network(f"{local_ip}/24", strict=False)]
+            #hostname = socket.gethostname()
+            #local_ip = socket.gethostbyname(hostname)
+            networks = [ipaddress.ip_network(f"{self.network_ip}/24", strict=False)]
         else:
             networks = [ipaddress.ip_network(cidr_range, strict=False)]
 
