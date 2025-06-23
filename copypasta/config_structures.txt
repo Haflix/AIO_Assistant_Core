@@ -16,10 +16,14 @@ plugins:
 
 
 general:
-    ident_name: str | Empty for same as hostname
-    log_path: str | Empty to disable
-    plugin_package: str
+    hostname: str | Empty for same as usual hostname
+    plugin_package: str | tries to use "plugins" as basedir if empty
+    console_log_level: str | Will use DEBUG if empty or if it doesnt exist
 
+networking:
+    enabled: boolean
+    network_ip: str | Your IP inside of a network (VPN recommended)
+    port: int | Port for all the networking
 
 
 plugin_config.yml:::(in folder with its plugin. every plugin should have its own folder)
