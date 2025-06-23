@@ -1,7 +1,8 @@
-CLI
+[ ] CLI
 
-Networking
+[ ] Networking
 
+[ ] Queues
 
 Other:
-- Add console log level to config
+- Add to config: Console log level, Network, Port
