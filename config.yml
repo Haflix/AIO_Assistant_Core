@@ -25,5 +25,5 @@ general:
 
 networking:
     enabled: True
-    network_ip: "172.23.245.220"
+    network_ip: "172.23.0.18"
     port: 2510
