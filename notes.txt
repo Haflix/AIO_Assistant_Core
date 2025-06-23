@@ -5,4 +5,4 @@
 [ ] Queues
 
 Other:
-- Add to config: Console log level, Network, Port
+- Log compression
