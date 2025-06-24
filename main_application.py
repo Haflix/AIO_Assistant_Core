@@ -15,7 +15,7 @@ async def main():
     while True:
         nodes = await plugin_core.network.discover_nodes()
         print("Discovered nodes:", nodes)
-        await asyncio.sleep(10)
+        await asyncio.sleep(30)
     
     # Example of using the one-liner execute method
     result1 = await plugin_core.execute("PluginA", "perform_operation", 3)

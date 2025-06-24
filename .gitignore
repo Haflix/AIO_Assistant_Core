@@ -9,9 +9,6 @@ __pycache__/
 # VS-Code
 .vscode/
 
-# Config
-config.yml
-
 # Distribution / packaging
 .Python
 build/
