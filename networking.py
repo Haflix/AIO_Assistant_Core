@@ -107,46 +107,50 @@ class NetworkManager:
 #        self.nodes = [ip for ip in results if ip]
 #        return self.nodes
 
-    async def discover_nodes(self, cidr_range=None):
-        if cidr_range is None:
-            #hostname = socket.gethostname()
-            #local_ip = socket.gethostbyname(hostname)
-            networks = [ipaddress.ip_network(f"{self.network_ip}/24", strict=False)]
-        else:
-            networks = [ipaddress.ip_network(cidr_range, strict=False)]
+    async def discover_nodes(self, extend_network, IP_list):
+        pass
 
-        ips_to_scan = [str(ip) for network in networks for ip in network.hosts()]
-        sem = asyncio.Semaphore(20)
-        active_nodes = []
-
-        @async_handle_errors(None)
-        async def _probe_node(ip, client, sem):
-            async with sem:
-                try:
-                    self._logger.debug(f"Trying to find node on http://{ip}:{self.port}/plugins")
-                    response = await client.get(
-                        f"http://{ip}:{self.port}/plugins"
-                    )
-                    if response.status_code == 200:
-                        return ip
-                except (httpx.ConnectError, httpx.TimeoutException):
-                    pass
-                except Exception:
-                    self._logger.warning(f"Exception while trying to find node on http://{ip}:{self.port}/plugins: ")
-                    pass
-            return None
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=0.1, read=0.2, write=0.2, pool=0.5)) as client:
-            tasks = [asyncio.create_task(_probe_node(ip, client, sem)) for ip in ips_to_scan]
-
-            for task in asyncio.as_completed(tasks):
-                result = await task
-                if result:
-                    active_nodes.append(result)
-                    self._logger.info(f"[DISCOVERY] Found active node: {result}")
-
-        self.nodes = active_nodes
-        return active_nodes
+#    async def discover_nodes(self, cidr_range=None, timeout=10):
+#        if cidr_range is None:
+#            #hostname = socket.gethostname()
+#            #local_ip = socket.gethostbyname(hostname)
+#            networks = [ipaddress.ip_network(f"{self.network_ip}/24", strict=False)]
+#        else:
+#            networks = [ipaddress.ip_network(cidr_range, strict=False)]
+#
+#        ips_to_scan = [str(ip) for network in networks for ip in network.hosts()]
+#        sem = asyncio.Semaphore(20)
+#        active_nodes = []
+#
+#        @async_handle_errors(None)
+#        async def _probe_node(ip, client, sem):
+#            async with sem:
+#                try:
+#                    self._logger.debug(f"Trying to find node on http://{ip}:{self.port}/plugins")
+#                    response = await client.get(
+#                        f"http://{ip}:{self.port}/plugins"
+#                    )
+#                    if response.status_code == 200:
+#                        return ip
+#                except (httpx.ConnectError, httpx.TimeoutException):
+#                    pass
+#                except Exception:
+#                    self._logger.warning(f"Exception while trying to find node on http://{ip}:{self.port}/plugins: ")
+#                    pass
+#            return None
+#
+#        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout=timeout)) as client:
+#        #async with httpx.AsyncClient(timeout=httpx.Timeout(connect=0.1, read=0.2, write=0.2, pool=0.5)) as client:
+#            tasks = [asyncio.create_task(_probe_node(ip, client, sem)) for ip in ips_to_scan]
+#
+#            for task in asyncio.as_completed(tasks):
+#                result = await task
+#                if result:
+#                    active_nodes.append(result)
+#                    self._logger.info(f"[DISCOVERY] Found active node: {result}")
+#
+#        self.nodes = active_nodes
+#        return active_nodes
 
 
         
