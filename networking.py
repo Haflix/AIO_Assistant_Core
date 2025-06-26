@@ -108,7 +108,15 @@ class NetworkManager:
 #        return self.nodes
 
     async def discover_nodes(self, extend_network, IP_list):
+        """
+        1. Get theoretical host list (with each host being a child of the Host class)
+        2. Pass it to method that checks one of them at a time --> returns availability 
+        --> (if extend_network is true, then get the following stuff) list of hosts that have extend network enabled as well from their uvicorn or something like that + all the plugins that it has from uvicorn with their parameters 
+        3. Change the status of the available hosts to true
+        4. Pass the new hosts from extend network to the host registry and go back to step 2
+        """
         pass
+
 
 #    async def discover_nodes(self, cidr_range=None, timeout=10):
 #        if cidr_range is None:
