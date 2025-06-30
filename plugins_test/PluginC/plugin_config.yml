@@ -1,2 +1,5 @@
 description: Example sync plugin
 version: 0.0.1
+remote: True
+arguments:
+  variable: test argument

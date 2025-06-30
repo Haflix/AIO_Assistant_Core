@@ -1,2 +1,4 @@
 description: idk plugin B
 version: 0.0.1
+remote: True
+arguments:
