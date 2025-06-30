@@ -113,8 +113,6 @@ class PluginCore:
 
         # Get values
         name = plugin_entry["name"]
-        expected_version = plugin_entry.get("version")
-        arguments = plugin_entry.get("arguments") or None
         
         
         if not plugin_entry.get("enabled"):
@@ -125,8 +123,6 @@ class PluginCore:
         if name in list(self.plugins.keys()):
             self._logger.info(f"Plugin \"{plugin_entry.name}\" has an old instance, that will be overwritten")
             await self.pop_plugin(name)
-            
-        
         
         # Resolve plugin directory
         path = plugin_entry.get("path") or os.path.join(self.plugin_package, name)
@@ -148,17 +144,13 @@ class PluginCore:
             return
         
         # Validate plugin config
-        for field in ["description", "version"]:
+        for field in ["description", "version", "remote", "arguments"]:
             if field not in plugin_config:
-                self._logger.error(f"{name} missing {field} in plugin_config.yml")
-                await self.pop_plugin(name)
-                continue
+                self._logger.warning(f"{name} missing {field} in plugin_config.yml")
+                #await self.pop_plugin(name)
+                #continue
             
-        # Version check (only if specified in main config)
-        if expected_version and plugin_config["version"] != expected_version:
-            self._logger.error(f"{name} version mismatch: {expected_version}≠{plugin_config['version']}")
-            await self.pop_plugin(name)
-            return
+        
         
         
         # Dynamic import
@@ -179,10 +171,12 @@ class PluginCore:
         plugin = plugin_class(
             self._logger.getChild(name),
             self,
-            arguments=arguments if isinstance(arguments, (list, dict, tuple)) else None
+            arguments=plugin_config["arguments"] if isinstance(plugin_config["arguments"], (list, dict, tuple)) else None
         )
         plugin.plugin_name = name  # Set name from main config
-        plugin.version = plugin_config["version"]
+        plugin.version = plugin_config["version"] or "0.0.0 - not given"
+        plugin.remote = plugin_config["remote"] or False
+        plugin.arguments = plugin_config["arguments"] or None
         
         async with self.plugin_lock:
             self.plugins[name] = plugin
@@ -304,6 +298,7 @@ class PluginCore:
             self.requests[request.id] = request
         
         self._logger.debug(f"Request {request.id} created by {author} targeting {plugin}.{method}")
+        
         task = asyncio.create_task(self._process_request(request))
         self.task_list.append(task)
         
@@ -337,6 +332,9 @@ class PluginCore:
         function_name = request.target_method
         
         plugin = await self.find_plugin(plugin_name)
+        
+        #FIXME: execute_remote
+        
         
         if not plugin:
             await self._set_request_result(request, f"Plugin {plugin_name} not found", True)
