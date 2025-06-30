@@ -8,13 +8,13 @@ import queue
 import socket
 import sys
 from logging import Logger, StreamHandler, DEBUG
-from typing import Union
 from uuid import uuid4
 import time
 import yaml
 from typing import Any, Optional, Tuple, Union
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from exceptions import RequestException, ConfigException
+from colorama import Fore, Style
 
 
 
@@ -66,7 +66,8 @@ from exceptions import RequestException, ConfigException
 #        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
 #        return root_logger
 class LogUtil(logging.Logger):
-    __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
+    __FORMATTER = f'{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.YELLOW}%(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s'
+    __FORMATTER_FILE = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
     
     def __init__(
         self,
@@ -99,6 +100,7 @@ class LogUtil(logging.Logger):
 
         # Create actual I/O handlers
         formatter = logging.Formatter(LogUtil.__FORMATTER)
+        formatterFile = logging.Formatter(LogUtil.__FORMATTER_FILE)
         
         # Console handler
         stream_handler = logging.StreamHandler(sys.stdout)
@@ -112,7 +114,7 @@ class LogUtil(logging.Logger):
         log_filename = f"AIO_AI_{timestamp}.log"
         log_file_path = os.path.join(logs_dir, log_filename)
         file_handler = logging.FileHandler(log_file_path)
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(formatterFile)
         file_handler.setLevel(logging.DEBUG)
 
         # Create and start listener
@@ -217,19 +219,34 @@ class Plugin:
     """Base class for all plugins."""
     
     def __init__(self, logger: Logger, plugin_core, arguments):
-        self.description = "UNKNOWN"
+        self.description = "UNKNOWN"    
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
+        self.enabled = False
+        self.remote = False #NOTE: Add to config
+        self.arguments = arguments
+        
         self._logger = logger
         self._plugin_core = plugin_core
-        self.enabled = False
         self.event_loop = plugin_core.main_event_loop
         
         self.on_load(
             *arguments if isinstance(arguments, (list, tuple)) else [],  # Unpack list/tuple if applicable
             **arguments if isinstance(arguments, dict) else {}  # Unpack dict if applicable
         )
+    
+    async def _to_dict(self):
+        info_dict = {}
+        info_dict["plugin_name"] = self.plugin_name
+        info_dict["version"] = self.version
+        info_dict["plugin_uuid"] = self.plugin_uuid 
+        info_dict["enabled"] = self.enabled 
+        info_dict["remote"] = self.remote 
+        info_dict["description"] = self.description
+        info_dict["arguments"] = self.arguments
+        
+        return info_dict
     
     @async_log_errors
     async def execute(self,

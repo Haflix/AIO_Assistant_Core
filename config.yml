@@ -2,17 +2,12 @@ plugins:
   - name: PluginA      
     enabled: true
     path: ./plugins_test/pluginA_v1  # Explicit path
-    version: 0.0.1
 
   - name: PluginC
     enabled: true
-    version: 0.0.1
-    arguments:
-        variable: test argument
 
   - name: PluginB
     enabled: true      # No path - auto-resolve to plugin_package/PluginB
-    version: 0.0.1    # Optional version check
 
 
 

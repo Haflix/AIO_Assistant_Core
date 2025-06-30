@@ -6,7 +6,11 @@ import socket
 import ipaddress
 import asyncio
 from decorators import *
-
+from networking_classes import Node
+from networking_classes import RemotePlugin
+import time
+from typing import List
+    
 
 class NetworkManager:
     def __init__(self, plugin_core, logger: Logger, network_ip: str = socket.gethostbyname(socket.gethostname()), port=2510):
@@ -21,7 +25,17 @@ class NetworkManager:
     def _setup_routes(self):
         @self.app.get("/plugins")
         async def list_plugins():
-            return list(self.plugin_core.plugins.keys())
+            return {
+            "plugins": [
+                await plugin._to_dict()
+                for plugin in self.plugin_core.plugins.values()
+            ]
+        }
+
+        
+        @self.app.get("/ping")
+        async def ping():
+            return {"status": "ok"}
 
         @self.app.post("/execute")
         async def execute_plugin(request: Request):
@@ -55,7 +69,6 @@ class NetworkManager:
         server = uvicorn.Server(config)
 
         await server.serve()
-        #await asyncio.to_thread(server.run)
 
     async def execute_remote(self, host: str, plugin: str, method: str, args=None, plugin_id="", author="remote", author_id="remote", timeout=5):
         url = f"http://{host}:{self.port}/execute"
@@ -107,8 +120,62 @@ class NetworkManager:
 #        self.nodes = [ip for ip in results if ip]
 #        return self.nodes
 
-    async def discover_nodes(self, extend_network, IP_list):
-        pass
+    @async_handle_errors(None)
+    async def discover_nodes(self, extend_network: bool, IP_list: list[str], timeout: int = 5) -> List[Node]:
+        sem = asyncio.Semaphore(20)
+        discovered = []
+
+        async def probe(ip):
+            async with sem:
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.get(f"http://{ip}:{self.port}/plugins")
+                    if response.status_code == 200:
+                        plugin_data = response.json()
+                        plugin_list = [
+                            RemotePlugin(
+                                name=p["plugin_name"],
+                                version=p["version"],
+                                uuid=p["plugin_uuid"],
+                                enabled=p["enabled"],
+                                remote=p["remote"],
+                                description=p["description"],
+                                arguments=p.get("arguments", [])
+                            )
+                            for p in plugin_data.get("plugins", [])
+                        ]
+                        node = Node(
+                            ip=ip,
+                            status=True,
+                            plugins=plugin_list,
+                            extend_network=extend_network
+                        )
+                        self._logger.info(f"[DISCOVERY] Node found at {ip}")
+                        return node
+
+                except Exception as e:
+                    self._logger.debug(f"[DISCOVERY] Failed to reach {ip}: {e}")
+                    return None
+
+        tasks = [probe(ip) for ip in IP_list]
+        results = await asyncio.gather(*tasks)
+        self.nodes = [node for node in results if node]
+        return self.nodes
+
+    
+    async def heartbeat_node(self, node: Node, timeout=3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(f"http://{node.ip}:{self.port}/ping") #NOTE: Add hash to check for new plugins?
+                if response.status_code == 200:
+                    node.status = True
+                    node.heartbeat()
+                else:
+                    node.status = False
+        except:
+            node.status = False
+
+
 
 #    async def discover_nodes(self, cidr_range=None, timeout=10):
 #        if cidr_range is None:
@@ -162,7 +229,7 @@ class NetworkManager:
         for node in self.nodes:
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
-                    response = await client.get(f"http://{node}:{self.port}/plugins")
+                    response = await client.get(f"http://{node.ip}:{self.port}/plugins")
                     if response.status_code == 200:
                         if plugin_name in response.json():
                             found_hosts.append(node)
