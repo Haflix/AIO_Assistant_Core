@@ -7,6 +7,7 @@ from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
 from exceptions import RequestException
+from networking_classes import RemotePlugin
 from utils import LogUtil, Request, Plugin, ConfigUtil
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from networking import NetworkManager
@@ -36,7 +37,7 @@ class PluginCore:
         
         
         self.main_event_loop = asyncio.get_event_loop()
-        self.plugins = {} #TODO: Add lock --> when reloading / deleting, it should lock it so that in that time, it cant tell wrong info
+        self.plugins = {}
         self.plugin_lock = asyncio.Lock()
         self.seen_paths = []
         
@@ -116,12 +117,12 @@ class PluginCore:
         
         
         if not plugin_entry.get("enabled"):
-            self._logger.debug(f"Plugin \"{plugin_entry.name}\" wont be loaded due to it being disabled")
+            self._logger.debug(f"Plugin \"{name}\" wont be loaded due to it being disabled")
             await self.pop_plugin(name)
             return
         
         if name in list(self.plugins.keys()):
-            self._logger.info(f"Plugin \"{plugin_entry.name}\" has an old instance, that will be overwritten")
+            self._logger.info(f"Plugin \"{name}\" has an old instance, that will be overwritten")
             await self.pop_plugin(name)
         
         # Resolve plugin directory
@@ -306,24 +307,41 @@ class PluginCore:
     
     @log_errors
     def create_request_sync(self, 
-                          author: str, 
-                          target: str, 
-                          args: Any = None, 
-                          timeout: Optional[float] = None) -> Request:
+                            plugin: str,
+                            method: str,
+                            args: Any = None,
+                            plugin_id: Optional[str] = "",
+                            host: str = "any",  # "any", "remote", "local", or hostname
+                            author: str = "system",
+                            author_id: str = "system",
+                            timeout: Optional[float] = None
+                            ) -> Request:
         """Create a new request synchronously."""
-        coro = self.create_request(author, target, args, timeout)
+        coro = self.create_request(plugin, method, args, plugin_id, host, author, author_id, timeout)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         return future.result()
     
     @async_log_errors
     async def find_plugin(self, name: str) -> Plugin:
-        #TODO: Add remote search, search by host & search by id
+        #TODO: Add remote search, search by host & search by id 
+        # check if other plugin meets:
+        #   remote == True
+        #   node gotta be active
+        #   wait! find plugin inside of network manager cause of lock? (node lock & plugin lock)
+    
         plg = None
+        
         for plugin in self.plugins.values():
             if plugin.plugin_name == name:
                 plg = plugin
 
+        if self.networking_enabled:
+            pass #NOTE: Add search for RemotePlugin s here
+        
         return plg
+    
+    #@async_log_errors
+    #async def _sub_find_plugin(self, plugins)
     
     @async_handle_errors(None)
     async def _process_request(self, request: Request) -> None:
@@ -334,7 +352,7 @@ class PluginCore:
         plugin = await self.find_plugin(plugin_name)
         
         #FIXME: execute_remote
-        
+        # Check if None, Plugin or RemotePlugin
         
         if not plugin:
             await self._set_request_result(request, f"Plugin {plugin_name} not found", True)
@@ -342,6 +360,8 @@ class PluginCore:
         
         self._logger.debug(f"Found {plugin.plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id}")
         
+        if isinstance(plugin, RemotePlugin):
+            
         
         func = getattr(plugin, function_name, None)
         if not callable(func):
