@@ -27,8 +27,9 @@ class RemotePlugin:
 
 
 class Node:
-    def __init__(self, ip: str, status: bool, plugins: list[RemotePlugin], extend_network: bool):
+    def __init__(self, ip: str, node_uuid: str, status: bool, plugins: list[RemotePlugin], extend_network: bool):
         self.ip = ip
+        self.node_uuid = node_uuid
         self.status = status
         self.last_heartbeat = int(time.time())
         self.plugins_lock = asyncio.Lock() #NOTE: Implement 
