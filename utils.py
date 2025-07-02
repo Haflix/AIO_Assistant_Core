@@ -177,7 +177,7 @@ class ConfigUtil:
                 _logger.warning(f"Missing config section (Default value will be used): /general/{key}")
         
         networking = list(yaml_config.get("networking", {}).keys())
-        for key in ["enabled", "network_ip", "port"]:
+        for key in ["enabled", "node_ips", "port", "discoverable", "discover_nodes"]:
             if key not in networking:
                 _logger.warning(f"Missing config key (Default value will be used): /networking/{key}")
         #TODO: Add validations for future networking
@@ -192,7 +192,7 @@ class ConfigUtil:
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
             plugin_core.yaml_config['general']['hostname'] = hostname
-        plugin_core.hostname = hostname + uuid4().hex
+        plugin_core.hostname = hostname#uuid4().hex
         plugin_core._logger.info(f"Network hostname: {plugin_core.hostname}")
 
         # Plugin base directory
@@ -204,10 +204,6 @@ class ConfigUtil:
         
         plugin_core.networking_enabled = networking_config.get('enabled', False)
         plugin_core._logger.info(f"Network enabling: {plugin_core.networking_enabled}")
-        
-        
-        plugin_core.networking_network_ip = networking_config.get('network_ip', socket.gethostbyname(socket.gethostname()))
-        plugin_core._logger.info(f"Networking IP: {plugin_core.networking_network_ip}")
         
         plugin_core.networking_port = networking_config.get('port', 2510)
         plugin_core._logger.info(f"Networking Port: {plugin_core.networking_port}")
