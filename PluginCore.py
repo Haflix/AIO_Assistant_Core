@@ -6,7 +6,7 @@ import asyncio
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
-from exceptions import RequestException
+from exceptions import NetworkRequestException, RequestException
 from networking_classes import RemotePlugin
 from utils import LogUtil, Request, Plugin, ConfigUtil
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
@@ -50,8 +50,10 @@ class PluginCore:
             self.network = NetworkManager(
                 self, 
                 self._logger.getChild("networking"),
-                network_ip=self.networking_network_ip,#FIXME: from config as well
-                port=self.networking_port #FIXME: from config as well
+                node_ips=self.yaml_config.get('networking').get("node_ips", []),
+                discover_nodes=self.yaml_config.get('networking').get("discover_nodes", False),
+                discoverable=self.yaml_config.get('networking').get("discoverable", False),
+                port=self.networking_port 
                 )
             asyncio.create_task(self.network.start())
     
@@ -59,9 +61,7 @@ class PluginCore:
     async def wait_until_ready(self):
         """Wait until the plugins have been reloaded."""
         await self._init_task
-        if True: #FIXME: Will be replaced by something like self.config["networking"]["enabled"]: boolean
-            pass
-            #await self._init_network_task
+        
         #NOTE: Wait for enabled?
     
     @log_errors
@@ -289,11 +289,15 @@ class PluginCore:
                             host: str = "any",  # "any", "remote", "local", or hostname
                             author: str = "system",
                             author_id: str = "system",
-                            timeout: Optional[float] = None
+                            timeout: Optional[float] = None,
+                            author_host: str = None
                             ) -> Request:
         """Create a new request asynchronously."""
-        #request = Request(self.hostname, author, target, args, timeout, self.main_event_loop)
-        request = Request(self.hostname, plugin, method, args, plugin_id, host, author, author_id, timeout, self.main_event_loop)
+        
+        if author_host == None:
+            author_host = self.hostname
+        
+        request = Request(author_host, plugin, method, args, plugin_id, host, author, author_id, timeout, self.main_event_loop)
         
         async with self.request_lock:
             self.requests[request.id] = request
@@ -326,8 +330,10 @@ class PluginCore:
         #TODO: Add remote search, search by host & search by id 
         # check if other plugin meets:
         #   remote == True
-        #   node gotta be active
+        #   node.enabled = True
+        #   node.alive = True
         #   wait! find plugin inside of network manager cause of lock? (node lock & plugin lock)
+        #   --> iterate nodes and call something like find_plugin?
     
         plg = None
         
@@ -362,17 +368,22 @@ class PluginCore:
         
         if isinstance(plugin, RemotePlugin):
             
+            #NOTE: Do the other stuff here
         
-        func = getattr(plugin, function_name, None)
-        if not callable(func):
-            await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
-            return
-        
-        
-        if asyncio.iscoroutinefunction(func):
-            result = await func(request.args)
         else:
-            result = await self.main_event_loop.run_in_executor(None, func, request.args)
+            if not plugin.remote and request.author_id not in :
+                await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
+                return
+            func = getattr(plugin, function_name, None)
+            if not callable(func):
+                await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
+                return
+        
+        
+            if asyncio.iscoroutinefunction(func):
+                result = await func(request.args)
+            else:
+                result = await self.main_event_loop.run_in_executor(None, func, request.args)
         
         await self._set_request_result(request, result)
     
@@ -405,10 +416,11 @@ class PluginCore:
         method: str,
         args: Any = None,
         plugin_id: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        host: str = "any",  # "any", "remote", "local", or host_uuid
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        author_host: str = None
         ) -> Any:
         """
         One-liner to execute a plugin method and get its result with built-in error handling.
@@ -423,7 +435,7 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
-        request = await self.create_request(plugin, method, args, plugin_id, host, author, author_id, timeout)
+        request = await self.create_request(plugin, method, args, plugin_id, host, author, author_id, timeout, author_host)
         result, error, _ = await request.wait_for_result_async()
         request.set_collected()  # Mark for cleanup
         
