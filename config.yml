@@ -21,7 +21,10 @@ general:
 networking:
     enabled: True
     node_ips: 
+      - "172.23.0.12"
       - "172.23.0.18"
+      - "172.23.0.24"
+      - "172.23.0.98"
     port: 2510
     discover_nodes: True
     discoverable: True

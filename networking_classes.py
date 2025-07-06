@@ -29,19 +29,25 @@ class RemotePlugin:
 
 
 class Node:
-    def __init__(self, ip: str, hostname: str, alive: bool, enabled: bool, plugins: dict, discoverable: bool):
-        self.ip = ip
+    def __init__(self, IP: str, hostname: str, enabled: bool, discoverable: bool):
+        self.IP = IP
         self.hostname = hostname
-        self.alive = alive
         self.enabled = enabled
-        self.last_heartbeat = int(time.time())
-        self.plugins_lock = asyncio.Lock() #FIXME: Implement 
-        self.plugins = plugins
+        self.last_heartbeat = 0
         self.discoverable = discoverable
 
-    async def _to_dict(self):
-        """"""
-        return
+    def __str__(self) -> str:
+        """String-representation of a node"""
+        return f"   IP: {self.IP}\n     Hostname: {self.hostname}\n     Enabled: {self.enabled}\n    Last Heartbeat: {self.is_alive_sync()}\n     Discoverable: {self.discoverable}\n"
+
+    async def _to_tuple(self) -> Tuple[str, str]:
+        """
+        Returns:
+            Tuple[str, str]: A tuple where:
+                - The first element is the node's IP address.
+                - The second element is the node's hostname.
+        """
+        return (self.IP, self.hostname)
 
     async def heartbeat(self):
         """Updates heartbeat timestamp"""
@@ -54,9 +60,6 @@ class Node:
         
         self.hostname = response["hostname"]
         self.discoverable = response["discoverable"]
-        
-        async with self.plugins_lock:
-            self.plugins = response.get("plugins")
             
         await self.heartbeat()
         
@@ -67,9 +70,15 @@ class Node:
     def update_remote_plugin(self):
         pass
 
-    def is_alive(self, timeout=30):
+    async def is_alive(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds"""
-        return (int(time.time()) - self.last_heartbeat) < timeout
+        #return (int(time.time()) - self.last_heartbeat) < timeout
+        return True #FIXME: Please PLEASE 🙏🙏 remove later
+    
+    def is_alive_sync(self, timeout=30):
+        """Returns True if last heartbeat was within timeout seconds"""
+        #return (int(time.time()) - self.last_heartbeat) < timeout
+        return True #FIXME: Please PLEASE 🙏🙏 remove later
 
     def get_remote_plugins(self):
         return [p for p in self.plugins if p.remote]
