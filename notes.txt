@@ -5,4 +5,5 @@
 [ ] Queues
 
 Other:
-- Log compression (this is so needed)
+- Methoddescriptions
+- Logging (add and improve)

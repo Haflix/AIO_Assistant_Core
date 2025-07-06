@@ -4,24 +4,27 @@ import uvicorn
 import httpx
 import socket
 import asyncio
-from decorators import *
+from decorators import async_log_errors, async_handle_errors
 from exceptions import NetworkRequestException
 from networking_classes import Node
 from networking_classes import RemotePlugin
-from typing import List, Union
+from typing import List, Union, Optional
     
 
 class NetworkManager:
     def __init__(self, plugin_core, logger: Logger, node_ips: list, discover_nodes:bool, discoverable: bool, port=2510):
         self.plugin_core = plugin_core
         self._logger = logger
+        
+        
         self.node_ips = node_ips
         self.discover_nodes = discover_nodes
         self.discoverable = discoverable
         self.port = port
-        self.nodes = []
+        self.nodes: list[Node] = []
         self.app = FastAPI()
         self._setup_routes()
+    
 
     def _setup_routes(self):
         @self.app.get("/plugins")
@@ -33,27 +36,47 @@ class NetworkManager:
             ]
         }
 
+        @self.app.get("/has_plugin")
+        async def has_plugin(name: str, plugin_uuid: Union[str, None] = None):
+            self._logger.debug(f"Remote request to find {name} {plugin_uuid}")
+            
+            plugin_uuid = plugin_uuid if plugin_uuid != "None" else None #NOTE: HORRIBLE SOLUTION
+            plugin, node = await self.plugin_core.find_plugin(name=name, host="local", plugin_uuid=plugin_uuid)
+            
+            if not plugin:
+                self._logger.debug(f"Couldnt find for remote request: {name} {plugin_uuid}")
+            else:
+                self._logger.debug(f"Found plugin for remote request: {plugin.plugin_name} {plugin.plugin_uuid}")
+            return {
+                "available": plugin is not None,
+                "remote": plugin.remote if plugin else None,
+                "hostname": self.plugin_core.hostname,
+                "plugin_uuid": plugin.plugin_uuid if plugin else None
+            }
+
         
         @self.app.get("/ping")
         async def ping():
             return {"status": "ok"}
         
         @self.app.post("/info")
-        async def info(hostname: str, discover_nodes: bool):
+        async def info(request: Request):
+            
+            data = await request.json()
+            hostname = data.get("hostname")
+            discover_nodes_info = data.get("discover_nodes_info")
             
             if type(hostname) != str:
                 return NetworkRequestException("The var hostname is not the correct type. Must be str.")
             
-            if type(discover_nodes) != bool:
+            if type(discover_nodes_info) != bool:
                 return NetworkRequestException("The var discover_nodes is not the correct type. Must be bool.")
+            
             
             return {
                     "hostname": self.plugin_core.hostname,
                     "discoverable": self.discoverable,
-                    "nodes": [node for node in self.nodes.values() if node.discoverable and not node.hostname == hostname and discover_nodes and node.enabled and node.alive],
-                    "plugins": {
-                        name: await self._remoteplugin_from_dict(await plugin._to_dict()) for name, plugin in self.plugin_core.plugins.items()
-                        }
+                    "nodes": [await node._to_tuple() for node in self.nodes if node.discoverable and not node.hostname == hostname and discover_nodes_info and node.enabled and node.alive]
                     }
 
         @self.app.post("/execute")
@@ -62,7 +85,7 @@ class NetworkManager:
             plugin = data.get("plugin")
             method = data.get("method")
             args = data.get("args")
-            plugin_id = data.get("plugin_id", "")
+            plugin_uuid = data.get("plugin_uuid", None)
             author = data.get("author", "remote")
             author_id = data.get("author_id", "remote")
             timeout = data.get("timeout")
@@ -70,7 +93,7 @@ class NetworkManager:
 
             try:
                 result = await self.plugin_core.execute(
-                    plugin, method, args, plugin_id, "local", author, author_id, timeout, author_host
+                    plugin, method, args, plugin_uuid, "local", author, author_id, timeout, author_host
                 )
                 
                 return {"result": result, "error": False}
@@ -93,14 +116,14 @@ class NetworkManager:
 
         await server.serve()
 
-    async def execute_remote(self, host: str, plugin: str, method: str, args=None, plugin_id="", author="remote", author_id="remote", timeout=5):
-        url = f"http://{host}:{self.port}/execute"
+    async def execute_remote(self, IP: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):
+        url = f"http://{IP}:{self.port}/execute"
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url, json={
                 "plugin": plugin,
                 "method": method,
                 "args": args,
-                "plugin_id": plugin_id,
+                "plugin_uuid": plugin_uuid,
                 "author": author,
                 "author_id": author_id,
                 "timeout": timeout,
@@ -108,14 +131,14 @@ class NetworkManager:
             })
             return response.json()
 
-#    def execute_remote_sync(self, host: str, plugin: str, method: str, args=None, plugin_id="", author="remote", author_id="remote", timeout=5):
+#    def execute_remote_sync(self, host: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):
 #        url = f"http://{host}:{self.port}/execute"
 #        with httpx.Client(timeout=timeout) as client:
 #            response = client.post(url, json={
 #                "plugin": plugin,
 #                "method": method,
 #                "args": args,
-#                "plugin_id": plugin_id,
+#                "plugin_uuid": plugin_uuid,
 #                "author": author,
 #                "author_id": author_id,
 #                "timeout": timeout
@@ -145,40 +168,50 @@ class NetworkManager:
 #        return self.nodes
 
     @async_handle_errors(None)
-    async def update_all_nodes(self, additional_IP_list: list[str] = [], timeout: int = 5) -> List[Node]:
+    async def update_all_nodes(self, additional_IP_list: list[str] = [], timeout: int = 5, ignore_enabled_status: bool = False) -> List[Node]:
         
         self.node_ips.extend(additional_IP_list)
-
+        
         await self._create_nodes(self.node_ips)
+        
 
-        tasks = [self.update_single(IP, timeout) for IP in self.node_ips]
+        tasks = [self.update_single(IP, timeout) for IP in self.node_ips if await self._get_node(IP).enabled or ignore_enabled_status]
         results = await asyncio.gather(*tasks)
+        
         return self.nodes
 
     @async_log_errors
     async def update_single(self, IP: str, timeout: int = 5):
-        sem = asyncio.Semaphore(20)
-        async with sem:
-            try:
-                response = await self._get_ip_info(IP, timeout=timeout)
-                if response.status_code == 200:
-                    response = response.json()
+        
+        await self._create_new_node(IP)
+                
+        try:
+            response = await self._get_ip_info(IP, timeout=timeout)
+            
+            if not response:
+                raise NetworkRequestException("Couldnt reach host")
+            
+            response = response.json()
+            
+            await (await self._get_node(IP)).update(response, self.plugin_core.hostname)
+            
+            for sub_node in response.get("nodes"):
+                if sub_node[0] not in self.node_ips and sub_node[1] != self.plugin_core.hostname:
+                    await self._add_ip(sub_node[0])
                     
-                    await (await self._get_node(IP)).update(response, self.plugin_core.hostname)
+                    await self._create_new_node(sub_node[0], sub_node[1])
                     
-                    for sub_node in response.get("nodes"):
-                        if sub_node.ip not in self.node_ips and sub_node.hostname != self.plugin_core.hostname:
-                            await self._add_ip(sub_node.ip)
-                            
-                    self._logger.info(f"[DISCOVERY] Node found at {IP}")
-
-            except Exception as e:
-                self._logger.debug(f"[DISCOVERY] Failed to reach {IP}: {e}")
+                    await self.update_single(sub_node[0])
+                    
+            self._logger.info(f"[DISCOVERY] Node found at {IP}")
+                
+        except Exception as e:
+            self._logger.debug(f"[DISCOVERY] Failed to reach {IP}: {e}")
 
 
     @async_log_errors
-    async def _add_ip(self, ip):
-        await self.node_ips.append(ip)
+    async def _add_ip(self, IP):
+        await self.node_ips.append(IP)
 
     @async_log_errors
     async def _create_nodes(self, IP_list: list):
@@ -186,30 +219,34 @@ class NetworkManager:
             await self._create_new_node(IP)
 
     @async_log_errors
-    async def _create_new_node(self, IP: str):
+    async def _create_new_node(self, IP: str, hostname: Union[str, None] = None):
         if not await self.node_exists(IP):
             
             self.nodes.append(
                             Node(
-                                ip=IP,
-                                hostname=None,
-                                alive=False,
+                                IP=IP,
+                                hostname=hostname,
                                 enabled=True,
-                                plugins={},
                                 discoverable=False
                                 )
                             )
     
-    @async_log_errors
+    @async_handle_errors(None)
     async def _get_ip_info(self, IP: str, timeout: Union[int, float] = 5):
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"http://{IP}:{self.port}/info",
-                data={
-                    "hostname":self.plugin_core.hostname,
-                    "discover_nodes": self.discover_nodes  
-                }
-            )
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"http://{IP}:{self.port}/info",
+                    json={
+                        'hostname': self.plugin_core.hostname,
+                        'discover_nodes_info': self.discover_nodes  
+                    },
+                    timeout=timeout
+                )
+        except Exception as e:
+            self._logger.debug(f"[GET_INFO] Failed to reach {IP}: {e}")
+            return
+            
         return response
     
     @async_log_errors
@@ -227,17 +264,22 @@ class NetworkManager:
     @async_log_errors
     async def node_exists(self, IP: str):
         for node in self.nodes:
-            if node.ip == IP:
+            if node.IP == IP:
                 return True
             
         return False
     
     @async_log_errors
-    async def _get_node(self, IP: str) -> Node:
+    async def _get_node(self, IP: str, hostame: Union[str, None] = None, autogenerate: bool = False) -> Node:
+        
+        if autogenerate:
+            await self._create_new_node(IP=IP, hostname=hostame)
         
         for node in self.nodes:
-            if node.ip == IP:
-                return node
+            if node.IP == IP:
+                if node.hostname == hostame or hostame == None:
+                    return node 
+
             
         self._logger.warning(f"A node with IP \"{IP}\" doesnt exist!")
         return None
@@ -256,7 +298,7 @@ class NetworkManager:
     async def heartbeat_node(self, node: Node, timeout=5):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(f"http://{node.ip}:{self.port}/ping") #NOTE: Add hash to check for new plugins?
+                response = await client.get(f"http://{node.IP}:{self.port}/ping") #NOTE: Add hash to check for new plugins?
                 if response.status_code == 200:
                     node.status = True
                     node.heartbeat()
@@ -264,6 +306,34 @@ class NetworkManager:
                     node.status = False
         except:
             node.status = False
+
+    @async_handle_errors(None)
+    async def node_has_plugin(self, IP: str, plugin_name: str, plugin_uuid: Union[str, None] = None, timeout: float = 3.0) -> Optional[dict]:
+        """
+        Ask a node if it has the specified plugin.
+        """
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                #plugin_uuid = plugin_uuid if not None else "None"
+                #plugin_uuid = plugin_uuid or "None"
+
+                if plugin_uuid:
+                    response = await client.get(
+                        f"http://{IP}:{self.port}/has_plugin",
+                        params={"name": plugin_name, 
+                                "plugin_uuid": plugin_uuid
+                                }
+                    )
+                else:
+                    response = await client.get(
+                        f"http://{IP}:{self.port}/has_plugin",
+                        params={"name": plugin_name
+                                }
+                    )
+                if response.status_code == 200:
+                    return response.json()
+            except Exception:
+                return None
 
 
 
