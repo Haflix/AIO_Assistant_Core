@@ -12,16 +12,20 @@ async def main():
     await plugin_core.wait_until_ready()
 
     
-    nodes = await plugin_core.network.discover_nodes(extend_network=True, IP_list = ["172.23.0.24"])
+    nodes = await plugin_core.network.update_all_nodes()
     print("Discovered nodes:", nodes)
 
-    #result4 = await plugin_core.network.execute_remote(nodes[0].ip, "PluginA", "perform_operation", 9)
+    #await plugin_core.purge_plugins()
+
     #print(result4)
-    await asyncio.sleep(30)
+    #while True:
+        #await asyncio.sleep(10000)
     
     # Example of using the one-liner execute method
-    result1 = await plugin_core.execute("PluginA", "perform_operation", 3)
+    result1 = await plugin_core.execute("PluginA", "perform_operation", 3, host="local")
     plugin_core._logger.info(f"Result from PluginA: {result1}")
+    
+    await asyncio.sleep(10000)
     
     result2 = await plugin_core.execute("PluginC", "perform_operation", 6)
     plugin_core._logger.info(f"Result from PluginC: {result2}")

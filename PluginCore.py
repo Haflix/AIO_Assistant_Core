@@ -7,7 +7,7 @@ from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
 
 from exceptions import NetworkRequestException, RequestException
-from networking_classes import RemotePlugin
+from networking_classes import Node, RemotePlugin
 from utils import LogUtil, Request, Plugin, ConfigUtil
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from networking import NetworkManager
@@ -247,11 +247,6 @@ class PluginCore:
         """#TODO: Write this
         """
         
-        #async with self.plugin_lock:
-        #plugin = self.plugins[plugin_name]
-            
-        #TODO: Check if plugin is already enabled
-        
         self.pop_plugin(plugin_name)
         
         self.load_plugin_with_conf(self.yaml_config["plugins"][plugin_name])
@@ -285,7 +280,7 @@ class PluginCore:
                             plugin: str,
                             method: str,
                             args: Any = None,
-                            plugin_id: Optional[str] = "",
+                            plugin_uuid: Optional[str] = "",
                             host: str = "any",  # "any", "remote", "local", or hostname
                             author: str = "system",
                             author_id: str = "system",
@@ -297,7 +292,7 @@ class PluginCore:
         if author_host == None:
             author_host = self.hostname
         
-        request = Request(author_host, plugin, method, args, plugin_id, host, author, author_id, timeout, self.main_event_loop)
+        request = Request(author_host, plugin, method, args, plugin_uuid, host, author, author_id, timeout, self.main_event_loop)
         
         async with self.request_lock:
             self.requests[request.id] = request
@@ -314,40 +309,64 @@ class PluginCore:
                             plugin: str,
                             method: str,
                             args: Any = None,
-                            plugin_id: Optional[str] = "",
+                            plugin_uuid: Optional[str] = "",
                             host: str = "any",  # "any", "remote", "local", or hostname
                             author: str = "system",
                             author_id: str = "system",
                             timeout: Optional[float] = None
                             ) -> Request:
         """Create a new request synchronously."""
-        coro = self.create_request(plugin, method, args, plugin_id, host, author, author_id, timeout)
+        coro = self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         return future.result()
     
     @async_log_errors
-    async def find_plugin(self, name: str) -> Plugin:
+    async def find_plugin(self, name: str, host: str = "any", plugin_uuid: Union[str, None] = None) -> Optional[Union[Plugin, tuple]]:
         #TODO: Add remote search, search by host & search by id 
         # check if other plugin meets:
         #   remote == True
         #   node.enabled = True
-        #   node.alive = True
-        #   wait! find plugin inside of network manager cause of lock? (node lock & plugin lock)
+        #   node.is_alive() == True
         #   --> iterate nodes and call something like find_plugin?
-    
-        plg = None
-        
-        for plugin in self.plugins.values():
-            if plugin.plugin_name == name:
-                plg = plugin
 
-        if self.networking_enabled:
-            pass #NOTE: Add search for RemotePlugin s here
-        
-        return plg
+        """
+        Tries to find a plugin locally first, then on remote nodes if networking is enabled.
+        """
+        # check locally first
+        if host in ["local", "any", self.hostname]:
+            for plugin in self.plugins.values():
+                plugin: Plugin
+
+                if plugin.plugin_name == name and (not plugin_uuid or plugin.plugin_uuid == plugin_uuid):
+                    #if plugin.plugin_name == name and (not plugin_uuid or plugin.plugin_uuid == plugin_uuid):
+                    return plugin, None
+
+
+        # if not found ask remote nodes
+        if self.networking_enabled and host != "local" and host != self.hostname:
+            for node in self.network.nodes:
+                node: Node
+                if not node.enabled or not await node.is_alive():
+                    continue
+
+                if host in ["remote", "any"] or node.hostname == host:
+
+
+                    result = await self.network.node_has_plugin(node.IP, name, plugin_uuid)
+                    if result and result.get("available") and result.get("remote"):
+                        return RemotePlugin(
+                            name=name,
+                            version="unknown",  # could fetch real version later
+                            uuid=result.get("plugin_uuid"),
+                            enabled=True,
+                            remote=True,
+                            description="Remote plugin",
+                            arguments=[],
+                            hostname=result.get("hostname", node.hostname)
+                        ), node
+
+        return None, None
     
-    #@async_log_errors
-    #async def _sub_find_plugin(self, plugins)
     
     @async_handle_errors(None)
     async def _process_request(self, request: Request) -> None:
@@ -355,31 +374,40 @@ class PluginCore:
         plugin_name = request.target_plugin
         function_name = request.target_method
         
-        plugin = await self.find_plugin(plugin_name)
+        plugin, node = await self.find_plugin(plugin_name, request.target_host, request.target_plugin_uuid)
         
-        #FIXME: execute_remote
-        # Check if None, Plugin or RemotePlugin
         
+
         if not plugin:
             await self._set_request_result(request, f"Plugin {plugin_name} not found", True)
             return
         
-        self._logger.debug(f"Found {plugin.plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id}")
+        
+        
+        host = f"(local) {self.hostname}" if isinstance(plugin, Plugin) else f"{node.IP}#{node.hostname}"
+        self._logger.debug(f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}")
         
         if isinstance(plugin, RemotePlugin):
-            
-            #NOTE: Do the other stuff here
+            result = await self.network.execute_remote(IP=node.IP,
+                                        plugin=plugin_name,
+                                        method=function_name,
+                                        args=request.args,
+                                        plugin_uuid=request.target_plugin_uuid,
+                                        author=f"{self.hostname} - {request.author}#{request.author_id}",
+                                        author_id=request.author_id,
+                                        timeout=request.timeout_duration
+                                        )
         
         else:
-            if not plugin.remote and request.author_id not in :
-                await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
-                return
+            #if not plugin.remote and request.author_id:
+            #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
+            #    return
             func = getattr(plugin, function_name, None)
             if not callable(func):
                 await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
                 return
-        
-        
+
+
             if asyncio.iscoroutinefunction(func):
                 result = await func(request.args)
             else:
@@ -415,7 +443,7 @@ class PluginCore:
         plugin: str,
         method: str,
         args: Any = None,
-        plugin_id: Optional[str] = "",
+        plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or host_uuid
         author: str = "system",
         author_id: str = "system",
@@ -435,7 +463,7 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
-        request = await self.create_request(plugin, method, args, plugin_id, host, author, author_id, timeout, author_host)
+        request = await self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host)
         result, error, _ = await request.wait_for_result_async()
         request.set_collected()  # Mark for cleanup
         
@@ -449,7 +477,7 @@ class PluginCore:
         plugin: str,
         method: str,
         args: Any = None,
-        plugin_id: Optional[str] = "",
+        plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
@@ -468,7 +496,7 @@ class PluginCore:
             The result from the plugin method or None if any error occurs
         """
         future = asyncio.run_coroutine_threadsafe(
-            self.execute(plugin, method, args, plugin_id, host, author, author_id, timeout),
+            self.execute(plugin, method, args, plugin_uuid, host, author, author_id, timeout),
             self.main_event_loop
         )
         return future.result()

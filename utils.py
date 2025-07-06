@@ -180,7 +180,6 @@ class ConfigUtil:
         for key in ["enabled", "node_ips", "port", "discoverable", "discover_nodes"]:
             if key not in networking:
                 _logger.warning(f"Missing config key (Default value will be used): /networking/{key}")
-        #TODO: Add validations for future networking
     
     @staticmethod
     @log_errors       
@@ -249,7 +248,7 @@ class Plugin:
         plugin: str,
         method: str,
         args: Any = None,
-        plugin_id: Optional[str] = "",
+        plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
@@ -266,14 +265,14 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        return await self._plugin_core.execute(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+        return await self._plugin_core.execute(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
     
     @log_errors
     def execute_sync(self,
         plugin: str,
         method: str,
         args: Any = None,
-        plugin_id: Optional[str] = "",
+        plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
@@ -290,7 +289,7 @@ class Plugin:
         Returns:
             The result from the target method or None if an error occurs
         """
-        return self._plugin_core.execute_sync(plugin, method, args, plugin_id, host, self.plugin_name, self.plugin_uuid, timeout)
+        return self._plugin_core.execute_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
     
     @log_errors
     def on_load(self):
@@ -313,19 +312,13 @@ class Plugin:
 
 class Request:
     """Represents a request from one plugin to another."""
-    #def __init__(self, 
-    #            author_host: str, 
-    #            author: str, 
-    #            target: str, 
-    #            args: Any = None, 
-    #            timeout: Optional[float] = None, 
-    #            event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    
     def __init__(self, 
                 author_host: str, 
                 plugin: str,
                 method: str, 
                 args: Any = None, 
-                plugin_id: Optional[str] = "",
+                plugin_uuid: Optional[str] = "",
                 target_host: str = "any",
                 author: str = "system",
                 author_id: str = "system",
@@ -337,7 +330,7 @@ class Request:
         self.id = uuid4().hex
         self.target_plugin = plugin
         self.target_method = method
-        self.target_plugin_id = plugin_id
+        self.target_plugin_uuid = plugin_uuid
         self.target_host = target_host
         self.args = args
         self.collected = False
@@ -345,8 +338,12 @@ class Request:
         self.ready = False
         self.error = False
         self.result = None
+        
+        #NOTE: Maybe change to timeout_at --> current time + the timeout time so that its equal across all hosts
         self.created_at = time.time()
         self.timeout_duration = timeout
+        
+        
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
     
