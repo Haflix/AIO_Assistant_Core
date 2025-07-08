@@ -52,7 +52,8 @@ class PluginCore:
                 self._logger.getChild("networking"),
                 node_ips=self.yaml_config.get('networking').get("node_ips", []),
                 discover_nodes=self.yaml_config.get('networking').get("discover_nodes", False),
-                discoverable=self.yaml_config.get('networking').get("discoverable", False),
+                direct_discoverable=self.networking_direct_discoverable,
+                auto_discoverable=self.networking_auto_discoverable,
                 port=self.networking_port 
                 )
             asyncio.create_task(self.network.start())
@@ -387,7 +388,8 @@ class PluginCore:
         host = f"(local) {self.hostname}" if isinstance(plugin, Plugin) else f"{node.IP}#{node.hostname}"
         self._logger.debug(f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}")
         
-        if isinstance(plugin, RemotePlugin):
+        if isinstance(plugin, RemotePlugin):#FIXME: Fix the timeout thing. Warn if ping is higher than timeout
+            #FIXME: Streams dont work remotely yet: gotta do it with the async start_server thingy i think
             result = await self.network.execute_remote(IP=node.IP,
                                         plugin=plugin_name,
                                         method=function_name,
@@ -403,16 +405,26 @@ class PluginCore:
             #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
             #    return
             func = getattr(plugin, function_name, None)
-            if not callable(func):
+            if not callable(func) or not inspect.isfunction(func):
                 await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
                 return
 
 
             if asyncio.iscoroutinefunction(func):
                 result = await func(request.args)
+            elif inspect.isasyncgenfunction(func):
+                raise Exception("Idk man. will be implemented soon probably. No async generators for now :( but soon (hopefully)")
+                #FIXME
+                async for result in func(request.args):
+                    pass
+            elif inspect.isgeneratorfunction(func):
+                raise Exception("Idk man. will be implemented soon probably. No sync generators for now :( but soon (hopefully)")
+                #FIXME
+                pass
             else:
                 result = await self.main_event_loop.run_in_executor(None, func, request.args)
-        
+
+        asyncio.Future.result
         await self._set_request_result(request, result)
     
     @async_handle_errors(None)
