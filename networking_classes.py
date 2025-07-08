@@ -29,16 +29,16 @@ class RemotePlugin:
 
 
 class Node:
-    def __init__(self, IP: str, hostname: str, enabled: bool, discoverable: bool):
+    def __init__(self, IP: str, hostname: str, enabled: bool, auto_discoverable: bool):
         self.IP = IP
         self.hostname = hostname
         self.enabled = enabled
         self.last_heartbeat = 0
-        self.discoverable = discoverable
+        self.auto_discoverable = auto_discoverable
 
     def __str__(self) -> str:
         """String-representation of a node"""
-        return f"   IP: {self.IP}\n     Hostname: {self.hostname}\n     Enabled: {self.enabled}\n    Last Heartbeat: {self.is_alive_sync()}\n     Discoverable: {self.discoverable}\n"
+        return f"   IP: {self.IP}\n     Hostname: {self.hostname}\n     Enabled: {self.enabled}\n    Last Heartbeat: {self.is_alive_sync()}\n     Discoverable: {self.auto_discoverable}\n"
 
     async def _to_tuple(self) -> Tuple[str, str]:
         """
@@ -59,7 +59,7 @@ class Node:
             return
         
         self.hostname = response["hostname"]
-        self.discoverable = response["discoverable"]
+        self.auto_discoverable = response["auto_discoverable"]
             
         await self.heartbeat()
         
@@ -79,6 +79,3 @@ class Node:
         """Returns True if last heartbeat was within timeout seconds"""
         #return (int(time.time()) - self.last_heartbeat) < timeout
         return True #FIXME: Please PLEASE 🙏🙏 remove later
-
-    def get_remote_plugins(self):
-        return [p for p in self.plugins if p.remote]

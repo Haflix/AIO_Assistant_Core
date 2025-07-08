@@ -177,7 +177,7 @@ class ConfigUtil:
                 _logger.warning(f"Missing config section (Default value will be used): /general/{key}")
         
         networking = list(yaml_config.get("networking", {}).keys())
-        for key in ["enabled", "node_ips", "port", "discoverable", "discover_nodes"]:
+        for key in ["enabled", "node_ips", "port", "direct_discoverable", "auto_discoverable", "discover_nodes"]:
             if key not in networking:
                 _logger.warning(f"Missing config key (Default value will be used): /networking/{key}")
     
@@ -202,11 +202,26 @@ class ConfigUtil:
         networking_config = plugin_core.yaml_config.get('networking')
         
         plugin_core.networking_enabled = networking_config.get('enabled', False)
-        plugin_core._logger.info(f"Network enabling: {plugin_core.networking_enabled}")
+        plugin_core.yaml_config['networking']['enabled'] = plugin_core.networking_enabled
+        plugin_core._logger.info(f"Networking enabled: {plugin_core.networking_enabled}")
         
         plugin_core.networking_port = networking_config.get('port', 2510)
+        plugin_core.yaml_config['networking']['port'] = plugin_core.networking_port
         plugin_core._logger.info(f"Networking Port: {plugin_core.networking_port}")
         
+        plugin_core.networking_auto_discoverable = networking_config.get('auto_discoverable', False)
+        plugin_core.yaml_config['networking']['auto_discoverable'] = plugin_core.networking_auto_discoverable
+        plugin_core._logger.info(f"auto_discoverable: {plugin_core.networking_auto_discoverable}")
+        
+        
+        plugin_core.networking_direct_discoverable = networking_config.get('direct_discoverable', False)
+        
+        if plugin_core.networking_auto_discoverable and not plugin_core.networking_direct_discoverable:
+            plugin_core._logger.info("direct_discoverable will be set to True as auto_discoverable is active. You cannot deactivate direct_discoverable if auto_discoverable is set to True.")
+            plugin_core.networking_direct_discoverable = True
+
+        plugin_core.yaml_config['networking']['direct_discoverable'] = plugin_core.networking_direct_discoverable
+        plugin_core._logger.info(f"direct_discoverable: {plugin_core.networking_direct_discoverable}")        
         
 
 
@@ -338,6 +353,7 @@ class Request:
         self.ready = False
         self.error = False
         self.result = None
+        #FIXME: The queue for streams here!!! 
         
         #NOTE: Maybe change to timeout_at --> current time + the timeout time so that its equal across all hosts
         self.created_at = time.time()
@@ -354,6 +370,8 @@ class Request:
             self.result = result
             self._future.set_result((result, error, False))
             self.ready = True
+            
+    
     
     def set_collected(self) -> None:
         """Mark the request as collected for cleanup."""

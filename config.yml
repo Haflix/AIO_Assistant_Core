@@ -27,4 +27,5 @@ networking:
       - "172.23.0.98"
     port: 2510
     discover_nodes: True
-    discoverable: True
+    direct_discoverable: True
+    auto_discoverable: True
