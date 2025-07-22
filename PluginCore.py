@@ -8,7 +8,7 @@ import yaml
 
 from exceptions import NetworkRequestException, RequestException
 from networking_classes import Node, RemotePlugin
-from utils import LogUtil, Request, Plugin, ConfigUtil
+from utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from networking import NetworkManager
 
@@ -83,6 +83,8 @@ class PluginCore:
         
         # Enable them
         await self.start_plugins()
+        
+        self._logger.info(f"Finished Loading plugins!")
     
     
     @async_log_errors
@@ -285,15 +287,16 @@ class PluginCore:
                             host: str = "any",  # "any", "remote", "local", or hostname
                             author: str = "system",
                             author_id: str = "system",
-                            timeout: Optional[float] = None,
-                            author_host: str = None
+                            timeout: Union[float, tuple] = None,
+                            author_host: str = None,
+                            request_id: str = None
                             ) -> Request:
         """Create a new request asynchronously."""
         
         if author_host == None:
             author_host = self.hostname
         
-        request = Request(author_host, plugin, method, args, plugin_uuid, host, author, author_id, timeout, self.main_event_loop)
+        request = Request(author_host, plugin, method, args, plugin_uuid, host, author, author_id, timeout, request_id, self.main_event_loop)
         
         async with self.request_lock:
             self.requests[request.id] = request
@@ -314,10 +317,60 @@ class PluginCore:
                             host: str = "any",  # "any", "remote", "local", or hostname
                             author: str = "system",
                             author_id: str = "system",
-                            timeout: Optional[float] = None
+                            timeout: Union[float, tuple] = None,
+                            author_host: str = None,
+                            request_id: str = None
                             ) -> Request:
         """Create a new request synchronously."""
-        coro = self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout)
+        coro = self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id)
+        future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
+        return future.result()
+    
+    @async_log_errors
+    async def create_gen_request(self, 
+                            plugin: str,
+                            method: str,
+                            args: Any = None,
+                            plugin_uuid: Optional[str] = "",
+                            host: str = "any",  # "any", "remote", "local", or hostname
+                            author: str = "system",
+                            author_id: str = "system",
+                            timeout: Union[float, tuple] = None,
+                            author_host: str = None,
+                            request_id: str = None
+                            ) -> GeneratorRequest:
+        """Create a new request asynchronously."""
+        
+        if author_host == None:
+            author_host = self.hostname
+        
+        request = GeneratorRequest(author_host, plugin, method, args, plugin_uuid, host, author, author_id, timeout, request_id, self.main_event_loop)
+        
+        async with self.request_lock:
+            self.requests[request.id] = request
+        
+        self._logger.debug(f"GeneratorRequest {request.id} created by {author} targeting {plugin}.{method}")
+        
+        task = asyncio.create_task(self._process_request_stream(request))
+        self.task_list.append(task)
+        
+        return request
+    
+    @log_errors
+    def create_gen_request_sync(self, 
+                            plugin: str,
+                            method: str,
+                            args: Any = None,
+                            plugin_uuid: Optional[str] = "",
+                            host: str = "any",  # "any", "remote", "local", or hostname
+                            author: str = "system",
+                            author_id: str = "system",
+                            timeout: Union[float, tuple] = None,
+                            author_host: str = None,
+                            request_id: str = None
+                            ) -> Request:
+        """Create a new request synchronously."""
+        coro = self.create_gen_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id)
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         return future.result()
     
@@ -397,7 +450,8 @@ class PluginCore:
                                         plugin_uuid=request.target_plugin_uuid,
                                         author=f"{self.hostname} - {request.author}#{request.author_id}",
                                         author_id=request.author_id,
-                                        timeout=request.timeout_duration
+                                        timeout=(request.timeout_duration, request.created_at),
+                                        request_id=request.id
                                         )
         
         else:
@@ -405,34 +459,109 @@ class PluginCore:
             #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
             #    return
             func = getattr(plugin, function_name, None)
-            if not callable(func) or not inspect.isfunction(func):
+            if not callable(func):# or not inspect.isfunction(func):
                 await self._set_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
                 return
 
-
+            
             if asyncio.iscoroutinefunction(func):
                 result = await func(request.args)
             elif inspect.isasyncgenfunction(func):
-                raise Exception("Idk man. will be implemented soon probably. No async generators for now :( but soon (hopefully)")
+                #async for
+                raise Exception(f"For Request {request.id}: The method you requested is an async-generator. Use execute_stream for generators")
                 #FIXME
-                async for result in func(request.args):
-                    pass
+                #async for result in func(request.args):
+                    #pass
             elif inspect.isgeneratorfunction(func):
-                raise Exception("Idk man. will be implemented soon probably. No sync generators for now :( but soon (hopefully)")
+                raise Exception(f"For Request {request.id}: The method you requested is a sync-generator. Use execute_stream for generators")
                 #FIXME
-                pass
+                #pass
             else:
                 result = await self.main_event_loop.run_in_executor(None, func, request.args)
 
-        asyncio.Future.result
+
         await self._set_request_result(request, result)
+        
+    #@async_handle_errors(None)
+    async def _process_request_stream(self, request: GeneratorRequest) -> None:
+        """Process a request by invoking the target plugin method."""
+        plugin_name = request.target_plugin
+        function_name = request.target_method
+        
+        plugin, node = await self.find_plugin(plugin_name, request.target_host, request.target_plugin_uuid)
+        
+        
+
+        if not plugin:
+            await self._set_gen_request_result(request, f"Plugin {plugin_name} not found", True)
+            return
+        
+        
+        
+        host = f"(local) {self.hostname}" if isinstance(plugin, Plugin) else f"{node.IP}#{node.hostname}"
+        self._logger.debug(f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}")
+        
+        if isinstance(plugin, RemotePlugin):
+            async for result in self.network.execute_remote_stream(IP=node.IP,
+                                        plugin=plugin_name,
+                                        method=function_name,
+                                        args=request.args,
+                                        plugin_uuid=request.target_plugin_uuid,
+                                        author=f"{self.hostname} - {request.author}#{request.author_id}",
+                                        author_id=request.author_id,
+                                        timeout=(request.timeout_duration, request.created_at),
+                                        request_id=request.id
+                                        ):
+                await request.queue.put(result)#FIXME
+        
+        else:
+            #if not plugin.remote and request.author_id:
+            #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
+            #    return
+            func = getattr(plugin, function_name, None)
+            if not callable(func):# or not inspect.isfunction(func):
+                #await request.queue.put((result, False, False))
+                await self._set_gen_request_result(request, f"Function {function_name} not found in plugin {plugin_name}", True)
+                return
+
+            
+            if asyncio.iscoroutinefunction(func):
+                await self._set_gen_request_result(request, f"For Request {request.id}: The method you requested is a non-generator async function. Use execute for non-generators", True)
+                return
+            
+            elif inspect.isasyncgenfunction(func):
+                async for result in func(request.args):
+                    await request.queue.put((result, False, False))#FIXME Add in utils
+                    
+            elif inspect.isgeneratorfunction(func):
+                generator = func(request.args)
+                sentinel = object()
+                while True:
+                    result = await asyncio.to_thread(next, generator, sentinel)
+                    if result is sentinel:
+                        break
+                    await request.queue.put((result, False, False))#FIXME Add in utils
+
+            else:
+                await self._set_gen_request_result(request, f"For Request {request.id}: The method you requested is a non-generator sync function. Use execute for non-generators", True)
+                return
+                #result = await self.main_event_loop.run_in_executor(None, func, request.args)
+
+
+        await self._set_gen_request_result(request)
     
     @async_handle_errors(None)
     async def _set_request_result(self, request: Request, result: Any, error: bool = False) -> None:
         """Set the result of a request."""
         if isinstance(result, asyncio.Future):
             result = await result
-        request.set_result(result, error)
+        await request.set_result(result, error)
+    
+    @async_handle_errors(None)
+    async def _set_gen_request_result(self, request: GeneratorRequest, result: Any = None, error: bool = False) -> None:
+        """Set the result of a request."""
+        
+        await request.set_result(result, error)
     
     async def running_loop(self):
         """Maintenance loop that cleans up tasks and requests."""
@@ -459,8 +588,9 @@ class PluginCore:
         host: str = "any",  # "any", "remote", "local", or host_uuid
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None,
-        author_host: str = None
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None
         ) -> Any:
         """
         One-liner to execute a plugin method and get its result with built-in error handling.
@@ -475,9 +605,9 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
-        request = await self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host)
+        request = await self.create_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id)
         result, error, _ = await request.wait_for_result_async()
-        request.set_collected()  # Mark for cleanup
+        await request.set_collected()  # Mark for cleanup
         
         if error:
             self._logger.warning(f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}. You can check the logs for this Req-ID.")
@@ -490,10 +620,12 @@ class PluginCore:
         method: str,
         args: Any = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        host: str = "any",  # "any", "remote", "local", or host_uuid
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None
     ) -> Any:
         """
         Synchronous one-liner to execute a plugin method with built-in error handling.
@@ -507,8 +639,77 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
+        
         future = asyncio.run_coroutine_threadsafe(
-            self.execute(plugin, method, args, plugin_uuid, host, author, author_id, timeout),
+            self.execute(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id),
+            self.main_event_loop
+        )
+        return future.result()
+    
+    #@async_handle_errors(default_return=None)
+    async def execute_stream(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_uuid: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or host_uuid
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None
+        ) -> Any:
+        """
+        One-liner to execute a plugin method and get its result with built-in error handling.
+        This combines request creation, processing, and result retrieval in one method.
+        
+        Args:
+            target: The plugin and method in format "PluginName.method_name"
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method or None if any error occurs
+        """
+        request = await self.create_gen_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id)
+        async for result, error, _ in request.get_queue_stream():
+
+            if error:#FIXME DOESNT DO SHIT
+                self._logger.warning(f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID.")
+                raise RequestException(result)
+            yield result
+        
+        await request.set_collected()  # Mark for cleanup
+    
+    #@handle_errors(default_return=None)
+    def execute_stream_sync(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_uuid: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or host_uuid
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None
+    ) -> Any:
+        """
+        Synchronous one-liner to execute a plugin method with built-in error handling.
+        
+        Args:
+            target: The plugin and method in format "PluginName.method_name"
+            args: Arguments to pass to the method
+            author: The name of the caller (defaults to "system")
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the plugin method or None if any error occurs
+        """
+        #FIXME Still wrong
+        future = asyncio.run_coroutine_threadsafe(
+            self.execute_stream(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id),
             self.main_event_loop
         )
         return future.result()
