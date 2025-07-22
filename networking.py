@@ -1,5 +1,6 @@
 from logging import Logger
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 import uvicorn
 import httpx
 import socket
@@ -9,7 +10,6 @@ from exceptions import NetworkRequestException, NodeException
 from networking_classes import Node
 from networking_classes import RemotePlugin
 from typing import List, Union, Optional
-    
 
 class NetworkManager:
     def __init__(self, plugin_core, logger: Logger, node_ips: list, discover_nodes:bool, direct_discoverable: bool, auto_discoverable: bool, port=2510):
@@ -93,7 +93,7 @@ class NetworkManager:
                     }
 
         @self.app.post("/execute")
-        async def execute_plugin(request: Request):
+        async def execute_plugin(request: Request):#FIXME Add new stuff
             data = await request.json()
             plugin = data.get("plugin")
             method = data.get("method")
@@ -103,10 +103,11 @@ class NetworkManager:
             author_id = data.get("author_id", "remote")
             timeout = data.get("timeout")
             author_host = data.get("author_host")
+            request_id = data.get("request_id")
 
             try:
                 result = await self.plugin_core.execute(
-                    plugin, method, args, plugin_uuid, "local", author, author_id, timeout, author_host
+                    plugin, method, args, plugin_uuid, "local", author, author_id, timeout, author_host, request_id=request_id
                 )
                 
                 return {"result": result, "error": False}
@@ -114,6 +115,77 @@ class NetworkManager:
                 return {"result": e, "error": True}
             except NetworkRequestException as e:
                 return {"result": e, "error": True}
+
+
+        @self.app.post("/execute_stream")
+        async def execute_stream(request: Request):
+            data = await request.json()
+            plugin = data.get("plugin")
+            method = data.get("method")
+            args = data.get("args", [])
+            plugin_uuid = data.get("plugin_uuid")
+            author = data.get("author", "remote")
+            author_id = data.get("author_id", "remote")
+            timeout = data.get("timeout")
+            author_host = data.get("author_host")
+            request_id = data.get("request_id")
+
+            async def stream_wrapper():
+                try:
+                    async for line in self.plugin_core.execute_stream(
+                        plugin=plugin,
+                        method=method,
+                        args=args,
+                        plugin_uuid=plugin_uuid,
+                        host="local",
+                        author=author,
+                        author_id=author_id,
+                        timeout=timeout,
+                        author_host=author_host,
+                        request_id=request_id
+                    ):
+                        print(line)
+                        yield line #+ "\n" #FIXME Makes everything a string?? + It NEEEEEEDS to put result, error, timeout
+                except Exception as e:
+                    yield f"[STREAM_ERROR] {str(e)}\n"
+
+            return StreamingResponse(stream_wrapper(), media_type="text/plain")
+        """
+        @self.app.post("/execute_stream")
+        def execute_stream_sync(request: Request):
+            data = request.json()
+            plugin = data.get("plugin")
+            method = data.get("method")
+            args = data.get("args", [])
+            plugin_uuid = data.get("plugin_uuid")
+            author = data.get("author", "remote")
+            author_id = data.get("author_id", "remote")
+            timeout = data.get("timeout")
+            author_host = data.get("author_host")
+            request_id = data.get("request_id")
+
+            async def stream_wrapper():
+                try:
+                    stream = self.plugin_core.execute_stream_sync(
+                        plugin=plugin,
+                        method=method,
+                        args=args,
+                        plugin_uuid=plugin_uuid,
+                        host="local",
+                        author=author,
+                        author_id=author_id,
+                        timeout=timeout,
+                        author_host=author_host,
+                        request_id=request_id
+                    )
+                    async for line in stream:
+                        yield line + "\n"
+                except Exception as e:
+                    yield f"[STREAM_ERROR] {str(e)}\n"
+
+            return StreamingResponse(stream_wrapper(), media_type="text/plain")
+    """
+
 
     async def start(self):
         """Starts FastAPI server without blocking the main loop."""
@@ -131,9 +203,9 @@ class NetworkManager:
 
         await server.serve()
 
-    async def execute_remote(self, IP: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):
+    async def execute_remote(self, IP: str, plugin: str, method: str, timeout: tuple, request_id: str, args=None, plugin_uuid="", author="remote", author_id="remote"):
         url = f"https://{IP}:{self.port}/execute"
-        async with httpx.AsyncClient(verify='./cert.pem', timeout=timeout) as client:
+        async with httpx.AsyncClient(verify='./cert.pem', timeout=timeout[0] if timeout[0] is not 0.0 else 7200.0) as client:#FIXME Is the timeout needed here and its def not implemented correctly
             response = await client.post(url, json={
                 "plugin": plugin,
                 "method": method,
@@ -142,9 +214,42 @@ class NetworkManager:
                 "author": author,
                 "author_id": author_id,
                 "timeout": timeout,
-                "author_host": self.plugin_core.hostname
+                "author_host": self.plugin_core.hostname,
+                "request_id":request_id
             })
             return response.json()
+        
+    async def execute_remote_stream(self, IP: str, plugin: str, method: str, timeout: tuple, request_id: str, args=None, plugin_uuid: str = "",author: str = "remote", author_id: str = "remote"):
+            url = f"https://{IP}:{self.port}/execute_stream"
+            args = args or []
+            timeout_val = timeout[0] if timeout[0] != 0.0 else 7200.0
+
+            yield (f"[STREAM_ERROR] execute_remote_stream is currently not available", True, False)
+            return
+
+            async with httpx.AsyncClient(verify='./cert.pem', timeout=timeout_val) as client:
+                try:
+                    async with client.stream("POST", url, json={
+                        "plugin": plugin,
+                        "method": method,
+                        "args": args,
+                        "plugin_uuid": plugin_uuid,
+                        "author": author,
+                        "author_id": author_id,
+                        "timeout": timeout,
+                        "author_host": self.plugin_core.hostname,
+                        "request_id": request_id
+                    }) as response:
+                        print(response) # science
+                        #async for line in response.read():#.aiter_lines():
+                        #print(line)
+                        if line.strip():
+                            yield line
+                        else:
+                            yield line
+                except Exception as e:
+                    yield (f"[STREAM_ERROR] {str(e)}", True, False)
+
 
 #    def execute_remote_sync(self, host: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):
 #        url = f"http://{host}:{self.port}/execute"

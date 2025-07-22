@@ -8,5 +8,11 @@ Other:
 - Methoddescriptions
 - Logging (add and improve)
 
-Important:
-- Discovery: Should it try to send itself as well?
+
+Notes:
+- Decorators for streaming
+
+
+Plugins & their methods:
+- define commands in their config with arguments etc
+
