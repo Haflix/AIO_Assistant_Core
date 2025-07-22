@@ -32,3 +32,11 @@ class PluginA(Plugin):
             return f"Error calling PluginB.calculate_square with {argument}"
         
         return result
+
+    #@async_log_errors
+    async def perform_operation_stream(self, argument):
+        result = await self.execute("PluginB", "calculate_square", argument)
+        for i in range(5):
+            await asyncio.sleep(0.5)
+            yield result # we live in a society
+        yield "ended stream test"

@@ -234,7 +234,7 @@ class Plugin:
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
         self.enabled = False
-        self.remote = False #NOTE: Add to config
+        self.remote = False 
         self.arguments = arguments
         
         self._logger = logger
@@ -306,6 +306,56 @@ class Plugin:
         """
         return self._plugin_core.execute_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
     
+    @async_log_errors
+    async def execute_stream(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_uuid: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+        ) -> Any:
+        """
+        One-liner to call another plugin's method asynchronously with error handling.
+        
+        Args:
+            target: Target plugin and method (format: "PluginName.method_name")
+            args: Arguments to pass to the method
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the target method or None if an error occurs
+        """
+        async for i in self._plugin_core.execute_stream(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout):
+            yield i
+    
+    @log_errors
+    def execute_stream_sync(self,
+        plugin: str,
+        method: str,
+        args: Any = None,
+        plugin_uuid: Optional[str] = "",
+        host: str = "any",  # "any", "remote", "local", or hostname
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Optional[float] = None
+    ) -> Any:
+        """
+        One-liner to call another plugin's method synchronously with error handling.
+        
+        Args:
+            target: Target plugin and method (format: "PluginName.method_name")
+            args: Arguments to pass to the method
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            The result from the target method or None if an error occurs
+        """
+        for i in self._plugin_core.execute_stream_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout):
+            yield i
+    
     @log_errors
     def on_load(self):
         """Override this method to implement functionality that needs to happen while the plugin gets loaded."""
@@ -337,12 +387,13 @@ class Request:
                 target_host: str = "any",
                 author: str = "system",
                 author_id: str = "system",
-                timeout: Optional[float] = None, 
+                timeout: Union[float, tuple] = None, #FIXME: Implement in execute_remote
+                request_id: str = None,
                 event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.author_host = author_host
         self.author = author
         self.author_id = author_id
-        self.id = uuid4().hex
+        self.id = uuid4().hex if not request_id else request_id
         self.target_plugin = plugin
         self.target_method = method
         self.target_plugin_uuid = plugin_uuid
@@ -353,27 +404,31 @@ class Request:
         self.ready = False
         self.error = False
         self.result = None
-        #FIXME: The queue for streams here!!! 
         
-        #NOTE: Maybe change to timeout_at --> current time + the timeout time so that its equal across all hosts
-        self.created_at = time.time()
-        self.timeout_duration = timeout
+        
+        if type(timeout) == tuple:
+            self.timeout_duration = timeout[0]
+            self.created_at = timeout[1]
+        else:
+            self.created_at = time.time()
+            self.timeout_duration = timeout
+        
         
         
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
     
-    def set_result(self, result: Any, error: bool = False) -> None:
+    async def set_result(self, result: Any, error: bool = False) -> None: #FIXME: Change it in PluginCore
         """Set the result of the request."""
         if not self._future.done():
             self.error = error
             self.result = result
-            self._future.set_result((result, error, False))
+            self._future.set_result((result, error, False)) 
             self.ready = True
             
     
     
-    def set_collected(self) -> None:
+    async def set_collected(self) -> None:
         """Mark the request as collected for cleanup."""
         self.collected = True
     
@@ -421,3 +476,202 @@ class Request:
                 return result, error, timed_out
         except Exception as e:
             return str(e), True, False
+        
+        
+class GeneratorRequest:
+    """Represents a request from one plugin to another. This type of Request is made for use with streams and generators."""
+    
+        
+    def __init__(self, 
+                author_host: str, 
+                plugin: str,
+                method: str, 
+                args: Any = None, 
+                plugin_uuid: Optional[str] = "",
+                target_host: str = "any",
+                author: str = "system",
+                author_id: str = "system",
+                timeout: Union[float, tuple] = None,
+                request_id: str = None,
+                event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        self.author_host = author_host
+        self.author = author
+        self.author_id = author_id
+        self.id = uuid4().hex if not request_id else request_id
+        self.target_plugin = plugin
+        self.target_method = method
+        self.target_plugin_uuid = plugin_uuid
+        self.target_host = target_host
+        self.args = args
+        self.collected = False
+        self.timeout = False
+        self.ready = False
+        self.error = False
+        self.result = None
+
+        self.queue = asyncio.Queue()
+
+        if type(timeout) == tuple:
+            self.timeout_duration = timeout[0]
+            self.created_at = timeout[1]
+        else:
+            self.created_at = time.time()
+            self.timeout_duration = timeout
+        
+        
+        self.event_loop = event_loop or asyncio.get_event_loop()
+        self._future = self.event_loop.create_future()
+    
+    async def set_result(self, result: Any, error: bool = False, timeout: bool = False) -> None: 
+        """Set the result of the request."""
+        if not self._future.done():
+            self.error = error
+            self.result = result if result else EndOfQueue()
+            self.timeout = timeout
+            self._future.set_result((result, error, timeout))
+            self.ready = True
+            
+            await self.queue.put((EndOfQueue(), self.error, self.timeout))
+            
+    
+    
+    async def set_collected(self) -> None:
+        """Mark the request as collected for cleanup."""
+        self.collected = True
+    
+    def get_queue_stream_sync(self):
+        """Get the result stream synchronously."""
+        #while True:
+        #    future = asyncio.run_coroutine_threadsafe(self.queue.get(), self.event_loop)#FIXME: put the get_queue_stream method here instead
+        #    try:
+        #        result, error, timed_out = future.result()
+        #        if error:
+        #            raise Exception(f"Request failed: {self.result}")
+        #        if type(future.result()) == EndOfQueue:
+        #            break
+        #        yield future.result()
+        #    except Exception as e:
+        #        raise e
+        iterator = self.get_queue_stream()
+        while True:
+            #future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)
+            future = asyncio.run_coroutine_threadsafe(iterator.__anext__(), self.event_loop)
+            try:
+                result = future.result()
+                yield result
+            except StopAsyncIteration:
+                break
+        
+        
+    
+    async def get_queue_stream(self):
+        """get the result stream asynchronously"""
+        #FIXME THIS IS WRONG CODE. LOOK AT THE OLD CODE BELOW AND THE TESTED SCRIPTS. or. uh idk. just stop on end of queue and implement the error handling from below
+        try:
+            if self.result is not None:
+                #return self.result, self.error, False
+                await self.set_result(str(e), True, False)
+
+
+            
+            while True:
+                if self.timeout_duration:
+                    remaining_time = self.timeout_duration - (time.time() - self.created_at)
+                    if remaining_time <= 0:
+                        # Already timed out
+                        self.result = f"Request {self.id} timed out"
+                        self.error = True
+                        self.ready = True
+                        self.timeout = True
+                        await self.set_result(self.result, True, True)
+                        break
+                
+
+                
+                try:
+                    if self.timeout_duration:
+                        item, error, timed_out = await asyncio.wait_for(self.queue.get(), timeout=remaining_time)#
+                        #print(data)
+                    else:
+                        item, error, timed_out = await self.queue.get()
+                        #print(data)
+                        
+                
+                except asyncio.TimeoutError:
+                    self.result = f"Request {self.id} timed out"
+                    self.error = True
+                    self.ready = True
+                    self.timeout = True
+                    await self.set_result(self.result, True, True)
+                    raise e
+                    break
+                
+                try:
+                    if error:
+                        await self.set_result(self.result, True, self.timeout)
+                        #raise Exception(f"Request failed: {self.result}")
+                        break
+                    if type(item) == EndOfQueue:
+                        break
+                    yield item, error, timed_out
+                except Exception as e:
+                    await self.set_result(str(e), True, self.timeout)
+                    raise e
+                    break
+                
+        except Exception as e:
+            await self.set_result(str(e), True, self.timeout)
+            raise e
+        
+        finally:
+            await self.set_result(None, self.error, self.timeout)
+            
+    #def get_result_sync(self) -> Any:
+#        """Get the result synchronously."""
+#        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
+#        try:
+#            result, error, timed_out = future.result()
+#            if error:
+#                raise Exception(f"Request failed: {self.result}")
+#            return self.result
+#        except Exception as e:
+#            raise e
+        
+    #async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
+#        """Wait for the result asynchronously."""
+#        try:
+#            if self.result is not None:
+#                return self.result, self.error, False
+#            
+#            # Check if we need to apply a timeout
+#            if self.timeout_duration:
+#                remaining_time = self.timeout_duration - (time.time() - self.created_at)
+#                if remaining_time <= 0:
+#                    # Already timed out
+#                    self.result = f"Request {self.id} timed out"
+#                    self.error = True
+#                    self.ready = True
+#                    self.timeout = True
+#                    return self.result, True, True
+#                
+#                # Wait with timeout
+#                try:
+#                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
+#                    return result, error, timed_out
+#                except asyncio.TimeoutError:
+#                    self.result = f"Request {self.id} timed out"
+#                    self.error = True
+#                    self.ready = True
+#                    self.timeout = True
+#                    return self.result, True, True
+#            else:
+#                # Wait indefinitely
+#                result, error, timed_out = await self._future
+#                return result, error, timed_out
+#        except Exception as e:
+#            return str(e), True, False
+
+
+class EndOfQueue:
+    def __init__(self):
+        pass
