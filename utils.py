@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import asyncio
 import datetime
 import logging
@@ -11,7 +12,7 @@ from logging import Logger, StreamHandler, DEBUG
 from uuid import uuid4
 import time
 import yaml
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union, final
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from exceptions import RequestException, ConfigException
 from colorama import Fore, Style
@@ -225,9 +226,10 @@ class ConfigUtil:
         
 
 
-class Plugin:
+class Plugin(ABC):
     """Base class for all plugins."""
     
+    @final
     def __init__(self, logger: Logger, plugin_core, arguments):
         self.description = "UNKNOWN"    
         self.plugin_name = "UNKNOWN"
@@ -236,6 +238,7 @@ class Plugin:
         self.enabled = False
         self.remote = False 
         self.arguments = arguments
+        self.endpoints = {}
         
         self._logger = logger
         self._plugin_core = plugin_core
@@ -255,6 +258,7 @@ class Plugin:
         info_dict["remote"] = self.remote 
         info_dict["description"] = self.description
         info_dict["arguments"] = self.arguments
+        raise NotImplementedError #NOTE: Add endpoint stuff (NOT JUST HERE)
         
         return info_dict
     
@@ -306,7 +310,7 @@ class Plugin:
         """
         return self._plugin_core.execute_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
     
-    @async_log_errors
+    #@async_log_errors
     async def execute_stream(self,
         plugin: str,
         method: str,
@@ -331,7 +335,7 @@ class Plugin:
         async for i in self._plugin_core.execute_stream(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout):
             yield i
     
-    @log_errors
+    #@log_errors
     def execute_stream_sync(self,
         plugin: str,
         method: str,
@@ -357,16 +361,19 @@ class Plugin:
             yield i
     
     @log_errors
+    @abstractmethod
     def on_load(self):
         """Override this method to implement functionality that needs to happen while the plugin gets loaded."""
         raise NotImplementedError
     
     @async_log_errors
+    @abstractmethod
     async def on_enable(self):
         """Override this method to implement plugin starting functionality. All loops and so on should be started here."""
         raise NotImplementedError
     
     @async_log_errors
+    @abstractmethod
     async def on_disable(self):
         """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
@@ -387,7 +394,7 @@ class Request:
                 target_host: str = "any",
                 author: str = "system",
                 author_id: str = "system",
-                timeout: Union[float, tuple] = None, #FIXME: Implement in execute_remote
+                timeout: Union[float, tuple] = None, 
                 request_id: str = None,
                 event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
         self.author_host = author_host
@@ -418,7 +425,7 @@ class Request:
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
     
-    async def set_result(self, result: Any, error: bool = False) -> None: #FIXME: Change it in PluginCore
+    async def set_result(self, result: Any, error: bool = False) -> None: 
         """Set the result of the request."""
         if not self._future.done():
             self.error = error
@@ -541,17 +548,7 @@ class GeneratorRequest:
     
     def get_queue_stream_sync(self):
         """Get the result stream synchronously."""
-        #while True:
-        #    future = asyncio.run_coroutine_threadsafe(self.queue.get(), self.event_loop)#FIXME: put the get_queue_stream method here instead
-        #    try:
-        #        result, error, timed_out = future.result()
-        #        if error:
-        #            raise Exception(f"Request failed: {self.result}")
-        #        if type(future.result()) == EndOfQueue:
-        #            break
-        #        yield future.result()
-        #    except Exception as e:
-        #        raise e
+        
         iterator = self.get_queue_stream()
         while True:
             #future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)

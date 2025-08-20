@@ -8,11 +8,30 @@ Other:
 - Methoddescriptions
 - Logging (add and improve)
 
+#FIXME Fix the stream and usual to be pickled (input arguments and output)
+# https://chatgpt.com/share/687a1942-eec0-800d-a751-e3d4b5168aa9 ❤️
++++ Add security to it
 
 Notes:
 - Decorators for streaming
+- Check on request if requester is eligible
+
+Check for issues:
+- try multiple arguments for execute
+- timeouts on remote
 
 
 Plugins & their methods:
 - define commands in their config with arguments etc
 
+|--> structure:
+
+
+
+
+
+
+
+move remote to each function? or just do both?
+add search for tags and check for tags (get all with tag, check for tag, get tags)
+no check for types needed. it will throw an error anyway if its wrong

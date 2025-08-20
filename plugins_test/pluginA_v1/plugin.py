@@ -4,11 +4,7 @@ import asyncio
 
 class PluginA(Plugin):
     """Example of an asynchronous plugin that calls another plugin."""
-    
-    def __init__(self, logger, plugin_core, arguments):
-        super().__init__(logger, plugin_core, arguments)
-        
-    
+
     @log_errors
     def on_load(self, *args, **kwargs):
         self._logger.debug(f"on_load")

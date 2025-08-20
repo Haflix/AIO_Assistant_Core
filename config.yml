@@ -4,7 +4,7 @@ plugins:
     path: ./plugins_test/pluginA_v1  # Explicit path
 
   - name: PluginC
-    enabled: false
+    enabled: true
 
   - name: PluginB
     enabled: true      # No path - auto-resolve to plugin_package/PluginB
