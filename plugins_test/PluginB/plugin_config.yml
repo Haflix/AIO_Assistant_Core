@@ -2,3 +2,14 @@ description: idk plugin B
 version: 0.0.1
 remote: True
 arguments:
+endpoints:
+  - internal_name: calculate_square
+    access_name: calculate_square
+    tags:
+    remote: True
+    accessable_by_other_plugins: True
+    description:
+    arguments:
+      - name: number
+        type: int
+        description:

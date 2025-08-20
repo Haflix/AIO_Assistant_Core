@@ -1,4 +1,26 @@
 description: Example async plugin
 version: 0.0.1
 remote: True
-arguments: #FIXME: Add to core
+arguments: 
+endpoints:
+  - internal_name: perform_operation
+    access_name: perform_operation
+    tags:
+    remote: True
+    accessable_by_other_plugins: True
+    description:
+    arguments:
+      - name: arguments
+        type: int
+        description:
+  
+  - internal_name: perform_operation_stream
+    access_name: perform_operation_stream_ABC
+    tags:
+    remote: True
+    accessable_by_other_plugins: True
+    description:
+    arguments:
+      - name: arguments
+        type: int
+        description:

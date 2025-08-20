@@ -13,8 +13,8 @@ async def main():
     await plugin_core.wait_until_ready()
 
     
-    nodes = await plugin_core.network.update_all_nodes()
-    print("Discovered nodes:", nodes)
+    #nodes = await plugin_core.network.update_all_nodes()
+    #print("Discovered nodes:", nodes)
 
     #await plugin_core.purge_plugins()
 
@@ -23,16 +23,12 @@ async def main():
         #await asyncio.sleep(10000)
     
     # Example of using the one-liner execute method
-    tracemalloc.start()
-    
     result2 = await plugin_core.execute("PluginA", "perform_operation", 6)
     plugin_core._logger.info(f"Result from PluginA: {result2}")
 
 
-    #FIXME Fix the stream to be pickled nahhh thats wrong :sob:
-    # https://chatgpt.com/share/687a1942-eec0-800d-a751-e3d4b5168aa9 ❤️
-    async for i in plugin_core.execute_stream("PluginA", "perform_operation_stream", 3, host="remote"):
-        plugin_core._logger.info(f"Result from PluginA: {i}")    
+    #async for i in plugin_core.execute_stream("PluginA", "perform_operation_stream", 3, host="any"):
+    #    plugin_core._logger.info(f"Result from PluginA: {i}")    
 
     
     await asyncio.sleep(10000)
