@@ -3,10 +3,6 @@ from decorators import log_errors, handle_errors, async_log_errors, async_handle
 
 class PluginC(Plugin):
     """Example of a synchronous plugin that calls an async plugin."""
-    
-    def __init__(self, logger, plugin_core, arguments):
-        super().__init__(logger, plugin_core, arguments)
-
 
     @log_errors
     def on_load(self, *args, **kwargs):

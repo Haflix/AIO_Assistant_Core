@@ -3,3 +3,14 @@ version: 0.0.1
 remote: True
 arguments:
   variable: test argument
+endpoints:
+  - internal_name: perform_operation
+    access_name: perform_operation
+    tags:
+    remote: True
+    accessable_by_other_plugins: True
+    description:
+    arguments:
+      - name: arguments
+        type: int
+        description:

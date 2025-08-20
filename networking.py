@@ -1,3 +1,4 @@
+import base64
 from logging import Logger
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -5,6 +6,7 @@ import uvicorn
 import httpx
 import socket
 import asyncio
+import pickle
 from decorators import async_log_errors, async_handle_errors
 from exceptions import NetworkRequestException, NodeException
 from networking_classes import Node
@@ -13,6 +15,7 @@ from typing import List, Union, Optional
 
 class NetworkManager:
     def __init__(self, plugin_core, logger: Logger, node_ips: list, discover_nodes:bool, direct_discoverable: bool, auto_discoverable: bool, port=2510):
+        #NOTE: Add loop for heartbeats and discoveries
         self.plugin_core = plugin_core
         self._logger = logger
         
@@ -29,21 +32,21 @@ class NetworkManager:
     
 
     def _setup_routes(self):
-        @self.app.get("/plugins")
-        async def list_plugins():
-            return {
-            "plugins": [
-                await plugin._to_dict()
-                for plugin in self.plugin_core.plugins.values()
-            ]
-        }
+        #@self.app.get("/plugins")
+        #async def list_plugins():
+        #    return {
+        #    "plugins": [
+        #        await plugin._to_dict()
+        #        for plugin in self.plugin_core.plugins.values()
+        #    ]
+        #}
 
         def get_ip(request: Request):
             return request.client.host
 
         @self.app.get("/has_plugin")
         async def has_plugin(name: str, plugin_uuid: Union[str, None] = None, IP: str = Depends(get_ip)):#
-            
+            #FIXME: Add author id etc
             self._logger.debug(f"Remote request to find {name} {plugin_uuid}")
             
             plugin_uuid = plugin_uuid if plugin_uuid != "None" else None #NOTE: HORRIBLE SOLUTION
@@ -78,13 +81,12 @@ class NetworkManager:
             if type(discover_nodes_info) != bool:
                 return NetworkRequestException("The var discover_nodes is not the correct type. Must be bool.")
             
+            if not self.direct_discoverable: 
+                raise HTTPException(status_code=418)
             
             if self.discover_nodes:
                 if not request.client.host in self.node_ips:
                     await self.node_ips.append(request.client.host)
-            
-            if not self.direct_discoverable: 
-                raise HTTPException(status_code=418)
             
             return {
                     "hostname": self.plugin_core.hostname,
@@ -93,63 +95,123 @@ class NetworkManager:
                     }
 
         @self.app.post("/execute")
-        async def execute_plugin(request: Request):#FIXME Add new stuff
+        async def execute_plugin(request: Request):
+            
             data = await request.json()
+            
             plugin = data.get("plugin")
             method = data.get("method")
-            args = data.get("args")
             plugin_uuid = data.get("plugin_uuid", None)
             author = data.get("author", "remote")
             author_id = data.get("author_id", "remote")
             timeout = data.get("timeout")
             author_host = data.get("author_host")
             request_id = data.get("request_id")
+            
+            args = data.get("args", [])
+            b = base64.b64decode(args)
+            args = pickle.loads(b)
 
             try:
-                result = await self.plugin_core.execute(
-                    plugin, method, args, plugin_uuid, "local", author, author_id, timeout, author_host, request_id=request_id
-                )
-                
+                if isinstance(args, (list, tuple)):
+                    result = await self.plugin_core.execute(
+                        plugin, method, *args,
+                        plugin_uuid=plugin_uuid,
+                        host="local",
+                        timeout=timeout,
+                        author=author,
+                        author_id=author_id,
+                        author_host=author_host,
+                        request_id=request_id
+                    )
+                else:
+                    result = await self.plugin_core.execute(
+                        plugin, method, args,
+                        plugin_uuid=plugin_uuid,
+                        host="local",
+                        timeout=timeout,
+                        author=author,
+                        author_id=author_id,
+                        author_host=author_host,
+                        request_id=request_id
+                    )
                 return {"result": result, "error": False}
-            except Exception as e:
-                return {"result": e, "error": True}
+            
             except NetworkRequestException as e:
-                return {"result": e, "error": True}
+                return {"result": str(e), "error": True}
+            
+            except Exception as e:
+                self._logger.exception("Exception in /execute")
+                return {"result": str(e), "error": True}
 
 
         @self.app.post("/execute_stream")
         async def execute_stream(request: Request):
+            
             data = await request.json()
+            
             plugin = data.get("plugin")
             method = data.get("method")
-            args = data.get("args", [])
             plugin_uuid = data.get("plugin_uuid")
             author = data.get("author", "remote")
             author_id = data.get("author_id", "remote")
             timeout = data.get("timeout")
             author_host = data.get("author_host")
             request_id = data.get("request_id")
+            
+            args = data.get("args", [])
+            b = base64.b64decode(args)
+            args = pickle.loads(b)
 
             async def stream_wrapper():
                 try:
-                    async for line in self.plugin_core.execute_stream(
-                        plugin=plugin,
-                        method=method,
-                        args=args,
-                        plugin_uuid=plugin_uuid,
-                        host="local",
-                        author=author,
-                        author_id=author_id,
-                        timeout=timeout,
-                        author_host=author_host,
-                        request_id=request_id
-                    ):
-                        print(line)
-                        yield line #+ "\n" #FIXME Makes everything a string?? + It NEEEEEEDS to put result, error, timeout
-                except Exception as e:
-                    yield f"[STREAM_ERROR] {str(e)}\n"
+                    # call plugin_core.execute_stream with normalized args
+                    if isinstance(args, (list, tuple)):
+                        agen = self.plugin_core.execute_stream(
+                            plugin=plugin,
+                            method=method,
+                            *args,
+                            plugin_uuid=plugin_uuid,
+                            host="local",
+                            author=author,
+                            author_id=author_id,
+                            timeout=timeout,
+                            author_host=author_host,
+                            request_id=request_id
+                        )
+                    else:
+                        agen = self.plugin_core.execute_stream(
+                            plugin=plugin,
+                            method=method,
+                            args=args,
+                            plugin_uuid=plugin_uuid,
+                            host="local",
+                            author=author,
+                            author_id=author_id,
+                            timeout=timeout,
+                            author_host=author_host,
+                            request_id=request_id
+                        )
 
-            return StreamingResponse(stream_wrapper(), media_type="text/plain")
+                    async for line in agen:
+                        # pickling + base64 line
+                        try:
+                            payload = pickle.dumps(line)
+                            b64 = base64.b64encode(payload)
+                            yield b64 + b"\n"
+                        except Exception as e:
+                            self._logger.exception("Failed to pickle/encode stream item")
+                            # send an error marker (also base64 of a tuple with error info)
+                            err_obj = ("__STREAM_ERROR__", str(e))
+                            payload = pickle.dumps(err_obj)
+                            yield base64.b64encode(payload) + b"\n"
+
+                except Exception as e:
+                    self._logger.exception("Exception while streaming")
+                    err_obj = ("__STREAM_EXCEPTION__", str(e))
+                    yield base64.b64encode(pickle.dumps(err_obj)) + b"\n"
+
+            return StreamingResponse(stream_wrapper(), media_type="application/octet-stream")
         """
         @self.app.post("/execute_stream")
         def execute_stream_sync(request: Request):
@@ -205,11 +267,16 @@ class NetworkManager:
 
     async def execute_remote(self, IP: str, plugin: str, method: str, timeout: tuple, request_id: str, args=None, plugin_uuid="", author="remote", author_id="remote"):
         url = f"https://{IP}:{self.port}/execute"
+        args = args or []
+        
+        payload = pickle.dumps(args)
+        b64 = base64.b64encode(payload)
+        
         async with httpx.AsyncClient(verify='./cert.pem', timeout=timeout[0] if timeout[0] is not 0.0 else 7200.0) as client:#FIXME Is the timeout needed here and its def not implemented correctly
             response = await client.post(url, json={
                 "plugin": plugin,
                 "method": method,
-                "args": args,
+                "args": b64,
                 "plugin_uuid": plugin_uuid,
                 "author": author,
                 "author_id": author_id,
@@ -217,15 +284,17 @@ class NetworkManager:
                 "author_host": self.plugin_core.hostname,
                 "request_id":request_id
             })
-            return response.json()
+            b = base64.b64decode(response.content)
+            item = pickle.loads(b)
+            return item
         
     async def execute_remote_stream(self, IP: str, plugin: str, method: str, timeout: tuple, request_id: str, args=None, plugin_uuid: str = "",author: str = "remote", author_id: str = "remote"):
             url = f"https://{IP}:{self.port}/execute_stream"
             args = args or []
             timeout_val = timeout[0] if timeout[0] != 0.0 else 7200.0
 
-            yield (f"[STREAM_ERROR] execute_remote_stream is currently not available", True, False)
-            return
+            payload = pickle.dumps(args)
+            b64 = base64.b64encode(payload)
 
             async with httpx.AsyncClient(verify='./cert.pem', timeout=timeout_val) as client:
                 try:
@@ -240,15 +309,21 @@ class NetworkManager:
                         "author_host": self.plugin_core.hostname,
                         "request_id": request_id
                     }) as response:
-                        print(response) # science
-                        #async for line in response.read():#.aiter_lines():
-                        #print(line)
-                        if line.strip():
-                            yield line
-                        else:
-                            yield line
+                        response.raise_for_status()
+                        async for raw_line in response.aiter_lines():
+                            if not raw_line:
+                                continue
+                            try:
+                                b = base64.b64decode(raw_line)
+                                item = pickle.loads(b)
+                                yield item
+                            except Exception as e:
+                                # yield an error tuple or raise depending on your design choice
+                                self._logger.exception("Failed to decode/deserialize remote stream line")
+                                yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
                 except Exception as e:
-                    yield (f"[STREAM_ERROR] {str(e)}", True, False)
+                    self._logger.exception("execute_remote_stream failed")
+                    yield ("__REMOTE_STREAM_ERROR__", str(e))
 
 
 #    def execute_remote_sync(self, host: str, plugin: str, method: str, args=None, plugin_uuid="", author="remote", author_id="remote", timeout=5):

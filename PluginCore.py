@@ -148,14 +148,22 @@ class PluginCore:
             return
         
         # Validate plugin config
-        for field in ["description", "version", "remote", "arguments"]:
+        for field in ["description", "version", "remote", "arguments", "endpoints"]:
             if field not in plugin_config:
                 self._logger.warning(f"{name} missing {field} in plugin_config.yml")
                 #await self.pop_plugin(name)
                 #continue
             
-        
-        
+        # Validate endpoints config
+        for endpoint in plugin_config["endpoints"]:
+            for field in ["internal_name", "access_name", "remote", "accessable_by_other_plugins"]:
+                if field not in endpoint:
+                    self._logger.warning(f"{endpoint} is missing {field} in plugin_config.yml")
+                    await self.pop_plugin(name)
+                    continue
+            
+        #FIXME: Check for correct arguments else get rid of it
+        #FIXME: Check if stuff like internal name is empty
         
         # Dynamic import
         module_path = os.path.join(path, "plugin.py")
@@ -181,6 +189,7 @@ class PluginCore:
         plugin.version = plugin_config["version"] or "0.0.0 - not given"
         plugin.remote = plugin_config["remote"] or False
         plugin.arguments = plugin_config["arguments"] or None
+        plugin.endpoints = plugin_config["endpoints"] or {}
         
         async with self.plugin_lock:
             self.plugins[name] = plugin
@@ -386,6 +395,8 @@ class PluginCore:
         """
         Tries to find a plugin locally first, then on remote nodes if networking is enabled.
         """
+        #NOTE: Check if endpoint is accessible by other plugins (add plugin_uuid of requester to find_plugin), remote, check for the access_name and then get the method via internal_name 
+        
         # check locally first
         if host in ["local", "any", self.hostname]:
             for plugin in self.plugins.values():
@@ -441,8 +452,7 @@ class PluginCore:
         host = f"(local) {self.hostname}" if isinstance(plugin, Plugin) else f"{node.IP}#{node.hostname}"
         self._logger.debug(f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}")
         
-        if isinstance(plugin, RemotePlugin):#FIXME: Fix the timeout thing. Warn if ping is higher than timeout
-            #FIXME: Streams dont work remotely yet: gotta do it with the async start_server thingy i think
+        if isinstance(plugin, RemotePlugin):#NOTE: Fix the timeout thing. Warn if ping is higher than timeout
             result = await self.network.execute_remote(IP=node.IP,
                                         plugin=plugin_name,
                                         method=function_name,
@@ -675,7 +685,7 @@ class PluginCore:
         request = await self.create_gen_request(plugin, method, args, plugin_uuid, host, author, author_id, timeout, author_host, request_id)
         async for result, error, _ in request.get_queue_stream():
 
-            if error:#FIXME DOESNT DO SHIT
+            if error:
                 self._logger.warning(f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID.")
                 raise RequestException(result)
             yield result
