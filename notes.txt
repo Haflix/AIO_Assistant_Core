@@ -2,7 +2,7 @@
 
 [ ] Networking
 
-[ ] Queues
+[X] Queues
 
 Other:
 - Methoddescriptions
@@ -21,17 +21,17 @@ Check for issues:
 - timeouts on remote
 
 
-Plugins & their methods:
-- define commands in their config with arguments etc
-
-|--> structure:
-
-
+Networking:
+- networking.py 
+--> search for nodes
+--> heartbeat for nodes (update_all_nodes()?)
 
 
-
-
-
-move remote to each function? or just do both?
-add search for tags and check for tags (get all with tag, check for tag, get tags)
-no check for types needed. it will throw an error anyway if its wrong
+- networking_classes.py 
+-|-> Node 
+    --> Values:
+        self.IP = IP
+        self.hostname = hostname
+        self.enabled = enabled
+        self.last_heartbeat = 0
+        self.auto_discoverable = auto_discoverable

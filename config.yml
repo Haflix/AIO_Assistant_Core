@@ -15,11 +15,11 @@ plugins:
 general:
     hostname: ""
     plugin_package: plugins_test  # Base directory for plugins if path is omitted
-    console_log_level: "DEBUG"
+    console_log_level: "INFO"
 
 
 networking:
-    enabled: True
+    enabled: False
     node_ips: 
       - "172.23.0.12"
       - "172.23.0.18"
