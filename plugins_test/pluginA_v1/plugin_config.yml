@@ -7,7 +7,7 @@ endpoints:
     access_name: perform_operation
     tags:
     remote: True
-    accessable_by_other_plugins: True
+    accessible_by_other_plugins: True
     description:
     arguments:
       - name: arguments
@@ -18,7 +18,7 @@ endpoints:
     access_name: perform_operation_stream_ABC
     tags:
     remote: True
-    accessable_by_other_plugins: True
+    accessible_by_other_plugins: True
     description:
     arguments:
       - name: arguments

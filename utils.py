@@ -18,8 +18,7 @@ from exceptions import RequestException, ConfigException
 from colorama import Fore, Style
 
 
-
-#class LogUtil(logging.Logger):
+# class LogUtil(logging.Logger):
 #    __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
 #    def __init__(
 #            self,
@@ -67,28 +66,37 @@ from colorama import Fore, Style
 #        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
 #        return root_logger
 class LogUtil(logging.Logger):
-    __FORMATTER = f'{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.YELLOW}%(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s'
+    __FORMATTER = f"{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.YELLOW}%(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s"
     __FORMATTER_FILE = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
-    
+
     def __init__(
         self,
         name: str,
         log_format: str = __FORMATTER,
         level: Union[int, str] = logging.DEBUG,
         *args,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(name, level)
         self.formatter = logging.Formatter(log_format)
 
     @staticmethod
-    def create(log_level: str = 'DEBUG') -> logging.Logger:
+    def change_level(log_level: str) -> None:
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+
+        for handler in getattr(root_logger, "_custom_handlers", []):
+            handler.setLevel(log_level)
+        root_logger.info(f"Changed console handler level to {log_level}")
+
+    @staticmethod
+    def create(log_level: str = "DEBUG") -> logging.Logger:
         """Create and configure the root logger with non-blocking I/O"""
         logging.setLoggerClass(LogUtil)
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
-        
-        logging.root.setLevel(log_level) #NOTE: FOR TESTING
+
+        # logging.root.setLevel(log_level)  # NOTE: FOR TESTING
 
         # Remove existing handlers
         for handler in root_logger.handlers[:]:
@@ -102,12 +110,12 @@ class LogUtil(logging.Logger):
         # Create actual I/O handlers
         formatter = logging.Formatter(LogUtil.__FORMATTER)
         formatterFile = logging.Formatter(LogUtil.__FORMATTER_FILE)
-        
+
         # Console handler
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
         stream_handler.setLevel(log_level)
-        
+
         # File handler
         logs_dir = "logs"
         os.makedirs(logs_dir, exist_ok=True)
@@ -120,21 +128,29 @@ class LogUtil(logging.Logger):
 
         # Create and start listener
         listener = QueueListener(
-            log_queue,
-            stream_handler,
-            file_handler,
-            respect_handler_level=True
+            log_queue, stream_handler, file_handler, respect_handler_level=True
         )
         listener.start()
+
+        # Tag the stream_handler so change_level can find it later
+        root_logger._custom_handlers = [stream_handler]
+
+        # Prevent httpx and httpcore logs from propagating
+        logging.getLogger("httpx").propagate = False
+        logging.getLogger("httpcore").propagate = False
 
         # Ensure proper shutdown
         def stop_listener():
             listener.stop()
             root_logger.removeHandler(queue_handler)
+
         import atexit
+
         atexit.register(stop_listener)
 
-        root_logger.info(f"Non-blocking logging initialized. Log file: {log_file_path}")
+        root_logger.info(
+            f"Non-blocking logging initialized with level '{log_level}'. Log file: {log_file_path}"
+        )
         return root_logger
 
 
@@ -144,7 +160,7 @@ class ConfigUtil:
     def load_config(config_path: str) -> dict:
         config = yaml.safe_load(Path(config_path).read_text())
         return config
-    
+
     @staticmethod
     @log_errors
     def quickget_config(config_path: str, fallback_value: Any = None) -> dict:
@@ -154,7 +170,7 @@ class ConfigUtil:
             return config
         except:
             return fallback_value
-    
+
     @staticmethod
     @log_errors
     def check_config_integrity(yaml_config: dict, _logger):
@@ -169,234 +185,312 @@ class ConfigUtil:
                 raise ConfigException("Plugin entry missing name/enabled field")
 
             # Warn if path is empty but plugin_package isn't configured
-            if not plugin.get("path") and "plugin_package" not in yaml_config.get("general", {}):
+            if not plugin.get("path") and "plugin_package" not in yaml_config.get(
+                "general", {}
+            ):
                 _logger.warning("No path or plugin_package - plugins may not load")
 
         general = list(yaml_config.get("general", {}).keys())
         for key in ["hostname", "plugin_package", "console_log_level"]:
             if key not in general:
-                _logger.warning(f"Missing config section (Default value will be used): /general/{key}")
-        
+                _logger.warning(
+                    f"Missing config section (Default value will be used): /general/{key}"
+                )
+
         networking = list(yaml_config.get("networking", {}).keys())
-        for key in ["enabled", "node_ips", "port", "direct_discoverable", "auto_discoverable", "discover_nodes"]:
+        for key in [
+            "enabled",
+            "node_ips",
+            "port",
+            "direct_discoverable",
+            "auto_discoverable",
+            "discover_nodes",
+        ]:
             if key not in networking:
-                _logger.warning(f"Missing config key (Default value will be used): /networking/{key}")
-    
+                _logger.warning(
+                    f"Missing config key (Default value will be used): /networking/{key}"
+                )
+
     @staticmethod
-    @log_errors       
+    @log_errors
     def apply_configvalues(plugin_core):
 
-        general_config = plugin_core.yaml_config.get('general', {})
-        
-        hostname = general_config.get('hostname')
+        general_config = plugin_core.yaml_config.get("general", {})
+
+        hostname = general_config.get("hostname")
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
-            plugin_core.yaml_config['general']['hostname'] = hostname
-        plugin_core.hostname = hostname#uuid4().hex
+            plugin_core.yaml_config["general"]["hostname"] = hostname
+        plugin_core.hostname = hostname  # uuid4().hex
         plugin_core._logger.info(f"Network hostname: {plugin_core.hostname}")
 
         # Plugin base directory
-        plugin_core.plugin_package = general_config.get('plugin_package', 'plugins')
+        plugin_core.plugin_package = general_config.get("plugin_package", "plugins")
         plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
-        
-        
-        networking_config = plugin_core.yaml_config.get('networking')
-        
-        plugin_core.networking_enabled = networking_config.get('enabled', False)
-        plugin_core.yaml_config['networking']['enabled'] = plugin_core.networking_enabled
-        plugin_core._logger.info(f"Networking enabled: {plugin_core.networking_enabled}")
-        
-        plugin_core.networking_port = networking_config.get('port', 2510)
-        plugin_core.yaml_config['networking']['port'] = plugin_core.networking_port
+
+        networking_config = plugin_core.yaml_config.get("networking")
+
+        plugin_core.networking_enabled = networking_config.get("enabled", False)
+        plugin_core.yaml_config["networking"][
+            "enabled"
+        ] = plugin_core.networking_enabled
+        plugin_core._logger.info(
+            f"Networking enabled: {plugin_core.networking_enabled}"
+        )
+
+        plugin_core.networking_port = networking_config.get("port", 2510)
+        plugin_core.yaml_config["networking"]["port"] = plugin_core.networking_port
         plugin_core._logger.info(f"Networking Port: {plugin_core.networking_port}")
-        
-        plugin_core.networking_auto_discoverable = networking_config.get('auto_discoverable', False)
-        plugin_core.yaml_config['networking']['auto_discoverable'] = plugin_core.networking_auto_discoverable
-        plugin_core._logger.info(f"auto_discoverable: {plugin_core.networking_auto_discoverable}")
-        
-        
-        plugin_core.networking_direct_discoverable = networking_config.get('direct_discoverable', False)
-        
-        if plugin_core.networking_auto_discoverable and not plugin_core.networking_direct_discoverable:
-            plugin_core._logger.info("direct_discoverable will be set to True as auto_discoverable is active. You cannot deactivate direct_discoverable if auto_discoverable is set to True.")
+
+        plugin_core.networking_auto_discoverable = networking_config.get(
+            "auto_discoverable", False
+        )
+        plugin_core.yaml_config["networking"][
+            "auto_discoverable"
+        ] = plugin_core.networking_auto_discoverable
+        plugin_core._logger.info(
+            f"auto_discoverable: {plugin_core.networking_auto_discoverable}"
+        )
+
+        plugin_core.networking_direct_discoverable = networking_config.get(
+            "direct_discoverable", False
+        )
+
+        if (
+            plugin_core.networking_auto_discoverable
+            and not plugin_core.networking_direct_discoverable
+        ):
+            plugin_core._logger.info(
+                "direct_discoverable will be set to True as auto_discoverable is active. You cannot deactivate direct_discoverable if auto_discoverable is set to True."
+            )
             plugin_core.networking_direct_discoverable = True
 
-        plugin_core.yaml_config['networking']['direct_discoverable'] = plugin_core.networking_direct_discoverable
-        plugin_core._logger.info(f"direct_discoverable: {plugin_core.networking_direct_discoverable}")        
-        
+        plugin_core.yaml_config["networking"][
+            "direct_discoverable"
+        ] = plugin_core.networking_direct_discoverable
+        plugin_core._logger.info(
+            f"direct_discoverable: {plugin_core.networking_direct_discoverable}"
+        )
 
 
 class Plugin(ABC):
     """Base class for all plugins."""
-    
+
     @final
     def __init__(self, logger: Logger, plugin_core, arguments):
-        self.description = "UNKNOWN"    
+        self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
         self.enabled = False
-        self.remote = False 
+        self.remote = False
         self.arguments = arguments
         self.endpoints = {}
-        
+
         self._logger = logger
         self._plugin_core = plugin_core
         self.event_loop = plugin_core.main_event_loop
-        
+
         self.on_load(
-            *arguments if isinstance(arguments, (list, tuple)) else [],  # Unpack list/tuple if applicable
-            **arguments if isinstance(arguments, dict) else {}  # Unpack dict if applicable
+            *(
+                arguments if isinstance(arguments, (list, tuple)) else []
+            ),  # Unpack list/tuple if applicable
+            **(
+                arguments if isinstance(arguments, dict) else {}
+            ),  # Unpack dict if applicable
         )
-    
+
     async def _to_dict(self):
         info_dict = {}
         info_dict["plugin_name"] = self.plugin_name
         info_dict["version"] = self.version
-        info_dict["plugin_uuid"] = self.plugin_uuid 
-        info_dict["enabled"] = self.enabled 
-        info_dict["remote"] = self.remote 
+        info_dict["plugin_uuid"] = self.plugin_uuid
+        info_dict["enabled"] = self.enabled
+        info_dict["remote"] = self.remote
         info_dict["description"] = self.description
         info_dict["arguments"] = self.arguments
-        raise NotImplementedError #NOTE: Add endpoint stuff (NOT JUST HERE)
-        
+        raise NotImplementedError  # NOTE: Add endpoint stuff (NOT JUST HERE)
+
         return info_dict
-    
+
     @async_log_errors
-    async def execute(self,
+    async def execute(
+        self,
         plugin: str,
         method: str,
-        args: Any = None,
+        args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
-        ) -> Any:
+        timeout: Optional[float] = None,
+    ) -> Any:
         """
         One-liner to call another plugin's method asynchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        return await self._plugin_core.execute(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
-    
+        return await self._plugin_core.execute(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
+        )
+
     @log_errors
-    def execute_sync(self,
+    def execute_sync(
+        self,
         plugin: str,
         method: str,
-        args: Any = None,
+        args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> Any:
         """
         One-liner to call another plugin's method synchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        return self._plugin_core.execute_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout)
-    
-    #@async_log_errors
-    async def execute_stream(self,
+        return self._plugin_core.execute_sync(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
+        )
+
+    # @async_log_errors
+    async def execute_stream(
+        self,
         plugin: str,
         method: str,
-        args: Any = None,
+        args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
-        ) -> Any:
+        timeout: Optional[float] = None,
+    ) -> Any:
         """
         One-liner to call another plugin's method asynchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        async for i in self._plugin_core.execute_stream(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout):
+        async for i in self._plugin_core.execute_stream(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
+        ):
             yield i
-    
-    #@log_errors
-    def execute_stream_sync(self,
+
+    # @log_errors
+    def execute_stream_sync(
+        self,
         plugin: str,
         method: str,
-        args: Any = None,
+        args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
         host: str = "any",  # "any", "remote", "local", or hostname
         author: str = "system",
         author_id: str = "system",
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> Any:
         """
         One-liner to call another plugin's method synchronously with error handling.
-        
+
         Args:
             target: Target plugin and method (format: "PluginName.method_name")
             args: Arguments to pass to the method
             timeout: Optional timeout in seconds
-            
+
         Returns:
             The result from the target method or None if an error occurs
         """
-        for i in self._plugin_core.execute_stream_sync(plugin, method, args, plugin_uuid, host, self.plugin_name, self.plugin_uuid, timeout):
+        for i in self._plugin_core.execute_stream_sync(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
+        ):
             yield i
-    
+
     @log_errors
     @abstractmethod
     def on_load(self):
         """Override this method to implement functionality that needs to happen while the plugin gets loaded."""
         raise NotImplementedError
-    
+
     @async_log_errors
     @abstractmethod
     async def on_enable(self):
         """Override this method to implement plugin starting functionality. All loops and so on should be started here."""
         raise NotImplementedError
-    
+
     @async_log_errors
     @abstractmethod
     async def on_disable(self):
         """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
-    
+
     def perform_operation(self, argument):
         """Override this method to implement plugin operations."""
         raise NotImplementedError
 
+
 class Request:
     """Represents a request from one plugin to another."""
-    
-    def __init__(self, 
-                author_host: str, 
-                plugin: str,
-                method: str, 
-                args: Any = None, 
-                plugin_uuid: Optional[str] = "",
-                target_host: str = "any",
-                author: str = "system",
-                author_id: str = "system",
-                timeout: Union[float, tuple] = None, 
-                request_id: str = None,
-                event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+
+    def __init__(
+        self,
+        author_host: str,
+        plugin: str,
+        method: str,
+        args: tuple = None,
+        plugin_uuid: Optional[str] = "",
+        target_host: str = "any",
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        request_id: str = None,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
         self.author_host = author_host
         self.author = author
         self.author_id = author_id
@@ -411,37 +505,34 @@ class Request:
         self.ready = False
         self.error = False
         self.result = None
-        
-        
+
         if type(timeout) == tuple:
             self.timeout_duration = timeout[0]
             self.created_at = timeout[1]
         else:
             self.created_at = time.time()
             self.timeout_duration = timeout
-        
-        
-        
+
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
-    
-    async def set_result(self, result: Any, error: bool = False) -> None: 
+
+    async def set_result(self, result: Any, error: bool = False) -> None:
         """Set the result of the request."""
         if not self._future.done():
             self.error = error
             self.result = result
-            self._future.set_result((result, error, False)) 
+            self._future.set_result((result, error, False))
             self.ready = True
-            
-    
-    
+
     async def set_collected(self) -> None:
         """Mark the request as collected for cleanup."""
         self.collected = True
-    
+
     def get_result_sync(self) -> Any:
         """Get the result synchronously."""
-        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
+        future = asyncio.run_coroutine_threadsafe(
+            self.wait_for_result_async(), self.event_loop
+        )
         try:
             result, error, timed_out = future.result()
             if error:
@@ -449,13 +540,13 @@ class Request:
             return self.result
         except Exception as e:
             raise e
-        
+
     async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
         """Wait for the result asynchronously."""
         try:
             if self.result is not None:
                 return self.result, self.error, False
-            
+
             # Check if we need to apply a timeout
             if self.timeout_duration:
                 remaining_time = self.timeout_duration - (time.time() - self.created_at)
@@ -466,10 +557,12 @@ class Request:
                     self.ready = True
                     self.timeout = True
                     return self.result, True, True
-                
+
                 # Wait with timeout
                 try:
-                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
+                    result, error, timed_out = await asyncio.wait_for(
+                        self._future, timeout=remaining_time
+                    )
                     return result, error, timed_out
                 except asyncio.TimeoutError:
                     self.result = f"Request {self.id} timed out"
@@ -483,24 +576,25 @@ class Request:
                 return result, error, timed_out
         except Exception as e:
             return str(e), True, False
-        
-        
+
+
 class GeneratorRequest:
     """Represents a request from one plugin to another. This type of Request is made for use with streams and generators."""
-    
-        
-    def __init__(self, 
-                author_host: str, 
-                plugin: str,
-                method: str, 
-                args: Any = None, 
-                plugin_uuid: Optional[str] = "",
-                target_host: str = "any",
-                author: str = "system",
-                author_id: str = "system",
-                timeout: Union[float, tuple] = None,
-                request_id: str = None,
-                event_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+
+    def __init__(
+        self,
+        author_host: str,
+        plugin: str,
+        method: str,
+        args: tuple = None,
+        plugin_uuid: Optional[str] = "",
+        target_host: str = "any",
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        request_id: str = None,
+        event_loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
         self.author_host = author_host
         self.author = author
         self.author_id = author_id
@@ -524,12 +618,13 @@ class GeneratorRequest:
         else:
             self.created_at = time.time()
             self.timeout_duration = timeout
-        
-        
+
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
-    
-    async def set_result(self, result: Any, error: bool = False, timeout: bool = False) -> None: 
+
+    async def set_result(
+        self, result: Any, error: bool = False, timeout: bool = False
+    ) -> None:
         """Set the result of the request."""
         if not self._future.done():
             self.error = error
@@ -537,43 +632,41 @@ class GeneratorRequest:
             self.timeout = timeout
             self._future.set_result((result, error, timeout))
             self.ready = True
-            
+
             await self.queue.put((EndOfQueue(), self.error, self.timeout))
-            
-    
-    
+
     async def set_collected(self) -> None:
         """Mark the request as collected for cleanup."""
         self.collected = True
-    
+
     def get_queue_stream_sync(self):
         """Get the result stream synchronously."""
-        
+
         iterator = self.get_queue_stream()
         while True:
-            #future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)
-            future = asyncio.run_coroutine_threadsafe(iterator.__anext__(), self.event_loop)
+            # future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)
+            future = asyncio.run_coroutine_threadsafe(
+                iterator.__anext__(), self.event_loop
+            )
             try:
                 result = future.result()
                 yield result
             except StopAsyncIteration:
                 break
-        
-        
-    
+
     async def get_queue_stream(self):
         """get the result stream asynchronously"""
-        #FIXME THIS IS WRONG CODE. LOOK AT THE OLD CODE BELOW AND THE TESTED SCRIPTS. or. uh idk. just stop on end of queue and implement the error handling from below
+        # FIXME THIS IS WRONG CODE. LOOK AT THE OLD CODE BELOW AND THE TESTED SCRIPTS. or. uh idk. just stop on end of queue and implement the error handling from below
         try:
             if self.result is not None:
-                #return self.result, self.error, False
+                # return self.result, self.error, False
                 await self.set_result(str(e), True, False)
 
-
-            
             while True:
                 if self.timeout_duration:
-                    remaining_time = self.timeout_duration - (time.time() - self.created_at)
+                    remaining_time = self.timeout_duration - (
+                        time.time() - self.created_at
+                    )
                     if remaining_time <= 0:
                         # Already timed out
                         self.result = f"Request {self.id} timed out"
@@ -582,18 +675,17 @@ class GeneratorRequest:
                         self.timeout = True
                         await self.set_result(self.result, True, True)
                         break
-                
 
-                
                 try:
                     if self.timeout_duration:
-                        item, error, timed_out = await asyncio.wait_for(self.queue.get(), timeout=remaining_time)#
-                        #print(data)
+                        item, error, timed_out = await asyncio.wait_for(
+                            self.queue.get(), timeout=remaining_time
+                        )  #
+                        # print(data)
                     else:
                         item, error, timed_out = await self.queue.get()
-                        #print(data)
-                        
-                
+                        # print(data)
+
                 except asyncio.TimeoutError:
                     self.result = f"Request {self.id} timed out"
                     self.error = True
@@ -602,11 +694,11 @@ class GeneratorRequest:
                     await self.set_result(self.result, True, True)
                     raise e
                     break
-                
+
                 try:
                     if error:
                         await self.set_result(self.result, True, self.timeout)
-                        #raise Exception(f"Request failed: {self.result}")
+                        # raise Exception(f"Request failed: {self.result}")
                         break
                     if type(item) == EndOfQueue:
                         break
@@ -615,15 +707,17 @@ class GeneratorRequest:
                     await self.set_result(str(e), True, self.timeout)
                     raise e
                     break
-                
+
         except Exception as e:
             await self.set_result(str(e), True, self.timeout)
             raise e
-        
+
         finally:
             await self.set_result(None, self.error, self.timeout)
-            
-    #def get_result_sync(self) -> Any:
+
+    # def get_result_sync(self) -> Any:
+
+
 #        """Get the result synchronously."""
 #        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
 #        try:
@@ -633,13 +727,13 @@ class GeneratorRequest:
 #            return self.result
 #        except Exception as e:
 #            raise e
-        
-    #async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
+
+# async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
 #        """Wait for the result asynchronously."""
 #        try:
 #            if self.result is not None:
 #                return self.result, self.error, False
-#            
+#
 #            # Check if we need to apply a timeout
 #            if self.timeout_duration:
 #                remaining_time = self.timeout_duration - (time.time() - self.created_at)
@@ -650,7 +744,7 @@ class GeneratorRequest:
 #                    self.ready = True
 #                    self.timeout = True
 #                    return self.result, True, True
-#                
+#
 #                # Wait with timeout
 #                try:
 #                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
