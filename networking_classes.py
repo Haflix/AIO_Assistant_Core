@@ -2,8 +2,19 @@ import time
 import asyncio
 from typing import Any, Optional, Tuple, Union
 
+
 class RemotePlugin:
-    def __init__(self, name: str, version: str, uuid: str, enabled: bool, remote: bool, description: str, arguments: Union[list, dict, tuple], hostname: str):
+    def __init__(
+        self,
+        name: str,
+        version: str,
+        uuid: str,
+        enabled: bool,
+        remote: bool,
+        description: str,
+        arguments: Union[list, dict, tuple],
+        hostname: str,
+    ):
         self.plugin_name = name
         self.version = version
         self.plugin_uuid = uuid
@@ -12,24 +23,18 @@ class RemotePlugin:
         self.description = description
         self.arguments = arguments
         self.hostname = hostname
-        
-#    def to_dict(self):
-#        return {
-#            "name": self.plugin_name,
-#            "version": self.version,
-#            "uuid": self.plugin_uuid,
-#            "enabled": self.enabled,
-#            "remote": self.remote,
-#            "description": self.description,
-#            "arguments": self.arguments,
-#            "hostname": self.
-#        }
-
-
 
 
 class Node:
     def __init__(self, IP: str, hostname: str, enabled: bool, auto_discoverable: bool):
+        """Node class for the networking system that represents another device with this script running
+
+        Args:
+            IP (str): The IP address of the node
+            hostname (str): The hostname of the node
+            enabled (bool): Whether the node is enabled
+            auto_discoverable (bool): Whether the node is auto-discoverable (can be discovered by other nodes with the automatic discovery feature)
+        """
         self.IP = IP
         self.hostname = hostname
         self.enabled = enabled
@@ -52,30 +57,23 @@ class Node:
     async def heartbeat(self):
         """Updates heartbeat timestamp"""
         self.last_heartbeat = int(time.time())
-        
+
     async def update(self, response: dict, device_hostname: str):
         if response["hostname"] == device_hostname:
             self.enabled = False
             return
-        
+
         self.hostname = response["hostname"]
         self.auto_discoverable = response["auto_discoverable"]
-            
+
         await self.heartbeat()
-        
-        
-    def add_remote_plugin(self):
-        pass
-    
-    def update_remote_plugin(self):
-        pass
 
     async def is_alive(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds"""
-        #return (int(time.time()) - self.last_heartbeat) < timeout
-        return True #FIXME: Please PLEASE 🙏🙏 remove later
-    
+        # return (int(time.time()) - self.last_heartbeat) < timeout
+        return True  # FIXME: Please PLEASE 🙏🙏 remove later
+
     def is_alive_sync(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds"""
-        #return (int(time.time()) - self.last_heartbeat) < timeout
-        return True #FIXME: Please PLEASE 🙏🙏 remove later
+        # return (int(time.time()) - self.last_heartbeat) < timeout
+        return True  # FIXME: Please PLEASE 🙏🙏 remove later
