@@ -1,0 +1,59 @@
+description: Networking test plugin
+version: 0.0.1
+remote: True
+arguments:
+endpoints:
+  - internal_name: echo
+    access_name: net_echo
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Echo the provided value
+    arguments:
+      - name: value
+        type: any
+        description: Any picklable value
+
+  - internal_name: big_object
+    access_name: net_big_object
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return a large object of the requested size
+    arguments:
+      - name: size_mb
+        type: int
+        description: Size in MiB (default 8)
+
+  - internal_name: stream_count
+    access_name: net_stream_count
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stream counting integers
+    arguments:
+      - name: n
+        type: int
+        description: Number of integers to stream (default 10)
+      - name: delay_ms
+        type: int
+        description: Delay between items in milliseconds (default 50)
+
+  - internal_name: stream_big
+    access_name: net_stream_big
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stream a few large blobs to test chunking
+    arguments:
+      - name: chunks
+        type: int
+        description: Number of chunks to send (default 3)
+      - name: size_mb
+        type: int
+        description: Size per chunk in MiB (default 2)
+      - name: delay_ms
+        type: int
+        description: Delay between chunks in ms (default 50)
+
+

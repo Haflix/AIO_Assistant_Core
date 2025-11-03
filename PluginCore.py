@@ -51,6 +51,10 @@ class PluginCore:
                 direct_discoverable=self.networking_direct_discoverable,
                 auto_discoverable=self.networking_auto_discoverable,
                 port=self.networking_port,
+                secret=getattr(self, "networking_secret", None),
+                cert_file=getattr(self, "networking_cert_file", None),
+                key_file=getattr(self, "networking_key_file", None),
+                pool_size=getattr(self, "networking_pool_size", 5),
             )
             self._init_tasks.append(asyncio.create_task(self.network.start()))
 
