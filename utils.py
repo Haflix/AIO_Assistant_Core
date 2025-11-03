@@ -272,6 +272,17 @@ class ConfigUtil:
             f"direct_discoverable: {plugin_core.networking_direct_discoverable}"
         )
 
+        # Security and connection pool configuration
+        plugin_core.networking_secret = networking_config.get("secret", None)
+        plugin_core.networking_cert_file = networking_config.get("cert_file", None)
+        plugin_core.networking_key_file = networking_config.get("key_file", None)
+        plugin_core.networking_pool_size = networking_config.get("pool_size", 5)
+
+        if plugin_core.networking_secret:
+            plugin_core._logger.warning(
+                "Using shared secret from config file. Consider using environment variable NETWORKING_SECRET for better security."
+            )
+
 
 class Plugin(ABC):
     """Base class for all plugins."""

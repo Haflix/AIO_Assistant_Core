@@ -9,6 +9,9 @@ plugins:
   - name: PluginB
     enabled: true      # No path - auto-resolve to plugin_package/PluginB
 
+  - name: NetTest
+    enabled: true
+
 
 
 
