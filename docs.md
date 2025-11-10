@@ -563,6 +563,32 @@ async def main():
 
 ---
 
+## Interop Test Plugins
+
+Two plugins validate sync/async calls and streaming (generators):
+
+- `InteropTarget`: exposes endpoints
+  - `it_sync_add(a, b=1)`, `it_async_add(a, b=1)`
+  - `it_sync_gen(n=3, prefix="g", delay_ms=10)`, `it_async_gen(n=3, prefix="ag", delay_ms=10)`
+- `InteropCaller`: runs the matrix via `interop_run(host="any")` and logs results.
+
+Usage:
+
+```python
+# Async context
+result = await self.execute("InteropCaller", "interop_run", {"host": "any"})
+
+# Sync context
+result = self.execute_sync("InteropCaller", "interop_run_sync", {"host": "any"})
+
+# Cross-device
+result = await self.execute("InteropCaller", "interop_run", {"host": "remote"})
+```
+
+Host options: "any", "local", "remote", or a specific hostname.
+
+---
+
 ## File Structure
 
 ```

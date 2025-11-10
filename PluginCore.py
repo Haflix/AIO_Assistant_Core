@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import importlib
 import inspect
 import os
@@ -29,18 +30,59 @@ class PluginCore:
         self.request_lock = asyncio.Lock()
         self.task_list = []
 
-        self.main_event_loop = asyncio.get_event_loop()
+        self.main_event_loop = None
         self.plugins = {}
+        self.plugins_by_uuid = {}
         self.plugin_lock = asyncio.Lock()
-        self.seen_paths = []
-
-        self.request_cleaner = asyncio.create_task(self.running_loop())
-
-        # Start initialization
         self._init_tasks = []
-        self._init_tasks.append(asyncio.create_task(self.load_plugins()))
+        self._running_loop_task = None
+        self.network = None
 
-        if self.networking_enabled:
+    async def wait_until_ready(self):
+        """Ensure initialization tasks are started and await their completion."""
+        # Ensure event loop and maintenance task
+        if self.main_event_loop is None:
+            self.main_event_loop = asyncio.get_running_loop()
+        if self._running_loop_task is None:
+            self._running_loop_task = asyncio.create_task(self.running_loop())
+
+        # If no init tasks yet, create them (backward-compat with older call sites)
+        if not self._init_tasks:
+            self._init_tasks.append(asyncio.create_task(self.load_plugins()))
+
+            if getattr(self, "networking_enabled", False):
+                if self.network is None:
+                    self.network = NetworkManager(
+                        self,
+                        self._logger.getChild("networking"),
+                        node_ips=self.yaml_config.get("networking").get("node_ips", []),
+                        discover_nodes=self.yaml_config.get("networking").get(
+                            "discover_nodes", False
+                        ),
+                        direct_discoverable=self.networking_direct_discoverable,
+                        auto_discoverable=self.networking_auto_discoverable,
+                        port=self.networking_port,
+                        secret=getattr(self, "networking_secret", None),
+                        cert_file=getattr(self, "networking_cert_file", None),
+                        key_file=getattr(self, "networking_key_file", None),
+                        pool_size=getattr(self, "networking_pool_size", 5),
+                    )
+                self._init_tasks.append(asyncio.create_task(self.network.start()))
+
+        if self._init_tasks:
+            await asyncio.gather(*self._init_tasks)
+
+        # NOTE: Wait for enabled?
+
+    async def start(self):
+        """Initialize background tasks, load plugins, and start networking."""
+        self.main_event_loop = asyncio.get_running_loop()
+        if self._running_loop_task is None:
+            self._running_loop_task = asyncio.create_task(self.running_loop())
+
+        self._init_tasks = [asyncio.create_task(self.load_plugins())]
+
+        if getattr(self, "networking_enabled", False):
             self.network = NetworkManager(
                 self,
                 self._logger.getChild("networking"),
@@ -58,11 +100,29 @@ class PluginCore:
             )
             self._init_tasks.append(asyncio.create_task(self.network.start()))
 
-    async def wait_until_ready(self):
-        """Wait until the plugins have been reloaded."""
-        await asyncio.gather(*self._init_tasks)
+        await self.wait_until_ready()
 
-        # NOTE: Wait for enabled?
+    async def close(self):
+        """Gracefully shutdown background tasks and networking."""
+        # Stop running loop task
+        if self._running_loop_task is not None:
+            self._running_loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._running_loop_task
+            self._running_loop_task = None
+
+        # Wait for in-flight tasks
+        pending = [t for t in self.task_list if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.task_list = []
+
+        # Stop networking
+        if hasattr(self, "network") and self.network is not None:
+            stop = getattr(self.network, "stop", None)
+            if callable(stop):
+                with contextlib.suppress(Exception):
+                    await stop()
 
     @log_errors
     def load_config_yaml(self, config_path: str):
@@ -95,14 +155,19 @@ class PluginCore:
     @async_log_errors
     async def start_plugins(self) -> None:
         """Start all plugin loops."""
-
+        tasks = []
         for plugin in self.plugins.values():
             if not plugin.enabled:
-                try:
-                    await self._enable_plugin(plugin.plugin_name)
-                except Exception as error:
+                tasks.append(self._enable_plugin(plugin.plugin_name))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for plugin, result in zip(
+                [p for p in self.plugins.values() if p.enabled], results
+            ):
+                if isinstance(result, Exception):
                     self._logger.warning(
-                        f'Error occured while enabling plugin with name "{plugin.plugin_name}": {type(error).__name__}: {error}'
+                        f'Error occured while enabling plugin with name "{plugin.plugin_name}": {type(result).__name__}: {result}'
                     )
                 # task = asyncio.create_task(self._enable_plugin(plugin.plugin_name))
                 # self.task_list.append(task)
@@ -218,10 +283,28 @@ class PluginCore:
         plugin.version = plugin_config["version"] or "0.0.0 - not given"
         plugin.remote = plugin_config["remote"] or False
         plugin.arguments = plugin_config["arguments"] or None
-        plugin.endpoints = plugin_config["endpoints"] or {}
+        endpoints_cfg = plugin_config.get("endpoints") or []
+        if not isinstance(endpoints_cfg, list):
+            await warn_config(f"{name} endpoints must be a list in plugin_config.yml")
+            endpoints_cfg = []
+        # Keep only valid endpoint dicts
+        plugin.endpoints = [e for e in endpoints_cfg if isinstance(e, dict)]
+        # Build quick lookup by access_name
+        try:
+            plugin._endpoint_by_access = {
+                e.get("access_name"): e
+                for e in plugin.endpoints
+                if e.get("access_name")
+            }
+        except Exception:
+            plugin._endpoint_by_access = {}
 
         async with self.plugin_lock:
             self.plugins[name] = plugin
+            # Maintain uuid index if available
+            plugin_uuid = getattr(plugin, "plugin_uuid", None)
+            if plugin_uuid:
+                self.plugins_by_uuid[plugin_uuid] = plugin
 
         self._logger.info(
             f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})"
@@ -235,7 +318,11 @@ class PluginCore:
                 if self.plugins[plugin_name].enabled:
                     await self._disable_plugin(plugin_name)
                 async with self.plugin_lock:
-                    self.plugins.pop(plugin_name)
+                    plugin = self.plugins.pop(plugin_name)
+                    # Remove from uuid index
+                    plugin_uuid = getattr(plugin, "plugin_uuid", None)
+                    if plugin_uuid and plugin_uuid in self.plugins_by_uuid:
+                        self.plugins_by_uuid.pop(plugin_uuid, None)
             else:
                 self._logger.warning(f'Plugin with name "{plugin_name}" doesnt exist')
         except Exception as error:
@@ -280,10 +367,27 @@ class PluginCore:
     @async_handle_errors(None)
     async def _reload_plugin(self, plugin_name: str):
         """#TODO: Write this"""
+        # Capture whether it was enabled before reload
+        previously_enabled = False
+        if plugin_name in self.plugins:
+            previously_enabled = self.plugins[plugin_name].enabled
 
-        self.pop_plugin(plugin_name)
+        await self.pop_plugin(plugin_name)
 
-        self.load_plugin_with_conf(self.yaml_config["plugins"][plugin_name])
+        entry = next(
+            (
+                p
+                for p in self.yaml_config.get("plugins", [])
+                if p.get("name") == plugin_name
+            ),
+            None,
+        )
+        if not entry:
+            raise Exception(f"Plugin '{plugin_name}' not found in config for reload")
+
+        await self.load_plugin_with_conf(entry)
+        if previously_enabled:
+            await self._enable_plugin(plugin_name)
 
     @contextlib.asynccontextmanager
     async def request_context_async(self, request: Request):
@@ -540,25 +644,22 @@ class PluginCore:
             f"target_plugin={target_plugin}"
         )
 
-        # Check if this is a remote request (from another node)
-        matching_plugin = next(
-            (
-                plugin
-                for plugin in self.plugins.values()
-                if plugin.plugin_uuid == requester_id
-            ),
-            None,
-        )
-        is_remote_request = (
-            matching_plugin is None and requester_id != self.hostname
-        ) and host == "local"
+        # Determine request provenance
+        # This is used to determine if a REMOTE NODE is checking OUR endpoints
+        # (handled by _handle_has_endpoint on the remote node)
+        is_local_system = requester_id == self.hostname
+        is_local_plugin = requester_id in self.plugins_by_uuid
+        is_remote_request = not (is_local_system or is_local_plugin)
 
         if is_remote_request:
             self._logger.debug(
                 f"Remote request detected from requester_id: {requester_id}"
             )
 
-        # Check locally first
+        # Check locally first (only if host includes local)
+        # Note: Remote accessibility checks for OUR endpoints should only happen
+        # when a remote node is querying us (is_remote_request=True).
+        # When WE are searching for remote endpoints, we don't check remote accessibility here.
         if host in ["local", "any", self.hostname]:
             for plugin in self.plugins.values():
                 # Skip if plugin doesn't match UUID filter
@@ -572,37 +673,33 @@ class PluginCore:
                 if not (plugin.enabled and hasattr(plugin, "endpoints")):
                     continue
 
-                # For remote requests, check if plugin allows remote access
-                if is_remote_request and not getattr(plugin, "remote", False):
-                    continue
-
-                # Search through plugin's endpoints
-                for endpoint in plugin.endpoints:
-                    if endpoint.get("access_name") == access_name:
-                        # Check access based on request type
-                        if is_remote_request:
-                            # Remote request: check endpoint remote flag
-                            if not endpoint.get("remote", False):
-                                continue
-                            # Verify requester exists and is allowed
-                            if not await self.is_requester_allowed(requester_id):
-                                continue
-                        else:
-                            # Local request: check accessible_by_other_plugins flag
-                            if (
-                                not endpoint.get("accessible_by_other_plugins", False)
-                                and plugin.plugin_uuid != requester_id
-                            ):
-                                continue
-
+                # Fast-path by access_name
+                endpoint = getattr(plugin, "_endpoint_by_access", {}).get(access_name)
+                if endpoint:
+                    # Check access based on request type
+                    if is_remote_request:
+                        # A remote node is checking OUR endpoints - check remote accessibility
+                        # This is the ONLY place where we check remote accessibility
+                        if not getattr(plugin, "remote", False):
+                            continue
+                        if not endpoint.get("remote", False):
+                            continue
                         return plugin, endpoint, None
+                    else:
+                        # Local request: check accessible_by_other_plugins flag
+                        if (
+                            not endpoint.get("accessible_by_other_plugins", False)
+                            and plugin.plugin_uuid != requester_id
+                        ):
+                            pass
+                        else:
+                            return plugin, endpoint, None
 
         # Check remote nodes if networking is enabled and host isn't local
-        if (
-            self.networking_enabled
-            and host not in ["local", self.hostname]
-            and (host in ["remote", "any"] or host != self.hostname)
-        ):
+        if getattr(self, "networking_enabled", False) and host not in [
+            "local",
+            self.hostname,
+        ]:
 
             for node in self.network.nodes:
                 if not (node.enabled and await node.is_alive()):
@@ -651,7 +748,7 @@ class PluginCore:
             True if the requester is allowed, False otherwise
         """
         # Check if requester exists locally
-        requester_plugin = self.plugins.get(requester_id)
+        requester_plugin = self.plugins_by_uuid.get(requester_id)
         if not requester_plugin:
             return False
 
@@ -712,11 +809,8 @@ class PluginCore:
             )
 
         else:
-            # if not plugin.remote and request.author_id:
-            #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
-            #    return
             func = getattr(plugin, endpoint.get("internal_name"), None)
-            if not callable(func):  # or not inspect.isfunction(func):
+            if not callable(func):
                 await self._set_request_result(
                     request,
                     f"Function {endpoint.get('access_name')}({endpoint.get('internal_name')}) not found in plugin {plugin_name}",
@@ -724,41 +818,36 @@ class PluginCore:
                 )
                 return
 
-            if asyncio.iscoroutinefunction(func):
-                if isinstance(request.args, tuple):
-                    result = await func(*request.args)
-                elif isinstance(request.args, dict):
-                    result = await func(**request.args)
-                elif request.args == None:
-                    result = await func()
-                else:
-                    result = await func(request.args)
+            if inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func):
+                raise Exception(
+                    f"For Request {request.id}: The method you requested is a generator. Use execute_stream for generators"
+                )
 
-            elif inspect.isasyncgenfunction(func):
-                raise Exception(
-                    f"For Request {request.id}: The method you requested is an async-generator. Use execute_stream for generators"
-                )
-            elif inspect.isgeneratorfunction(func):
-                raise Exception(
-                    f"For Request {request.id}: The method you requested is a sync-generator. Use execute_stream for generators"
-                )
-            else:
-                if isinstance(request.args, tuple):
-                    result = await self.main_event_loop.run_in_executor(
-                        None, func, *request.args
-                    )
-                elif isinstance(request.args, dict):
-                    result = await self.main_event_loop.run_in_executor(
-                        None, func, **request.args
-                    )
-                elif request.args == None:
-                    result = await self.main_event_loop.run_in_executor(None, func)
-                else:
-                    result = await self.main_event_loop.run_in_executor(
-                        None, func, request.args
-                    )
+            result = await self._call_endpoint(func, request.args)
 
         await self._set_request_result(request, result)
+
+    async def _call_endpoint(self, func: Callable, args: Any) -> Any:
+        """Call endpoint function handling sync/async and arg shapes."""
+        if asyncio.iscoroutinefunction(func):
+            if isinstance(args, tuple):
+                return await func(*args)
+            if isinstance(args, dict):
+                return await func(**args)
+            if args is None:
+                return await func()
+            return await func(args)
+
+        # sync function -> threadpool
+        if isinstance(args, tuple):
+            return await self.main_event_loop.run_in_executor(None, func, *args)
+        if isinstance(args, dict):
+            return await self.main_event_loop.run_in_executor(
+                None, functools.partial(func, **args)
+            )
+        if args is None:
+            return await self.main_event_loop.run_in_executor(None, func)
+        return await self.main_event_loop.run_in_executor(None, func, args)
 
     # @async_handle_errors(None)
     async def _process_request_stream(self, request: GeneratorRequest) -> None:
@@ -1094,20 +1183,30 @@ class PluginCore:
             author = self.hostname
             author_id = self.hostname
 
-        # FIXME Still wrong
-        future = asyncio.run_coroutine_threadsafe(
-            self.execute_stream(
-                plugin,
-                method,
-                args,
-                plugin_uuid,
-                host,
-                author,
-                author_id,
-                timeout,
-                author_host,
-                request_id,
-            ),
-            self.main_event_loop,
+        ### Not supported: a synchronous wrapper for an async generator is ambiguous.
+        ##raise NotImplementedError(
+        ##    "execute_stream_sync is not supported. Use execute_stream (async) or request a blocking adapter."
+        ##)
+
+        if author == "system":
+            author = self.hostname
+            author_id = self.hostname
+
+        gen = self.execute_stream(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            host,
+            author,
+            author_id,
+            timeout,
+            author_host,
+            request_id,
         )
-        return future.result()
+
+        try:
+            while True:
+                yield self.main_event_loop.run_until_complete(gen.__anext__())
+        except StopAsyncIteration:
+            pass

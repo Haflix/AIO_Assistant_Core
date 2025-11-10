@@ -8,7 +8,7 @@ import tracemalloc
 async def main():
     """Main function to demonstrate the plugin system."""
 
-    tracemalloc.start()
+    # tracemalloc.start()
 
     # Initialize the plugin collection
     plugin_core = PluginCore("config.yml")
@@ -17,22 +17,28 @@ async def main():
     await plugin_core.wait_until_ready()
 
     # nodes = await plugin_core.network.update_all_nodes()
-    # print("Discovered nodes:", nodes)
+    # print("Discovered nodes:" + "\n".join(node.__str__() for node in nodes))
 
-    # await plugin_core.purge_plugins()
+    result = await plugin_core.execute(
+        "InteropCaller", "interop_run", {"host": "remote"}, host="any"
+    )
+    plugin_core._logger.info(f"Result from Test: {result}")
 
-    # print(result4)
-    # while True:
-    # await asyncio.sleep(10000)
+    # plugin_core.execute_sync("InteropCaller", "interop_run", host="any")
 
     # Example of using the one-liner execute method
-    result2 = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
-    plugin_core._logger.info(f"Result from PluginB: {result2}")
+    # result2 = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
+    # plugin_core._logger.info(f"Result from PluginB: {result2}")
 
-    async for i in plugin_core.execute_stream(
-        "PluginA", "perform_operation_stream_ABC", (9), host="any"
-    ):
-        plugin_core._logger.info(f"Result from PluginA: {i}")
+    # async for i in plugin_core.execute_stream(
+    #    "PluginA", "perform_operation_stream_ABC", (9), host="any"
+    # ):
+    #    plugin_core._logger.info(f"Result from PluginA: {i}")
+
+    # nettest_result = await plugin_core.execute(
+    #    "NetTest", "net_echo", ("hello",), host="remote"
+    # )
+    # plugin_core._logger.info(f"Result from NetTest: {nettest_result}")
 
     # result2 = await plugin_core.execute("PluginC", "perform_operation", (6))
     # plugin_core._logger.info(f"Result from PluginC: {result2}")

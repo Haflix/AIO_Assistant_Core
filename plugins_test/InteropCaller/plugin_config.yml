@@ -1,0 +1,28 @@
+description: Interop caller plugin that runs interop test matrix
+version: 0.0.1
+remote: True
+arguments:
+endpoints:
+  - internal_name: run_suite
+    access_name: interop_run
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Run interop suite; host can be any|local|remote|hostname
+    arguments:
+      - name: host
+        type: str
+        description: Target host selection
+
+  - internal_name: run_suite_sync
+    access_name: interop_run_sync
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Run interop suite in sync context using execute_sync/execute_stream_sync
+    arguments:
+      - name: host
+        type: str
+        description: Target host selection
+
+
