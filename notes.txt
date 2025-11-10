@@ -1,37 +1,15 @@
 [ ] CLI
 
-[ ] Networking
-
-[X] Queues
+[ ] Stream decorators & warning if you use the wrong one
 
 Other:
 - Methoddescriptions
 - Logging (add and improve)
 
-#FIXME Fix the stream and usual to be pickled (input arguments and output)
-# https://chatgpt.com/share/687a1942-eec0-800d-a751-e3d4b5168aa9 ❤️
-+++ Add security to it
 
 Notes:
-- Decorators for streaming
 - Check on request if requester is eligible
 
 Check for issues:
-- try multiple arguments for execute
 - timeouts on remote
 
-
-Networking:
-- networking.py 
---> search for nodes
---> heartbeat for nodes (update_all_nodes()?)
-
-
-- networking_classes.py 
--|-> Node 
-    --> Values:
-        self.IP = IP
-        self.hostname = hostname
-        self.enabled = enabled
-        self.last_heartbeat = 0
-        self.auto_discoverable = auto_discoverable
