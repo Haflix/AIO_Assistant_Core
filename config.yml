@@ -12,13 +12,21 @@ plugins:
   - name: NetTest
     enabled: true
 
+  - name: InteropTarget
+    enabled: true
+    path: ./plugins_test/InteropTarget
+
+  - name: InteropCaller
+    enabled: true
+    path: ./plugins_test/InteropCaller
+
 
 
 
 general:
     hostname: ""
     plugin_package: plugins_test  # Base directory for plugins if path is omitted
-    console_log_level: "INFO"
+    console_log_level: "DEBUG"
 
 
 networking:

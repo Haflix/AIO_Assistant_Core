@@ -1,6 +1,7 @@
 from logging import Logger
 import ssl
 import socket
+import ipaddress
 import asyncio
 import pickle
 import struct
@@ -71,9 +72,16 @@ class NetworkManager:
         # Server state
         self.server = None
         self.server_task = None
+        self.heartbeat_task = None
+        self.discovery_task = None
 
         # SSL context (will be initialized in start)
         self.ssl_context = None
+
+        # Loop intervals and timeouts (defaults per plan)
+        self.heartbeat_interval: float = 10.0
+        self.lookup_interval: float = 60.0
+        self.liveness_timeout: float = 30.0
 
     # Message Protocol Utilities
 
@@ -92,10 +100,28 @@ class NetworkManager:
             msg_length = len(payload) + 1  # +1 for message type byte
             header = struct.pack(">IB", msg_length, msg_type)
 
+            # Log endpoint-related messages
+            if msg_type == MSG_HAS_ENDPOINT:
+                self._logger.debug(
+                    f"[MESSAGE] Sending HAS_ENDPOINT: payload_size={len(payload)}, "
+                    f"data={data}"
+                )
+
             writer.write(header + payload)
             await writer.drain()
         except Exception as e:
-            self._logger.exception(f"Error sending message type {msg_type}")
+            msg_type_name = {
+                MSG_HAS_ENDPOINT: "HAS_ENDPOINT",
+                MSG_EXECUTE: "EXECUTE",
+                MSG_EXECUTE_STREAM: "EXECUTE_STREAM",
+                MSG_PING: "PING",
+                MSG_INFO: "INFO",
+                MSG_RESULT: "RESULT",
+                MSG_ERROR: "ERROR",
+            }.get(msg_type, f"UNKNOWN({msg_type})")
+            self._logger.exception(
+                f"[MESSAGE] Error sending message type {msg_type_name} ({msg_type})"
+            )
             raise
 
     async def _receive_message(self, reader: asyncio.StreamReader) -> Tuple[int, any]:
@@ -121,12 +147,28 @@ class NetworkManager:
             else:
                 data = None
 
+            # Log endpoint-related messages
+            if msg_type == MSG_HAS_ENDPOINT:
+                self._logger.debug(
+                    f"[MESSAGE] Received HAS_ENDPOINT: payload_size={payload_length}, "
+                    f"data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+                )
+            elif (
+                msg_type == MSG_RESULT
+                and isinstance(data, dict)
+                and "available" in data
+            ):
+                self._logger.debug(
+                    f"[MESSAGE] Received RESULT (endpoint check): available={data.get('available')}, "
+                    f"hostname={data.get('hostname')}"
+                )
+
             return msg_type, data
         except asyncio.IncompleteReadError as e:
-            self._logger.debug(f"Incomplete read: {e}")
+            self._logger.debug(f"[MESSAGE] Incomplete read: {e}")
             raise ConnectionError("Connection closed unexpectedly")
         except Exception as e:
-            self._logger.exception("Error receiving message")
+            self._logger.exception("[MESSAGE] Error receiving message")
             raise
 
     async def _send_stream_chunk(
@@ -228,7 +270,7 @@ class NetworkManager:
                     .add_extension(
                         x509.SubjectAlternativeName(
                             [
-                                x509.IPAddress(socket.inet_aton("127.0.0.1")),
+                                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
                             ]
                         ),
                         critical=False,
@@ -272,6 +314,12 @@ class NetworkManager:
 
     async def start(self):
         """Starts socket server without blocking the main loop."""
+        self._logger.info(
+            f"[SERVER] Starting server: port={self.port}, discover_nodes={self.discover_nodes}, "
+            f"direct_discoverable={self.direct_discoverable}, auto_discoverable={self.auto_discoverable}, "
+            f"heartbeat_interval={self.heartbeat_interval}, lookup_interval={self.lookup_interval}, "
+            f"liveness_timeout={self.liveness_timeout}"
+        )
         # Create SSL context
         self.ssl_context = self._create_ssl_context()
 
@@ -308,8 +356,63 @@ class NetworkManager:
         self.server_task = asyncio.create_task(serve())
         await asyncio.sleep(0)  # let it start properly
 
+        # Start background loops
+        if self.discover_nodes:
+            # Initial discovery to seed nodes
+            try:
+                await self.update_all_nodes()
+            except Exception:
+                self._logger.debug("Initial node discovery failed; continuing")
+
+            async def lookup_loop():
+                while True:
+                    try:
+                        await self.update_all_nodes()
+                    except Exception:
+                        self._logger.debug("Periodic node discovery failed")
+                    await asyncio.sleep(self.lookup_interval)
+
+            self._logger.debug("[SERVER] Starting discovery lookup loop task")
+            self.discovery_task = asyncio.create_task(lookup_loop())
+
+        async def heartbeat_loop():
+            while True:
+                try:
+                    # Iterate over a snapshot to avoid concurrent modification
+                    for node in list[Node](self.nodes):
+                        try:
+                            if not node.enabled:
+                                continue
+                            ok = await self.heartbeat_node(
+                                node, timeout=self.liveness_timeout
+                            )
+                            if not ok:
+                                node.enabled = False
+                        except Exception:
+                            # Mark node disabled on heartbeat failure
+                            try:
+                                node.enabled = False
+                            except Exception:
+                                pass
+                except Exception:
+                    self._logger.debug("Heartbeat iteration failed")
+                await asyncio.sleep(self.heartbeat_interval)
+
+        self._logger.debug("[SERVER] Starting heartbeat loop task")
+        self.heartbeat_task = asyncio.create_task(heartbeat_loop())
+
     async def stop(self):
         """Stop the socket server and close all connections."""
+        self._logger.info("[SERVER] Stopping server and background tasks")
+        # Cancel background tasks first
+        for task in [self.heartbeat_task, self.discovery_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -323,13 +426,19 @@ class NetworkManager:
 
         # Close all pooled connections
         for ip, pool in self.connection_pools.items():
+            closed = 0
             while not pool.empty():
                 try:
                     reader, writer = await asyncio.wait_for(pool.get(), timeout=0.1)
                     writer.close()
                     await writer.wait_closed()
+                    closed += 1
                 except (asyncio.TimeoutError, Exception):
                     break
+            if closed:
+                self._logger.debug(
+                    f"[CONNECTION] Closed {closed} pooled connections for {ip}"
+                )
 
         self._logger.info("Socket server stopped")
 
@@ -344,7 +453,15 @@ class NetworkManager:
 
         try:
             # Authenticate client
-            msg_type, data = await self._receive_message(reader)
+            try:
+                msg_type, data = await asyncio.wait_for(
+                    self._receive_message(reader), timeout=5.0
+                )
+            except (asyncio.TimeoutError, ConnectionError, ConnectionResetError):
+                self._logger.debug(
+                    f"Auth phase failed/timeout from {client_addr}; closing connection"
+                )
+                return
             if msg_type != MSG_AUTH:
                 await self._send_error(
                     writer, "Authentication required as first message"
@@ -358,19 +475,31 @@ class NetworkManager:
 
             # Authentication successful, process requests
             while True:
-                msg_type, data = await self._receive_message(reader)
+                try:
+                    msg_type, data = await self._receive_message(reader)
+                except (ConnectionError, ConnectionResetError):
+                    self._logger.debug(
+                        f"Connection lost while handling client {client_addr}"
+                    )
+                    break
 
                 if msg_type == MSG_EXECUTE:
                     await self._handle_execute(reader, writer, data)
                 elif msg_type == MSG_EXECUTE_STREAM:
                     await self._handle_execute_stream(reader, writer, data)
                 elif msg_type == MSG_HAS_ENDPOINT:
+                    self._logger.debug(
+                        f"[ENDPOINT] Routing HAS_ENDPOINT message from {client_addr} to handler"
+                    )
                     await self._handle_has_endpoint(reader, writer, data)
                 elif msg_type == MSG_PING:
                     await self._handle_ping(reader, writer, data)
                 elif msg_type == MSG_INFO:
                     await self._handle_info(reader, writer, data)
                 else:
+                    self._logger.warning(
+                        f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
+                    )
                     await self._send_error(writer, f"Unknown message type: {msg_type}")
                     break
 
@@ -397,6 +526,12 @@ class NetworkManager:
             author_host = data.get("author_host")
             request_id = data.get("request_id")
             args = data.get("args", [])
+
+            self._logger.info(
+                f"[EXECUTE] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
+                f"author={author}, author_id={author_id}, author_host={author_host}, request_id={request_id}, "
+                f"args_type={type(args).__name__}, timeout={timeout}"
+            )
 
             # Execute plugin method
             if isinstance(args, (list, tuple)):
@@ -431,6 +566,7 @@ class NetworkManager:
             payload = pickle.dumps(result)
             if len(payload) > CHUNK_SIZE:
                 # Split large result into chunks
+                sent = 0
                 offset = 0
                 while offset < len(payload):
                     chunk_data = payload[offset : offset + CHUNK_SIZE]
@@ -439,6 +575,10 @@ class NetworkManager:
                     writer.write(header + chunk_data)
                     await writer.drain()
                     offset += CHUNK_SIZE
+                    sent += 1
+                self._logger.debug(
+                    f"[EXECUTE] Sent chunked result: chunks={sent}, bytes={len(payload)}"
+                )
             else:
                 # Small result, send as single chunk
                 chunk_length = len(payload) + 1
@@ -446,7 +586,15 @@ class NetworkManager:
                 writer.write(header + payload)
                 await writer.drain()
 
+            try:
+                result_type = type(result).__name__
+            except Exception:
+                result_type = "unknown"
+
             await self._send_end_stream(writer)
+            self._logger.info(
+                f"[EXECUTE] Completed: result_type={result_type}, size_bytes={len(payload)}"
+            )
 
         except NetworkRequestException as e:
             await self._send_error(writer, str(e))
@@ -468,6 +616,12 @@ class NetworkManager:
             author_host = data.get("author_host")
             request_id = data.get("request_id")
             args = data.get("args", [])
+
+            self._logger.info(
+                f"[EXECUTE_STREAM] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
+                f"author={author}, author_id={author_id}, author_host={author_host}, request_id={request_id}, "
+                f"args_type={type(args).__name__}, timeout={timeout}"
+            )
 
             # Execute streaming plugin method
             if isinstance(args, (list, tuple)):
@@ -498,12 +652,14 @@ class NetworkManager:
                 )
 
             # Stream results - each yielded item as a chunk
+            sent_items = 0
             async for line in agen:
                 try:
                     # Send each item - may split if very large
                     payload = pickle.dumps(line)
                     if len(payload) > CHUNK_SIZE:
                         # Split large item into chunks
+                        parts = 0
                         offset = 0
                         while offset < len(payload):
                             chunk_data = payload[offset : offset + CHUNK_SIZE]
@@ -512,12 +668,17 @@ class NetworkManager:
                             writer.write(header + chunk_data)
                             await writer.drain()
                             offset += CHUNK_SIZE
+                            parts += 1
+                        self._logger.debug(
+                            f"[EXECUTE_STREAM] Sent large item in {parts} chunks, bytes={len(payload)}"
+                        )
                     else:
                         # Small item, send as single chunk
                         chunk_length = len(payload) + 1
                         header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                         writer.write(header + payload)
                         await writer.drain()
+                    sent_items += 1
                 except Exception as e:
                     self._logger.exception("Failed to send stream chunk")
                     err_obj = ("__STREAM_ERROR__", str(e))
@@ -529,6 +690,7 @@ class NetworkManager:
                     break
 
             await self._send_end_stream(writer)
+            self._logger.info(f"[EXECUTE_STREAM] Completed: items_sent={sent_items}")
 
         except Exception as e:
             self._logger.exception("Exception while streaming")
@@ -543,13 +705,25 @@ class NetworkManager:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
     ):
         """Handle HAS_ENDPOINT message (checks plugin existence AND endpoint in one call)."""
+        client_addr = writer.get_extra_info("peername")
         try:
             access_name = data.get("access_name")
             plugin_uuid = data.get("plugin_uuid")
             requester_id = data.get("requester_id")
             target_plugin = data.get("target_plugin")
 
+            self._logger.info(
+                f"[ENDPOINT] Received HAS_ENDPOINT request from {client_addr}: "
+                f"access_name='{access_name}', plugin_uuid={plugin_uuid}, "
+                f"requester_id={requester_id}, target_plugin={target_plugin}"
+            )
+
             # Use find_endpoint which already does both checks
+            self._logger.debug(
+                f"[ENDPOINT] Calling find_endpoint: access_name='{access_name}', "
+                f"host='local', plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
+                f"target_plugin={target_plugin}"
+            )
             plugin, endpoint, node = await self.plugin_core.find_endpoint(
                 access_name=access_name,
                 host="local",
@@ -558,8 +732,16 @@ class NetworkManager:
                 target_plugin=target_plugin,
             )
 
+            available = plugin is not None and endpoint is not None
+            self._logger.info(
+                f"[ENDPOINT] find_endpoint result: available={available}, "
+                f"plugin={plugin.plugin_name if plugin else None}, "
+                f"endpoint={endpoint.get('name') if endpoint else None}, "
+                f"node={node.IP if node else None}"
+            )
+
             response = {
-                "available": plugin is not None and endpoint is not None,
+                "available": available,
                 "hostname": self.plugin_core.hostname,
             }
 
@@ -570,18 +752,32 @@ class NetworkManager:
                     "uuid": plugin.plugin_uuid,
                     "description": getattr(plugin, "description", "Remote plugin"),
                 }
+                self._logger.debug(
+                    f"[ENDPOINT] Plugin info: name={plugin.plugin_name}, "
+                    f"uuid={plugin.plugin_uuid}, version={getattr(plugin, 'version', 'unknown')}"
+                )
             else:
                 response["plugin_info"] = None
+                self._logger.debug("[ENDPOINT] No plugin found")
 
             if endpoint:
                 response["endpoint"] = endpoint
+                self._logger.debug(
+                    f"[ENDPOINT] Endpoint info: {endpoint.get('name') if isinstance(endpoint, dict) else endpoint}"
+                )
             else:
                 response["endpoint"] = None
+                self._logger.debug("[ENDPOINT] No endpoint found")
 
+            self._logger.info(
+                f"[ENDPOINT] Sending response to {client_addr}: available={available}"
+            )
             await self._send_message(writer, MSG_RESULT, response)
 
         except Exception as e:
-            self._logger.exception("Exception in _handle_has_endpoint")
+            self._logger.exception(
+                f"[ENDPOINT] Exception in _handle_has_endpoint from {client_addr}: {e}"
+            )
             await self._send_error(writer, str(e))
 
     async def _handle_ping(
@@ -601,6 +797,10 @@ class NetworkManager:
         try:
             hostname = data.get("hostname")
             discover_nodes_info = data.get("discover_nodes_info")
+
+            self._logger.debug(
+                f"[INFO] Received INFO request: hostname={hostname}, discover_nodes_info={discover_nodes_info}"
+            )
 
             if not isinstance(hostname, str):
                 await self._send_error(writer, "hostname must be str")
@@ -634,6 +834,9 @@ class NetworkManager:
                 ],
             }
 
+            self._logger.debug(
+                f"[INFO] Returning nodes info: count={len(response['nodes'])}, hostname={response['hostname']}"
+            )
             await self._send_message(writer, MSG_RESULT, response)
 
         except Exception as e:
@@ -646,6 +849,9 @@ class NetworkManager:
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Create a new TLS connection to a node."""
+        self._logger.debug(
+            f"[CONNECTION] Creating new TLS connection to {IP}:{self.port}"
+        )
         # Create SSL context for client
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False  # Allow self-signed certs
@@ -653,14 +859,25 @@ class NetworkManager:
             ssl.CERT_NONE
         )  # For testing - production should verify
 
-        reader, writer = await asyncio.open_connection(
-            IP,
-            self.port,
-            ssl=ssl_context,
-        )
+        try:
+            reader, writer = await asyncio.open_connection(
+                IP,
+                self.port,
+                ssl=ssl_context,
+            )
+            self._logger.debug(
+                f"[CONNECTION] TLS connection established to {IP}:{self.port}"
+            )
+        except Exception as e:
+            self._logger.warning(
+                f"[CONNECTION] Failed to establish connection to {IP}:{self.port}: {e}"
+            )
+            raise
 
         # Authenticate with shared secret
+        self._logger.debug(f"[CONNECTION] Authenticating with {IP}")
         await self._send_message(writer, MSG_AUTH, self.secret)
+        self._logger.debug(f"[CONNECTION] Authentication message sent to {IP}")
 
         # Wait for auth confirmation (server should not send error)
         # For now, we'll just proceed - if auth fails, the next message will error
@@ -673,13 +890,25 @@ class NetworkManager:
         """Get a connection from pool or create new one."""
         if IP not in self.connection_pools:
             self.connection_pools[IP] = asyncio.Queue(maxsize=self.pool_size)
+            self._logger.debug(f"[CONNECTION] Created new connection pool for {IP}")
 
         pool = self.connection_pools[IP]
+        pool_size = pool.qsize()
+        self._logger.debug(
+            f"[CONNECTION] Pool for {IP}: size={pool_size}/{self.pool_size}, "
+            f"empty={pool.empty()}"
+        )
 
         # Try to get from pool
         if not pool.empty():
             try:
+                self._logger.debug(
+                    f"[CONNECTION] Attempting to get connection from pool for {IP}"
+                )
                 reader, writer = await asyncio.wait_for(pool.get(), timeout=0.1)
+                self._logger.debug(
+                    f"[CONNECTION] Retrieved connection from pool for {IP}, performing health check"
+                )
                 # Health check - try a ping
                 try:
                     await self._send_message(writer, MSG_PING, {})
@@ -687,22 +916,38 @@ class NetworkManager:
                         self._receive_message(reader), timeout=2.0
                     )
                     if msg_type == MSG_RESULT:
+                        self._logger.debug(
+                            f"[CONNECTION] Pooled connection to {IP} is healthy"
+                        )
                         return reader, writer
                     else:
                         # Connection is bad, close it
+                        self._logger.warning(
+                            f"[CONNECTION] Pooled connection to {IP} failed health check "
+                            f"(msg_type={msg_type}), closing"
+                        )
                         writer.close()
                         await writer.wait_closed()
-                except Exception:
+                except Exception as e:
                     # Connection is bad, close it and create new
+                    self._logger.warning(
+                        f"[CONNECTION] Pooled connection to {IP} failed health check: {e}, closing"
+                    )
                     try:
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
             except asyncio.TimeoutError:
+                self._logger.debug(
+                    f"[CONNECTION] Timeout getting connection from pool for {IP}"
+                )
                 pass
 
         # Create new connection
+        self._logger.debug(
+            f"[CONNECTION] Creating new connection to {IP} (pool empty or health check failed)"
+        )
         return await self._create_connection(IP)
 
     async def _return_connection(
@@ -713,11 +958,20 @@ class NetworkManager:
             self.connection_pools[IP] = asyncio.Queue(maxsize=self.pool_size)
 
         pool = self.connection_pools[IP]
+        pool_size_before = pool.qsize()
 
         try:
             pool.put_nowait((reader, writer))
+            self._logger.debug(
+                f"[CONNECTION] Returned connection to pool for {IP}: "
+                f"pool_size={pool_size_before} -> {pool.qsize()}"
+            )
         except asyncio.QueueFull:
             # Pool is full, close connection
+            self._logger.debug(
+                f"[CONNECTION] Pool for {IP} is full ({pool.qsize()}/{self.pool_size}), "
+                f"closing connection"
+            )
             writer.close()
             await writer.wait_closed()
 
@@ -743,7 +997,13 @@ class NetworkManager:
         connection_returned = False
 
         try:
+            self._logger.info(
+                f"[REMOTE] execute_remote: ip={IP}, plugin={plugin}, method={method}, "
+                f"plugin_uuid={plugin_uuid}, author_id={author_id}, request_id={request_id}"
+            )
+            self._logger.debug(f"[REMOTE] Getting connection for {IP}")
             reader, writer = await self._get_connection(IP)
+            self._logger.debug(f"[REMOTE] Connection acquired for {IP}")
 
             # Prepare request
             request_data = {
@@ -759,10 +1019,16 @@ class NetworkManager:
             }
 
             # Send execute request
+            self._logger.debug(
+                f"[REMOTE] Sending EXECUTE to {IP}: plugin={plugin}, method={method}, "
+                f"args_type={type(request_data['args']).__name__}"
+            )
             await self._send_message(writer, MSG_EXECUTE, request_data)
 
             # Receive response (may be chunked if large)
             result_chunks_bytes = []
+            total_bytes = 0
+            chunks = 0
             while True:
                 # Read raw message to get pickled bytes (don't unpickle yet for chunks)
                 length_bytes = await reader.readexactly(4)
@@ -778,7 +1044,16 @@ class NetworkManager:
                     if msg_type == MSG_STREAM_CHUNK:
                         # Collect raw pickled bytes
                         result_chunks_bytes.append(payload)
+                        chunks += 1
+                        total_bytes += len(payload)
+                        if chunks % 10 == 0:
+                            self._logger.debug(
+                                f"[REMOTE] Receiving chunks from {IP}: count={chunks}, total_bytes={total_bytes}"
+                            )
                     elif msg_type == MSG_END_STREAM:
+                        self._logger.debug(
+                            f"[REMOTE] Received END_STREAM from {IP}: chunks={chunks}, total_bytes={total_bytes}"
+                        )
                         break
                     elif msg_type == MSG_ERROR:
                         # Error message is pickled, so unpickle it
@@ -788,13 +1063,22 @@ class NetworkManager:
                             and len(error_data) == 2
                             and error_data[0] == "__STREAM_ERROR__"
                         ):
+                            self._logger.warning(
+                                f"[REMOTE] EXECUTE error from {IP}: {error_data[1]}"
+                            )
                             raise NetworkRequestException(error_data[1])
+                        self._logger.warning(
+                            f"[REMOTE] EXECUTE error from {IP}: {str(error_data)}"
+                        )
                         raise NetworkRequestException(str(error_data))
                     else:
                         raise NetworkRequestException(
                             f"Unexpected message type: {msg_type}"
                         )
                 elif msg_type == MSG_END_STREAM:
+                    self._logger.debug(
+                        f"[REMOTE] Received END_STREAM (no payload) from {IP}: chunks={chunks}, total_bytes={total_bytes}"
+                    )
                     break
                 else:
                     raise NetworkRequestException(
@@ -806,8 +1090,18 @@ class NetworkManager:
                 # Concatenate all pickled chunks and unpickle
                 full_pickled = b"".join(result_chunks_bytes)
                 result = pickle.loads(full_pickled)
+                try:
+                    result_type = type(result).__name__
+                except Exception:
+                    result_type = "unknown"
+                self._logger.info(
+                    f"[REMOTE] EXECUTE complete from {IP}: chunks={chunks}, total_bytes={total_bytes}, result_type={result_type}"
+                )
                 return result
             else:
+                self._logger.info(
+                    f"[REMOTE] EXECUTE complete from {IP}: no result returned"
+                )
                 return None
 
         except Exception as e:
@@ -817,6 +1111,7 @@ class NetworkManager:
             # Return connection to pool (or close if error)
             if reader and writer and not connection_returned:
                 try:
+                    self._logger.debug(f"[REMOTE] Returning connection for {IP}")
                     await self._return_connection(IP, reader, writer)
                     connection_returned = True
                 except Exception:
@@ -846,7 +1141,13 @@ class NetworkManager:
         connection_returned = False
 
         try:
+            self._logger.info(
+                f"[REMOTE_STREAM] start: ip={IP}, plugin={plugin}, method={method}, "
+                f"plugin_uuid={plugin_uuid}, author_id={author_id}, request_id={request_id}"
+            )
+            self._logger.debug(f"[REMOTE_STREAM] Getting connection for {IP}")
             reader, writer = await self._get_connection(IP)
+            self._logger.debug(f"[REMOTE_STREAM] Connection acquired for {IP}")
 
             # Prepare request
             request_data = {
@@ -862,10 +1163,16 @@ class NetworkManager:
             }
 
             # Send execute_stream request
+            self._logger.debug(
+                f"[REMOTE_STREAM] Sending EXECUTE_STREAM to {IP}: plugin={plugin}, method={method}"
+            )
             await self._send_message(writer, MSG_EXECUTE_STREAM, request_data)
 
             # Stream results - collect chunks until we have a complete item
             current_item_chunks = []
+            items_yielded = 0
+            item_bytes = 0
+            item_chunks = 0
             while True:
                 # Read raw message
                 length_bytes = await reader.readexactly(4)
@@ -880,6 +1187,8 @@ class NetworkManager:
 
                     if msg_type == MSG_STREAM_CHUNK:
                         current_item_chunks.append(payload)
+                        item_chunks += 1
+                        item_bytes += len(payload)
                         # Check if this is the last chunk of an item (smaller than CHUNK_SIZE)
                         # Actually, we can't know from just one chunk. We need to check if next message is END_STREAM or another chunk.
                         # For now, we'll peek ahead or use a different approach.
@@ -922,20 +1231,42 @@ class NetworkManager:
                                             )
                                             yield ("__REMOTE_STREAM_ERROR__", item[1])
                                             break
+                                    items_yielded += 1
+                                    try:
+                                        item_type = type(item).__name__
+                                    except Exception:
+                                        item_type = "unknown"
+                                    self._logger.info(
+                                        f"[REMOTE_STREAM] yielded item #{items_yielded} from {IP}: "
+                                        f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
+                                    )
                                     yield item
                                     current_item_chunks = []
+                                    item_chunks = 0
+                                    item_bytes = 0
                                 except Exception as e:
                                     self._logger.exception(
                                         f"Failed to unpickle stream item from {IP}"
                                     )
                                     yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
                                     current_item_chunks = []
+                                    item_chunks = 0
+                                    item_bytes = 0
                     elif msg_type == MSG_END_STREAM:
                         # End of stream - yield any remaining chunks as final item
                         if current_item_chunks:
                             full_pickled = b"".join(current_item_chunks)
                             try:
                                 item = pickle.loads(full_pickled)
+                                items_yielded += 1
+                                try:
+                                    item_type = type(item).__name__
+                                except Exception:
+                                    item_type = "unknown"
+                                self._logger.info(
+                                    f"[REMOTE_STREAM] yielded final item #{items_yielded} from {IP}: "
+                                    f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
+                                )
                                 yield item
                             except Exception as e:
                                 self._logger.exception(
@@ -947,6 +1278,9 @@ class NetworkManager:
                         error_msg = str(error_data)
                         if isinstance(error_data, tuple) and len(error_data) == 2:
                             error_msg = error_data[1]
+                        self._logger.warning(
+                            f"[REMOTE_STREAM] Node {IP} returned ERROR: {error_msg}"
+                        )
                         raise NetworkRequestException(error_msg)
                     else:
                         raise NetworkRequestException(
@@ -958,6 +1292,15 @@ class NetworkManager:
                         full_pickled = b"".join(current_item_chunks)
                         try:
                             item = pickle.loads(full_pickled)
+                            items_yielded += 1
+                            try:
+                                item_type = type(item).__name__
+                            except Exception:
+                                item_type = "unknown"
+                            self._logger.info(
+                                f"[REMOTE_STREAM] yielded final item #{items_yielded} from {IP}: "
+                                f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
+                            )
                             yield item
                         except Exception as e:
                             self._logger.exception(
@@ -976,6 +1319,7 @@ class NetworkManager:
             # Return connection to pool (or close if error)
             if reader and writer and not connection_returned:
                 try:
+                    self._logger.debug(f"[REMOTE_STREAM] Returning connection for {IP}")
                     await self._return_connection(IP, reader, writer)
                     connection_returned = True
                 except Exception:
@@ -1122,69 +1466,114 @@ class NetworkManager:
         additional_IP_list: list[str] = [],
         timeout: int = 5,
         ignore_enabled_status: bool = False,
+        concurrency: int = 20,
     ) -> List[Node]:
 
-        self.node_ips.extend(additional_IP_list)
+        self._logger.info(
+            f"[DISCOVERY] update_all_nodes start: existing_ips={len(self.node_ips)}, additional={len(additional_IP_list) if additional_IP_list else 0}, concurrency={concurrency}"
+        )
+        # Merge and deduplicate IPs
+        if additional_IP_list:
+            self.node_ips.extend(additional_IP_list)
+        self.node_ips = list(dict.fromkeys(self.node_ips))
 
+        # Ensure Node objects exist
         await self._create_nodes(self.node_ips)
 
-        tasks = [
-            self.update_single(IP, timeout)
-            for IP in self.node_ips
-            if (await self._get_node(IP)).enabled or ignore_enabled_status
-        ]
-        results = await asyncio.gather(*tasks)
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+        update_tasks = []
 
+        async def _guarded_update(ip: str):
+            async with sem:
+                node = await self._get_node(ip)
+                if node and (node.enabled or ignore_enabled_status):
+                    await self.update_single(ip, timeout)
+
+        for ip in self.node_ips:
+            update_tasks.append(asyncio.create_task(_guarded_update(ip)))
+
+        if update_tasks:
+            await asyncio.gather(*update_tasks, return_exceptions=True)
+
+        self._logger.info(
+            f"[DISCOVERY] update_all_nodes done: nodes={len(self.nodes)}, ips={len(self.node_ips)}"
+        )
         return self.nodes
 
     @async_log_errors
     async def update_single(self, IP: str, timeout: int = 5):
 
+        self._logger.debug(
+            f"[DISCOVERY] update_single start for {IP} (timeout={timeout})"
+        )
         await self._create_new_node(IP)
 
         try:
             response = await self._get_ip_info(IP, timeout=timeout)
+            self._logger.debug(
+                f"[DISCOVERY] _get_ip_info response for {IP}: type={type(response).__name__}"
+            )
 
             if not response:
+                node = await self._get_node(IP)
+                if node:
+                    node.enabled = False
                 raise NetworkRequestException("Couldnt reach host")
 
             # Check if it's a MockResponse (418 error)
             if hasattr(response, "status_code") and response.status_code == 418:
-                (await self._get_node(IP)).enabled = False
+                node = await self._get_node(IP)
+                if node:
+                    node.enabled = False
                 raise NodeException("Host is not discoverable")
 
             # Response is now a dict, not an httpx.Response
             if not isinstance(response, dict):
+                node = await self._get_node(IP)
+                if node:
+                    node.enabled = False
                 raise NetworkRequestException(f"Invalid response format from {IP}")
 
+            # Update node info and mark enabled
+            node = await self._get_node(IP)
+            if node:
+                node.enabled = True
             await (await self._get_node(IP)).update(response, self.plugin_core.hostname)
 
+            # Cascade discovery for returned auto_discoverable nodes
+            followups = []
             for sub_node in response.get("nodes", []):
+                sub_ip, sub_hostname = sub_node[0], sub_node[1]
                 if (
-                    sub_node[0] not in self.node_ips
-                    and sub_node[1] != self.plugin_core.hostname
+                    sub_ip not in self.node_ips
+                    and sub_hostname != self.plugin_core.hostname
                 ):
-                    await self._add_ip(sub_node[0])
+                    await self._add_ip(sub_ip)
+                    await self._create_new_node(sub_ip, sub_hostname)
+                    followups.append(self.update_single(sub_ip))
 
-                    await self._create_new_node(sub_node[0], sub_node[1])
-
-                    await self.update_single(sub_node[0])
-
-                if sub_node[1] != self.plugin_core.hostname:
-                    self._logger.info(f"[DISCOVERY] Node found at {IP}")
-
+                if sub_hostname != self.plugin_core.hostname:
+                    self._logger.info(f"[DISCOVERY] Node found at {sub_ip}")
                 else:
-                    self._logger.info(f"[DISCOVERY] Found own node at {IP}")
+                    self._logger.info(f"[DISCOVERY] Found own node at {sub_ip}")
+
+            if followups:
+                self._logger.debug(
+                    f"[DISCOVERY] Scheduling follow-up updates: count={len(followups)}"
+                )
+                await asyncio.gather(*followups, return_exceptions=True)
 
         except Exception as e:
             self._logger.debug(f"[DISCOVERY] Failed to reach {IP}: {e}")
 
     @async_log_errors
     async def _add_ip(self, IP):
+        self._logger.debug(f"[DISCOVERY] Adding IP to list: {IP}")
         await self.node_ips.append(IP)
 
     @async_log_errors
     async def _create_nodes(self, IP_list: list):
+        self._logger.debug(f"[DISCOVERY] Creating Node objects for {len(IP_list)} IPs")
         for IP in IP_list:
             await self._create_new_node(IP)
 
@@ -1192,6 +1581,9 @@ class NetworkManager:
     async def _create_new_node(self, IP: str, hostname: Union[str, None] = None):
         if not await self.node_exists(IP):
 
+            self._logger.debug(
+                f"[DISCOVERY] Creating new Node: ip={IP}, hostname={hostname}"
+            )
             self.nodes.append(
                 Node(IP=IP, hostname=hostname, enabled=True, auto_discoverable=False)
             )
@@ -1206,6 +1598,7 @@ class NetworkManager:
         connection_returned = False
 
         try:
+            self._logger.debug(f"[GET_INFO] Connecting to {IP} (timeout={timeout})")
             reader, writer = await self._get_connection(IP)
 
             request_data = {
@@ -1213,11 +1606,18 @@ class NetworkManager:
                 "discover_nodes_info": self.discover_nodes,
             }
 
+            self._logger.debug(f"[GET_INFO] Sending INFO to {IP}: {request_data}")
             await self._send_message(writer, MSG_INFO, request_data)
 
             msg_type, data = await self._receive_message(reader)
+            self._logger.debug(
+                f"[GET_INFO] Received message from {IP}: type={msg_type}, data_type={type(data).__name__}"
+            )
 
             if msg_type == MSG_RESULT:
+                self._logger.debug(
+                    f"[GET_INFO] Result from {IP}: keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+                )
                 return data
             elif msg_type == MSG_ERROR:
                 # Check for 418 error (not discoverable)
@@ -1238,6 +1638,7 @@ class NetworkManager:
         finally:
             if reader and writer and not connection_returned:
                 try:
+                    self._logger.debug(f"[GET_INFO] Returning connection for {IP}")
                     await self._return_connection(IP, reader, writer)
                     connection_returned = True
                 except Exception:
@@ -1249,14 +1650,17 @@ class NetworkManager:
 
     @async_log_errors
     async def _delete_node(self, IP: str):
+        self._logger.info(f"[NODE] Deleting node {IP}")
         self.nodes.remove(await self._get_node(IP))
 
     @async_log_errors
     async def _enable_node(self, IP: str):
+        self._logger.info(f"[NODE] Enabling node {IP}")
         (await self._get_node(IP)).enabled = True
 
     @async_log_errors
     async def _disable_node(self, IP: str):
+        self._logger.info(f"[NODE] Disabling node {IP}")
         (await self._get_node(IP)).enabled = False
 
     @async_log_errors
@@ -1302,6 +1706,9 @@ class NetworkManager:
         connection_returned = False
 
         try:
+            self._logger.debug(
+                f"[HEARTBEAT] Pinging node {node.IP} (timeout={timeout})"
+            )
             reader, writer = await self._get_connection(node.IP)
 
             await self._send_message(writer, MSG_PING, {})
@@ -1312,6 +1719,7 @@ class NetworkManager:
 
             if msg_type == MSG_RESULT and data.get("status") == "ok":
                 await node.heartbeat()
+                self._logger.debug(f"[HEARTBEAT] Node {node.IP} is alive")
                 return True
             return False
 
@@ -1323,6 +1731,9 @@ class NetworkManager:
         finally:
             if reader and writer and not connection_returned:
                 try:
+                    self._logger.debug(
+                        f"[HEARTBEAT] Returning connection for {node.IP}"
+                    )
                     await self._return_connection(node.IP, reader, writer)
                     connection_returned = True
                 except Exception:
@@ -1341,8 +1752,16 @@ class NetworkManager:
         writer = None
         connection_returned = False
 
+        self._logger.info(
+            f"[ENDPOINT] Checking endpoint on node {IP}: access_name='{access_name}', "
+            f"plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
+            f"target_plugin={target_plugin}"
+        )
+
         try:
+            self._logger.debug(f"[ENDPOINT] Getting connection to {IP}")
             reader, writer = await self._get_connection(IP)
+            self._logger.debug(f"[ENDPOINT] Connection acquired to {IP}")
 
             request_data = {
                 "access_name": access_name,
@@ -1351,29 +1770,55 @@ class NetworkManager:
                 "target_plugin": target_plugin,
             }
 
+            self._logger.debug(
+                f"[ENDPOINT] Sending HAS_ENDPOINT message to {IP}: {request_data}"
+            )
             await self._send_message(writer, MSG_HAS_ENDPOINT, request_data)
+            self._logger.debug(f"[ENDPOINT] HAS_ENDPOINT message sent to {IP}")
 
+            self._logger.debug(f"[ENDPOINT] Waiting for response from {IP}")
             msg_type, data = await self._receive_message(reader)
+            self._logger.debug(
+                f"[ENDPOINT] Received message from {IP}: type={msg_type}, "
+                f"data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+            )
 
             if msg_type == MSG_RESULT:
+                available = data.get("available", False)
+                self._logger.info(
+                    f"[ENDPOINT] Endpoint check result from {IP}: available={available}, "
+                    f"hostname={data.get('hostname')}, "
+                    f"plugin_info={data.get('plugin_info')}, "
+                    f"endpoint={data.get('endpoint')}"
+                )
                 return data
             elif msg_type == MSG_ERROR:
-                self._logger.debug(f"Node {IP} returned error for has_endpoint: {data}")
+                self._logger.warning(
+                    f"[ENDPOINT] Node {IP} returned error for has_endpoint: {data}"
+                )
                 return None
             else:
-                self._logger.warning(f"Unexpected message type {msg_type} from {IP}")
+                self._logger.warning(
+                    f"[ENDPOINT] Unexpected message type {msg_type} from {IP}"
+                )
                 return None
 
         except Exception as e:
-            self._logger.debug(f"Error checking endpoint on {IP}: {e}")
+            self._logger.exception(f"[ENDPOINT] Error checking endpoint on {IP}: {e}")
             return None
         finally:
             if reader and writer and not connection_returned:
                 try:
+                    self._logger.debug(
+                        f"[ENDPOINT] Returning connection to pool for {IP}"
+                    )
                     await self._return_connection(IP, reader, writer)
                     connection_returned = True
                 except Exception:
                     try:
+                        self._logger.debug(
+                            f"[ENDPOINT] Closing connection to {IP} (pool return failed)"
+                        )
                         writer.close()
                         await writer.wait_closed()
                     except Exception:

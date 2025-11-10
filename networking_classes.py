@@ -70,10 +70,8 @@ class Node:
 
     async def is_alive(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds"""
-        # return (int(time.time()) - self.last_heartbeat) < timeout
-        return True  # FIXME: Please PLEASE 🙏🙏 remove later
+        return (int(time.time()) - self.last_heartbeat) < timeout
 
     def is_alive_sync(self, timeout=30):
         """Returns True if last heartbeat was within timeout seconds"""
-        # return (int(time.time()) - self.last_heartbeat) < timeout
-        return True  # FIXME: Please PLEASE 🙏🙏 remove later
+        return (int(time.time()) - self.last_heartbeat) < timeout

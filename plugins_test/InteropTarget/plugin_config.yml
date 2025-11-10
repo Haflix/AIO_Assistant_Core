@@ -1,0 +1,68 @@
+description: Interop target plugin exposing sync/async and generator endpoints
+version: 0.0.1
+remote: True
+arguments:
+endpoints:
+  - internal_name: sync_add
+    access_name: it_sync_add
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Synchronous add
+    arguments:
+      - name: a
+        type: any
+        description: First addend
+      - name: b
+        type: any
+        description: Second addend (default 1)
+
+  - internal_name: async_add
+    access_name: it_async_add
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Asynchronous add
+    arguments:
+      - name: a
+        type: any
+        description: First addend
+      - name: b
+        type: any
+        description: Second addend (default 1)
+
+  - internal_name: sync_gen
+    access_name: it_sync_gen
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Synchronous generator emitting strings
+    arguments:
+      - name: n
+        type: int
+        description: Number of items
+      - name: prefix
+        type: str
+        description: Prefix for emitted items
+      - name: delay_ms
+        type: int
+        description: Delay between items in ms
+
+  - internal_name: async_gen
+    access_name: it_async_gen
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Asynchronous generator emitting strings
+    arguments:
+      - name: n
+        type: int
+        description: Number of items
+      - name: prefix
+        type: str
+        description: Prefix for emitted items
+      - name: delay_ms
+        type: int
+        description: Delay between items in ms
+
+
