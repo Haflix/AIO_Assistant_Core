@@ -1,0 +1,6 @@
+description: CLI plugin that allows you to run commands and scripts with plugins
+version: 0.0.1
+remote: False
+arguments:
+endpoints:
+

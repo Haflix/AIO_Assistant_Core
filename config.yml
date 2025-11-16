@@ -20,6 +20,10 @@ plugins:
     enabled: true
     path: ./plugins_test/InteropCaller
 
+  - name: CLI
+    enabled: true
+    path: ./plugins_test/CLI
+
 
 
 

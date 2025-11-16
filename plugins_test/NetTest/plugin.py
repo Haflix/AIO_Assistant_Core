@@ -1,5 +1,5 @@
 from utils import Plugin
-from decorators import log_errors, async_log_errors
+from decorators import log_errors, async_log_errors, async_gen_log_errors
 import asyncio
 
 
@@ -35,7 +35,7 @@ class NetTest(Plugin):
 
     # ----- Streaming endpoints -----
 
-    @async_log_errors
+    @async_gen_log_errors
     async def stream_count(self, n: int = 10, delay_ms: int = 50):
         """Yield integers 0..n-1 with a small delay to test streaming."""
         delay = max(0, int(delay_ms)) / 1000.0
@@ -43,7 +43,7 @@ class NetTest(Plugin):
             await asyncio.sleep(delay)
             yield i
 
-    @async_log_errors
+    @async_gen_log_errors
     async def stream_big(self, chunks: int = 3, size_mb: int = 2, delay_ms: int = 50):
         """Yield a few large blobs to test chunked streaming of big items."""
         chunks = max(1, int(chunks))
