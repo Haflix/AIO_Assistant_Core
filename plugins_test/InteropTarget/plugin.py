@@ -1,5 +1,10 @@
 from utils import Plugin
-from decorators import log_errors, async_log_errors
+from decorators import (
+    log_errors,
+    async_log_errors,
+    gen_log_errors,
+    async_gen_log_errors,
+)
 import asyncio
 import time
 
@@ -39,6 +44,7 @@ class InteropTarget(Plugin):
 
     # ----- Generator endpoints -----
 
+    @gen_log_errors
     def sync_gen(self, n=3, prefix="g", delay_ms=10):
         """Synchronous generator yielding prefix+index strings optionally delayed by sleep."""
         n = max(0, int(n))
@@ -48,6 +54,7 @@ class InteropTarget(Plugin):
                 time.sleep(delay_s)
             yield f"{prefix}{i}"
 
+    @async_gen_log_errors
     async def async_gen(self, n=3, prefix="ag", delay_ms=10):
         """Async generator yielding prefix+index strings with asyncio sleep."""
         n = max(0, int(n))

@@ -24,3 +24,14 @@ endpoints:
       - name: arguments
         type: int
         description:
+        
+  - internal_name: background_stream
+    access_name: background_stream
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description:
+    arguments:
+      - name: arguments
+        type: int
+        description:

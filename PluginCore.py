@@ -219,7 +219,11 @@ class PluginCore:
                 await warn_config(f"{name} missing {field} in plugin_config.yml")
 
         # Validate endpoints config
-        for endpoint in plugin_config["endpoints"]:
+        for endpoint in (
+            plugin_config["endpoints"]
+            if isinstance(plugin_config["endpoints"], list)
+            else []
+        ):
             for field in [
                 "internal_name",
                 "access_name",
@@ -339,6 +343,87 @@ class PluginCore:
             self._logger.info("Purged all plugins")
         except Exception as error:
             raise Exception(f"Error while purging plugins: {error}")
+
+    @async_log_errors
+    async def purge_plugins_except(self, excluded_names: List[str]):
+        """Purge all plugins except those in the excluded_names list."""
+        self._logger.info(f"Purging plugins except: {excluded_names}")
+        try:
+            plugins_to_purge = [
+                name for name in list(self.plugins.keys()) if name not in excluded_names
+            ]
+            for plugin_name in plugins_to_purge:
+                await self._disable_plugin(plugin_name)
+            async with self.plugin_lock:
+                for plugin_name in plugins_to_purge:
+                    plugin = self.plugins.pop(plugin_name, None)
+                    if plugin:
+                        plugin_uuid = getattr(plugin, "plugin_uuid", None)
+                        if plugin_uuid and plugin_uuid in self.plugins_by_uuid:
+                            self.plugins_by_uuid.pop(plugin_uuid, None)
+            self._logger.info(
+                f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
+            )
+        except Exception as error:
+            raise Exception(f"Error while purging plugins: {error}")
+
+    @async_log_errors
+    async def get_plugin_info(self, plugin_name: str) -> Optional[Dict[str, Any]]:
+        """Get structured information about a plugin."""
+        async with self.plugin_lock:
+            plugin = self.plugins.get(plugin_name)
+            if not plugin:
+                return None
+
+            return {
+                "name": plugin.plugin_name,
+                "version": getattr(plugin, "version", "unknown"),
+                "uuid": plugin.plugin_uuid,
+                "enabled": plugin.enabled,
+                "remote": getattr(plugin, "remote", False),
+                "description": getattr(plugin, "description", "No description"),
+                "arguments": getattr(plugin, "arguments", None),
+            }
+
+    @async_log_errors
+    async def get_plugin_endpoints(
+        self, plugin_name: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Get all endpoints for a plugin."""
+        async with self.plugin_lock:
+            plugin = self.plugins.get(plugin_name)
+            if not plugin:
+                return None
+
+            endpoints = getattr(plugin, "endpoints", [])
+            if not isinstance(endpoints, list):
+                return []
+
+            return [
+                {
+                    "access_name": ep.get("access_name", ""),
+                    "internal_name": ep.get("internal_name", ""),
+                    "remote": ep.get("remote", False),
+                    "accessible_by_other_plugins": ep.get(
+                        "accessible_by_other_plugins", False
+                    ),
+                    "description": ep.get("description", ""),
+                    "tags": ep.get("tags", []),
+                }
+                for ep in endpoints
+                if isinstance(ep, dict)
+            ]
+
+    @async_log_errors
+    async def graceful_shutdown(self):
+        """Gracefully shutdown the system by closing PluginCore."""
+        self._logger.info("Initiating graceful shutdown...")
+        await self.close()
+        self._logger.info(
+            "PluginCore closed. Event loop should be stopped by the application."
+        )
+        # Note: Stopping the event loop should be handled by the main application
+        # This method just ensures PluginCore is properly closed
 
     @async_handle_errors(None)
     async def _enable_plugin(self, plugin_name: str):

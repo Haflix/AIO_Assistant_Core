@@ -20,7 +20,7 @@ async def main():
     # print("Discovered nodes:" + "\n".join(node.__str__() for node in nodes))
 
     result = await plugin_core.execute(
-        "InteropCaller", "interop_run", {"host": "remote"}, host="any"
+        "InteropCaller", "interop_run", {"host": "any"}, host="any"
     )
     plugin_core._logger.info(f"Result from Test: {result}")
 
