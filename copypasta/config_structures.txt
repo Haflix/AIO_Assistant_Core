@@ -1,32 +1,61 @@
 config.yml:::
+================================================================================
+Main configuration file for the AIO Assistant Core system.
+Place this in the root directory of your project.
+
 plugins:
-  - name: str
-    enabled: boolean
-    path: str | Empty
-    version: str | Empty so it doesnt check for version
-    arguments: 
-        [Any] | Empty
+  - name: str                    # Plugin name (must match class name in plugin.py)
+    enabled: boolean             # Whether to load and enable this plugin on startup
+    path: str | Empty            # Optional: Explicit path to plugin directory
+                                 # If empty, auto-resolves to plugin_package/<name>
+    arguments:                   # Optional: Arguments passed to plugin during load
+        [Any] | Empty            # Can be any data structure (dict, list, etc.)
 
   - name: str
     enabled: boolean
     path: str | Empty
-    version: str | Empty
     arguments: 
         [Any] | Empty
 
 
 general:
-    hostname: str | Empty for same as usual hostname
-    plugin_package: str | tries to use "plugins" as basedir if empty
-    console_log_level: str | Will use DEBUG if empty or if it doesnt exist
+    hostname: str                # Unique identifier for this node (used in networking)
+                                 # Empty = uses system hostname
+    plugin_package: str          # Base directory for plugins when path is not specified
+                                 # Default: "plugins"
+    console_log_level: str       # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+                                 # Default: "DEBUG"
 
 networking:
-    enabled: boolean
-    network_ip: str | Your IP inside of a network (VPN recommended)
-    port: int | Port for all the networking
+    enabled: boolean             # Enable/disable networking features
+    node_ips:                    # List of known node IP addresses for manual connection
+      - "str"                    # Example: "172.23.0.12"
+      - "str"                    # Example: "172.23.0.18"
+    port: int                    # Port for all networking communication
+                                 # Default: 2510
+    discover_nodes: boolean      # Enable automatic discovery of nodes on the network
+    direct_discoverable: boolean # Allow other nodes to discover this node directly
+    auto_discoverable: boolean   # Enable automatic discovery broadcasting
 
 
-plugin_config.yml:::(in folder with its plugin. every plugin should have its own folder)
+plugin_config.yml:::
+================================================================================
+Plugin-specific configuration file.
+Place this in the same folder as plugin.py. Every plugin should have its own folder.
 
-description: str
-version: str
+description: str                 # Description of what the plugin does
+version: str                     # Plugin version (e.g., "1.0.0")
+remote: boolean                  # Whether this plugin should be accessible remotely
+arguments:                       # Optional: List of arguments expected during loading
+endpoints:                       # List of methods that can be called by other plugins
+  - internal_name: str           # Actual method name in the plugin class
+    access_name: str             # Name used when calling from other plugins
+    tags:                        # Optional: List of tags for categorization
+      - str
+    remote: boolean              # Whether this endpoint can be called remotely
+    accessible_by_other_plugins: boolean  # Whether other plugins can call this
+    description: str             # Description of what the endpoint does
+    arguments:                   # List of arguments this endpoint accepts
+      - name: str                # Argument name
+        type: str                # Argument type (int, str, dict, list, any, etc.)
+        description: str         # Description of the argument

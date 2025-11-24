@@ -12,34 +12,28 @@ from decorators import (
 import asyncio
 
 
-class AveragePlugin(Plugin):
+class AI_Interaction_Plugin(Plugin):
     """
-    Example plugin demonstrating the AIO Assistant Core plugin structure.
-
-    This plugin shows:
-    - Basic plugin lifecycle (on_load, on_enable, on_disable)
-    - Using decorators for error handling and logging
-    - Calling other plugins via self.execute()
-    - Both simple and streaming methods
+    This plugin is used to interact with the AI.
     """
 
     @log_errors
     def on_load(self, *args, **kwargs):
         """Called when the plugin is first loaded. Use for initialization."""
-        self._logger.debug(f"AveragePlugin loaded")
+        self._logger.debug(f"AI_Interaction_Plugin loaded")
         # Initialize any instance variables here
         self.state = {}
 
     @async_log_errors
     async def on_enable(self):
         """Called when the plugin is enabled. Use for async setup."""
-        self._logger.debug(f"AveragePlugin enabled")
+        self._logger.debug(f"AI_Interaction_Plugin enabled")
         # Start any background tasks or async initialization here
 
     @async_log_errors
     async def on_disable(self):
         """Called when the plugin is disabled. Use for cleanup."""
-        self._logger.debug(f"AveragePlugin disabled")
+        self._logger.debug(f"AI_Interaction_Plugin disabled")
         # Clean up resources, stop background tasks, etc.
 
     @async_log_errors

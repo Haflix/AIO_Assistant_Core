@@ -9,6 +9,9 @@ __pycache__/
 # VS-Code
 .vscode/
 
+# Personal files
+_old/
+
 # Distribution / packaging
 .Python
 build/
