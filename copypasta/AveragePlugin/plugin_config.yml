@@ -1,2 +1,43 @@
-description: Example async plugin
-version: 0.0.1
+description: Example plugin demonstrating the AIO Assistant Core plugin structure
+version: 1.0.0
+remote: True  # Set to True if this plugin should be accessible remotely
+arguments:  # Optional: Arguments passed during plugin loading
+endpoints:
+  - internal_name: example_method  # Method name in the plugin class
+    access_name: example_method  # Name used when calling from other plugins
+    tags: []  # Optional: Tags for categorization
+    remote: True  # Set to True if this endpoint can be called remotely
+    accessible_by_other_plugins: True  # Set to True to allow other plugins to call this
+    description: Example method that doubles the input value
+    arguments:
+      - name: value
+        type: any
+        description: Input value to process
+  
+  - internal_name: call_other_plugin
+    access_name: call_other_plugin
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Example showing how to call another plugin
+    arguments:
+      - name: plugin_name
+        type: str
+        description: Name of the plugin to call
+      - name: method_name
+        type: str
+        description: Method to execute
+      - name: args
+        type: any
+        description: Arguments to pass to the method
+  
+  - internal_name: example_stream
+    access_name: example_stream
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Example streaming method that yields multiple results
+    arguments:
+      - name: count
+        type: int
+        description: Number of items to yield
