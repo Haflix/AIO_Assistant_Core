@@ -480,10 +480,6 @@ class Plugin(ABC):
         """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
 
-    def perform_operation(self, argument):
-        """Override this method to implement plugin operations."""
-        raise NotImplementedError
-
 
 class Request:
     """Represents a request from one plugin to another."""
@@ -668,6 +664,7 @@ class GeneratorRequest:
     async def get_queue_stream(self):
         """get the result stream asynchronously"""
         # FIXME THIS IS WRONG CODE. LOOK AT THE OLD CODE BELOW AND THE TESTED SCRIPTS. or. uh idk. just stop on end of queue and implement the error handling from below
+        # Idk if this is correct, but it works for now.
         try:
             if self.result is not None:
                 # return self.result, self.error, False
@@ -704,7 +701,6 @@ class GeneratorRequest:
                     self.timeout = True
                     await self.set_result(self.result, True, True)
                     raise e
-                    break
 
                 try:
                     if error:
@@ -717,7 +713,6 @@ class GeneratorRequest:
                 except Exception as e:
                     await self.set_result(str(e), True, self.timeout)
                     raise e
-                    break
 
         except Exception as e:
             await self.set_result(str(e), True, self.timeout)
@@ -725,53 +720,6 @@ class GeneratorRequest:
 
         finally:
             await self.set_result(None, self.error, self.timeout)
-
-    # def get_result_sync(self) -> Any:
-
-
-#        """Get the result synchronously."""
-#        future = asyncio.run_coroutine_threadsafe(self.wait_for_result_async(), self.event_loop)
-#        try:
-#            result, error, timed_out = future.result()
-#            if error:
-#                raise Exception(f"Request failed: {self.result}")
-#            return self.result
-#        except Exception as e:
-#            raise e
-
-# async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
-#        """Wait for the result asynchronously."""
-#        try:
-#            if self.result is not None:
-#                return self.result, self.error, False
-#
-#            # Check if we need to apply a timeout
-#            if self.timeout_duration:
-#                remaining_time = self.timeout_duration - (time.time() - self.created_at)
-#                if remaining_time <= 0:
-#                    # Already timed out
-#                    self.result = f"Request {self.id} timed out"
-#                    self.error = True
-#                    self.ready = True
-#                    self.timeout = True
-#                    return self.result, True, True
-#
-#                # Wait with timeout
-#                try:
-#                    result, error, timed_out = await asyncio.wait_for(self._future, timeout=remaining_time)
-#                    return result, error, timed_out
-#                except asyncio.TimeoutError:
-#                    self.result = f"Request {self.id} timed out"
-#                    self.error = True
-#                    self.ready = True
-#                    self.timeout = True
-#                    return self.result, True, True
-#            else:
-#                # Wait indefinitely
-#                result, error, timed_out = await self._future
-#                return result, error, timed_out
-#        except Exception as e:
-#            return str(e), True, False
 
 
 class EndOfQueue:

@@ -22,10 +22,12 @@ async def main():
     result = await plugin_core.execute(
         "InteropCaller", "interop_run", {"host": "any"}, host="any"
     )
-    plugin_core._logger.info(f"Result from Test: {result}")
+    plugin_core._logger.info(f"Result from Test Async: {result}")
 
-    # plugin_core.execute_sync("InteropCaller", "interop_run", host="any")
-
+    result = await plugin_core.execute(
+        "InteropCaller", "interop_run_sync", {"host": "any"}, host="any"
+    )
+    plugin_core._logger.info(f"Result from Test Sync: {result}")
     # Example of using the one-liner execute method
     # result2 = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
     # plugin_core._logger.info(f"Result from PluginB: {result2}")

@@ -1268,16 +1268,7 @@ class PluginCore:
             author = self.hostname
             author_id = self.hostname
 
-        ### Not supported: a synchronous wrapper for an async generator is ambiguous.
-        ##raise NotImplementedError(
-        ##    "execute_stream_sync is not supported. Use execute_stream (async) or request a blocking adapter."
-        ##)
-
-        if author == "system":
-            author = self.hostname
-            author_id = self.hostname
-
-        gen = self.execute_stream(
+        request = self.create_gen_request_sync(
             plugin,
             method,
             args,
@@ -1290,8 +1281,13 @@ class PluginCore:
             request_id,
         )
 
-        try:
-            while True:
-                yield self.main_event_loop.run_until_complete(gen.__anext__())
-        except StopAsyncIteration:
-            pass
+        for result, error, _ in request.get_queue_stream_sync():
+
+            if error:
+                self._logger.warning(
+                    f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID."
+                )
+                raise RequestException(result)
+            yield result
+
+        asyncio.run_coroutine_threadsafe(request.set_collected(), self.main_event_loop)
