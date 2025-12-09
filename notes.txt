@@ -2,10 +2,13 @@
 
 [ ] Stream decorators & warning if you use the wrong one
 
+[ ] Pipeline/Datastream
+    -> for continuous data processing that can be used for streaming and batch processing by giving it as a parameter
+
+
+
 Other:
 - Methoddescriptions
-- Logging (add and improve)
-
 
 Notes:
 - Check on request if requester is eligible

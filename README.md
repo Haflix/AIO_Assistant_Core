@@ -1,6 +1,7 @@
 # AIO Assistant Core Documentation
 
 ## Table of Contents
+
 1. [Overview](#overview)
 2. [Getting Started](#getting-started)
 3. [Architecture](#architecture)
@@ -51,10 +52,10 @@ from PluginCore import PluginCore
 async def main():
     # Initialize the plugin system
     plugin_core = PluginCore("config.yml")
-    
+  
     # Wait for plugins to be loaded
     await plugin_core.wait_until_ready()
-    
+  
     # Execute a plugin method
     result = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
     print(f"Result: {result}")
@@ -81,9 +82,9 @@ if __name__ == "__main__":
 ### Component Interaction
 
 ```
-┌─────────────────┐
+┌──────────────────┐
 │  main_application│
-└────────┬────────┘
+└────────┬─────────┘
          │
          ▼
 ┌─────────────────┐
@@ -109,6 +110,7 @@ The main class that manages all plugins and facilitates communication between th
 **Location**: `PluginCore.py`
 
 **Key Responsibilities**:
+
 - Loading and managing plugins
 - Handling plugin requests
 - Managing plugin lifecycle (enable/disable)
@@ -116,6 +118,7 @@ The main class that manages all plugins and facilitates communication between th
 - Request processing and result management
 
 **Key Methods**:
+
 - `execute()` - Execute a plugin method asynchronously
 - `execute_sync()` - Execute a plugin method synchronously
 - `execute_stream()` - Execute a generator/streaming plugin method
@@ -132,6 +135,7 @@ Manages network communication between multiple nodes for distributed plugin exec
 **Location**: `networking.py`
 
 **Key Features**:
+
 - Node discovery (auto-discovery and manual node IPs)
 - FastAPI-based REST API for plugin communication
 - Plugin availability checking across nodes
@@ -139,6 +143,7 @@ Manages network communication between multiple nodes for distributed plugin exec
 - Streaming support for remote generators
 
 **HTTP Endpoints**:
+
 - `GET /ping` - Health check
 - `GET /has_plugin` - Check if a plugin exists
 - `POST /info` - Exchange node information
@@ -152,11 +157,13 @@ All plugins must inherit from the `Plugin` base class.
 **Location**: `utils.py`
 
 **Required Methods**:
+
 - `on_load(*args, **kwargs)` - Called when plugin is loaded
 - `on_enable()` - Called when plugin is enabled (async)
 - `on_disable()` - Called when plugin is disabled (async)
 
 **Properties**:
+
 - `plugin_name` - Name of the plugin
 - `version` - Plugin version
 - `plugin_uuid` - Unique identifier for the plugin instance
@@ -172,34 +179,35 @@ All plugins must inherit from the `Plugin` base class.
 ### Creating a Plugin
 
 1. **Create a plugin directory** (e.g., `plugins_test/MyPlugin/`)
-
 2. **Create `plugin.py`**:
+
 ```python
 from utils import Plugin
 from decorators import async_log_errors
 
 class MyPlugin(Plugin):
     """Example plugin."""
-    
+  
     def on_load(self, *args, **kwargs):
         self.plugin_name = "MyPlugin"
         self.version = "1.0.0"
         self.description = "My custom plugin"
-        
+      
     @async_log_errors
     async def on_enable(self):
         self._logger.info("Plugin enabled!")
-        
+      
     @async_log_errors
     async def on_disable(self):
         self._logger.info("Plugin disabled!")
-        
+      
     async def my_method(self, arg1, arg2):
         """Example method that can be called from other plugins."""
         return arg1 + arg2
 ```
 
 3. **Create `plugin_config.yml`**:
+
 ```yaml
 description: My custom plugin
 version: 1.0.0
@@ -222,6 +230,7 @@ endpoints:
 ```
 
 4. **Add to `config.yml`**:
+
 ```yaml
 plugins:
   - name: MyPlugin
@@ -337,16 +346,19 @@ networking:
 ### Configuration Options
 
 **General**:
+
 - `hostname`: Unique identifier for this node (used in network communication)
 - `plugin_package`: Default directory where plugins are located if path is not specified
 - `console_log_level`: Logging level for console output
 
 **Plugins**:
+
 - `name`: Plugin name (must match class name)
 - `enabled`: Whether to load and enable this plugin
 - `path`: Optional explicit path to plugin directory
 
 **Networking**:
+
 - `enabled`: Enable/disable networking
 - `node_ips`: List of known node IP addresses for manual connection
 - `port`: Port number for network communication
@@ -365,6 +377,7 @@ networking:
 Execute a plugin method asynchronously.
 
 **Parameters**:
+
 - `plugin` (str): Name of the plugin
 - `method` (str): Method name to execute
 - `args` (tuple/dict/None): Arguments to pass to the method
@@ -422,6 +435,7 @@ Unload all plugins.
 Remove a specific plugin by name.
 
 **Parameters**:
+
 - `plugin_name` (str): Name of plugin to remove
 
 **Returns**: None (coroutine)
@@ -472,7 +486,7 @@ from PluginCore import PluginCore
 async def main():
     plugin_core = PluginCore("config.yml")
     await plugin_core.wait_until_ready()
-    
+  
     # Execute a simple calculation
     result = await plugin_core.execute(
         "PluginB", 
@@ -491,7 +505,7 @@ asyncio.run(main())
 async def main():
     plugin_core = PluginCore("config.yml")
     await plugin_core.wait_until_ready()
-    
+  
     # Process streaming results
     async for item in plugin_core.execute_stream(
         "PluginA", 
@@ -511,7 +525,7 @@ from decorators import async_log_errors
 class PluginA(Plugin):
     def on_load(self, *args, **kwargs):
         self.plugin_name = "PluginA"
-        
+      
     @async_log_errors
     async def on_enable(self):
         # Call another plugin from within this plugin
@@ -522,7 +536,7 @@ class PluginA(Plugin):
             host="local"
         )
         self._logger.info(f"Got result: {result}")
-        
+      
     async def process_data(self, data):
         # Your plugin logic here
         return processed_data
@@ -538,7 +552,7 @@ class SafePlugin(Plugin):
     async def safe_calculation(self, x):
         # If this raises an exception, returns 0 instead
         return x / 0  # This would normally crash
-        
+      
     @async_log_errors
     async def logged_operation(self):
         # Exceptions are logged but still raised
@@ -551,7 +565,7 @@ class SafePlugin(Plugin):
 async def main():
     plugin_core = PluginCore("config.yml")
     await plugin_core.wait_until_ready()
-    
+  
     # Execute on any available node (will find remote if local not available)
     result = await plugin_core.execute(
         "RemotePlugin", 
@@ -656,4 +670,3 @@ See `LICENSE` file for details.
 ## Support
 
 For issues, questions, or contributions, please refer to the project repository.
-
