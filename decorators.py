@@ -3,6 +3,65 @@ import inspect
 import logging
 import traceback
 from typing import Callable, Any, Optional
+from exceptions import PluginTypeMissmatchError
+
+
+def _check_type(func, expected_type, correct_decorator):
+    """
+    Helper function to check if the function type matches the expected type.
+    """
+    if expected_type == "sync":
+        if inspect.iscoroutinefunction(func):
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is a coroutine. Use @async_{correct_decorator} instead. Fix in called plugin."
+            )
+        if inspect.isasyncgenfunction(func):
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is an async generator. Use @async_gen_{correct_decorator} instead. Fix in called plugin."
+            )
+        if inspect.isgeneratorfunction(func):
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is a generator. Use @gen_{correct_decorator} instead. Fix in called plugin."
+            )
+    elif expected_type == "async":
+        if not inspect.iscoroutinefunction(func):
+            if inspect.isgeneratorfunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is a generator. Use @gen_{correct_decorator} instead. Fix in called plugin."
+                )
+            if inspect.isasyncgenfunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is an async generator. Use @async_gen_{correct_decorator} instead. Fix in called plugin."
+                )
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is not a coroutine. Use @{correct_decorator} instead. Fix in called plugin."
+            )
+    elif expected_type == "gen":
+        if not inspect.isgeneratorfunction(func):
+            if inspect.iscoroutinefunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is a coroutine. Use @async_{correct_decorator} instead. Fix in called plugin."
+                )
+            if inspect.isasyncgenfunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is an async generator. Use @async_gen_{correct_decorator} instead. Fix in called plugin."
+                )
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is not a generator. Use @{correct_decorator} instead. Fix in called plugin."
+            )
+    elif expected_type == "async_gen":
+        if not inspect.isasyncgenfunction(func):
+            if inspect.iscoroutinefunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is a coroutine. Use @async_{correct_decorator} instead. Fix in called plugin."
+                )
+            if inspect.isgeneratorfunction(func):
+                raise PluginTypeMissmatchError(
+                    f"Function {func.__name__} is a generator. Use @gen_{correct_decorator} instead. Fix in called plugin."
+                )
+            raise PluginTypeMissmatchError(
+                f"Function {func.__name__} is not an async generator. Use @{correct_decorator} or appropriate decorator. Fix in called plugin."
+            )
 
 
 def log_errors(logger: Optional[logging.Logger] = None):
@@ -19,6 +78,8 @@ def log_errors(logger: Optional[logging.Logger] = None):
     """
 
     def decorator(func):
+        _check_type(func, "sync", "log_errors")
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if not provided
@@ -73,6 +134,8 @@ def handle_errors(default_return: Any = None, logger: Optional[logging.Logger] =
     """
 
     def decorator(func):
+        _check_type(func, "sync", "handle_errors")
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if not provided
@@ -113,6 +176,7 @@ def async_log_errors(func):
     """
     Decorator for async functions to log exceptions without affecting the function's behavior.
     """
+    _check_type(func, "async", "log_errors")
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
@@ -161,6 +225,8 @@ def async_handle_errors(default_return=None):
     """
 
     def decorator(func):
+        _check_type(func, "async", "handle_errors")
+
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if available
@@ -219,6 +285,8 @@ def gen_log_errors(logger: Optional[logging.Logger] = None):
     """
 
     def decorator(func):
+        _check_type(func, "gen", "log_errors")
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if not provided
@@ -284,6 +352,8 @@ def gen_handle_errors(
     """
 
     def decorator(func):
+        _check_type(func, "gen", "handle_errors")
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if not provided
@@ -343,6 +413,8 @@ def async_gen_log_errors(logger: Optional[logging.Logger] = None):
     """
 
     def decorator(func):
+        _check_type(func, "async_gen", "log_errors")
+
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if available
@@ -407,6 +479,8 @@ def async_gen_handle_errors(
     """
 
     def decorator(func):
+        _check_type(func, "async_gen", "handle_errors")
+
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             # Get the logger from the first argument (self) if available

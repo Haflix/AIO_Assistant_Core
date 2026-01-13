@@ -11,6 +11,7 @@ __pycache__/
 
 # Personal files
 _old/
+_private/
 
 # Distribution / packaging
 .Python
