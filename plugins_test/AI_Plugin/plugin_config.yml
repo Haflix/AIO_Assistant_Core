@@ -1,5 +1,0 @@
-description: This plugin is used to interact with the AI.
-version: 0.0.1
-remote: True  # Set to True if this plugin should be accessible remotely
-arguments:  # Optional: Arguments passed during plugin loading
-endpoints:
