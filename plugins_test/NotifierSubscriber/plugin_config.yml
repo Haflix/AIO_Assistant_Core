@@ -1,0 +1,55 @@
+description: Test subscriber for the notifier system
+version: 0.0.1
+remote: True
+arguments:
+endpoints:
+  # Config-driven subscription: this endpoint is automatically subscribed
+  # to the "test/greet" topic when the plugin loads.
+  - internal_name: _handle_greet
+    access_name: handle_greet
+    topic: "test/greet"
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Handles greet events via config-driven topic subscription
+    arguments:
+      - name: name
+        type: str
+        description: Name to greet
+
+  # Config-driven wildcard subscription: matches any "test/math/*" topic
+  - internal_name: _handle_math
+    access_name: handle_math
+    topic: "test/math/*"
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Handles any math operation via wildcard topic
+    arguments:
+      - name: a
+        type: int
+        description: First operand
+      - name: b
+        type: int
+        description: Second operand
+
+  # Streaming endpoint subscribed to a topic
+  - internal_name: _stream_count
+    access_name: stream_count
+    topic: "test/stream"
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Streaming handler for topic-based stream requests
+    arguments:
+      - name: n
+        type: int
+        description: Number of items to stream
+
+  - internal_name: _get_log
+    access_name: get_log
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Return the internal event log (for test verification)
+    arguments:

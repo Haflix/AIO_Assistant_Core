@@ -12,7 +12,7 @@ from logging import Logger, StreamHandler, DEBUG
 from uuid import uuid4
 import time
 import yaml
-from typing import Any, Optional, Tuple, Union, final
+from typing import Any, Callable, Optional, Tuple, Union, final
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from exceptions import RequestException, ConfigException
 from colorama import Fore, Style
@@ -59,14 +59,32 @@ from colorama import Fore, Style
 #        root_logger.addHandler(stream_handler)
 #
 #        # Add file handler
-#        file_handler = logging.FileHandler(log_file_path)
+#        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
 #        file_handler.setFormatter(formatter)
 #        root_logger.addHandler(file_handler)
 #
 #        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
 #        return root_logger
+class ColoredFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG:    Fore.CYAN,
+        logging.INFO:     Fore.GREEN,
+        logging.WARNING:  Fore.YELLOW,
+        logging.ERROR:    Fore.RED,
+        logging.CRITICAL: Fore.RED + Style.BRIGHT,
+    }
+
+    def format(self, record):
+        color = self.LEVEL_COLORS.get(record.levelno, Fore.RESET)
+        original_levelname = record.levelname
+        record.levelname = f"{color}{record.levelname}{Style.RESET_ALL}"
+        result = super().format(record)
+        record.levelname = original_levelname
+        return result
+
+
 class LogUtil(logging.Logger):
-    __FORMATTER = f"{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.YELLOW}%(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s"
+    __FORMATTER = f"{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| %(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s"
     __FORMATTER_FILE = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
 
     def __init__(
@@ -108,7 +126,7 @@ class LogUtil(logging.Logger):
         root_logger.addHandler(queue_handler)
 
         # Create actual I/O handlers
-        formatter = logging.Formatter(LogUtil.__FORMATTER)
+        formatter = ColoredFormatter(LogUtil.__FORMATTER)
         formatterFile = logging.Formatter(LogUtil.__FORMATTER_FILE)
 
         # Console handler
@@ -122,7 +140,7 @@ class LogUtil(logging.Logger):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_filename = f"AIO_AI_{timestamp}.log"
         log_file_path = os.path.join(logs_dir, log_filename)
-        file_handler = logging.FileHandler(log_file_path)
+        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
         file_handler.setFormatter(formatterFile)
         file_handler.setLevel(logging.DEBUG)
 
@@ -135,9 +153,10 @@ class LogUtil(logging.Logger):
         # Tag the stream_handler so change_level can find it later
         root_logger._custom_handlers = [stream_handler]
 
-        # Prevent httpx and httpcore logs from propagating
-        logging.getLogger("httpx").propagate = False
-        logging.getLogger("httpcore").propagate = False
+        # Prevent noisy third-party loggers from propagating
+        for _name in ("httpx", "httpcore", "psycopg", "psycopg.pool",
+                       "asyncio", "urllib3"):
+            logging.getLogger(_name).propagate = False
 
         # Ensure proper shutdown
         def stop_listener():
@@ -168,7 +187,7 @@ class ConfigUtil:
         try:
             ConfigUtil.check_config_integrity(config)
             return config
-        except:
+        except Exception:
             return fallback_value
 
     @staticmethod
@@ -320,9 +339,8 @@ class Plugin(ABC):
         info_dict["remote"] = self.remote
         info_dict["description"] = self.description
         info_dict["arguments"] = self.arguments
-        raise NotImplementedError  # NOTE: Add endpoint stuff (NOT JUST HERE)
-
-        return info_dict
+        # TODO: Include endpoint info. For now use PluginCore.get_plugin_info() instead.
+        raise NotImplementedError
 
     @async_log_errors
     async def execute(
@@ -337,15 +355,20 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """
-        One-liner to call another plugin's method asynchronously with error handling.
+        Call another plugin's method asynchronously with error handling.
 
         Args:
-            target: Target plugin and method (format: "PluginName.method_name")
-            args: Arguments to pass to the method
-            timeout: Optional timeout in seconds
+            plugin: Target plugin name.
+            method: Method name to call on the plugin.
+            args: Arguments to pass (tuple, dict, or None).
+            plugin_uuid: Optional UUID to target a specific plugin instance.
+            host: Where to run: "any", "remote", "local", or a hostname.
+            author: Caller identifier (default "system").
+            author_id: Caller ID (default "system").
+            timeout: Optional timeout in seconds.
 
         Returns:
-            The result from the target method or None if an error occurs
+            The result from the target method or None if an error occurs.
         """
         return await self._plugin_core.execute(
             plugin,
@@ -371,15 +394,20 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """
-        One-liner to call another plugin's method synchronously with error handling.
+        Call another plugin's method synchronously with error handling.
 
         Args:
-            target: Target plugin and method (format: "PluginName.method_name")
-            args: Arguments to pass to the method
-            timeout: Optional timeout in seconds
+            plugin: Target plugin name.
+            method: Method name to call on the plugin.
+            args: Arguments to pass (tuple, dict, or None).
+            plugin_uuid: Optional UUID to target a specific plugin instance.
+            host: Where to run: "any", "remote", "local", or a hostname.
+            author: Caller identifier (default "system").
+            author_id: Caller ID (default "system").
+            timeout: Optional timeout in seconds.
 
         Returns:
-            The result from the target method or None if an error occurs
+            The result from the target method or None if an error occurs.
         """
         return self._plugin_core.execute_sync(
             plugin,
@@ -405,15 +433,20 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """
-        One-liner to call another plugin's method asynchronously with error handling.
+        Call another plugin's method asynchronously and stream results with error handling.
 
         Args:
-            target: Target plugin and method (format: "PluginName.method_name")
-            args: Arguments to pass to the method
-            timeout: Optional timeout in seconds
+            plugin: Target plugin name.
+            method: Method name to call on the plugin.
+            args: Arguments to pass (tuple, dict, or None).
+            plugin_uuid: Optional UUID to target a specific plugin instance.
+            host: Where to run: "any", "remote", "local", or a hostname.
+            author: Caller identifier (default "system").
+            author_id: Caller ID (default "system").
+            timeout: Optional timeout in seconds.
 
-        Returns:
-            The result from the target method or None if an error occurs
+        Yields:
+            Each value yielded by the target streaming method.
         """
         async for i in self._plugin_core.execute_stream(
             plugin,
@@ -440,15 +473,20 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """
-        One-liner to call another plugin's method synchronously with error handling.
+        Call another plugin's method synchronously and stream results with error handling.
 
         Args:
-            target: Target plugin and method (format: "PluginName.method_name")
-            args: Arguments to pass to the method
-            timeout: Optional timeout in seconds
+            plugin: Target plugin name.
+            method: Method name to call on the plugin.
+            args: Arguments to pass (tuple, dict, or None).
+            plugin_uuid: Optional UUID to target a specific plugin instance.
+            host: Where to run: "any", "remote", "local", or a hostname.
+            author: Caller identifier (default "system").
+            author_id: Caller ID (default "system").
+            timeout: Optional timeout in seconds.
 
-        Returns:
-            The result from the target method or None if an error occurs
+        Yields:
+            Each value yielded by the target streaming method.
         """
         for i in self._plugin_core.execute_stream_sync(
             plugin,
@@ -461,6 +499,140 @@ class Plugin(ABC):
             timeout,
         ):
             yield i
+
+    # ── Notifier: fire-and-forget (one-to-many) ──────────────────────────
+
+    @async_log_errors
+    async def notify(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+    ) -> int:
+        """
+        Publish to a topic (fire-and-forget). All subscribers are called
+        concurrently; errors are logged but do not propagate.
+
+        Args:
+            topic: Topic string (e.g. "ai/chat", "sensor/bathroom/temperature").
+            args: Arguments forwarded to every subscriber.
+            host: Where to dispatch: "any", "local", "remote", or a hostname.
+
+        Returns:
+            Number of subscribers that were called.
+        """
+        return await self._plugin_core.notify(
+            topic, args, host, self.plugin_name, self.plugin_uuid,
+        )
+
+    @log_errors
+    def notify_sync(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+    ) -> int:
+        """Synchronous variant of notify()."""
+        return self._plugin_core.notify_sync(
+            topic, args, host, self.plugin_name, self.plugin_uuid,
+        )
+
+    # ── Notifier: request-by-topic (one-to-one with response) ─────────
+
+    @async_log_errors
+    async def request_topic(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """
+        Request a topic — the first matching handler is called and its
+        result returned. Same discovery logic as execute() with host="any".
+
+        Args:
+            topic: Topic string to request.
+            args: Arguments forwarded to the handler.
+            host: Where to search: "any", "local", "remote", or a hostname.
+            timeout: Optional timeout in seconds.
+
+        Returns:
+            The result from the handler.
+        """
+        return await self._plugin_core.request_topic(
+            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+        )
+
+    @log_errors
+    def request_topic_sync(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Synchronous variant of request_topic()."""
+        return self._plugin_core.request_topic_sync(
+            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+        )
+
+    async def request_topic_stream(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """
+        Request a topic and stream results from the matching handler.
+
+        Yields:
+            Each value yielded by the handler.
+        """
+        async for i in self._plugin_core.request_topic_stream(
+            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+        ):
+            yield i
+
+    def request_topic_stream_sync(
+        self,
+        topic: str,
+        args: Union[tuple, dict, None] = None,
+        host: str = "any",
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Synchronous streaming variant of request_topic()."""
+        for i in self._plugin_core.request_topic_stream_sync(
+            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+        ):
+            yield i
+
+    # ── Notifier: subscription management ─────────────────────────────
+
+    async def subscribe(self, topic: str, handler: Callable) -> str:
+        """
+        Subscribe to a topic at runtime (code-driven).
+
+        Args:
+            topic: Topic pattern (supports "*" wildcard per segment).
+            handler: Callable to invoke when the topic is published/requested.
+
+        Returns:
+            Subscription ID (use with unsubscribe() to remove).
+        """
+        return await self._plugin_core.subscribe(
+            topic, self.plugin_name, self.plugin_uuid, handler=handler,
+        )
+
+    async def unsubscribe(self, subscription_id: str) -> bool:
+        """
+        Remove a runtime subscription by its ID.
+
+        Returns:
+            True if the subscription was found and removed.
+        """
+        return await self._plugin_core.unsubscribe(subscription_id)
 
     @log_errors
     @abstractmethod
@@ -663,12 +835,9 @@ class GeneratorRequest:
 
     async def get_queue_stream(self):
         """get the result stream asynchronously"""
-        # FIXME THIS IS WRONG CODE. LOOK AT THE OLD CODE BELOW AND THE TESTED SCRIPTS. or. uh idk. just stop on end of queue and implement the error handling from below
-        # Idk if this is correct, but it works for now.
         try:
             if self.result is not None:
-                # return self.result, self.error, False
-                await self.set_result(str(e), True, False)
+                await self.set_result(str(self.result), True, False)
 
             while True:
                 if self.timeout_duration:
@@ -700,7 +869,7 @@ class GeneratorRequest:
                     self.ready = True
                     self.timeout = True
                     await self.set_result(self.result, True, True)
-                    raise e
+                    raise
 
                 try:
                     if error:

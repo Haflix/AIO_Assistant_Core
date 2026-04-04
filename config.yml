@@ -1,29 +1,96 @@
 plugins:
   - name: PluginA      
-    enabled: true
+    enabled: false
     path: ./plugins_test/pluginA_v1  # Explicit path
 
   - name: PluginC
-    enabled: true
+    enabled: false
 
   - name: PluginB
-    enabled: true      # No path - auto-resolve to plugin_package/PluginB
+    enabled: false      # No path - auto-resolve to plugin_package/PluginB
 
   - name: NetTest
-    enabled: true
+    enabled: false
 
   - name: InteropTarget
-    enabled: true
+    enabled: false
     path: ./plugins_test/InteropTarget
 
   - name: InteropCaller
-    enabled: true
+    enabled: false
     path: ./plugins_test/InteropCaller
 
   - name: CLI
-    enabled: true
+    enabled: false
     path: ./plugins_test/CLI
 
+  - name: PostgreSQL
+    enabled: true
+    path: ./_private/DATABASE/PostgreSQL
+
+  - name: MinIO
+    enabled: true
+    path: ./_private/DATABASE/MinIO
+
+  - name: Backup
+    enabled: true
+    path: ./_private/DATABASE/Backup
+
+  - name: DataCollection
+    enabled: true
+    path: ./_private/DataCollection
+
+  - name: DeviceControl
+    enabled: false
+    path: ./_private/DeviceControl
+
+  - name: AI_Interaction
+    enabled: true
+    path: ./_private/AI_Plugin
+
+  - name: DiscordBot
+    enabled: true
+    path: ./_private/DiscordBot
+
+  - name: Websearch
+    enabled: true
+    path: ./_private/Websearch
+
+  - name: Geocoding
+    enabled: true
+    path: ./_private/Geocoding
+
+  - name: MCPClient
+    enabled: true
+    path: ./_private/MCPClient
+
+  - name: STT_AI_Plugin
+    enabled: true
+    path: ./_private/STT_AI_Plugin
+
+  - name: WakeWord
+    enabled: true
+    path: ./_private/WakeWord
+
+  - name: TTS
+    enabled: true
+    path: ./_private/TTS
+
+  - name: VoiceDiarization
+    enabled: true
+    path: ./_private/VoiceDiarization
+
+  - name: VoicePipeline
+    enabled: true
+    path: ./_private/VoicePipeline
+
+  - name: TelegramBot
+    enabled: false
+    path: ./_private/TelegramBot
+
+  - name: DocumentAnalyzer
+    enabled: false
+    path: ./_private/DocumentAnalyzer
 
 
 

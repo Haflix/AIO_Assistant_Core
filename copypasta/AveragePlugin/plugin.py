@@ -78,6 +78,21 @@ class AveragePlugin(Plugin):
 
         return result
 
+    @async_log_errors
+    async def handle_event(self, data):
+        """
+        Example topic-subscribed endpoint.
+
+        This method is called when someone publishes to "example/event"
+        via self.notify("example/event", data) or
+        self.request_topic("example/event", data).
+
+        No need to know which plugin handles this — topic-based routing
+        decouples the caller from the handler.
+        """
+        self._logger.info(f"Received event: {data}")
+        return {"received": data, "handled_by": self.plugin_name}
+
     @async_gen_log_errors
     async def example_stream(self, count):
         """

@@ -1,18 +1,5 @@
-[ ] CLI
-
-[ ] Stream decorators & warning if you use the wrong one
-
-[ ] Pipeline/Datastream
-    -> for continuous data processing that can be used for streaming and batch processing by giving it as a parameter
-
-
-
-Other:
-- Methoddescriptions
-
-Notes:
-- Check on request if requester is eligible
-
-Check for issues:
-- timeouts on remote
-
+TODO:
+[] Validate plugin names and endpoint names: only letters, numbers, underscores. Blacklist reserved names ("system", "general").
+[] Check endpoint access_names are unique across all loaded plugins (currently no uniqueness enforcement).
+[] Remote execution: audit timeout propagation (remaining_time vs network latency).
+[X] Notifiers (like MQTT works)

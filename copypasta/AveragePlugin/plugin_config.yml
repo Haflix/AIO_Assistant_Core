@@ -3,41 +3,58 @@ version: 1.0.0
 remote: True  # Set to True if this plugin should be accessible remotely
 arguments:  # Optional: Arguments passed during plugin loading
 endpoints:
-  - internal_name: example_method  # Method name in the plugin class
-    access_name: example_method  # Name used when calling from other plugins
-    tags: []  # Optional: Tags for categorization
-    remote: True  # Set to True if this endpoint can be called remotely
-    accessible_by_other_plugins: True  # Set to True to allow other plugins to call this
-    description: Example method that doubles the input value
+
+  - internal_name: example_method
+    access_name: example_method
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Example method that doubles the input value and returns the result
     arguments:
       - name: value
         type: any
         description: Input value to process
-  
+
   - internal_name: call_other_plugin
     access_name: call_other_plugin
     tags: []
     remote: True
     accessible_by_other_plugins: True
-    description: Example showing how to call another plugin
+    description: Call another plugin's method by name and return its result
     arguments:
       - name: plugin_name
         type: str
         description: Name of the plugin to call
       - name: method_name
         type: str
-        description: Method to execute
+        description: Method to execute on the target plugin
       - name: args
         type: any
         description: Arguments to pass to the method
-  
+
   - internal_name: example_stream
     access_name: example_stream
     tags: []
     remote: True
     accessible_by_other_plugins: True
-    description: Example streaming method that yields multiple results
+    description: Streaming method that yields sequential results
     arguments:
       - name: count
         type: int
         description: Number of items to yield
+
+  # Topic-subscribed endpoint example (notifier system):
+  # Adding a "topic" field makes this endpoint callable via notify() or request_topic()
+  # instead of hardcoding the plugin name. Topics use "/" as separator.
+  # Wildcards: subscribe to "sensor/*/temperature" to match "sensor/bath/temperature" etc.
+  - internal_name: handle_event
+    access_name: handle_event
+    topic: "example/event"  # <-- subscribes this endpoint to the topic
+    tags: []
+    remote: True
+    accessible_by_other_plugins: True
+    description: Example endpoint subscribed to a topic via config
+    arguments:
+      - name: data
+        type: any
+        description: Event data received from the topic

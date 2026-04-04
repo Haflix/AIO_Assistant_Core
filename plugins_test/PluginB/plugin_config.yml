@@ -5,11 +5,11 @@ arguments:
 endpoints:
   - internal_name: calculate_square
     access_name: calculate_square
-    tags:
+    tags: []
     remote: True
     accessible_by_other_plugins: True
-    description:
+    description: Calculate the square of a number
     arguments:
       - name: number
         type: int
-        description:
+        description: The number to square

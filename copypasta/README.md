@@ -74,7 +74,7 @@ Import from `decorators` module:
 From within your plugin:
 
 ```python
-# Call another plugin's method
+# Call another plugin's method (direct — you must know the plugin name)
 result = await self.execute("PluginName", "method_name", args, host="any")
 
 # Host options:
@@ -87,6 +87,51 @@ result = await self.execute("PluginName", "method_name", args, host="any")
 async for item in self.execute_stream("PluginName", "stream_method", args, host="any"):
     print(item)
 ```
+
+### Topic-Based Communication (Notifier System)
+
+Use topics to decouple plugins — the caller doesn't need to know which plugin handles the request.
+
+```python
+# Fire-and-forget (one-to-many) — all subscribers are called
+count = await self.notify("sensor/temperature", {"value": 22.5})
+
+# Request-by-topic (one-to-one with response) — first matching handler
+result = await self.request_topic("ai/chat", {"message": "hello"})
+
+# Streaming request-by-topic
+async for chunk in self.request_topic_stream("ai/stream", args):
+    print(chunk)
+
+# Sync variants available too:
+self.notify_sync("sensor/temperature", {"value": 22.5})
+result = self.request_topic_sync("ai/chat", {"message": "hello"})
+```
+
+**Subscribing to topics — two ways:**
+
+1. **Config-driven** (in plugin_config.yml):
+```yaml
+endpoints:
+  - internal_name: _handle_chat
+    access_name: handle_chat
+    topic: "ai/chat"            # auto-subscribed on plugin load
+    remote: True
+    accessible_by_other_plugins: True
+```
+
+2. **Code-driven** (at runtime, typically in `on_enable`):
+```python
+async def on_enable(self):
+    self._sub_id = await self.subscribe("events/*", self._on_event)
+
+async def on_disable(self):
+    await self.unsubscribe(self._sub_id)
+```
+
+**Topics** use `/` as separator. Single-level wildcard `*` matches one segment:
+- `sensor/*/temperature` matches `sensor/bathroom/temperature`
+- `sensor/*` does NOT match `sensor/bathroom/temperature` (different segment count)
 
 ### Accessing Plugin Properties
 
@@ -107,13 +152,14 @@ arguments:                       # Optional: Load-time arguments
 endpoints:
   - internal_name: method_name   # Method in your class
     access_name: method_name     # Name others use to call it
-    tags: []                     # Optional categorization
+    topic: "some/topic"          # Optional: Subscribe to a notifier topic
+    tags: []                     # Optional categorization tags
     remote: boolean              # Allow remote calls
     accessible_by_other_plugins: boolean
     description: str             # What the method does
     arguments:
       - name: param_name
-        type: str                # int, str, dict, list, any, etc.
+        type: str                # int, str, dict, list, any, bool, float
         description: str
 ```
 
@@ -170,6 +216,20 @@ async def call_other(self):
     return result
 ```
 
+## Tags
+
+Tags are arbitrary strings you can assign to endpoints for categorization. Other plugins can use `find_endpoints_by_tag(tag)` on the PluginCore to discover endpoints with a specific tag. This is useful for building systems where plugins need to dynamically discover each other's capabilities.
+
+The AI system uses mode-based tags to discover tools at runtime:
+- `AI-minimum` — Available in all modes (device control, weather)
+- `AI-conversation` — Available in conversation+ modes (memory, tasks, appointments, sessions)
+- `AI-working` — Available in working+ modes (documents, web search, notes, locations)
+- `AI-debug` — Available only in debug mode (all raw CRUD endpoints)
+
+```yaml
+tags: ["AI-minimum", "AI-conversation"]  # Available in minimum, conversation, working, and debug modes
+```
+
 ## Best Practices
 
 1. **Always use decorators** on your methods for proper error handling and logging
@@ -179,6 +239,7 @@ async def call_other(self):
 5. **Clean up resources** in `on_disable()` (close files, cancel tasks, etc.)
 6. **Test locally first** before enabling remote access
 7. **Use meaningful names** for methods and arguments
+8. **Return JSON-serializable data** (dicts, lists, strings, numbers, bools, None)
 
 ## Troubleshooting
 
@@ -207,4 +268,3 @@ See the main README.md in the project root for:
 - Networking configuration
 - Advanced features
 - More examples
-

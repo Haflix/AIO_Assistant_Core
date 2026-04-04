@@ -7,7 +7,7 @@ import pickle
 import struct
 import os
 from typing import List, Union, Optional, Tuple
-from decorators import async_log_errors, async_handle_errors
+from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors
 from exceptions import NetworkRequestException, NodeException
 from networking_classes import Node
 from networking_classes import RemotePlugin
@@ -19,11 +19,16 @@ MSG_EXECUTE_STREAM = 2
 MSG_HAS_ENDPOINT = 3
 MSG_PING = 4
 MSG_INFO = 5
+MSG_FIND_TAGGED_ENDPOINTS = 6
 
 MSG_RESULT = 10
 MSG_STREAM_CHUNK = 11
 MSG_ERROR = 12
 MSG_END_STREAM = 13
+
+MSG_NOTIFY = 7             # Fire-and-forget topic notification
+MSG_TOPIC_REQUEST = 8      # Request-by-topic (one-to-one with response)
+MSG_TOPIC_REQUEST_STREAM = 9  # Streaming request-by-topic
 
 MSG_AUTH = 20  # Authentication message (shared secret)
 
@@ -116,6 +121,10 @@ class NetworkManager:
                 MSG_EXECUTE_STREAM: "EXECUTE_STREAM",
                 MSG_PING: "PING",
                 MSG_INFO: "INFO",
+                MSG_FIND_TAGGED_ENDPOINTS: "FIND_TAGGED_ENDPOINTS",
+                MSG_NOTIFY: "NOTIFY",
+                MSG_TOPIC_REQUEST: "TOPIC_REQUEST",
+                MSG_TOPIC_REQUEST_STREAM: "TOPIC_REQUEST_STREAM",
                 MSG_RESULT: "RESULT",
                 MSG_ERROR: "ERROR",
             }.get(msg_type, f"UNKNOWN({msg_type})")
@@ -496,6 +505,14 @@ class NetworkManager:
                     await self._handle_ping(reader, writer, data)
                 elif msg_type == MSG_INFO:
                     await self._handle_info(reader, writer, data)
+                elif msg_type == MSG_FIND_TAGGED_ENDPOINTS:
+                    await self._handle_find_tagged_endpoints(reader, writer, data)
+                elif msg_type == MSG_NOTIFY:
+                    await self._handle_notify(reader, writer, data)
+                elif msg_type == MSG_TOPIC_REQUEST:
+                    await self._handle_topic_request(reader, writer, data)
+                elif msg_type == MSG_TOPIC_REQUEST_STREAM:
+                    await self._handle_topic_request_stream(reader, writer, data)
                 else:
                     self._logger.warning(
                         f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
@@ -778,6 +795,141 @@ class NetworkManager:
             self._logger.exception(
                 f"[ENDPOINT] Exception in _handle_has_endpoint from {client_addr}: {e}"
             )
+            await self._send_error(writer, str(e))
+
+    async def _handle_find_tagged_endpoints(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+    ):
+        """Handle FIND_TAGGED_ENDPOINTS message -- returns all local endpoints matching a tag."""
+        client_addr = writer.get_extra_info("peername")
+        try:
+            tag = data.get("tag")
+            self._logger.info(
+                f"[TAG_SEARCH] Received FIND_TAGGED_ENDPOINTS from {client_addr}: tag='{tag}'"
+            )
+
+            endpoints = []
+            for plugin in self.plugin_core.plugins.values():
+                if plugin.enabled:
+                    for endpoint in plugin.endpoints.values():
+                        if tag in endpoint.get("tags", []):
+                            endpoints.append(
+                                {
+                                    "plugin_name": plugin.plugin_name,
+                                    "plugin_uuid": plugin.plugin_uuid,
+                                    "plugin_version": getattr(plugin, "version", "unknown"),
+                                    "plugin_description": getattr(plugin, "description", ""),
+                                    "endpoint": endpoint,
+                                }
+                            )
+
+            self._logger.info(
+                f"[TAG_SEARCH] Found {len(endpoints)} endpoint(s) for tag '{tag}', "
+                f"sending to {client_addr}"
+            )
+            await self._send_message(
+                writer,
+                MSG_RESULT,
+                {"hostname": self.plugin_core.hostname, "endpoints": endpoints},
+            )
+
+        except Exception as e:
+            self._logger.exception(
+                f"[TAG_SEARCH] Exception in _handle_find_tagged_endpoints from {client_addr}: {e}"
+            )
+            await self._send_error(writer, str(e))
+
+    # ── Notifier handlers (server-side, called when a remote node sends us a topic message) ──
+
+    async def _handle_notify(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+    ):
+        """Handle MSG_NOTIFY: fan out to local subscribers."""
+        try:
+            topic = data.get("topic")
+            args = data.get("args")
+            author = data.get("author", "remote")
+            author_id = data.get("author_id", "remote")
+
+            self._logger.info(f"[NOTIFY] Remote notify for topic '{topic}'")
+
+            count = await self.plugin_core.notify(
+                topic, args, host="local",
+                author=author, author_id=author_id,
+            )
+            await self._send_message(writer, MSG_RESULT, {"count": count})
+        except Exception as e:
+            self._logger.exception(f"[NOTIFY] Exception: {e}")
+            await self._send_error(writer, str(e))
+
+    async def _handle_topic_request(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+    ):
+        """Handle MSG_TOPIC_REQUEST: find local handler and return result."""
+        try:
+            topic = data.get("topic")
+            args = data.get("args")
+            author = data.get("author", "remote")
+            author_id = data.get("author_id", "remote")
+            timeout = data.get("timeout")
+
+            self._logger.info(f"[TOPIC_REQUEST] Remote request for topic '{topic}'")
+
+            result = await self.plugin_core.request_topic(
+                topic, args, host="local",
+                author=author, author_id=author_id,
+                timeout=timeout,
+            )
+
+            # Send result using same chunked protocol as _handle_execute
+            payload = pickle.dumps(result)
+            if len(payload) > CHUNK_SIZE:
+                offset = 0
+                while offset < len(payload):
+                    chunk_data = payload[offset:offset + CHUNK_SIZE]
+                    chunk_length = len(chunk_data) + 1
+                    header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                    writer.write(header + chunk_data)
+                    await writer.drain()
+                    offset += CHUNK_SIZE
+            else:
+                chunk_length = len(payload) + 1
+                header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                writer.write(header + payload)
+                await writer.drain()
+
+            await self._send_end_stream(writer)
+        except Exception as e:
+            self._logger.exception(f"[TOPIC_REQUEST] Exception: {e}")
+            await self._send_error(writer, str(e))
+
+    async def _handle_topic_request_stream(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+    ):
+        """Handle MSG_TOPIC_REQUEST_STREAM: find local handler and stream results."""
+        try:
+            topic = data.get("topic")
+            args = data.get("args")
+            author = data.get("author", "remote")
+            author_id = data.get("author_id", "remote")
+            timeout = data.get("timeout")
+
+            self._logger.info(f"[TOPIC_STREAM] Remote stream request for topic '{topic}'")
+
+            async for chunk in self.plugin_core.request_topic_stream(
+                topic, args, host="local",
+                author=author, author_id=author_id,
+                timeout=timeout,
+            ):
+                payload = pickle.dumps(chunk)
+                chunk_length = len(payload) + 1
+                header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                writer.write(header + payload)
+                await writer.drain()
+
+            await self._send_end_stream(writer)
+        except Exception as e:
+            self._logger.exception(f"[TOPIC_STREAM] Exception: {e}")
             await self._send_error(writer, str(e))
 
     async def _handle_ping(
@@ -1121,7 +1273,7 @@ class NetworkManager:
                     except Exception:
                         pass
 
-    @async_handle_errors(None)
+    @async_gen_handle_errors(None)
     async def execute_remote_stream(
         self,
         IP: str,
@@ -1328,6 +1480,172 @@ class NetworkManager:
                         await writer.wait_closed()
                     except Exception:
                         pass
+
+    # ── Notifier client methods (called by PluginCore to reach remote nodes) ──
+
+    async def notify_remote(
+        self,
+        IP: str,
+        topic: str,
+        args=None,
+        author: str = "remote",
+        author_id: str = "remote",
+    ) -> int:
+        """Send a fire-and-forget notification to a remote node."""
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "args": args,
+                "author": author,
+                "author_id": author_id,
+            }
+            await self._send_message(writer, MSG_NOTIFY, request_data)
+
+            msg_type, data = await self._receive_message(reader)
+            if msg_type == MSG_ERROR:
+                self._logger.warning(f"[NOTIFY_REMOTE] Node {IP} returned error: {data}")
+                return 0
+
+            await self._return_connection(IP, reader, writer)
+            connection_returned = True
+            return data.get("count", 0) if isinstance(data, dict) else 0
+        except Exception as e:
+            self._logger.exception(f"[NOTIFY_REMOTE] Error notifying {IP}: {e}")
+            return 0
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def request_topic_remote(
+        self,
+        IP: str,
+        topic: str,
+        args=None,
+        author: str = "remote",
+        author_id: str = "remote",
+        timeout=None,
+    ):
+        """Request-by-topic on a remote node, returning the result."""
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "args": args,
+                "author": author,
+                "author_id": author_id,
+                "timeout": timeout,
+            }
+            await self._send_message(writer, MSG_TOPIC_REQUEST, request_data)
+
+            # Receive chunked response (same protocol as execute_remote)
+            result_chunks_bytes = []
+            while True:
+                length_bytes = await reader.readexactly(4)
+                msg_length = struct.unpack(">I", length_bytes)[0]
+                msg_type_byte = await reader.readexactly(1)
+                msg_type = msg_type_byte[0]
+                payload_length = msg_length - 1
+
+                if payload_length > 0:
+                    payload = await reader.readexactly(payload_length)
+                    if msg_type == MSG_STREAM_CHUNK:
+                        result_chunks_bytes.append(payload)
+                    elif msg_type == MSG_END_STREAM:
+                        break
+                    elif msg_type == MSG_ERROR:
+                        error_data = pickle.loads(payload)
+                        raise NetworkRequestException(str(error_data))
+                    else:
+                        raise NetworkRequestException(f"Unexpected msg type: {msg_type}")
+                elif msg_type == MSG_END_STREAM:
+                    break
+
+            await self._return_connection(IP, reader, writer)
+            connection_returned = True
+
+            if result_chunks_bytes:
+                full_pickled = b"".join(result_chunks_bytes)
+                return pickle.loads(full_pickled)
+            return None
+        except Exception as e:
+            self._logger.exception(f"[TOPIC_REQUEST_REMOTE] Error from {IP}: {e}")
+            raise
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def request_topic_stream_remote(
+        self,
+        IP: str,
+        topic: str,
+        args=None,
+        author: str = "remote",
+        author_id: str = "remote",
+        timeout=None,
+    ):
+        """Request-by-topic streaming on a remote node, yielding results."""
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "args": args,
+                "author": author,
+                "author_id": author_id,
+                "timeout": timeout,
+            }
+            await self._send_message(writer, MSG_TOPIC_REQUEST_STREAM, request_data)
+
+            while True:
+                length_bytes = await reader.readexactly(4)
+                msg_length = struct.unpack(">I", length_bytes)[0]
+                msg_type_byte = await reader.readexactly(1)
+                msg_type = msg_type_byte[0]
+                payload_length = msg_length - 1
+
+                if payload_length > 0:
+                    payload = await reader.readexactly(payload_length)
+                    if msg_type == MSG_STREAM_CHUNK:
+                        yield pickle.loads(payload)
+                    elif msg_type == MSG_END_STREAM:
+                        break
+                    elif msg_type == MSG_ERROR:
+                        error_data = pickle.loads(payload)
+                        raise NetworkRequestException(str(error_data))
+                    else:
+                        raise NetworkRequestException(f"Unexpected msg type: {msg_type}")
+                elif msg_type == MSG_END_STREAM:
+                    break
+
+            await self._return_connection(IP, reader, writer)
+            connection_returned = True
+        except Exception as e:
+            self._logger.exception(f"[TOPIC_STREAM_REMOTE] Error from {IP}: {e}")
+            raise
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     # async def execute_remote(
     #    self,
@@ -1825,6 +2143,85 @@ class NetworkManager:
                         pass
 
     @async_handle_errors(None)
+    async def node_get_tagged_endpoints(self, IP: str, tag: str):
+        """Ask a remote node for all endpoints matching a tag.
+
+        Args:
+            IP: The node's IP address.
+            tag: The tag to search for.
+
+        Returns:
+            List of tuples (RemotePlugin, endpoint_dict, description, arguments)
+            matching the format used by PluginCore.find_endpoints_by_tag,
+            or None on error.
+        """
+        reader = None
+        writer = None
+        connection_returned = False
+
+        self._logger.info(
+            f"[TAG_SEARCH] Querying node {IP} for tag '{tag}'"
+        )
+
+        try:
+            reader, writer = await self._get_connection(IP)
+
+            await self._send_message(
+                writer, MSG_FIND_TAGGED_ENDPOINTS, {"tag": tag}
+            )
+
+            msg_type, data = await self._receive_message(reader)
+
+            if msg_type == MSG_RESULT:
+                remote_endpoints = []
+                hostname = data.get("hostname", IP)
+                for entry in data.get("endpoints", []):
+                    rp = RemotePlugin(
+                        name=entry["plugin_name"],
+                        version=entry.get("plugin_version", "unknown"),
+                        uuid=entry["plugin_uuid"],
+                        enabled=True,
+                        remote=True,
+                        description=entry.get("plugin_description", ""),
+                        arguments=[],
+                        hostname=hostname,
+                    )
+                    ep = entry["endpoint"]
+                    remote_endpoints.append(
+                        (rp, ep, ep.get("description"), ep.get("arguments"))
+                    )
+
+                self._logger.info(
+                    f"[TAG_SEARCH] Node {IP} returned {len(remote_endpoints)} endpoint(s) for tag '{tag}'"
+                )
+                return remote_endpoints
+
+            elif msg_type == MSG_ERROR:
+                self._logger.warning(
+                    f"[TAG_SEARCH] Node {IP} returned error: {data}"
+                )
+                return None
+
+            return None
+
+        except Exception as e:
+            self._logger.exception(
+                f"[TAG_SEARCH] Error querying node {IP} for tag '{tag}': {e}"
+            )
+            return None
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    await self._return_connection(IP, reader, writer)
+                    connection_returned = True
+                except Exception:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+    @async_handle_errors(None)
     async def node_has_plugin(
         self,
         IP: str,
@@ -1834,8 +2231,9 @@ class NetworkManager:
     ) -> Optional[dict]:
         """
         Ask a node if it has the specified plugin.
-        DEPRECATED: Use node_has_endpoint instead. This method uses node_has_endpoint with access_name=None.
+        DEPRECATED: Use node_has_endpoint instead.
         """
+        raise DeprecationWarning
         # For backward compatibility, use node_has_endpoint with access_name=None
         # This will check plugin existence but not endpoint
         result = await self.node_has_endpoint(
