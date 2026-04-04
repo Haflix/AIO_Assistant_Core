@@ -28,6 +28,7 @@
 - **Connection Pooling**: Efficient reuse of network connections with configurable pool sizes
 - **Endpoint-Based Routing**: Fine-grained access control per endpoint with `accessible_by_other_plugins` and `remote` flags
 - **Simple API**: One-liner syntax for executing plugin methods
+- **Topic-Based Notifier**: Pub/sub and request-by-topic system for decoupled plugin communication with wildcard support
 - **Streaming Support**: Full support for both sync and async generator-based data streams
 - **Built-in CLI**: Interactive command-line interface for managing plugins at runtime
 - **Error Handling**: Comprehensive decorator-based error handling for sync functions, async functions, sync generators, and async generators
@@ -44,12 +45,15 @@
 git clone <repository-url>
 cd AIO_Assistant_Core
 
-# Install dependencies
+# Install core dependencies
 pip install pyyaml colorama
 # For networking with auto-generated TLS certificates:
 pip install cryptography
 # For the CLI plugin:
 pip install prompt_toolkit
+
+# Plugin-specific dependencies are listed in requirements.txt
+# (only install what you need for the plugins you plan to use)
 ```
 
 ### Basic Usage
@@ -72,12 +76,57 @@ async def main():
     await plugin_core.close()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+    asyncio.run(main())
+```
+
+### Production Pattern: Signal Handling and Shutdown Event
+
+The included `main_application.py` demonstrates a production-ready pattern with signal handlers and a shutdown event to keep the application alive until explicitly stopped:
+
+```python
+import asyncio
+import signal
+from PluginCore import PluginCore
+
+_plugin_core = None
+
+async def main():
+    global _plugin_core
     try:
-        loop.create_task(main())
-        loop.run_forever()
+        _plugin_core = PluginCore("config.yml")
+
+        # Register signal handlers for graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s)))
+            except NotImplementedError:
+                pass  # Windows — handled by KeyboardInterrupt
+
+        await _plugin_core.wait_until_ready()
+
+        # Keep alive until shutdown is triggered
+        _shutdown_event = asyncio.Event()
+        _plugin_core._shutdown_event = _shutdown_event
+        await _shutdown_event.wait()
     finally:
-        loop.close()
+        if _plugin_core is not None:
+            await _plugin_core.graceful_shutdown()
+            _plugin_core = None
+
+async def shutdown(sig=None):
+    global _plugin_core
+    if _plugin_core is not None:
+        if hasattr(_plugin_core, "_shutdown_event"):
+            _plugin_core._shutdown_event.set()
+        await _plugin_core.graceful_shutdown()
+        _plugin_core = None
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Interrupted by user")
 ```
 
 ### Alternative: Using `start()` / `close()`
@@ -256,6 +305,67 @@ Request objects manage the lifecycle of plugin calls:
 
 Both support timeouts, error tracking, and collection status for cleanup.
 
+### Sync vs Async Plugins: Thread Pool Deadlock Risk
+
+PluginCore supports both sync and async plugin methods seamlessly. However, there is a
+critical architectural detail that plugin developers **must** understand:
+
+**How sync methods are executed:**
+
+When PluginCore calls a **sync** plugin method, it runs it in a thread pool via
+`run_in_executor()`. This thread pool has a **fixed size** (Python default:
+`min(32, cpu_count + 4)`, typically ~20 threads). While the method runs, it occupies one
+thread.
+
+**How `execute_sync()` works from inside a sync method:**
+
+When a sync method calls `execute_sync()` to reach another plugin, it:
+1. Submits a coroutine to the event loop via `run_coroutine_threadsafe()`
+2. Calls `future.result()` which **blocks the current thread** until the result arrives
+3. The event loop processes the request — if the target is sync, it needs **another thread**
+   from the same pool
+
+**The deadlock scenario:**
+
+```
+Thread pool (capacity: 2 for illustration)
+
+Thread 1: ai_chat() → calls execute_sync("PostgreSQL", "pg_execute")
+           → submits coroutine to event loop
+           → blocks on future.result() ← WAITING FOR THREAD
+
+Thread 2: another_method() → calls execute_sync("PostgreSQL", "pg_fetch")
+           → submits coroutine to event loop
+           → blocks on future.result() ← WAITING FOR THREAD
+
+Event loop: receives both coroutines
+           → calls run_in_executor(None, pg_execute)  ← NEEDS A FREE THREAD
+           → calls run_in_executor(None, pg_fetch)    ← NEEDS A FREE THREAD
+           → no threads available → DEADLOCK
+```
+
+Both threads are waiting for results that require threads to produce. The pool is both
+the producer and the consumer. Once full, **nothing can finish because everything is
+waiting for everything else**. This is not a slowdown — it is a permanent, silent deadlock.
+
+**How to prevent it:**
+
+1. **Prefer async methods.** Async plugin endpoints run directly in the event loop — no
+   thread pool involvement, no deadlock risk. This is the recommended approach for any
+   plugin that primarily does I/O (database, network, API calls).
+
+2. **Use timeouts.** Always pass `timeout=` to `execute()` and `execute_sync()` calls.
+   Without a timeout, a deadlocked request waits forever. With a timeout, it fails with a
+   `RequestException` after the specified seconds, freeing the caller to recover.
+
+3. **Avoid deep sync-to-sync call chains.** Each hop in a sync → `execute_sync` → sync
+   chain consumes one thread. A chain of 3 sync plugins needs 3 threads simultaneously.
+   Under concurrent load, this exhausts the pool quickly.
+
+**Rule of thumb:** If your plugin does I/O (database queries, HTTP requests, API calls),
+make its methods `async def`. Reserve sync methods for pure CPU-bound work that genuinely
+needs a thread (e.g., audio processing, ML inference).
+
 ---
 
 ## Plugin System
@@ -365,11 +475,91 @@ for item in self.execute_stream_sync("PluginA", "streaming_method", args, host="
     print(item)
 ```
 
+### Topic-Based Communication (Notifier System)
+
+The notifier system provides topic-based pub/sub and request-by-topic routing, decoupling plugins from having to know each other's names.
+
+**Two communication patterns:**
+
+| Pattern | Method | Description |
+|---|---|---|
+| Fire-and-forget | `notify()` / `notify_sync()` | One-to-many. All subscribers called, errors logged, no return value. |
+| Request-by-topic | `request_topic()` / `request_topic_sync()` | One-to-one. First matching handler called, result returned. |
+| Streaming request | `request_topic_stream()` / `request_topic_stream_sync()` | One-to-one streaming. |
+
+**Topics** use `/` as separator. Single-level wildcard `*` matches exactly one segment:
+
+```
+"ai/chat"                   — exact topic
+"sensor/*/temperature"      — matches "sensor/bathroom/temperature"
+"sensor/*"                  — does NOT match "sensor/bathroom/temperature"
+```
+
+**Subscribe via config** (in `plugin_config.yml`):
+
+```yaml
+endpoints:
+  - internal_name: _handle_chat
+    access_name: handle_chat
+    topic: "ai/chat"              # auto-subscribed on plugin load
+    remote: True
+    accessible_by_other_plugins: True
+```
+
+**Subscribe via code** (runtime, in `on_enable`):
+
+```python
+async def on_enable(self):
+    self._sub_id = await self.subscribe("events/*", self._on_event)
+
+async def on_disable(self):
+    await self.unsubscribe(self._sub_id)
+```
+
+**Usage from a plugin:**
+
+```python
+# Fire-and-forget — all subscribers receive it
+count = await self.notify("sensor/temperature", {"value": 22.5})
+
+# Request with response — first matching handler
+result = await self.request_topic("ai/chat", {"message": "hello"})
+
+# Streaming
+async for chunk in self.request_topic_stream("ai/stream", args):
+    process(chunk)
+```
+
+**Cross-node:** Topic operations support the same `host` parameter as `execute()` (`"any"`, `"local"`, `"remote"`, or a specific hostname). Remote nodes are queried when no local handler is found.
+
+### Tags and AI Modes
+
+Endpoint `tags` serve two purposes: general categorization and AI tool discovery. The AI system (`AI_Interaction` plugin) uses `find_endpoints_by_tag()` to discover endpoints at runtime via a four-mode system:
+
+| Mode | Model | Tags Loaded | Use Case |
+|------|-------|-------------|----------|
+| **Minimum** | Haiku | `AI-minimum` | Quick voice tasks (device control, weather). Short TTS-optimized responses. Separate non-Genesis identity. |
+| **Conversation** | Haiku | `AI-minimum` + `AI-conversation` | Default mode. Normal chatting and personal assistant tasks (memory, tasks, appointments, sessions). |
+| **Working** | Sonnet | + `AI-working` | High-accuracy workflows, document processing, web search. Activated via `/mode working`. |
+| **Debug** | Sonnet/Opus | + `AI-debug` | Full system access including all raw CRUD endpoints. For debugging and administration. |
+
+Each endpoint is explicitly tagged with every mode it belongs to (no inheritance). Modes are configured per-session and reset on inactivity timeout. Users switch modes via the `/mode` slash command in Discord or Telegram.
+
+Key technical details:
+- `tool_choice.disable_parallel_tool_use: true` for Haiku modes (prevents tool accuracy issues)
+- Per-mode configuration: model, max_tokens, temperature, system_prompt_file, enable_reasoning, prompt_caching, inject flags (person context, memories, session info), summarization
+- Conversation history caching for Working/Debug modes
+- Daily cost tracking with configurable EUR threshold warning
+
+- **Empty `[]`**: The endpoint is invisible to the AI and only callable by other plugins directly.
+
+This replaces the old three-tier system (AI-1/AI-2/AI-3) with explicit per-endpoint mode tags.
+
 ### Endpoint Access Control
 
 Endpoints have two access flags in `plugin_config.yml`:
 
-- `accessible_by_other_plugins`: Controls whether other local plugins can call this endpoint. If `False`, only the plugin itself can invoke it.
+- `accessible_by_other_plugins`: Controls whether other local plugins can call this endpoint. If `False`, only the plugin itself can invoke it. Must be `True` for the AI to call the endpoint.
 - `remote`: Controls whether this endpoint can be called from remote nodes. The plugin-level `remote` flag must also be `True`.
 
 ---
@@ -520,7 +710,8 @@ endpoints:
     arguments:
       - name: param_name
         type: str                # int, str, dict, list, any, etc.
-        description: str
+        description: str         # Include "Optional" or "Omit" to auto-exclude from required
+        required: boolean        # Optional: explicit override (true/false) for auto-detection
 ```
 
 ---
@@ -598,6 +789,65 @@ Synchronous version of `execute_stream()`. Returns a sync generator. Must not be
 
 **Yields**: Results from the plugin's generator method
 
+#### `notify(topic, args=None, host="any", author="system", author_id="system")`
+
+Fire-and-forget publish to a topic. All matching subscribers are called concurrently; errors are logged but do not propagate.
+
+**Parameters**:
+
+- `topic` (str): Topic string using `/` separator (e.g. `"sensor/bathroom/temperature"`)
+- `args` (tuple/dict/None): Arguments forwarded to every subscriber
+- `host` (str): `"local"`, `"remote"`, `"any"`, or a specific hostname
+
+**Returns**: Number of subscribers that were called (int)
+
+#### `notify_sync(topic, args=None, host="any", ...)`
+
+Synchronous variant of `notify()`.
+
+#### `request_topic(topic, args=None, host="any", author="system", author_id="system", timeout=None)`
+
+Request-by-topic: find the first matching handler and return its result. Same discovery logic as `execute()` with `host="any"` (local first, then remote).
+
+**Parameters**:
+
+- `topic` (str): Topic string to request
+- `args` (tuple/dict/None): Arguments forwarded to the handler
+- `host` (str): `"local"`, `"remote"`, `"any"`, or a specific hostname
+- `timeout` (float): Optional timeout in seconds
+
+**Returns**: Result from the handler
+
+**Raises**: `RequestException` if no handler found
+
+#### `request_topic_sync(topic, args=None, ...)`
+
+Synchronous variant of `request_topic()`.
+
+#### `request_topic_stream(topic, args=None, host="any", ...)`
+
+Request-by-topic with streaming. Finds the first matching handler and yields its results.
+
+**Yields**: Results from the handler's generator method
+
+**Raises**: `RequestException` if no handler found
+
+#### `request_topic_stream_sync(topic, args=None, ...)`
+
+Synchronous streaming variant of `request_topic()`.
+
+#### `subscribe(topic, plugin_name, plugin_uuid, endpoint_access_name=None, handler=None, config_driven=False)`
+
+Register a topic subscription. Used internally by `Plugin.subscribe()`.
+
+**Returns**: Subscription ID (str)
+
+#### `unsubscribe(subscription_id)`
+
+Remove a topic subscription by ID.
+
+**Returns**: `True` if found and removed
+
 #### `wait_until_ready()`
 
 Ensure initialization tasks are started and await their completion. Safe to call multiple times.
@@ -629,6 +879,16 @@ Get structured information about a loaded plugin.
 Get all endpoints for a plugin.
 
 **Returns**: List of endpoint dicts with keys `access_name`, `internal_name`, `remote`, `accessible_by_other_plugins`, `description`, `tags` -- or `None` if not found.
+
+#### `find_endpoints_by_tag(tag)`
+
+Find all endpoints (local and remote) that have a specific tag. Used by the AI system to discover tools at runtime.
+
+**Parameters**:
+
+- `tag` (str): The tag to search for (e.g., `"AI-minimum"`, `"AI-conversation"`, `"AI-working"`, `"AI-debug"`)
+
+**Returns**: List of tuples `(plugin, endpoint_dict, description, arguments)` where `plugin` is either a `Plugin` (local) or `RemotePlugin` (remote) instance. Returns an empty list if no endpoints match.
 
 #### `get_plugins()`
 
@@ -706,7 +966,7 @@ Sync generator one-liner to stream from another plugin's generator method. Must 
 
 **Location**: `decorators.py`
 
-All decorators include automatic type checking -- using the wrong decorator (e.g., `@async_log_errors` on a sync function) raises `PluginTypeMissmatchError` with a message indicating the correct decorator.
+All decorators include automatic type checking -- using the wrong decorator (e.g., `@async_log_errors` on a sync function) raises `PluginTypeMissmatchError` with a message indicating the correct decorator. The `async_handle_errors` decorator also lets `RequestException` propagate (re-raised instead of caught), so callers can handle plugin/request errors upstream.
 
 **For sync functions:**
 
@@ -716,7 +976,7 @@ All decorators include automatic type checking -- using the wrong decorator (e.g
 **For async functions:**
 
 - `@async_log_errors`: Log exceptions without stopping execution, then re-raise
-- `@async_handle_errors(default_return=...)`: Catch exceptions, log them, and return a default value
+- `@async_handle_errors` / `@async_handle_errors(default_return=...)`: Catch exceptions, log them, and return a default value (can be used with or without parentheses; defaults to `None`)
 
 **For sync generators:**
 
@@ -726,7 +986,7 @@ All decorators include automatic type checking -- using the wrong decorator (e.g
 **For async generators:**
 
 - `@async_gen_log_errors` / `@async_gen_log_errors()`: Log exceptions in async generators, then re-raise
-- `@async_gen_handle_errors(default_return=...)`: Catch exceptions in async generators and stop the generator
+- `@async_gen_handle_errors` / `@async_gen_handle_errors(default_return=...)`: Catch exceptions in async generators and stop the generator (can be used with or without parentheses; defaults to `None`)
 
 ### Usage
 
@@ -991,10 +1251,12 @@ AIO_Assistant_Core/
 ├── exceptions.py              # Custom exception classes
 ├── main_application.py        # Example application entry point
 ├── config.yml                 # Main configuration file
+├── requirements.txt           # Python package dependencies
 ├── notes.txt                  # Development notes and TODOs
 ├── README.md                  # This documentation file
 ├── copypasta/                 # Plugin templates and examples
 │   ├── README.md              # Template usage guide
+│   ├── NEW_PUGIN_INFO.md      # Guide for AI-integrated endpoint setup
 │   ├── AveragePlugin/         # Example plugin template
 │   │   ├── plugin.py
 │   │   └── plugin_config.yml
@@ -1007,6 +1269,14 @@ AIO_Assistant_Core/
 │   ├── InteropTarget/         # Interop test target (sync/async/generators)
 │   ├── InteropCaller/         # Interop test runner
 │   └── NetTest/               # Network testing plugin (echo, big objects, streaming)
+├── _private/                  # Production plugins (not part of open-source core)
+│   ├── AI_Plugin/             # AI assistant (Claude API via Anthropic SDK, 4-mode system)
+│   ├── DataCollection/        # Centralized life-data storage (PostgreSQL + MinIO)
+│   ├── VoicePipeline/         # Voice-to-text with speaker diarization and TTS
+│   ├── DiscordBot/            # Discord bot interface with approval system and AI modes
+│   ├── TelegramBot/           # Telegram bot for document scanning and AI chat
+│   ├── DATABASE/              # PostgreSQL and MinIO database plugins
+│   └── TTS/                   # Piper text-to-speech plugin
 ```
 
 ---
@@ -1023,6 +1293,47 @@ The system uses a custom logging utility (`LogUtil` in `utils.py`) that provides
 - **Automatic cleanup**: The `QueueListener` is stopped via `atexit` hook
 
 Log files are automatically created in the `logs/` directory with format: `AIO_AI_YYYY-MM-DD_HH-MM-SS.log`
+
+---
+
+## Private Plugins
+
+The `_private/` directory contains production plugins that build on top of the core framework. These are not part of the open-source core but demonstrate the framework's capabilities. Each plugin has its own documentation in its directory.
+
+### AI_Interaction (`_private/AI_Plugin/`)
+
+An AI assistant powered by Claude (Haiku/Sonnet/Opus) via the Anthropic SDK. Key features:
+
+- **Anthropic API backend**: Uses `anthropic.Anthropic` client with Claude's native structured tool calling (`tool_use`/`tool_result` content blocks). Requires `ANTHROPIC_API_KEY` environment variable or `api_key` in plugin config. Message normalization (`_normalize_messages`) ensures proper user/assistant alternation required by the API.
+- **Inference lock and cancellation**: An `_inference_lock` (threading.Lock) serializes all `ai_chat` / `ai_chat_stream` calls so only one inference runs at a time across all consumers (Discord, voice, API). A `_cancel_event` is checked every token and tool iteration. The `cancel_generation` endpoint allows any consumer to stop the current generation immediately.
+- **Four-mode AI system**: Mode-aware routing selects model, tools, and context per task complexity. Minimum (Haiku, device control), Conversation (Haiku, personal assistant), Working (Sonnet, documents/web), Debug (Sonnet/Opus, full access). Each mode defines its own model, max_tokens, temperature, system prompt, tool tags, and context injection flags. Modes are per-session and reset on inactivity timeout. See [Tags and AI Modes](#tags-and-ai-modes) for details.
+- **Prompt caching**: `_inject_context` returns a `(system_blocks, messages)` tuple. The system prompt is fully static and cacheable (including owner/family person records fetched once on load). Dynamic context (time, channel, memories, semantic results) is prepended as a `[System Context]` message in the messages array. Cache structure: system (cached) -> tools (cached) -> messages (dynamic). Conversation history caching enabled for Working/Debug modes.
+- **Smart optional parameters**: Tool definitions auto-detect optional parameters from argument descriptions containing "optional" or "omit". These parameters are not marked as `required` in the JSON schema, so the LLM does not have to fill them with placeholder values.
+- **Endpoint approval system**: Before executing a tool call, the AI checks the endpoint's approval policy (prompt/auto_approve/deny) from the database. Users approve via Discord buttons.
+- **Tool call visibility**: Conversation history includes `[Tools used: ...]` summaries from metadata, so the AI can reference previous tool results across turns.
+- **Context injection**: Dynamic context is injected per-message (configurable per mode) from: (1) general knowledge memory, (2) active short-term memories, (3) semantically relevant notes, and (4) pending/in-progress tasks semantically related to the user's message.
+- **Daily cost tracking**: Per-call API cost tracking with configurable EUR threshold warning via Discord DM.
+- **Error handling**: Explicit handling for API errors (authentication, rate limits, etc.) that yields/returns visible error messages instead of silent failures.
+
+### DataCollection (`_private/DataCollection/`)
+
+Centralized data storage for all "life data" (people, organizations, documents, appointments, tasks, notes, logs, etc.) backed by PostgreSQL and MinIO. Supports vector-based semantic search (fastembed) over notes, short-term memories, tasks, and documents. See `_private/DataCollection/DOCS.md` for full technical documentation.
+
+### VoicePipeline (`_private/VoicePipeline/`)
+
+Voice-to-text pipeline with speaker diarization (pyannote or speechbrain), Whisper-based STT, and Piper TTS. Uses the current `token=` parameter (not the deprecated `use_auth_token=`) for `Model.from_pretrained` calls. See `_private/VoicePipeline/SETUP_GUIDE.md`.
+
+### DiscordBot (`_private/DiscordBot/`)
+
+Discord bot interface that bridges users to the AI assistant with approval buttons, conversation management, proactive reminders, and AI mode control. Key features:
+
+- **`!ais <message>` (stop+replace)**: Cancels the current AI generation and processes the new message instead.
+- **`!ai` while busy**: The message is queued (hourglass reaction), then processed after the current response finishes. Maximum queue depth: 5 per channel.
+- **`/stop` slash command**: Cancels the current AI generation without sending a new message.
+- **`/mode <minimum|conversation|working|debug>`**: Switch AI mode per channel. Shows confirmation embed with mode name, model, and tool count.
+- **`/debuginfo on|off`**: Toggle debug overlay on AI responses (shows mode, model, token usage).
+- **Per-channel state tracking**: Each channel tracks busy status, a cancel event, a message queue, and active AI mode independently.
+- **Auto-registration of DM channels**: When a user DMs the bot, the DM channel is automatically registered in the DataCollection database with `is_private: True` and `belongs_to` set to the user's person ID.
 
 ---
 

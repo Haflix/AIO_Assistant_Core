@@ -1,97 +1,35 @@
 import asyncio
+import signal
 from PluginCore import PluginCore
-from decorators import async_log_errors
-import tracemalloc
 
 
-# @async_log_errors
 async def main():
-    """Main function to demonstrate the plugin system."""
+    pc = PluginCore("config.yml")
+    await pc.wait_until_ready()
 
-    # tracemalloc.start()
+    # Plugins (e.g., DiscordBot /shutdown) set this event to trigger exit.
+    pc._shutdown_event = asyncio.Event()
 
-    # Initialize the plugin collection
-    plugin_core = PluginCore("config.yml")
+    # Handle Ctrl+C gracefully — set the shutdown event instead of killing the loop.
+    # This lets graceful_shutdown() run (disabling plugins, closing connections).
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, pc._shutdown_event.set)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler for SIGINT in all contexts.
+            # Fall back to signal.signal for Ctrl+C.
+            signal.signal(sig, lambda s, f: pc._shutdown_event.set())
 
-    # Wait for plugins to be loaded
-    await plugin_core.wait_until_ready()
-
-    # nodes = await plugin_core.network.update_all_nodes()
-    # print("Discovered nodes:" + "\n".join(node.__str__() for node in nodes))
-
-    result = await plugin_core.execute(
-        "InteropCaller", "interop_run", {"host": "any"}, host="any"
-    )
-    plugin_core._logger.info(f"Result from Test Async: {result}")
-
-    result = await plugin_core.execute(
-        "InteropCaller", "interop_run_sync", {"host": "any"}, host="any"
-    )
-    plugin_core._logger.info(f"Result from Test Sync: {result}")
-    # Example of using the one-liner execute method
-    # result2 = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
-    # plugin_core._logger.info(f"Result from PluginB: {result2}")
-
-    # async for i in plugin_core.execute_stream(
-    #    "PluginA", "perform_operation_stream_ABC", (9), host="any"
-    # ):
-    #    plugin_core._logger.info(f"Result from PluginA: {i}")
-
-    # nettest_result = await plugin_core.execute(
-    #    "NetTest", "net_echo", ("hello",), host="remote"
-    # )
-    # plugin_core._logger.info(f"Result from NetTest: {nettest_result}")
-
-    # result2 = await plugin_core.execute("PluginC", "perform_operation", (6))
-    # plugin_core._logger.info(f"Result from PluginC: {result2}")
-
-    await asyncio.sleep(10000)
-
-    # Attempt to call a non-existent plugin - will return None due to error handling
-    result3 = await plugin_core.execute("PluginD", "perform_operation")
-    plugin_core._logger.info(f"Result from non-existent PluginD: {result3}")
-
-    plugin_core._logger.info(plugin_core.plugins)
-
-    await plugin_core.purge_plugins()
-
-    plugin_core._logger.info(plugin_core.plugins)
-
-    await plugin_core.get_plugins()
-
-    plugin_core._logger.info(plugin_core.plugins)
-
-    await plugin_core.start_plugins()
-
-    plugin_core._logger.info(plugin_core.plugins)
-
-    result1 = await plugin_core.execute("PluginA", "perform_operation", 4)
-    plugin_core._logger.info(f"Result from PluginA: {result1}")
-
-    await plugin_core.pop_plugin("PluginB")
-
-    result1 = await plugin_core.execute("PluginC", "perform_operation")
-    plugin_core._logger.info(f"Result from PluginC: {result1}")
-
-
-async def shutdown(loop, signal=None):
-    """Cleanup tasks tied to the service's shutdown."""
-    if signal:
-        print(f"Received exit signal {signal.name}...")
-
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-
-    print(f"Cancelling {len(tasks)} outstanding tasks")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
+    await pc._shutdown_event.wait()
+    print("Shutting down...")
+    await pc.graceful_shutdown()
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
     try:
-        loop.create_task(main())
-        loop.run_forever()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Interrupted by user")
     finally:
         print("Successfully shutdown the service.")
-        loop.close()

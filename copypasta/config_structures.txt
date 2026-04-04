@@ -14,7 +14,7 @@ plugins:
   - name: str
     enabled: boolean
     path: str | Empty
-    arguments: 
+    arguments:
         [Any] | Empty
 
 
@@ -36,6 +36,10 @@ networking:
     discover_nodes: boolean      # Enable automatic discovery of nodes on the network
     direct_discoverable: boolean # Allow other nodes to discover this node directly
     auto_discoverable: boolean   # Enable automatic discovery broadcasting
+    secret: str                  # Shared secret for authentication (or use NETWORKING_SECRET env var)
+    cert_file: str               # Path to TLS certificate file (PEM). Empty = auto-generated self-signed
+    key_file: str                # Path to TLS private key file (PEM). Empty = auto-generated
+    pool_size: int               # Connection pool size per remote node. Default: 5
 
 
 plugin_config.yml:::
@@ -50,12 +54,16 @@ arguments:                       # Optional: List of arguments expected during l
 endpoints:                       # List of methods that can be called by other plugins
   - internal_name: str           # Actual method name in the plugin class
     access_name: str             # Name used when calling from other plugins
-    tags:                        # Optional: List of tags for categorization
+    topic: str | Empty           # Optional: Topic for notifier system (e.g. "ai/chat")
+                                 # Subscribes this endpoint to the topic on load.
+                                 # Uses "/" separator. Supports "*" wildcard per segment.
+                                 # Example: "sensor/*/temperature" matches "sensor/bath/temperature"
+    tags:                        # Tags for categorization (can be any string)
       - str
     remote: boolean              # Whether this endpoint can be called remotely
     accessible_by_other_plugins: boolean  # Whether other plugins can call this
     description: str             # Description of what the endpoint does
     arguments:                   # List of arguments this endpoint accepts
       - name: str                # Argument name
-        type: str                # Argument type (int, str, dict, list, any, etc.)
+        type: str                # Argument type (int, str, dict, list, any, bool, float)
         description: str         # Description of the argument

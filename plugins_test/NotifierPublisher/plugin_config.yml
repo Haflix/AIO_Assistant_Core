@@ -1,0 +1,54 @@
+description: Test publisher for the notifier system
+version: 0.0.1
+remote: True
+arguments:
+endpoints:
+  - internal_name: _test_notify
+    access_name: test_notify
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Fire-and-forget notify to a topic
+    arguments:
+      - name: topic
+        type: str
+        description: Topic to publish to
+      - name: args
+        type: any
+        description: Arguments to send
+
+  - internal_name: _test_request
+    access_name: test_request
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Request-by-topic (one-to-one with response)
+    arguments:
+      - name: topic
+        type: str
+        description: Topic to request
+      - name: args
+        type: any
+        description: Arguments to send
+
+  - internal_name: _test_request_stream
+    access_name: test_request_stream
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Streaming request-by-topic
+    arguments:
+      - name: topic
+        type: str
+        description: Topic to request
+      - name: args
+        type: any
+        description: Arguments to send
+
+  - internal_name: _test_all
+    access_name: test_all
+    tags: []
+    remote: False
+    accessible_by_other_plugins: True
+    description: Run all notifier tests and return results
+    arguments:

@@ -3,7 +3,7 @@ import inspect
 import logging
 import traceback
 from typing import Callable, Any, Optional
-from exceptions import PluginTypeMissmatchError
+from exceptions import PluginTypeMissmatchError, RequestException
 
 
 def _check_type(func, expected_type, correct_decorator):
@@ -240,6 +240,9 @@ def async_handle_errors(default_return=None):
                 return await func(*args, **kwargs)
 
             except Exception as e:
+                # Let RequestException propagate so callers can handle plugin/request errors
+                if isinstance(e, RequestException):
+                    raise
                 # Get useful information about where the error occurred
                 func_name = func.__name__
                 file_name = func.__code__.co_filename

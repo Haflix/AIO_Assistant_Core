@@ -134,8 +134,10 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments / env files (tokens, secrets)
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -199,3 +201,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Claude
+.claude/
+CLAUDE.md
+
+# Backups
+backups/
+
+# Config files
+config.yml
