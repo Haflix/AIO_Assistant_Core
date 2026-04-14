@@ -1,6 +1,5 @@
-description: CLI plugin that allows you to run commands and scripts with plugins
-version: 0.0.1
+description: "AIO Dashboard — Textual TUI for PluginCore management, monitoring, and plugin interaction"
+version: 2.4.0
 remote: False
-arguments:
-endpoints:
-
+arguments: []
+endpoints: []

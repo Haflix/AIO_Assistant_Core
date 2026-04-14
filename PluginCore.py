@@ -18,6 +18,7 @@ import functools
 import importlib
 import inspect
 import asyncio
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List
@@ -1264,10 +1265,12 @@ class PluginCore:
 
     @async_log_errors
     async def cleanup_requests(self):
-        """Remove collected requests."""
+        """Remove collected requests older than 10 seconds."""
+        _timer = time.time() - 10
         async with self.request_lock:
             self.requests = {
-                rid: req for rid, req in self.requests.items() if not req.collected
+                rid: req for rid, req in self.requests.items()
+                if not req.collected or (req.finished_at is None or req.finished_at > _timer)
             }
 
     # One-liner methods for plugin communication

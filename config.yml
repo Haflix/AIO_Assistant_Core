@@ -21,7 +21,7 @@ plugins:
     path: ./plugins_test/InteropCaller
 
   - name: CLI
-    enabled: false
+    enabled: true
     path: ./plugins_test/CLI
 
   - name: PostgreSQL
@@ -43,6 +43,10 @@ plugins:
   - name: DeviceControl
     enabled: false
     path: ./_private/DeviceControl
+
+  - name: MemoryPlugin
+    enabled: true
+    path: ./_private/MemoryPlugin
 
   - name: AI_Interaction
     enabled: true

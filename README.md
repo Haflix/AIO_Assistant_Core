@@ -30,7 +30,7 @@
 - **Simple API**: One-liner syntax for executing plugin methods
 - **Topic-Based Notifier**: Pub/sub and request-by-topic system for decoupled plugin communication with wildcard support
 - **Streaming Support**: Full support for both sync and async generator-based data streams
-- **Built-in CLI**: Interactive command-line interface for managing plugins at runtime
+- **Built-in CLI Dashboard**: Textual-based TUI with system stats, plugin management, config editing, and live logs
 - **Error Handling**: Comprehensive decorator-based error handling for sync functions, async functions, sync generators, and async generators
 - **Non-Blocking Logging**: Thread-safe queue-based logging with colored console output and file logging
 
@@ -49,8 +49,10 @@ cd AIO_Assistant_Core
 pip install pyyaml colorama
 # For networking with auto-generated TLS certificates:
 pip install cryptography
-# For the CLI plugin:
-pip install prompt_toolkit
+# For the CLI dashboard plugin:
+pip install textual
+# Optional (enables CPU/memory sparkline graphs):
+pip install psutil
 
 # Plugin-specific dependencies are listed in requirements.txt
 # (only install what you need for the plugins you plan to use)
@@ -1006,64 +1008,38 @@ async def my_stream(self, count):
 
 ---
 
-## CLI Plugin
+## CLI Dashboard Plugin
 
-The CLI plugin provides an interactive command-line interface for managing plugins at runtime using `prompt_toolkit`.
+The CLI plugin provides a Textual-based terminal dashboard (TUI) for managing and monitoring the PluginCore at runtime.
 
 **Location**: `plugins_test/CLI/`
+**Version**: 2.2.0
+**Dependencies**: `textual` (required), `psutil` (optional — enables CPU/memory sparkline graphs)
 
-### Available Commands
+### Dashboard Tabs
 
-**Plugin Management:**
-
-| Command | Description |
+| Tab | Description |
 |---|---|
-| `load <name>` | Load a plugin from config |
-| `enable <name>` | Enable a loaded plugin |
-| `disable <name>` | Disable a plugin |
-| `reload <name>` | Reload a plugin (disable, remove, re-load, re-enable) |
-| `pop <name>` | Remove a plugin from memory |
-| `purge` | Remove all plugins (including CLI) |
-| `purge_safe` | Remove all plugins except CLI |
+| **Home** | System stats (CPU, memory, uptime) with live sparkline graphs. Active requests and network node tables with empty-state labels |
+| **Plugins** | DataTable of all loaded plugins with enable/disable/reload/remove buttons |
+| **Config** | Edit `config.yml` and per-plugin `plugin_config.yml` files with YAML validation. Dirty tracking warns on unsaved changes when switching files or tabs |
+| **Logs** | Live log viewer with level filtering, text search, and auto-scroll. Incremental DataTable updates (append/remove) preserve scroll position. Record count indicator shows filtered/total with "(filtered)" suffix. Per-level color styling (ERROR red, WARNING amber, INFO gray, DEBUG dim) |
+| **Per-Plugin** | Auto-generated tabs for each plugin (from endpoints or custom registration) |
 
-**Inspection:**
+### Plugin Registration API
 
-| Command | Description |
+Plugins can register custom TUI panels by implementing either method:
+
+- **Option A — Declarative** (`get_tui_menu() -> dict`): No Textual dependency required. Return a dict describing menu items and the Dashboard renders them.
+- **Option B — Full Widget** (`get_tui_widget() -> Widget`): Return a Textual widget for maximum control.
+
+If neither method is implemented, the Dashboard auto-generates a view from the plugin's registered endpoints.
+
+### Key Bindings
+
+| Key | Action |
 |---|---|
-| `list` | List all loaded plugins with status |
-| `info <name>` | Show detailed plugin information |
-| `endpoints <name>` | Show all endpoints for a plugin |
-| `status` | Show system status (hostname, plugin count, networking) |
-
-**Execution:**
-
-| Command | Description |
-|---|---|
-| `call <plugin> <method> [json_args]` | Call a plugin method (runs in background) |
-| `stream <plugin> <method> [json_args]` | Stream from a plugin method (runs in background) |
-
-**System:**
-
-| Command | Description |
-|---|---|
-| `shutdown` | Gracefully shutdown the system |
-| `clear` | Clear the screen |
-| `config show` | Show current config file contents |
-| `config edit` | Show instructions for editing config |
-| `help` | Show help message |
-
-### CLI Examples
-
-```
-AIO> list
-AIO> info PluginA
-AIO> endpoints PluginB
-AIO> call PluginB calculate_square 6
-AIO> call PluginA perform_operation {"argument": 5}
-AIO> stream PluginA perform_operation_stream {"argument": 5}
-AIO> reload PluginB
-AIO> shutdown
-```
+| `q` | Quit the dashboard (triggers system shutdown) |
 
 ---
 
@@ -1265,7 +1241,7 @@ AIO_Assistant_Core/
 │   ├── pluginA_v1/            # Async plugin calling another plugin
 │   ├── PluginB/               # Async calculation plugin
 │   ├── PluginC/               # Sync plugin calling an async plugin
-│   ├── CLI/                   # Interactive command-line interface plugin
+│   ├── CLI/                   # Textual TUI dashboard (stats, plugin mgmt, config editor, logs)
 │   ├── InteropTarget/         # Interop test target (sync/async/generators)
 │   ├── InteropCaller/         # Interop test runner
 │   └── NetTest/               # Network testing plugin (echo, big objects, streaming)
