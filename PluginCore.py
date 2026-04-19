@@ -42,7 +42,7 @@ from decorators import (
     gen_log_errors,
     gen_handle_errors,
 )
-from networking import NetworkManager
+from networking import NetworkManager, REMOTE_NO_RESULT
 from notifier import TopicRegistry, Subscription
 
 
@@ -56,7 +56,9 @@ class PluginCore:
         self.config_path = config_path
         self.load_config_yaml(self.config_path)
 
-        LogUtil.change_level(self.yaml_config["general"]["console_log_level"])
+        general = self.yaml_config.get("general", {})
+        LogUtil.change_level(general.get("console_log_level", "DEBUG"))
+        LogUtil.change_file_level(general.get("file_log_level", "DEBUG"))
 
         self.requests = {}
         self.request_lock = asyncio.Lock()
@@ -76,14 +78,16 @@ class PluginCore:
         self._running_loop_task = None
         self.network = None
         self.topic_registry = TopicRegistry(self._logger.getChild("notifier"))
+        self._config_write_lock = threading.Lock()
 
     async def wait_until_ready(self):
         """Ensure initialization tasks are started and await their completion."""
         # Ensure event loop and maintenance task
         if self.main_event_loop is None:
             self.main_event_loop = asyncio.get_running_loop()
-            self.main_event_loop.set_debug(True)
-            self.main_event_loop.slow_callback_duration = 0.5
+            if self.yaml_config.get("general", {}).get("asyncio_debug", False):
+                self.main_event_loop.set_debug(True)
+                self.main_event_loop.slow_callback_duration = 0.5
         if self._running_loop_task is None:
             self._running_loop_task = asyncio.create_task(self.running_loop())
 
@@ -227,6 +231,90 @@ class PluginCore:
 
         ConfigUtil.apply_configvalues(self)
 
+    async def async_load_config_yaml(self, config_path: str):
+        """Async wrapper around load_config_yaml for use outside __init__."""
+        self.load_config_yaml(config_path)
+
+    # ── Config file editing ──────────────────────────────────────────
+
+    @log_errors
+    def list_config_files(self) -> Dict[str, str]:
+        """Return {label: absolute_path} for main config and all plugin configs."""
+        files = {}
+        main_config = os.path.abspath(self.config_path)
+        files["config.yml (main)"] = main_config
+
+        for entry in self.yaml_config.get("plugins", []):
+            name = entry.get("name", "")
+            path = entry.get("path") or os.path.join(self.plugin_package, name)
+            cfg = os.path.join(os.path.abspath(path), "plugin_config.yml")
+            if os.path.isfile(cfg):
+                files[f"{name}/plugin_config.yml"] = cfg
+
+        return files
+
+    @log_errors
+    def read_config_file(self, path: str) -> str:
+        """Read and return raw content of a known config file.
+
+        Args:
+            path: Absolute path to the config file.
+
+        Returns:
+            File content as string.
+
+        Raises:
+            FileNotFoundError: If path doesn't exist.
+            ValueError: If path not in list_config_files().
+        """
+        abs_path = os.path.abspath(path)
+        allowed = set(self.list_config_files().values())
+        if abs_path not in allowed:
+            raise ValueError(f"Path not in known config files: {path}")
+
+        with open(abs_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @log_errors
+    def save_config_file(self, path: str, content: str, backup: bool = True) -> None:
+        """Validate YAML, create .bak backup, and write content.
+
+        Does NOT re-apply main config — call load_config_yaml() explicitly
+        if you need settings to take effect immediately.
+
+        Args:
+            path: Absolute path to the config file.
+            content: New YAML content to write.
+            backup: Whether to create a .yml.bak before overwriting.
+
+        Raises:
+            ValueError: If path not in known config files or content parses to empty.
+            yaml.YAMLError: If content is invalid YAML.
+        """
+        abs_path = os.path.abspath(path)
+        allowed = set(self.list_config_files().values())
+        if abs_path not in allowed:
+            raise ValueError(f"Path not in known config files: {path}")
+
+        parsed = yaml.safe_load(content)
+        if not parsed:
+            raise ValueError("Config content is empty or null after parsing")
+
+        with self._config_write_lock:
+            if backup and os.path.exists(abs_path):
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    old_content = f.read()
+                bak_path = abs_path + ".bak"
+                with open(bak_path, "w", encoding="utf-8") as f:
+                    f.write(old_content)
+
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    def is_main_config(self, path: str) -> bool:
+        """Check if path points to the main config.yml."""
+        return os.path.abspath(path) == os.path.abspath(self.config_path)
+
     @async_log_errors
     async def load_plugins(self):
         # Load the plugins
@@ -249,15 +337,15 @@ class PluginCore:
     async def start_plugins(self) -> None:
         """Start all plugin loops."""
         tasks = []
+        task_plugins = []
         for plugin in self.plugins.values():
             if not plugin.enabled:
                 tasks.append(self._enable_plugin(plugin.plugin_name))
+                task_plugins.append(plugin)
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for plugin, result in zip(
-                [p for p in self.plugins.values() if p.enabled], results
-            ):
+            for plugin, result in zip(task_plugins, results):
                 if isinstance(result, Exception):
                     self._logger.warning(
                         f'Error occured while enabling plugin with name "{plugin.plugin_name}": {type(result).__name__}: {result}'
@@ -315,8 +403,8 @@ class PluginCore:
 
         # Validate endpoints config
         for endpoint in (
-            plugin_config["endpoints"]
-            if isinstance(plugin_config["endpoints"], list)
+            plugin_config.get("endpoints")
+            if isinstance(plugin_config.get("endpoints"), list)
             else []
         ):
             for field in [
@@ -326,8 +414,8 @@ class PluginCore:
                 "accessible_by_other_plugins",
             ]:
                 if field not in endpoint:
-                    error_config(f"{endpoint} is missing {field} in plugin_config.yml")
-                    continue
+                    await error_config(f"{endpoint} is missing {field} in plugin_config.yml")
+                    return
 
             for check in [
                 ("internal_name", str, True, True),
@@ -362,10 +450,17 @@ class PluginCore:
 
         # Find first Plugin subclass
         plugin_class = next(
-            cls
-            for _, cls in inspect.getmembers(module, inspect.isclass)
-            if issubclass(cls, Plugin) and cls != Plugin
+            (
+                cls
+                for _, cls in inspect.getmembers(module, inspect.isclass)
+                if issubclass(cls, Plugin) and cls != Plugin
+            ),
+            None,
         )
+        if plugin_class is None:
+            self._logger.error(f"No Plugin subclass found in {module_path}")
+            error_config(name)
+            return
 
         # Instantiate with config
         plugin = plugin_class(
@@ -379,9 +474,9 @@ class PluginCore:
         )
 
         plugin.plugin_name = name  # Set name from main config
-        plugin.version = plugin_config["version"] or "0.0.0 - not given"
-        plugin.remote = plugin_config["remote"] or False
-        plugin.arguments = plugin_config["arguments"] or None
+        plugin.version = plugin_config["version"] if plugin_config["version"] is not None else "0.0.0 - not given"
+        plugin.remote = plugin_config["remote"] if plugin_config["remote"] is not None else False
+        plugin.arguments = plugin_config["arguments"] if plugin_config["arguments"] is not None else None
         endpoints_cfg = plugin_config.get("endpoints") or []
         if not isinstance(endpoints_cfg, list):
             await warn_config(f"{name} endpoints must be a list in plugin_config.yml")
@@ -458,7 +553,12 @@ class PluginCore:
             for plugin_name in list(self.plugins.keys()):
                 await self._disable_plugin(plugin_name)
             async with self.plugin_lock:
+                for plugin in self.plugins.values():
+                    plugin_uuid = getattr(plugin, "plugin_uuid", None)
+                    if plugin_uuid:
+                        await self.topic_registry.unsubscribe_plugin(plugin_uuid)
                 self.plugins.clear()
+                self.plugins_by_uuid.clear()
             self._logger.info("Purged all plugins")
         except Exception as error:
             raise Exception(f"Error while purging plugins: {error}")
@@ -478,8 +578,12 @@ class PluginCore:
                     plugin = self.plugins.pop(plugin_name, None)
                     if plugin:
                         plugin_uuid = getattr(plugin, "plugin_uuid", None)
-                        if plugin_uuid and plugin_uuid in self.plugins_by_uuid:
-                            self.plugins_by_uuid.pop(plugin_uuid, None)
+                        if plugin_uuid:
+                            if plugin_uuid in self.plugins_by_uuid:
+                                self.plugins_by_uuid.pop(plugin_uuid, None)
+                            await self.topic_registry.unsubscribe_plugin(
+                                plugin_uuid
+                            )
             self._logger.info(
                 f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
             )
@@ -611,7 +715,7 @@ class PluginCore:
                 raise Exception(f"Request {request.id} failed: {request.result}")
             yield result
         finally:
-            request.set_collected()
+            await request.set_collected()
 
     @contextlib.contextmanager
     def request_context_sync(self, request: Request):
@@ -622,7 +726,9 @@ class PluginCore:
                 raise Exception(f"Request failed: {request.result}")
             yield result
         finally:
-            request.set_collected()
+            asyncio.run_coroutine_threadsafe(
+                request.set_collected(), self.main_event_loop
+            )
 
     @async_log_errors
     async def create_request(
@@ -1130,114 +1236,122 @@ class PluginCore:
     # @async_handle_errors(None)
     async def _process_request_stream(self, request: GeneratorRequest) -> None:
         """Process a request by invoking the target plugin method."""
-        plugin_name = request.target_plugin
-        function_name = request.target_method
+        try:
+            plugin_name = request.target_plugin
+            function_name = request.target_method
 
-        # plugin, node = await self.find_plugin(
-        #    plugin_name, request.target_host, request.target_plugin_uuid
-        # )
-        plugin, endpoint, node = await self.find_endpoint(
-            request.target_method,
-            request.target_host,
-            request.target_plugin_uuid,
-            request.author_id,
-            request.target_plugin,
-        )
-
-        if not plugin:
-            await self._set_gen_request_result(
-                request, f"Endpoint {function_name} not found", True
+            # plugin, node = await self.find_plugin(
+            #    plugin_name, request.target_host, request.target_plugin_uuid
+            # )
+            plugin, endpoint, node = await self.find_endpoint(
+                request.target_method,
+                request.target_host,
+                request.target_plugin_uuid,
+                request.author_id,
+                request.target_plugin,
             )
-            return
 
-        host = (
-            f"(local) {self.hostname}"
-            if isinstance(plugin, Plugin)
-            else f"{node.IP}#{node.hostname}"
-        )
-        self._logger.debug(
-            f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}"
-        )
-
-        if isinstance(plugin, RemotePlugin):
-            async for result in self.network.execute_remote_stream(
-                IP=node.IP,
-                plugin=plugin_name,
-                method=function_name,
-                args=request.args,
-                plugin_uuid=request.target_plugin_uuid,
-                author=f"{self.hostname} - {request.author}#{request.author_id}",
-                author_id=request.author_id,
-                timeout=(request.timeout_duration, request.created_at),
-                request_id=request.id,
-            ):
-                await request.queue.put(result)  # FIXME
-
-        else:
-            # if not plugin.remote and request.author_id:
-            #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
-            #    return
-            func = getattr(plugin, endpoint.get("internal_name"), None)
-            if not callable(func):  # or not inspect.isfunction(func):
-                # await request.queue.put((result, False, False))
+            if not plugin:
                 await self._set_gen_request_result(
-                    request,
-                    f"Function {endpoint.get('access_name')}({endpoint.get('internal_name')}) not found in plugin {plugin_name}",
-                    True,
+                    request, f"Endpoint {function_name} not found", True
                 )
                 return
 
-            if asyncio.iscoroutinefunction(func):
-                await self._set_gen_request_result(
-                    request,
-                    f"For Request {request.id}: The method you requested is a non-generator async function. Use execute for non-generators",
-                    True,
-                )
-                return
+            host = (
+                f"(local) {self.hostname}"
+                if isinstance(plugin, Plugin)
+                else f"{node.IP}#{node.hostname}"
+            )
+            self._logger.debug(
+                f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}"
+            )
 
-            elif inspect.isasyncgenfunction(func):
-                if isinstance(request.args, tuple):
-                    async for result in func(*request.args):
-                        await request.queue.put((result, False, False))
-                elif isinstance(request.args, dict):
-                    async for result in func(**request.args):
-                        await request.queue.put((result, False, False))
-                elif request.args == None:
-                    async for result in func():
-                        await request.queue.put((result, False, False))
-                else:
-                    async for result in func(request.args):
-                        await request.queue.put((result, False, False))
-
-            elif inspect.isgeneratorfunction(func):
-                if isinstance(request.args, tuple):
-                    generator = func(*request.args)
-                elif isinstance(request.args, dict):
-                    generator = func(**request.args)
-                elif request.args == None:
-                    generator = func()
-                else:
-                    generator = func(request.args)
-
-                sentinel = object()
-                while True:
-                    result = await asyncio.to_thread(next, generator, sentinel)
-                    if result is sentinel:
-                        break
-                    await request.queue.put(
-                        (result, False, False)
-                    )  # FIXME Add in utils
+            if isinstance(plugin, RemotePlugin):
+                async for result in self.network.execute_remote_stream(
+                    IP=node.IP,
+                    plugin=plugin_name,
+                    method=function_name,
+                    args=request.args,
+                    plugin_uuid=request.target_plugin_uuid,
+                    author=f"{self.hostname} - {request.author}#{request.author_id}",
+                    author_id=request.author_id,
+                    timeout=(request.timeout_duration, request.created_at),
+                    request_id=request.id,
+                ):
+                    await request.queue.put((result, False, False))
 
             else:
-                await self._set_gen_request_result(
-                    request,
-                    f"For Request {request.id}: The method you requested is a non-generator sync function. Use execute for non-generators",
-                    True,
-                )
-                return
-                # result = await self.main_event_loop.run_in_executor(self._plugin_executor, func, request.args)
+                # if not plugin.remote and request.author_id:
+                #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
+                #    return
+                func = getattr(plugin, endpoint.get("internal_name"), None)
+                if not callable(func):  # or not inspect.isfunction(func):
+                    # await request.queue.put((result, False, False))
+                    await self._set_gen_request_result(
+                        request,
+                        f"Function {endpoint.get('access_name')}({endpoint.get('internal_name')}) not found in plugin {plugin_name}",
+                        True,
+                    )
+                    return
 
-        await self._set_gen_request_result(request)
+                if asyncio.iscoroutinefunction(func):
+                    await self._set_gen_request_result(
+                        request,
+                        f"For Request {request.id}: The method you requested is a non-generator async function. Use execute for non-generators",
+                        True,
+                    )
+                    return
+
+                elif inspect.isasyncgenfunction(func):
+                    if isinstance(request.args, tuple):
+                        async for result in func(*request.args):
+                            await request.queue.put((result, False, False))
+                    elif isinstance(request.args, dict):
+                        async for result in func(**request.args):
+                            await request.queue.put((result, False, False))
+                    elif request.args == None:
+                        async for result in func():
+                            await request.queue.put((result, False, False))
+                    else:
+                        async for result in func(request.args):
+                            await request.queue.put((result, False, False))
+
+                elif inspect.isgeneratorfunction(func):
+                    if isinstance(request.args, tuple):
+                        generator = func(*request.args)
+                    elif isinstance(request.args, dict):
+                        generator = func(**request.args)
+                    elif request.args == None:
+                        generator = func()
+                    else:
+                        generator = func(request.args)
+
+                    sentinel = object()
+                    while True:
+                        result = await asyncio.to_thread(next, generator, sentinel)
+                        if result is sentinel:
+                            break
+                        await request.queue.put(
+                            (result, False, False)
+                        )  # FIXME Add in utils
+
+                else:
+                    await self._set_gen_request_result(
+                        request,
+                        f"For Request {request.id}: The method you requested is a non-generator sync function. Use execute for non-generators",
+                        True,
+                    )
+                    return
+                    # result = await self.main_event_loop.run_in_executor(self._plugin_executor, func, request.args)
+
+            await self._set_gen_request_result(request)
+
+        except Exception as e:
+            # Safety net: resolve the future so consumers don't hang forever
+            if not request._future.done():
+                await self._set_gen_request_result(
+                    request, f"Unhandled error processing stream request: {e}", True
+                )
 
     @async_handle_errors(None)
     async def _set_request_result(
@@ -1654,42 +1768,46 @@ class PluginCore:
         Request-by-topic: find the first matching handler and return its result.
         Same discovery logic as execute() with host="any" (local first).
         """
-        sub = await self.topic_registry.find_first(topic)
+        # Try local subscription first (only if host includes local)
+        sub = None
+        if host in ("any", "local", self.hostname):
+            sub = await self.topic_registry.find_first(topic)
 
-        if sub is None:
-            # No local subscription — check remote if applicable
-            if getattr(self, "networking_enabled", False) and host not in (
-                "local", self.hostname,
-            ):
-                for node in self.network.nodes:
-                    if not (node.enabled and await node.is_alive()):
-                        continue
-                    if host not in ("any", "remote") and node.hostname != host:
-                        continue
-                    try:
-                        result = await self.network.request_topic_remote(
-                            node.IP, topic, args, author, author_id, timeout,
-                        )
-                        if result is not None:
-                            return result
-                    except Exception as e:
-                        self._logger.warning(
-                            f"request_topic '{topic}': remote {node.hostname} failed: {e}"
-                        )
-            raise RequestException(f"No handler found for topic '{topic}'")
+        if sub is not None:
+            plugin_name, access_name, handler = await self._resolve_subscription(sub)
 
-        plugin_name, access_name, handler = await self._resolve_subscription(sub)
+            if handler is not None:
+                return await self._call_endpoint(handler, args)
 
-        if handler is not None:
-            return await self._call_endpoint(handler, args)
+            return await self.execute(
+                plugin_name, access_name, args,
+                plugin_uuid=sub.plugin_uuid,
+                host="local",
+                author=author, author_id=author_id,
+                timeout=timeout,
+            )
 
-        return await self.execute(
-            plugin_name, access_name, args,
-            plugin_uuid=sub.plugin_uuid,
-            host="local",
-            author=author, author_id=author_id,
-            timeout=timeout,
-        )
+        # No local match (or host excludes local) — check remote
+        if getattr(self, "networking_enabled", False) and host not in (
+            "local", self.hostname,
+        ):
+            for node in self.network.nodes:
+                if not (node.enabled and await node.is_alive()):
+                    continue
+                if host not in ("any", "remote") and node.hostname != host:
+                    continue
+                try:
+                    result = await self.network.request_topic_remote(
+                        node.IP, topic, args, author, author_id, timeout,
+                    )
+                    if result is not REMOTE_NO_RESULT:
+                        return result
+                except Exception as e:
+                    self._logger.warning(
+                        f"request_topic '{topic}': remote {node.hostname} failed: {e}"
+                    )
+
+        raise RequestException(f"No handler found for topic '{topic}'")
 
     @log_errors
     def request_topic_sync(
@@ -1729,7 +1847,9 @@ class PluginCore:
         Request-by-topic with streaming: find the first matching handler
         and yield its results.
         """
-        sub = await self.topic_registry.find_first(topic)
+        sub = None
+        if host in ("any", "local", self.hostname):
+            sub = await self.topic_registry.find_first(topic)
 
         if sub is None:
             if getattr(self, "networking_enabled", False) and host not in (
@@ -1771,17 +1891,19 @@ class PluginCore:
                         yield chunk
             elif inspect.isgeneratorfunction(handler):
                 if isinstance(args, tuple):
-                    for chunk in handler(*args):
-                        yield chunk
+                    gen = handler(*args)
                 elif isinstance(args, dict):
-                    for chunk in handler(**args):
-                        yield chunk
+                    gen = handler(**args)
                 elif args is None:
-                    for chunk in handler():
-                        yield chunk
+                    gen = handler()
                 else:
-                    for chunk in handler(args):
-                        yield chunk
+                    gen = handler(args)
+                sentinel = object()
+                while True:
+                    chunk = await asyncio.to_thread(next, gen, sentinel)
+                    if chunk is sentinel:
+                        break
+                    yield chunk
             else:
                 raise RequestException(
                     f"Handler for topic '{topic}' is not a generator function"

@@ -2,8 +2,8 @@
 AIO Dashboard Plugin — Textual-based TUI for the PluginCore.
 
 Plugins can register custom TUI panels by implementing either:
-  - get_tui_menu() -> dict    (declarative, no Textual dependency)
-  - get_tui_widget() -> Widget (full Textual widget, more power)
+  - get_tui_module_info() -> dict  (Dashboard imports TUI package, recommended)
+  - get_tui_menu() -> dict         (declarative, no Textual dependency)
 """
 
 import asyncio

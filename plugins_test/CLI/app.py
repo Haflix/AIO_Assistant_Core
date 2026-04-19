@@ -34,6 +34,7 @@ except ImportError:
     HAS_PSUTIL = False
 
 from textual import on, work
+from textual.worker import Worker, WorkerState
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -208,6 +209,32 @@ Footer {
 .plugin-view-container > Horizontal { height: auto; padding: 0 0 1 0; }
 .plugin-view-container > Horizontal > Button { margin: 0 1 0 0; }
 
+.view-mode-bar {
+    height: auto;
+    layout: horizontal;
+    padding: 0 0 1 0;
+    dock: top;
+}
+.view-mode-bar Button {
+    margin: 0 1 0 0;
+    min-width: 16;
+}
+.view-mode-bar .view-bar-spacer {
+    width: 1fr;
+}
+.view-mode-bar .close-tab-btn {
+    margin: 0 0 0 1;
+}
+.view-mode-bar .active-mode {
+    background: #2d3340;
+    color: #7dade0;
+    text-style: bold;
+}
+.view-mode-bar .inactive-mode {
+    background: #3c3c3c;
+    color: #808080;
+}
+
 .ep-meta { color: #808080; }
 .ep-arg-table { height: auto; max-height: 8; }
 
@@ -345,6 +372,7 @@ class DashboardApp(App):
         self._id_counter = 0
         self._id_registry: Dict[str, Dict[str, str]] = {}
         self._plugin_tab_map: Dict[str, str] = {}
+        self._plugin_tab_modes: Dict[str, str] = {}
 
         # Plugin search filter
         self._plugin_filter: str = ""
@@ -369,7 +397,17 @@ class DashboardApp(App):
         future = asyncio.run_coroutine_threadsafe(coro, self._main_loop)
         # Wrap the concurrent.futures.Future so we can await it on Textual's loop.
         # Timeout prevents a hung PluginCore call from freezing the entire TUI.
-        return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            future.cancel()
+            raise
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except Exception:
+            future.cancel()
+            raise
 
     # ─── ID Registry ─────────────────────────────────────────────────
 
@@ -386,8 +424,14 @@ class DashboardApp(App):
     def _lookup_id(self, wid: str) -> Optional[Dict[str, str]]:
         return self._id_registry.get(wid)
 
-    def _cleanup_registry_for_plugin(self, plugin_name: str) -> None:
-        to_remove = [k for k, v in self._id_registry.items() if v.get("plugin") == plugin_name]
+    def _cleanup_registry_for_plugin(self, plugin_name: str,
+                                      exclude_types: set | None = None) -> None:
+        to_remove = [
+            k for k, v in self._id_registry.items()
+            if v.get("plugin") == plugin_name
+            and (exclude_types is None
+                 or v.get("type") not in exclude_types)
+        ]
         for wid in to_remove:
             del self._id_registry[wid]
 
@@ -774,7 +818,9 @@ class DashboardApp(App):
             if HAS_PSUTIL:
                 cpu = psutil.cpu_percent(interval=None)
                 mem = psutil.virtual_memory()
-                proc_cpu = self._process.cpu_percent() if self._process else 0
+                # cpu_percent() sums across cores — normalize to match Task Manager view
+                raw_cpu = self._process.cpu_percent() if self._process else 0
+                proc_cpu = raw_cpu / psutil.cpu_count(logical=True)
                 try:
                     proc_mem = self._process.memory_info().rss / (1024**3) if self._process else 0
                 except Exception:
@@ -1022,20 +1068,16 @@ class DashboardApp(App):
                 pass
             self._load_config_file(label)
 
-    @work(thread=False, exclusive=True, group="config")
+    @work(thread=False, exclusive=True, group="config-save")
     async def _save_config_file(self) -> None:
         if not self._current_config_file:
             self._set_status("No file loaded", error=True)
             return
         try:
             content = self.query_one("#config-editor", TextArea).text
-            yaml.safe_load(content)
-            config_path = Path(self._current_config_file)
-            if config_path.exists():
-                config_path.with_suffix(".yml.bak").write_text(
-                    config_path.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-            config_path.write_text(content, encoding="utf-8")
+            await self._run_on_main(
+                self._save_config_on_main(self._current_config_file, content)
+            )
             self._config_clean_hash = hashlib.md5(content.encode()).hexdigest()
             main = os.path.abspath(self.plugin_core.config_path)
             if self._current_config_file == main:
@@ -1046,6 +1088,10 @@ class DashboardApp(App):
             self._set_status(f"Invalid YAML: {e}", error=True)
         except Exception as e:
             self._set_status(f"Error: {e}", error=True)
+
+    async def _save_config_on_main(self, path: str, content: str) -> None:
+        """Dispatch config save to PluginCore (thread-safe with backup)."""
+        self.plugin_core.save_config_file(path, content, backup=True)
 
     def _config_is_dirty(self) -> bool:
         """Check if config editor content differs from last load/save."""
@@ -1103,44 +1149,98 @@ class DashboardApp(App):
 
     # ─── Plugin view generation ──────────────────────────────────────
 
-    def _build_plugin_tab_content(self, plugin_name: str, plugin=None) -> list:
+    def _build_plugin_tab_content(self, plugin_name: str, plugin=None,
+                                    force_mode: str = "auto",
+                                    has_bar: bool = False) -> list:
+        """Build tab content for a plugin.
+
+        Args:
+            plugin_name: Name of the plugin.
+            plugin: Plugin instance (fetched from registry if None).
+            force_mode: "auto" (normal priority chain), "custom" (only custom
+                widget/menu), or "generated" (only auto-generated view).
+            has_bar: True when a view-mode-bar exists above the scroll
+                container (close button already in bar — skip duplicates).
+        """
+        _log = logging.getLogger("CLI.TabBuilder")
         if plugin is None:
             plugin = self.plugin_core.plugins.get(plugin_name)
         if not plugin:
             return [Static(f"Plugin '{escape(plugin_name)}' not found.")]
 
-        # Custom widget
-        if hasattr(plugin, "get_tui_widget") and callable(plugin.get_tui_widget):
+        if force_mode == "generated":
+            _log.debug("[%s] force_mode=generated — skipping custom checks",
+                       plugin_name)
+            return self._auto_generate_plugin_view(plugin_name, plugin,
+                                                   has_bar=has_bar)
+
+        # Module-info based custom widget (Dashboard imports the TUI module)
+        has_module_info = (hasattr(plugin, "get_tui_module_info")
+                          and callable(plugin.get_tui_module_info))
+        _log.debug("[%s] has get_tui_module_info: %s", plugin_name,
+                   has_module_info)
+        if has_module_info:
             try:
                 from textual.widget import Widget as _Widget
-                w = plugin.get_tui_widget()
-                if w is not None and isinstance(w, _Widget):
-                    return [w]
+                info = plugin.get_tui_module_info()
+                _log.debug("[%s] get_tui_module_info() returned: %s",
+                           plugin_name, info)
+                if info and isinstance(info, dict):
+                    w = self._load_tui_widget_from_module_info(plugin, info)
+                    if w is not None and isinstance(w, _Widget):
+                        return [w]
+                    _log.warning("[%s] TUI module load returned None or "
+                                "non-Widget — falling through", plugin_name)
+                else:
+                    _log.warning("[%s] get_tui_module_info() returned "
+                                "non-dict — falling through", plugin_name)
             except Exception as e:
+                _log.error("[%s] get_tui_module_info() raised: %s",
+                           plugin_name, e, exc_info=True)
                 return [Static(f"Error: {escape(str(e))}")]
 
         # Menu dict
-        if hasattr(plugin, "get_tui_menu") and callable(plugin.get_tui_menu):
+        has_menu = (hasattr(plugin, "get_tui_menu")
+                    and callable(plugin.get_tui_menu))
+        _log.debug("[%s] has get_tui_menu: %s", plugin_name, has_menu)
+        if has_menu:
             try:
                 menu = plugin.get_tui_menu()
                 if menu and isinstance(menu, dict):
-                    return self._render_menu_dict(plugin_name, menu)
+                    return self._render_menu_dict(plugin_name, menu,
+                                                  has_bar=has_bar)
+                _log.warning("[%s] get_tui_menu() returned non-dict or empty",
+                             plugin_name)
             except Exception as e:
+                _log.error("[%s] get_tui_menu() raised: %s", plugin_name, e,
+                           exc_info=True)
                 return [Static(f"Error: {escape(str(e))}")]
 
+        if force_mode == "custom":
+            _log.warning("[%s] force_mode=custom but no custom view available",
+                         plugin_name)
+            return [Static("No custom view available for this plugin.")]
+
         # Auto-generate
+        _log.debug("[%s] falling through to auto-generated view", plugin_name)
         return self._auto_generate_plugin_view(plugin_name, plugin)
 
-    def _auto_generate_plugin_view(self, plugin_name: str, plugin) -> list:
+    def _auto_generate_plugin_view(self, plugin_name: str, plugin,
+                                    has_bar: bool = False) -> list:
         widgets = []
 
-        # Header with close + config buttons side by side
-        close_id = self._make_id("close", plugin_name, "", "close-tab")
+        # Header with close + config buttons (skip close when bar has one)
         config_id = self._make_id("cfg", plugin_name, "", "goto-config")
-        btn_row = Horizontal(
-            Button("Close Tab", id=close_id, variant="error"),
-            Button("Open Config", id=config_id, variant="primary"),
-        )
+        if has_bar:
+            btn_row = Horizontal(
+                Button("Open Config", id=config_id, variant="primary"),
+            )
+        else:
+            close_id = self._make_id("close", plugin_name, "", "close-tab")
+            btn_row = Horizontal(
+                Button("Close Tab", id=close_id, variant="error"),
+                Button("Open Config", id=config_id, variant="primary"),
+            )
         widgets.append(btn_row)
 
         desc = getattr(plugin, "description", "")
@@ -1265,15 +1365,9 @@ class DashboardApp(App):
                 result_id = self._make_id("result", plugin_name, access_name, "result")
 
                 # Store cross-references
-                form_field_ids = [
-                    wid for wid, entry in self._id_registry.items()
-                    if entry.get("type") == "form-field"
-                    and entry.get("plugin") == plugin_name
-                    and entry.get("endpoint", "").startswith(f"{access_name}.")
-                ]
                 self._id_registry[call_id]["json_id"] = json_id
                 self._id_registry[call_id]["result_id"] = result_id
-                self._id_registry[call_id]["form_fields"] = form_field_ids
+                self._id_registry[call_id]["form_fields"] = form_field_ids_for_mode
                 self._id_registry[call_id]["mode_id"] = mode_id if arguments else ""
                 self._id_registry[call_id]["arg_names"] = [
                     a.get("name", "param") for a in arguments if isinstance(a, dict)
@@ -1288,11 +1382,13 @@ class DashboardApp(App):
 
         return widgets
 
-    def _render_menu_dict(self, plugin_name: str, menu: dict) -> list:
+    def _render_menu_dict(self, plugin_name: str, menu: dict,
+                          has_bar: bool = False) -> list:
         widgets = []
-        # Close button
-        close_id = self._make_id("close", plugin_name, "", "close-tab")
-        widgets.append(Button("Close Tab", id=close_id, variant="error"))
+        # Close button (skip when view-mode-bar already has one)
+        if not has_bar:
+            close_id = self._make_id("close", plugin_name, "", "close-tab")
+            widgets.append(Button("Close Tab", id=close_id, variant="error"))
 
         label = menu.get("label", plugin_name)
         widgets.append(Static(f"[bold]{escape(label)}[/bold]", markup=True))
@@ -1335,6 +1431,80 @@ class DashboardApp(App):
 
     # ─── Dynamic plugin tabs ─────────────────────────────────────────
 
+    def _plugin_has_custom_view(self, plugin) -> bool:
+        """Check whether a plugin provides a custom TUI view."""
+        if hasattr(plugin, "get_tui_module_info") and callable(plugin.get_tui_module_info):
+            return True
+        if hasattr(plugin, "get_tui_menu") and callable(plugin.get_tui_menu):
+            return True
+        return False
+
+    def _load_tui_widget_from_module_info(self, plugin, info: dict):
+        """Import a TUI widget class from module_info and instantiate it.
+
+        The import runs inside the Dashboard process where Textual is
+        available, so plugins don't need Textual on their own import path.
+        The module is cached in sys.modules after first load; subsequent
+        calls reuse the cached module and only create a fresh widget.
+        """
+        _log = logging.getLogger("CLI.TabBuilder")
+        tui_path = info.get("path", "")
+        class_name = info.get("class_name", "")
+        if not tui_path or not class_name:
+            _log.error("get_tui_module_info() returned incomplete info: %s",
+                       info)
+            return None
+
+        plugin_name = getattr(plugin, "plugin_name", "unknown")
+        pkg_name = f"_tui_{plugin_name}"
+
+        # Reuse cached module if already loaded
+        mod = _sys.modules.get(pkg_name)
+        if mod is not None:
+            _log.debug("[%s] reusing cached TUI module %s", plugin_name,
+                       pkg_name)
+        else:
+            # Register the tui/ directory as a package so internal relative
+            # imports (from .css, from .sections, etc.) resolve correctly.
+            init_path = os.path.join(tui_path, "__init__.py")
+            if not os.path.isfile(init_path):
+                _log.error("TUI package missing __init__.py: %s", init_path)
+                return None
+
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                pkg_name, init_path,
+                submodule_search_locations=[tui_path],
+            )
+            if spec is None:
+                _log.error("Could not create module spec for %s", init_path)
+                return None
+
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = pkg_name
+            _sys.modules[pkg_name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as e:
+                _log.error("Failed to load TUI module from %s: %s",
+                           tui_path, e, exc_info=True)
+                _sys.modules.pop(pkg_name, None)
+                return None
+            _log.debug("[%s] TUI module %s loaded successfully", plugin_name,
+                       pkg_name)
+
+        widget_cls = getattr(mod, class_name, None)
+        if widget_cls is None:
+            _log.error("Class %s not found in %s", class_name, pkg_name)
+            return None
+
+        try:
+            return widget_cls(plugin)
+        except Exception as e:
+            _log.error("Failed to instantiate %s: %s", class_name, e,
+                       exc_info=True)
+            return None
+
     async def open_plugin_tab(self, plugin_name: str) -> None:
         tab_id = f"tab-plugin-{self._sanitize_id(plugin_name)}"
         tabs = self.query_one("#main-tabs", TabbedContent)
@@ -1349,8 +1519,15 @@ class DashboardApp(App):
         self._cleanup_registry_for_plugin(plugin_name)
 
         plugin_snapshot = self.plugin_core.plugins.get(plugin_name)
+        has_custom = self._plugin_has_custom_view(plugin_snapshot)
 
-        content = self._build_plugin_tab_content(plugin_name, plugin_snapshot)
+        # Default to custom view when available
+        mode = "custom" if has_custom else "generated"
+        content = self._build_plugin_tab_content(
+            plugin_name, plugin_snapshot, force_mode=mode,
+            has_bar=has_custom,
+        )
+
         pane = TabPane(plugin_name, id=tab_id)
         await tabs.add_pane(pane)
 
@@ -1359,12 +1536,37 @@ class DashboardApp(App):
         except NoMatches:
             return
 
-        scroll = VerticalScroll(classes="plugin-view-container")
+        # View-mode toggle bar (only when plugin has a custom view)
+        if has_custom:
+            bar = Horizontal(classes="view-mode-bar",
+                             id=f"{tab_id}-view-bar")
+            await pane.mount(bar)
+            custom_cls = "active-mode" if mode == "custom" else "inactive-mode"
+            gen_cls = "active-mode" if mode == "generated" else "inactive-mode"
+            btn_custom_id = self._make_id(
+                "vmode", plugin_name, "", "view-mode-custom")
+            btn_gen_id = self._make_id(
+                "vmode", plugin_name, "", "view-mode-generated")
+            close_id = self._make_id(
+                "close", plugin_name, "", "close-tab")
+            await bar.mount(
+                Button("Custom View", id=btn_custom_id,
+                       classes=custom_cls),
+                Button("Generated View", id=btn_gen_id,
+                       classes=gen_cls),
+                Static("", classes="view-bar-spacer"),
+                Button("Close Tab", id=close_id,
+                       variant="error", classes="close-tab-btn"),
+            )
+
+        scroll = VerticalScroll(classes="plugin-view-container",
+                                id=f"{tab_id}-scroll")
         await pane.mount(scroll)
         for w in content:
             await scroll.mount(w)
 
         self._plugin_tab_map[tab_id] = plugin_name
+        self._plugin_tab_modes[tab_id] = mode
         tabs.active = tab_id
 
     async def _close_plugin_tab(self, plugin_name: str) -> None:
@@ -1375,7 +1577,17 @@ class DashboardApp(App):
         except Exception:
             pass
         self._cleanup_registry_for_plugin(plugin_name)
+        self._cleanup_tui_module(plugin_name)
         self._plugin_tab_map.pop(tab_id, None)
+        self._plugin_tab_modes.pop(tab_id, None)
+
+    def _cleanup_tui_module(self, plugin_name: str) -> None:
+        """Remove cached TUI package and submodules from sys.modules."""
+        pkg_name = f"_tui_{plugin_name}"
+        to_remove = [k for k in _sys.modules if k == pkg_name
+                     or k.startswith(f"{pkg_name}.")]
+        for key in to_remove:
+            _sys.modules.pop(key, None)
 
     def _cleanup_stale_plugin_tabs(self) -> None:
         stale = []
@@ -1384,9 +1596,11 @@ class DashboardApp(App):
                 self.query_one(f"#{tab_id}", TabPane)
             except NoMatches:
                 self._cleanup_registry_for_plugin(pname)
+                self._cleanup_tui_module(pname)
                 stale.append(tab_id)
         for tid in stale:
             self._plugin_tab_map.pop(tid, None)
+            self._plugin_tab_modes.pop(tid, None)
 
     # ─── Event handlers ──────────────────────────────────────────────
 
@@ -1446,7 +1660,9 @@ class DashboardApp(App):
     async def _reload_main_config(self) -> None:
         """Reload config.yml into PluginCore (re-applies general settings)."""
         try:
-            self.plugin_core.load_config_yaml(self.plugin_core.config_path)
+            await self._run_on_main(
+                self.plugin_core.async_load_config_yaml(self.plugin_core.config_path)
+            )
             self._set_status("Main config reloaded. General settings applied.")
             # Refresh settings display and config file list
             self._populate_settings_info()
@@ -1515,8 +1731,90 @@ class DashboardApp(App):
                 self._close_plugin_tab_sync(entry["plugin"])
             elif t == "goto-config":
                 self.load_plugin_config(entry["plugin"])
+            elif t in ("view-mode-custom", "view-mode-generated"):
+                self._switch_plugin_view_mode(entry["plugin"], t)
         except Exception:
             pass
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Contain crashes from custom plugin tab workers.
+
+        If a worker owned by a widget inside a plugin tab fails, replace
+        the tab content with an error message instead of killing the app.
+        """
+        if event.state != WorkerState.ERROR:
+            return
+
+        worker = event.worker
+        node = getattr(worker, "node", None)
+        if node is None:
+            return
+
+        # Walk up from the crashed widget to see if it lives inside a
+        # plugin tab pane.
+        current = node
+        tab_id = None
+        while current is not None:
+            wid = getattr(current, "id", None) or ""
+            if wid.startswith("tab-plugin-"):
+                tab_id = wid
+                break
+            current = getattr(current, "parent", None)
+
+        if tab_id is None:
+            return  # not a plugin tab worker — let Textual handle it
+
+        # Swallow the error so the app stays alive
+        event.prevent_default()
+
+        plugin_name = self._plugin_tab_map.get(tab_id, "unknown")
+        error = getattr(worker, "error", None)
+        error_msg = str(error) if error else "Unknown error"
+        worker_name = getattr(worker, "name", "?")
+        logging.getLogger("CLI.TabBuilder").error(
+            "[%s] Worker '%s' crashed: %s", plugin_name, worker_name,
+            error_msg, exc_info=error,
+        )
+
+        # Replace tab content with error message
+        self._show_tab_error(tab_id, plugin_name, worker_name, error_msg)
+
+    @work(thread=False)
+    async def _show_tab_error(self, tab_id: str, plugin_name: str,
+                              worker_name: str, error_msg: str) -> None:
+        scroll_id = f"{tab_id}-scroll"
+        try:
+            scroll = self.query_one(f"#{scroll_id}", VerticalScroll)
+        except NoMatches:
+            return
+        await scroll.remove_children()
+
+        # Only add close button if no view-mode-bar (which already has one)
+        bar_id = f"{tab_id}-view-bar"
+        has_bar = False
+        try:
+            self.query_one(f"#{bar_id}", Horizontal)
+            has_bar = True
+        except NoMatches:
+            pass
+
+        if not has_bar:
+            close_id = self._make_id("close", plugin_name, "", "close-tab")
+            await scroll.mount(
+                Horizontal(
+                    Button("Close Tab", id=close_id, variant="error"),
+                ),
+            )
+        await scroll.mount(
+            Static(
+                f"[bold red]Custom view crashed[/bold red]\n\n"
+                f"Plugin: [bold]{escape(plugin_name)}[/bold]\n"
+                f"Worker: {escape(worker_name)}\n"
+                f"Error: {escape(error_msg)}\n\n"
+                f"[dim]Switch to Generated View or close this tab.[/dim]",
+                markup=True,
+            ),
+        )
 
     def _close_plugin_tab_sync(self, plugin_name: str) -> None:
         """Non-async wrapper to close a plugin tab from a button handler."""
@@ -1525,6 +1823,61 @@ class DashboardApp(App):
     @work(thread=False)
     async def _do_close_plugin_tab(self, plugin_name: str) -> None:
         await self._close_plugin_tab(plugin_name)
+
+    def _switch_plugin_view_mode(self, plugin_name: str, mode_type: str) -> None:
+        """Switch between custom and generated views for a plugin tab."""
+        self._do_switch_view_mode(plugin_name, mode_type)
+
+    _VIEW_MODE_TYPES = frozenset({
+        "view-mode-custom", "view-mode-generated", "close-tab",
+    })
+
+    @work(thread=False)
+    async def _do_switch_view_mode(self, plugin_name: str,
+                                   mode_type: str) -> None:
+        new_mode = ("custom" if mode_type == "view-mode-custom"
+                    else "generated")
+        tab_id = f"tab-plugin-{self._sanitize_id(plugin_name)}"
+
+        if self._plugin_tab_modes.get(tab_id) == new_mode:
+            return  # already in this mode
+
+        # Mark mode early to guard against rapid clicks
+        self._plugin_tab_modes[tab_id] = new_mode
+
+        # Rebuild content (preserve toggle button registry entries)
+        self._cleanup_registry_for_plugin(
+            plugin_name, exclude_types=self._VIEW_MODE_TYPES,
+        )
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        content = self._build_plugin_tab_content(
+            plugin_name, plugin, force_mode=new_mode,
+            has_bar=True,
+        )
+
+        # Replace scroll container contents
+        scroll_id = f"{tab_id}-scroll"
+        try:
+            scroll = self.query_one(f"#{scroll_id}", VerticalScroll)
+        except NoMatches:
+            return
+        await scroll.remove_children()
+        for w in content:
+            await scroll.mount(w)
+
+        # Update toggle button styles
+        bar_id = f"{tab_id}-view-bar"
+        try:
+            bar = self.query_one(f"#{bar_id}", Horizontal)
+            for btn in bar.query(Button):
+                entry = self._id_registry.get(btn.id or "")
+                if not entry:
+                    continue
+                is_active = entry["type"] == mode_type
+                btn.remove_class("active-mode", "inactive-mode")
+                btn.add_class("active-mode" if is_active else "inactive-mode")
+        except NoMatches:
+            pass
 
     @on(Select.Changed, "#log-level-filter")
     def _on_log_level_changed(self, event: Select.Changed) -> None:
@@ -1644,7 +1997,7 @@ class DashboardApp(App):
             self._set_status(f"Error: {e}", error=True)
         self._refresh_plugin_table_worker()
 
-    @work(thread=False)
+    @work(thread=False, exclusive=True, group="plugin-detail")
     async def _update_plugin_detail(self, plugin_name: str) -> None:
         try:
             info = await self._run_on_main(self.plugin_core.get_plugin_info(plugin_name))

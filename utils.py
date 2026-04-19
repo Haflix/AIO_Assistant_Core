@@ -404,6 +404,14 @@ class LogUtil(logging.Logger):
         root_logger.info(f"Changed console handler level to {log_level}")
 
     @staticmethod
+    def change_file_level(log_level: str) -> None:
+        root_logger = logging.getLogger()
+        fh = getattr(root_logger, "_file_handler", None)
+        if fh:
+            fh.setLevel(log_level)
+            root_logger.info(f"Changed file handler level to {log_level}")
+
+    @staticmethod
     def create(log_level: str = "DEBUG") -> logging.Logger:
         """Create and configure the root logger with non-blocking I/O"""
         logging.setLoggerClass(LogUtil)
@@ -457,6 +465,7 @@ class LogUtil(logging.Logger):
         # (e.g. CLI plugin mutes console output while TUI is active)
         root_logger._queue_listener = listener
         root_logger._custom_handlers = [stream_handler]
+        root_logger._file_handler = file_handler
         root_logger._fd_redirector = redirector
 
         # Prevent noisy third-party loggers from propagating
@@ -500,7 +509,7 @@ class ConfigUtil:
 
     @staticmethod
     @log_errors
-    def check_config_integrity(yaml_config: dict, _logger):
+    def check_config_integrity(yaml_config: dict, _logger=None):
         # Check required sections
         for section in ["plugins", "general", "networking"]:
             if section not in yaml_config:
@@ -515,11 +524,12 @@ class ConfigUtil:
             if not plugin.get("path") and "plugin_package" not in yaml_config.get(
                 "general", {}
             ):
-                _logger.warning("No path or plugin_package - plugins may not load")
+                if _logger:
+                    _logger.warning("No path or plugin_package - plugins may not load")
 
         general = list(yaml_config.get("general", {}).keys())
         for key in ["hostname", "plugin_package", "console_log_level"]:
-            if key not in general:
+            if key not in general and _logger:
                 _logger.warning(
                     f"Missing config section (Default value will be used): /general/{key}"
                 )
@@ -533,7 +543,7 @@ class ConfigUtil:
             "auto_discoverable",
             "discover_nodes",
         ]:
-            if key not in networking:
+            if key not in networking and _logger:
                 _logger.warning(
                     f"Missing config key (Default value will be used): /networking/{key}"
                 )
@@ -1034,7 +1044,7 @@ class Request:
         """Wait for the result asynchronously."""
         try:
             if self.result is not None:
-                return self.result, self.error, False
+                return self.result, self.error, self.timeout
 
             # Check if we need to apply a timeout
             if self.timeout_duration:
@@ -1118,7 +1128,7 @@ class GeneratorRequest:
         """Set the result of the request."""
         if not self._future.done():
             self.error = error
-            self.result = result if result else EndOfQueue()
+            self.result = result if result is not None else EndOfQueue()
             self.timeout = timeout
             self._future.set_result((result, error, timeout))
             self.ready = True

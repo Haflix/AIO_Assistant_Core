@@ -87,8 +87,8 @@ def _make_mock_plugin_core(plugins=None, yaml_config=None):
 def _make_mock_plugin(
     name="TestPlugin", enabled=True, version="1.0", remote=False,
     description="A test plugin", endpoints=None,
-    has_tui_widget=False, has_tui_menu=False,
-    tui_widget_return=None, tui_menu_return=None,
+    has_tui_module_info=False, has_tui_menu=False,
+    tui_module_info_return=None, tui_menu_return=None,
 ):
     p = MagicMock()
     p.enabled = enabled
@@ -97,10 +97,10 @@ def _make_mock_plugin(
     p.description = description
     p.plugin_name = name
     p.endpoints = endpoints or []
-    if not has_tui_widget:
-        del p.get_tui_widget
+    if not has_tui_module_info:
+        del p.get_tui_module_info
     else:
-        p.get_tui_widget.return_value = tui_widget_return
+        p.get_tui_module_info.return_value = tui_module_info_return
     if not has_tui_menu:
         del p.get_tui_menu
     else:
@@ -131,6 +131,7 @@ def _make_dashboard_app(plugin_core=None):
     app._id_counter = 0
     app._id_registry = {}
     app._plugin_tab_map = {}
+    app._plugin_tab_modes = {}
     app._plugin_filter = ""
     return app
 
@@ -523,14 +524,16 @@ class TestPluginViewGeneration:
         widgets = app._build_plugin_tab_content("Nope")
         assert len(widgets) == 1
 
-    def test_custom_widget(self):
-        from textual.widgets import Static
+    def test_custom_menu(self):
         app = _make_dashboard_app()
-        cw = Static("Custom")
-        plugin = _make_mock_plugin(has_tui_widget=True, tui_widget_return=cw)
+        menu = {"label": "Test", "sections": [
+            {"title": "Info", "type": "info", "items": ["hello"]},
+        ]}
+        plugin = _make_mock_plugin(has_tui_menu=True, tui_menu_return=menu)
         app.plugin_core.plugins = {"P": plugin}
         result = app._build_plugin_tab_content("P")
-        assert result[0] is cw
+        # Should return rendered menu widgets, not auto-generated
+        assert len(result) > 0
 
 
 class TestConfigDirtyTracking:
@@ -575,7 +578,7 @@ def mock_pc():
         ),
     }
     for p in pc.plugins.values():
-        del p.get_tui_widget
+        del p.get_tui_module_info
         del p.get_tui_menu
     pc.yaml_config = {"plugins": [], "general": {}, "networking": {}}
     pc.config_path = "config.yml"

@@ -30,10 +30,16 @@ MSG_NOTIFY = 7             # Fire-and-forget topic notification
 MSG_TOPIC_REQUEST = 8      # Request-by-topic (one-to-one with response)
 MSG_TOPIC_REQUEST_STREAM = 9  # Streaming request-by-topic
 
+MSG_STREAM_ITEM_END = 14  # Marks end of one item in a streaming response
+
 MSG_AUTH = 20  # Authentication message (shared secret)
 
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
+
+# Sentinel returned by request_topic_remote when server sends no result data.
+# Distinguishes "handler returned None" (valid) from "no response received."
+REMOTE_NO_RESULT = object()
 
 
 class NetworkManager:
@@ -64,9 +70,14 @@ class NetworkManager:
         self.nodes: list[Node] = []
 
         # Security configuration
-        self.secret = secret or os.getenv("NETWORKING_SECRET", "").encode()
+        self.secret = secret or os.getenv("NETWORKING_SECRET", "")
         if isinstance(self.secret, str):
             self.secret = self.secret.encode()
+        if not self.secret:
+            logger.warning(
+                "[SECURITY] No shared secret configured! Set 'secret' in networking "
+                "config or NETWORKING_SECRET env var. Networking will refuse to start."
+            )
         self.cert_file = cert_file
         self.key_file = key_file
         self.pool_size = pool_size
@@ -82,6 +93,7 @@ class NetworkManager:
 
         # SSL context (will be initialized in start)
         self.ssl_context = None
+        self._temp_ssl_files = []  # Track temp cert/key files for cleanup
 
         # Loop intervals and timeouts (defaults per plan)
         self.heartbeat_interval: float = 10.0
@@ -309,6 +321,7 @@ class NetworkManager:
                     temp_key = key_file.name
 
                 context.load_cert_chain(temp_cert, temp_key)
+                self._temp_ssl_files.extend([temp_cert, temp_key])
                 self._logger.info("Generated self-signed certificate for testing")
             except ImportError:
                 raise RuntimeError(
@@ -323,6 +336,11 @@ class NetworkManager:
 
     async def start(self):
         """Starts socket server without blocking the main loop."""
+        if not self.secret:
+            raise RuntimeError(
+                "Networking cannot start without a shared secret. "
+                "Set 'secret' in networking config or NETWORKING_SECRET env var."
+            )
         self._logger.info(
             f"[SERVER] Starting server: port={self.port}, discover_nodes={self.discover_nodes}, "
             f"direct_discoverable={self.direct_discoverable}, auto_discoverable={self.auto_discoverable}, "
@@ -388,7 +406,7 @@ class NetworkManager:
             while True:
                 try:
                     # Iterate over a snapshot to avoid concurrent modification
-                    for node in list[Node](self.nodes):
+                    for node in list(self.nodes):
                         try:
                             if not node.enabled:
                                 continue
@@ -449,6 +467,15 @@ class NetworkManager:
                     f"[CONNECTION] Closed {closed} pooled connections for {ip}"
                 )
 
+        # Clean up temp SSL files
+        for path in self._temp_ssl_files:
+            try:
+                os.remove(path)
+                self._logger.debug(f"[SSL] Removed temp file: {path}")
+            except OSError:
+                pass
+        self._temp_ssl_files.clear()
+
         self._logger.info("Socket server stopped")
 
     # Server-side Request Handlers
@@ -482,7 +509,10 @@ class NetworkManager:
                 self._logger.warning(f"Authentication failed for {client_addr}")
                 return
 
-            # Authentication successful, process requests
+            # Authentication successful — send confirmation so client knows
+            await self._send_message(writer, MSG_RESULT, {"status": "authenticated"})
+
+            # Process requests
             while True:
                 try:
                     msg_type, data = await self._receive_message(reader)
@@ -551,32 +581,21 @@ class NetworkManager:
             )
 
             # Execute plugin method
-            if isinstance(args, (list, tuple)):
-                result = await self.plugin_core.execute(
-                    plugin,
-                    method,
-                    *args,
-                    plugin_uuid=plugin_uuid,
-                    host="local",
-                    timeout=timeout,
-                    author=author,
-                    author_id=author_id,
-                    author_host=author_host,
-                    request_id=request_id,
-                )
-            else:
-                result = await self.plugin_core.execute(
-                    plugin,
-                    method,
-                    args,
-                    plugin_uuid=plugin_uuid,
-                    host="local",
-                    timeout=timeout,
-                    author=author,
-                    author_id=author_id,
-                    author_host=author_host,
-                    request_id=request_id,
-                )
+            # Pass args as a single object — PluginCore.execute unpacks internally
+            if isinstance(args, list):
+                args = tuple(args)
+            result = await self.plugin_core.execute(
+                plugin,
+                method,
+                args=args if args else None,
+                plugin_uuid=plugin_uuid,
+                host="local",
+                timeout=timeout,
+                author=author,
+                author_id=author_id,
+                author_host=author_host,
+                request_id=request_id,
+            )
 
             # Send result as a single message (use streaming protocol for large objects)
             # For large objects, we still use STREAM_CHUNK + END_STREAM to be consistent
@@ -641,34 +660,23 @@ class NetworkManager:
             )
 
             # Execute streaming plugin method
-            if isinstance(args, (list, tuple)):
-                agen = self.plugin_core.execute_stream(
-                    plugin=plugin,
-                    method=method,
-                    *args,
-                    plugin_uuid=plugin_uuid,
-                    host="local",
-                    author=author,
-                    author_id=author_id,
-                    timeout=timeout,
-                    author_host=author_host,
-                    request_id=request_id,
-                )
-            else:
-                agen = self.plugin_core.execute_stream(
-                    plugin=plugin,
-                    method=method,
-                    args=args,
-                    plugin_uuid=plugin_uuid,
-                    host="local",
-                    author=author,
-                    author_id=author_id,
-                    timeout=timeout,
-                    author_host=author_host,
-                    request_id=request_id,
-                )
+            # Pass args as a single object — PluginCore.execute_stream unpacks internally
+            if isinstance(args, list):
+                args = tuple(args)
+            agen = self.plugin_core.execute_stream(
+                plugin=plugin,
+                method=method,
+                args=args if args else None,
+                plugin_uuid=plugin_uuid,
+                host="local",
+                author=author,
+                author_id=author_id,
+                timeout=timeout,
+                author_host=author_host,
+                request_id=request_id,
+            )
 
-            # Stream results - each yielded item as a chunk
+            # Stream results - each yielded item as chunks + item boundary marker
             sent_items = 0
             async for line in agen:
                 try:
@@ -695,6 +703,10 @@ class NetworkManager:
                         header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                         writer.write(header + payload)
                         await writer.drain()
+                    # Mark end of this item so receiver knows where item boundaries are
+                    item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
+                    writer.write(item_end_header)
+                    await writer.drain()
                     sent_items += 1
                 except Exception as e:
                     self._logger.exception("Failed to send stream chunk")
@@ -811,7 +823,7 @@ class NetworkManager:
             endpoints = []
             for plugin in self.plugin_core.plugins.values():
                 if plugin.enabled:
-                    for endpoint in plugin.endpoints.values():
+                    for endpoint in plugin.endpoints:
                         if tag in endpoint.get("tags", []):
                             endpoints.append(
                                 {
@@ -1031,8 +1043,20 @@ class NetworkManager:
         await self._send_message(writer, MSG_AUTH, self.secret)
         self._logger.debug(f"[CONNECTION] Authentication message sent to {IP}")
 
-        # Wait for auth confirmation (server should not send error)
-        # For now, we'll just proceed - if auth fails, the next message will error
+        # Wait for auth confirmation
+        try:
+            msg_type, data = await asyncio.wait_for(
+                self._receive_message(reader), timeout=5.0
+            )
+            if msg_type == MSG_ERROR:
+                raise ConnectionError(f"Authentication failed: {data}")
+            if msg_type != MSG_RESULT:
+                raise ConnectionError(f"Unexpected auth response type: {msg_type}")
+            self._logger.debug(f"[CONNECTION] Authenticated with {IP}")
+        except asyncio.TimeoutError:
+            writer.close()
+            await writer.wait_closed()
+            raise ConnectionError(f"Authentication timeout with {IP}")
 
         return reader, writer
 
@@ -1186,6 +1210,11 @@ class NetworkManager:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
+                if msg_length > MAX_MESSAGE_SIZE:
+                    raise NetworkRequestException(
+                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
+                    )
+
                 msg_type_byte = await reader.readexactly(1)
                 msg_type = msg_type_byte[0]
 
@@ -1330,6 +1359,11 @@ class NetworkManager:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
+                if msg_length > MAX_MESSAGE_SIZE:
+                    raise NetworkRequestException(
+                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
+                    )
+
                 msg_type_byte = await reader.readexactly(1)
                 msg_type = msg_type_byte[0]
 
@@ -1341,84 +1375,56 @@ class NetworkManager:
                         current_item_chunks.append(payload)
                         item_chunks += 1
                         item_bytes += len(payload)
-                        # Check if this is the last chunk of an item (smaller than CHUNK_SIZE)
-                        # Actually, we can't know from just one chunk. We need to check if next message is END_STREAM or another chunk.
-                        # For now, we'll peek ahead or use a different approach.
-                        # Better: send a marker between items, OR accumulate until we get END_STREAM or next item starts.
-                        # Actually, for streaming generators, each complete item should be sent as one or more chunks,
-                        # then END_STREAM marks the end of the stream (all items).
-                        # So we need to know when an item is complete. Let's use a heuristic: if chunk is smaller than CHUNK_SIZE,
-                        # it might be the last chunk of an item. But this isn't reliable.
 
-                        # Better solution: Send each item as atomic - if large, split pickled bytes, but mark item boundaries.
-                        # For now, simpler: accumulate all chunks until END_STREAM, then yield items.
-                        # But that defeats streaming...
-
-                        # Actually, the protocol should be: each generator item = one or more STREAM_CHUNK messages (if item is large),
-                        # followed by a special marker or we just know by size.
-                        # Simplest: assume if we receive a chunk smaller than CHUNK_SIZE and it's not the first chunk,
-                        # it's the last chunk of an item. Then unpickle and yield.
-
-                        # Check if this completes an item (heuristic: small chunk after a large one, or first small chunk)
-                        if len(payload) < CHUNK_SIZE:
-                            # This might be the last chunk of an item - reconstruct and yield
-                            if current_item_chunks:
-                                full_pickled = b"".join(current_item_chunks)
-                                try:
-                                    item = pickle.loads(full_pickled)
-                                    # Check if it's an error marker
-                                    if isinstance(item, tuple) and len(item) == 2:
-                                        if item[0] == "__STREAM_ERROR__":
-                                            self._logger.exception(
-                                                f"Stream error from {IP}: {item[1]}"
-                                            )
-                                            yield (
-                                                "__REMOTE_STREAM_DECODE_ERROR__",
-                                                item[1],
-                                            )
-                                            break
-                                        elif item[0] == "__STREAM_EXCEPTION__":
-                                            self._logger.exception(
-                                                f"Stream exception from {IP}: {item[1]}"
-                                            )
-                                            yield ("__REMOTE_STREAM_ERROR__", item[1])
-                                            break
-                                    items_yielded += 1
-                                    try:
-                                        item_type = type(item).__name__
-                                    except Exception:
-                                        item_type = "unknown"
-                                    self._logger.info(
-                                        f"[REMOTE_STREAM] yielded item #{items_yielded} from {IP}: "
-                                        f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
-                                    )
-                                    yield item
-                                    current_item_chunks = []
-                                    item_chunks = 0
-                                    item_bytes = 0
-                                except Exception as e:
-                                    self._logger.exception(
-                                        f"Failed to unpickle stream item from {IP}"
-                                    )
-                                    yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
-                                    current_item_chunks = []
-                                    item_chunks = 0
-                                    item_bytes = 0
-                    elif msg_type == MSG_END_STREAM:
-                        # End of stream - yield any remaining chunks as final item
+                    elif msg_type == MSG_STREAM_ITEM_END:
+                        # Item boundary — reconstruct and yield accumulated chunks
                         if current_item_chunks:
                             full_pickled = b"".join(current_item_chunks)
                             try:
                                 item = pickle.loads(full_pickled)
+                                # Check if it's an error marker
+                                if isinstance(item, tuple) and len(item) == 2:
+                                    if item[0] == "__STREAM_ERROR__":
+                                        self._logger.exception(
+                                            f"Stream error from {IP}: {item[1]}"
+                                        )
+                                        yield (
+                                            "__REMOTE_STREAM_DECODE_ERROR__",
+                                            item[1],
+                                        )
+                                        break
+                                    elif item[0] == "__STREAM_EXCEPTION__":
+                                        self._logger.exception(
+                                            f"Stream exception from {IP}: {item[1]}"
+                                        )
+                                        yield ("__REMOTE_STREAM_ERROR__", item[1])
+                                        break
                                 items_yielded += 1
                                 try:
                                     item_type = type(item).__name__
                                 except Exception:
                                     item_type = "unknown"
                                 self._logger.info(
-                                    f"[REMOTE_STREAM] yielded final item #{items_yielded} from {IP}: "
+                                    f"[REMOTE_STREAM] yielded item #{items_yielded} from {IP}: "
                                     f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
                                 )
+                                yield item
+                            except Exception as e:
+                                self._logger.exception(
+                                    f"Failed to unpickle stream item from {IP}"
+                                )
+                                yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
+                            current_item_chunks = []
+                            item_chunks = 0
+                            item_bytes = 0
+
+                    elif msg_type == MSG_END_STREAM:
+                        # End of entire stream — yield any remaining chunks as final item
+                        if current_item_chunks:
+                            full_pickled = b"".join(current_item_chunks)
+                            try:
+                                item = pickle.loads(full_pickled)
+                                items_yielded += 1
                                 yield item
                             except Exception as e:
                                 self._logger.exception(
@@ -1438,21 +1444,31 @@ class NetworkManager:
                         raise NetworkRequestException(
                             f"Unexpected message type: {msg_type}"
                         )
-                elif msg_type == MSG_END_STREAM:
-                    # End of stream - yield any remaining chunks
+
+                elif msg_type == MSG_STREAM_ITEM_END:
+                    # Item boundary with no payload — same handling
                     if current_item_chunks:
                         full_pickled = b"".join(current_item_chunks)
                         try:
                             item = pickle.loads(full_pickled)
                             items_yielded += 1
-                            try:
-                                item_type = type(item).__name__
-                            except Exception:
-                                item_type = "unknown"
-                            self._logger.info(
-                                f"[REMOTE_STREAM] yielded final item #{items_yielded} from {IP}: "
-                                f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
+                            yield item
+                        except Exception as e:
+                            self._logger.exception(
+                                f"Failed to unpickle stream item from {IP}"
                             )
+                            yield ("__REMOTE_STREAM_DECODE_ERROR__", str(e))
+                        current_item_chunks = []
+                        item_chunks = 0
+                        item_bytes = 0
+
+                elif msg_type == MSG_END_STREAM:
+                    # End of stream with no payload
+                    if current_item_chunks:
+                        full_pickled = b"".join(current_item_chunks)
+                        try:
+                            item = pickle.loads(full_pickled)
+                            items_yielded += 1
                             yield item
                         except Exception as e:
                             self._logger.exception(
@@ -1553,6 +1569,10 @@ class NetworkManager:
             while True:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
+                if msg_length > MAX_MESSAGE_SIZE:
+                    raise NetworkRequestException(
+                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
+                    )
                 msg_type_byte = await reader.readexactly(1)
                 msg_type = msg_type_byte[0]
                 payload_length = msg_length - 1
@@ -1577,7 +1597,7 @@ class NetworkManager:
             if result_chunks_bytes:
                 full_pickled = b"".join(result_chunks_bytes)
                 return pickle.loads(full_pickled)
-            return None
+            return REMOTE_NO_RESULT
         except Exception as e:
             self._logger.exception(f"[TOPIC_REQUEST_REMOTE] Error from {IP}: {e}")
             raise
@@ -1616,6 +1636,10 @@ class NetworkManager:
             while True:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
+                if msg_length > MAX_MESSAGE_SIZE:
+                    raise NetworkRequestException(
+                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
+                    )
                 msg_type_byte = await reader.readexactly(1)
                 msg_type = msg_type_byte[0]
                 payload_length = msg_length - 1
@@ -1781,7 +1805,7 @@ class NetworkManager:
     @async_handle_errors(None)
     async def update_all_nodes(
         self,
-        additional_IP_list: list[str] = [],
+        additional_IP_list: list[str] = None,
         timeout: int = 5,
         ignore_enabled_status: bool = False,
         concurrency: int = 20,
@@ -1856,7 +1880,7 @@ class NetworkManager:
             node = await self._get_node(IP)
             if node:
                 node.enabled = True
-            await (await self._get_node(IP)).update(response, self.plugin_core.hostname)
+                await node.update(response, self.plugin_core.hostname)
 
             # Cascade discovery for returned auto_discoverable nodes
             followups = []
@@ -1887,7 +1911,7 @@ class NetworkManager:
     @async_log_errors
     async def _add_ip(self, IP):
         self._logger.debug(f"[DISCOVERY] Adding IP to list: {IP}")
-        await self.node_ips.append(IP)
+        self.node_ips.append(IP)
 
     @async_log_errors
     async def _create_nodes(self, IP_list: list):
@@ -1969,7 +1993,11 @@ class NetworkManager:
     @async_log_errors
     async def _delete_node(self, IP: str):
         self._logger.info(f"[NODE] Deleting node {IP}")
-        self.nodes.remove(await self._get_node(IP))
+        node = await self._get_node(IP)
+        if node:
+            self.nodes.remove(node)
+        else:
+            self._logger.warning(f"[NODE] Cannot delete node {IP}: not found")
 
     @async_log_errors
     async def _enable_node(self, IP: str):
@@ -1991,15 +2019,15 @@ class NetworkManager:
 
     @async_log_errors
     async def _get_node(
-        self, IP: str, hostame: Union[str, None] = None, autogenerate: bool = False
+        self, IP: str, hostname: Union[str, None] = None, autogenerate: bool = False
     ) -> Node:  # FIXME: Get Node only by hostname if theres no duplicate?
 
         if autogenerate:
-            await self._create_new_node(IP=IP, hostname=hostame)
+            await self._create_new_node(IP=IP, hostname=hostname)
 
         for node in self.nodes:
             if node.IP == IP:
-                if node.hostname == hostame or hostame == None:
+                if node.hostname == hostname or hostname is None:
                     return node
 
         self._logger.warning(f'A node with IP "{IP}" doesnt exist!')
@@ -2015,6 +2043,7 @@ class NetworkManager:
             remote=plugin_data["remote"],
             description=plugin_data["description"],
             arguments=plugin_data.get("arguments", []),
+            hostname=plugin_data.get("hostname", "unknown"),
         )
 
     async def heartbeat_node(self, node: Node, timeout=5):
@@ -2233,7 +2262,7 @@ class NetworkManager:
         Ask a node if it has the specified plugin.
         DEPRECATED: Use node_has_endpoint instead.
         """
-        raise DeprecationWarning
+        raise NotImplementedError("node_has_plugin is deprecated. Use node_has_endpoint instead.")
         # For backward compatibility, use node_has_endpoint with access_name=None
         # This will check plugin existence but not endpoint
         result = await self.node_has_endpoint(

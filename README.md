@@ -227,6 +227,10 @@ The main class that manages all plugins and facilitates communication between th
 - `purge_plugins_except()` - Unload all plugins except specified ones
 - `pop_plugin()` - Remove a specific plugin
 - `graceful_shutdown()` - Gracefully shutdown the entire system
+- `list_config_files()` - Return `{label: absolute_path}` dict for main config and all plugin configs
+- `read_config_file()` - Read content of a known config file (path-allowlisted)
+- `save_config_file()` - Validate YAML, back up, and write a config file (thread-safe)
+- `is_main_config()` - Check whether a path points to the main config.yml
 
 ### NetworkManager
 
@@ -540,15 +544,15 @@ Endpoint `tags` serve two purposes: general categorization and AI tool discovery
 
 | Mode | Model | Tags Loaded | Use Case |
 |------|-------|-------------|----------|
-| **Minimum** | Haiku | `AI-minimum` | Quick voice tasks (device control, weather). Short TTS-optimized responses. Separate non-Genesis identity. |
-| **Conversation** | Haiku | `AI-minimum` + `AI-conversation` | Default mode. Normal chatting and personal assistant tasks (memory, tasks, appointments, sessions). |
-| **Working** | Sonnet | + `AI-working` | High-accuracy workflows, document processing, web search. Activated via `/mode working`. |
-| **Debug** | Sonnet/Opus | + `AI-debug` | Full system access including all raw CRUD endpoints. For debugging and administration. |
+| **Minimum** | grok-4.1-fast (fallback: Haiku) | `AI-minimum` | Quick voice tasks (device control, weather). Short TTS-optimized responses. Separate non-Genesis identity. |
+| **Conversation** | kimi-k2.5 (fallback: Haiku) | `AI-minimum` + `AI-conversation` | Default mode. Normal chatting and personal assistant tasks (memory, tasks, appointments, sessions). |
+| **Working** | kimi-k2.5 (fallback: Sonnet) | + `AI-working` | High-accuracy workflows, document processing, web search. Activated via `/mode working`. |
+| **Debug** | kimi-k2.5 (fallback: Sonnet) | + `AI-debug` | Full system access including all raw CRUD endpoints. For debugging and administration. |
 
 Each endpoint is explicitly tagged with every mode it belongs to (no inheritance). Modes are configured per-session and reset on inactivity timeout. Users switch modes via the `/mode` slash command in Discord or Telegram.
 
 Key technical details:
-- `tool_choice.disable_parallel_tool_use: true` for Haiku modes (prevents tool accuracy issues)
+- `disable_parallel_tool_use: true` for minimum mode (prevents tool accuracy issues with simpler models)
 - Per-mode configuration: model, max_tokens, temperature, system_prompt_file, enable_reasoning, prompt_caching, inject flags (person context, memories, session info), summarization
 - Conversation history caching for Working/Debug modes
 - Daily cost tracking with configurable EUR threshold warning
@@ -856,6 +860,48 @@ Ensure initialization tasks are started and await their completion. Safe to call
 
 **Returns**: None (coroutine)
 
+#### `list_config_files() -> Dict[str, str]`
+
+Return a dict of `{label: absolute_path}` for the main `config.yml` and every plugin's `plugin_config.yml`. Labels follow the format `"config.yml (main)"` and `"PluginName/plugin_config.yml"`.
+
+**Returns**: Dict mapping human-readable labels to absolute file paths.
+
+#### `read_config_file(path: str) -> str`
+
+Read and return the raw content of a known config file. The path must appear in `list_config_files()` (allowlist validation).
+
+**Parameters**:
+
+- `path` (str): Absolute path to the config file.
+
+**Returns**: File content as a string.
+
+**Raises**: `ValueError` if path is not in the allowlist; `FileNotFoundError` if the file does not exist.
+
+#### `save_config_file(path: str, content: str, backup: bool = True) -> None`
+
+Validate YAML syntax, optionally create a `.yml.bak` backup, and write new content to a config file. Writing is serialized with a `threading.Lock` for thread safety. The path must appear in `list_config_files()`.
+
+**Important**: This method does **not** auto-reload the main config. If `is_main_config(path)` returns `True`, the caller must call `load_config_yaml()` explicitly for settings to take effect.
+
+**Parameters**:
+
+- `path` (str): Absolute path to the config file.
+- `content` (str): New YAML content to write.
+- `backup` (bool): Whether to create a `.yml.bak` before overwriting (default `True`).
+
+**Raises**: `ValueError` if path is not in the allowlist or content parses to empty; `yaml.YAMLError` if content is invalid YAML.
+
+#### `is_main_config(path: str) -> bool`
+
+Check whether a path points to the main `config.yml`.
+
+**Parameters**:
+
+- `path` (str): Path to check.
+
+**Returns**: `True` if the path resolves to the main config file.
+
 #### `find_endpoint(access_name, host="any", plugin_uuid=None, requester_id=None, target_plugin=None)`
 
 Find a plugin endpoint locally or on remote nodes with access control.
@@ -1013,7 +1059,7 @@ async def my_stream(self, count):
 The CLI plugin provides a Textual-based terminal dashboard (TUI) for managing and monitoring the PluginCore at runtime.
 
 **Location**: `plugins_test/CLI/`
-**Version**: 2.2.0
+**Version**: 2.4.0
 **Dependencies**: `textual` (required), `psutil` (optional — enables CPU/memory sparkline graphs)
 
 ### Dashboard Tabs
@@ -1022,18 +1068,21 @@ The CLI plugin provides a Textual-based terminal dashboard (TUI) for managing an
 |---|---|
 | **Home** | System stats (CPU, memory, uptime) with live sparkline graphs. Active requests and network node tables with empty-state labels |
 | **Plugins** | DataTable of all loaded plugins with enable/disable/reload/remove buttons |
-| **Config** | Edit `config.yml` and per-plugin `plugin_config.yml` files with YAML validation. Dirty tracking warns on unsaved changes when switching files or tabs |
+| **Config** | Edit `config.yml` and per-plugin `plugin_config.yml` files via PluginCore's config editing API (`list_config_files`, `read_config_file`, `save_config_file`). YAML validation, backup-on-save, dirty tracking warns on unsaved changes when switching files or tabs |
 | **Logs** | Live log viewer with level filtering, text search, and auto-scroll. Incremental DataTable updates (append/remove) preserve scroll position. Record count indicator shows filtered/total with "(filtered)" suffix. Per-level color styling (ERROR red, WARNING amber, INFO gray, DEBUG dim) |
 | **Per-Plugin** | Auto-generated tabs for each plugin (from endpoints or custom registration) |
 
 ### Plugin Registration API
 
-Plugins can register custom TUI panels by implementing either method:
+Plugins can register custom TUI panels. The Dashboard checks these in priority order:
 
-- **Option A — Declarative** (`get_tui_menu() -> dict`): No Textual dependency required. Return a dict describing menu items and the Dashboard renders them.
-- **Option B — Full Widget** (`get_tui_widget() -> Widget`): Return a Textual widget for maximum control.
+1. **`get_tui_module_info()` → dict** (recommended for rich UIs): Return `{"path": "...", "class_name": "..."}` pointing to a TUI package. The Dashboard imports it via importlib, registering it as a proper Python package so relative imports work.
+2. **`get_tui_menu()` → dict** (no Textual dependency): Return a declarative dict describing menu sections and the Dashboard renders them automatically.
+3. **Auto-generated view** from the plugin's registered endpoints (fallback).
 
-If neither method is implemented, the Dashboard auto-generates a view from the plugin's registered endpoints.
+When a plugin has a custom view, the tab shows toggle buttons to switch between "Custom View" and "Generated View".
+
+See `plugins_test/CLI/CUSTOM_TABS.md` for full API documentation and examples.
 
 ### Key Bindings
 
@@ -1232,7 +1281,6 @@ AIO_Assistant_Core/
 ├── README.md                  # This documentation file
 ├── copypasta/                 # Plugin templates and examples
 │   ├── README.md              # Template usage guide
-│   ├── NEW_PUGIN_INFO.md      # Guide for AI-integrated endpoint setup
 │   ├── AveragePlugin/         # Example plugin template
 │   │   ├── plugin.py
 │   │   └── plugin_config.yml
@@ -1244,15 +1292,27 @@ AIO_Assistant_Core/
 │   ├── CLI/                   # Textual TUI dashboard (stats, plugin mgmt, config editor, logs)
 │   ├── InteropTarget/         # Interop test target (sync/async/generators)
 │   ├── InteropCaller/         # Interop test runner
-│   └── NetTest/               # Network testing plugin (echo, big objects, streaming)
+│   ├── NetTest/               # Network testing plugin (echo, big objects, streaming)
+│   ├── NotifierPublisher/     # Topic-based notifier test publisher
+│   └── NotifierSubscriber/    # Topic-based notifier test subscriber
 ├── _private/                  # Production plugins (not part of open-source core)
-│   ├── AI_Plugin/             # AI assistant (Claude API via Anthropic SDK, 4-mode system)
+│   ├── AI_Interaction/         # Multi-provider AI assistant (4-mode system, OpenRouter/Anthropic)
+│   ├── MemoryPlugin/          # Memory orchestration (working memory, projects, facts)
 │   ├── DataCollection/        # Centralized life-data storage (PostgreSQL + MinIO)
-│   ├── VoicePipeline/         # Voice-to-text with speaker diarization and TTS
 │   ├── DiscordBot/            # Discord bot interface with approval system and AI modes
 │   ├── TelegramBot/           # Telegram bot for document scanning and AI chat
-│   ├── DATABASE/              # PostgreSQL and MinIO database plugins
-│   └── TTS/                   # Piper text-to-speech plugin
+│   ├── VoicePipeline/         # Voice-to-text with speaker diarization
+│   ├── WakeWord/              # Always-on wake-word detection (openwakeword)
+│   ├── STT_AI_Plugin/         # Speech-to-text (faster-whisper)
+│   ├── TTS/                   # Piper text-to-speech plugin
+│   ├── VoiceDiarization/      # Speaker identification (pyannote/speechbrain)
+│   ├── DATABASE/              # PostgreSQL, MinIO, and Backup database plugins
+│   ├── DeviceControl/         # Smart home IR/BT control
+│   ├── Websearch/             # Web search, news, weather, URL fetch
+│   ├── DocumentAnalyzer/      # Document scanning pipeline (OCR, classification)
+│   ├── Geocoding/             # Address/coordinate conversion (OSM)
+│   ├── MCPClient/             # Model Context Protocol client
+│   └── AudioPlayer/           # Audio clip playback from MinIO
 ```
 
 ---
@@ -1276,11 +1336,11 @@ Log files are automatically created in the `logs/` directory with format: `AIO_A
 
 The `_private/` directory contains production plugins that build on top of the core framework. These are not part of the open-source core but demonstrate the framework's capabilities. Each plugin has its own documentation in its directory.
 
-### AI_Interaction (`_private/AI_Plugin/`)
+### AI_Interaction (`_private/AI_Interaction/`)
 
-An AI assistant powered by Claude (Haiku/Sonnet/Opus) via the Anthropic SDK. Key features:
+A multi-provider AI assistant with a four-mode system. Primary models: kimi-k2.5 via OpenRouter (conversation/working/debug), grok-4.1-fast via OpenRouter (minimum). Fallback: Anthropic Haiku/Sonnet. Key features:
 
-- **Anthropic API backend**: Uses `anthropic.Anthropic` client with Claude's native structured tool calling (`tool_use`/`tool_result` content blocks). Requires `ANTHROPIC_API_KEY` environment variable or `api_key` in plugin config. Message normalization (`_normalize_messages`) ensures proper user/assistant alternation required by the API.
+- **Provider abstraction layer** (`providers/`): Supports Anthropic, OpenAI-compatible (including OpenRouter), and LlamaCPP backends with automatic fallback (including streaming fallback for provider outages). Requires `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` environment variables. Message normalization (`_normalize_messages`) ensures proper user/assistant alternation.
 - **Inference lock and cancellation**: An `_inference_lock` (threading.Lock) serializes all `ai_chat` / `ai_chat_stream` calls so only one inference runs at a time across all consumers (Discord, voice, API). A `_cancel_event` is checked every token and tool iteration. The `cancel_generation` endpoint allows any consumer to stop the current generation immediately.
 - **Four-mode AI system**: Mode-aware routing selects model, tools, and context per task complexity. Minimum (Haiku, device control), Conversation (Haiku, personal assistant), Working (Sonnet, documents/web), Debug (Sonnet/Opus, full access). Each mode defines its own model, max_tokens, temperature, system prompt, tool tags, and context injection flags. Modes are per-session and reset on inactivity timeout. See [Tags and AI Modes](#tags-and-ai-modes) for details.
 - **Prompt caching**: `_inject_context` returns a `(system_blocks, messages)` tuple. The system prompt is fully static and cacheable (including owner/family person records fetched once on load). Dynamic context (time, channel, memories, semantic results) is prepended as a `[System Context]` message in the messages array. Cache structure: system (cached) -> tools (cached) -> messages (dynamic). Conversation history caching enabled for Working/Debug modes.
