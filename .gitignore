@@ -209,5 +209,5 @@ CLAUDE.md
 # Backups
 backups/
 
-# Config files
+# Config files — local user copy. Copy config.example.yml to config.yml and edit.
 config.yml
