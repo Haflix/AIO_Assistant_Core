@@ -46,6 +46,62 @@ from networking import NetworkManager, REMOTE_NO_RESULT
 from notifier import TopicRegistry, Subscription
 
 
+def _deep_merge_args(
+    base: dict, override: dict, plugin_name: str, logger,
+    counters: dict, _path: str = "",
+) -> dict:
+    """Deep-merge override into a copy of base. Lists fully replaced.
+    Logs each change at DEBUG (key path only — never values).
+    `counters` is mutated with {'added','replaced','type_mismatched'}.
+
+    Single-level shallow copy at each recursion. Keys present only in `base`
+    keep their original reference. Plugins must not mutate `self.arguments`
+    in place — consistent with the existing contract.
+
+    A dict containing `__replace__: true` is treated as a wholesale-replace
+    directive: the rest of that dict (with the marker stripped) becomes the
+    value at this position, bypassing deep merge. Use it to clear a subtree
+    (`{__replace__: true}` -> `{}`) or replace it (`{__replace__: true, k: v}` -> `{k: v}`).
+    """
+    if override.get("__replace__") is True:
+        replacement = {k: v for k, v in override.items() if k != "__replace__"}
+        counters["replaced"] += 1
+        logger.debug(
+            f"Plugin '{plugin_name}': arg subtree replaced '{_path or '<root>'}'"
+        )
+        return replacement
+
+    out = dict(base)
+    for key, ov in override.items():
+        path = f"{_path}.{key}" if _path else key
+        if key not in out:
+            out[key] = ov
+            counters["added"] += 1
+            logger.debug(f"Plugin '{plugin_name}': arg added '{path}'")
+        elif isinstance(out[key], dict) and isinstance(ov, dict):
+            out[key] = _deep_merge_args(out[key], ov, plugin_name, logger, counters, path)
+        elif type(out[key]) == type(ov) and out[key] == ov:
+            # No-op: same type AND same value. Type guard prevents `True == 1`
+            # (bool vs int) from being treated as no-op — that pair must reach
+            # the type-mismatch branch below.
+            pass
+        else:
+            # Base-was-None is NOT a mismatch — overriding a previously-null
+            # key is normal. Everything else with a type change warns.
+            if out[key] is not None and type(out[key]) != type(ov):
+                counters["type_mismatched"] += 1
+                logger.warning(
+                    f"Plugin '{plugin_name}': arg '{path}' type mismatch "
+                    f"({type(out[key]).__name__} -> "
+                    f"{type(ov).__name__ if ov is not None else 'NoneType'}); override applied"
+                )
+            else:
+                counters["replaced"] += 1
+                logger.debug(f"Plugin '{plugin_name}': arg replaced '{path}'")
+            out[key] = ov
+    return out
+
+
 class PluginCore:
     """Manages all plugins and facilitates communication between them."""
 
@@ -516,6 +572,47 @@ class PluginCore:
                     )
                     return
 
+        # ── Argument override application ────────────────────────────────
+        # Base args from plugin_config.yml. Must be dict-or-null.
+        base_args = plugin_config.get("arguments")
+        if base_args is not None and not isinstance(base_args, dict):
+            await error_config(
+                f"top-level 'arguments' in plugin_config.yml must be a mapping (dict) "
+                f"or omitted; got {type(base_args).__name__}"
+            )
+            return
+
+        # Override from main config.yml plugin entry. Must be dict-or-missing.
+        # Asymmetry intentional: invalid plugin_config is a hard error (plugin
+        # author bug). Invalid main-config override is a warning that ignores
+        # the override (deployment misconfig — let other plugins still load).
+        # Order matters: type-check BEFORE emptiness short-circuit, so wrong
+        # falsy types ([], "", 0, False) still warn instead of being silently dropped.
+        override = plugin_entry.get("arguments")
+        if override is None:
+            merged_args = base_args
+        elif not isinstance(override, dict):
+            await warn_config(
+                f"main config 'arguments' for '{name}' must be a mapping; "
+                f"got {type(override).__name__}; ignoring overrides"
+            )
+            merged_args = base_args
+        elif not override:
+            merged_args = base_args
+        else:
+            counters = {"added": 0, "replaced": 0, "type_mismatched": 0}
+            merged_args = _deep_merge_args(
+                base_args or {}, override, name, self._logger, counters,
+            )
+            total = counters["added"] + counters["replaced"] + counters["type_mismatched"]
+            if total:
+                self._logger.info(
+                    f"Plugin '{name}': applied {total} override(s) "
+                    f"({counters['added']} added, "
+                    f"{counters['replaced']} replaced, "
+                    f"{counters['type_mismatched']} type-mismatched)"
+                )
+
         # Dynamic import
         module_path = os.path.join(path, "plugin.py")
         spec = importlib.util.spec_from_file_location(name, module_path)
@@ -532,28 +629,23 @@ class PluginCore:
             None,
         )
         if plugin_class is None:
-            self._logger.error(f"No Plugin subclass found in {module_path}")
-            error_config(name)
+            await error_config(f"No Plugin subclass found in {module_path}")
             return
 
-        # Instantiate with config
+        # Instantiate with merged arguments
         plugin = plugin_class(
             self._logger.getChild(name),
             self,
-            arguments=(
-                plugin_config["arguments"]
-                if isinstance(plugin_config["arguments"], (list, dict, tuple))
-                else None
-            ),
+            arguments=merged_args,
         )
 
-        plugin.plugin_name = name  # Set name from main config
-        plugin.version = plugin_config["version"] if plugin_config["version"] is not None else "0.0.0 - not given"
-        plugin.remote = plugin_config["remote"] if plugin_config["remote"] is not None else False
-        plugin.arguments = plugin_config["arguments"] if plugin_config["arguments"] is not None else None
+        plugin.plugin_name = name
+        plugin.version = plugin_config.get("version") or "0.0.0 - not given"
+        plugin.remote = plugin_config.get("remote") or False
+        plugin.arguments = merged_args
         endpoints_cfg = plugin_config.get("endpoints") or []
         if not isinstance(endpoints_cfg, list):
-            await warn_config(f"{name} endpoints must be a list in plugin_config.yml")
+            await warn_config(f"endpoints must be a list in plugin_config.yml")
             endpoints_cfg = []
         # Keep only valid endpoint dicts
         plugin.endpoints = [e for e in endpoints_cfg if isinstance(e, dict)]

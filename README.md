@@ -686,6 +686,7 @@ networking:
 - `name`: Plugin name (must match class name)
 - `enabled`: Whether to load and enable this plugin on startup
 - `path`: Optional explicit path to plugin directory. If omitted, resolves to `{plugin_package}/{name}`
+- `arguments`: Optional dict that overrides values from the plugin's own `plugin_config.yml`. Deep-merged into the plugin's base arguments — see [Argument Overrides](#argument-overrides) for the merge rules and the `__replace__` marker
 - `arguments`: Optional data passed to the plugin's `on_load()` method
 
 **Networking**:
@@ -700,6 +701,76 @@ networking:
 - `cert_file`: Path to TLS certificate file (PEM format)
 - `key_file`: Path to TLS private key file (PEM format)
 - `pool_size`: Maximum number of pooled connections per remote node (default: 5)
+
+### Argument Overrides
+
+A plugin's default arguments live in its own `plugin_config.yml`. To change them per-deployment without editing the plugin's file, add an `arguments:` block to the plugin's entry in the main `config.yml`:
+
+```yaml
+plugins:
+  - name: AI_Interaction
+    enabled: true
+    path: ./_private/AI/AI_Interaction
+    arguments:
+      modes:
+        conversation:
+          temperature: 0.3   # only this leaf is overridden
+      daily_cost_warning_eur: 5.0
+```
+
+**Merge rules:**
+
+- **Dicts deep-merge.** Same key + both dict ⇒ recurse into both. Sibling keys in the base are preserved untouched at every depth. The example above replaces only `modes.conversation.temperature` and adds `daily_cost_warning_eur` — every other mode and every other field of `conversation` stays as declared in `plugin_config.yml`.
+- **Lists fully replace.** Override list wins wholesale. For list-of-dicts cases (e.g. `notifiers:`, `servers:` in MCPClient), you must restate every element you want to keep.
+- **Scalars replace.** Override value wins; the merged dict reaches the plugin via `on_load(**arguments)` and `self.arguments`.
+- **Type mismatch logs a warning.** A `bool`-base overridden with a `str`, or a typed value overridden with `null`, applies anyway and logs `arg '<path>' type mismatch (X -> Y); override applied`. Base-was-`null` is not a mismatch.
+- **No-op overrides are silent.** Same-type, same-value overrides do not log and do not increment counters.
+
+**`__replace__: true` marker — wholesale subtree replacement.**
+
+To bypass deep-merge at a specific node and replace its value entirely, include the special key `__replace__: true` inside the override dict at that level. The marker itself is stripped from the result.
+
+```yaml
+arguments:
+  modes:
+    __replace__: true              # discard every existing mode
+    conversation: {model: x}       # this is the new modes dict
+```
+
+Two common uses:
+- **Clear a subtree:** `key: {__replace__: true}` ⇒ `key: {}`.
+- **Replace without inheriting siblings:** `key: {__replace__: true, a: 1}` ⇒ `key: {a: 1}` (any other keys the base had under `key` are gone).
+
+**Constraints and corner cases:**
+
+- The top-level `arguments:` in `plugin_config.yml` must be a dict, `null`, or omitted. Lists and scalars at the root are rejected (the plugin fails to load).
+- The `arguments:` override in `config.yml` must also be a dict (or omitted). A wrong type logs a warning and the override is ignored — other plugins keep loading.
+- `arguments: null` (or missing) + no override ⇒ `self.arguments is None` (unchanged from before this feature).
+- `arguments: {}` (explicit empty dict) + no override ⇒ `self.arguments == {}` (unchanged).
+- `arguments: null` + a real override dict ⇒ `self.arguments == <override>`.
+- Plugins must not mutate `self.arguments` in place — nested dicts may share references with the original parsed config until reload.
+
+**Logging:**
+
+- Each per-key change is logged at DEBUG level: `arg added '<path>'`, `arg replaced '<path>'`, or `arg subtree replaced '<path>'`. Only key paths are logged — never values, since arguments may contain secrets.
+- One INFO summary per plugin: `applied N override(s) (X added, Y replaced, Z type-mismatched)`. Plugins with no override changes emit no summary line.
+
+**Multi-instance plugins:**
+
+Each entry in the `plugins:` list is independent. Two `DiscordBot` entries with different `name` values can carry different override dicts — handy when running two bot instances on the same node with different configurations.
+
+**Networking:**
+
+Overrides apply locally on the node where they are configured. There is no cross-node merging — each node's `config.yml` defines its own overrides for its own plugin loadout.
+
+**Hot-reload:**
+
+Overrides are baked in at plugin load time. To pick up edits to `config.yml` without restarting, use the CLI Dashboard in two steps:
+
+1. Click **Reload Main Config** (in the Config tab) — re-reads `config.yml` into `self.yaml_config`.
+2. Click the per-plugin **Reload** button — re-instantiates the plugin with the new merged arguments.
+
+Skipping step 1 leaves the system using whatever override was active at startup; the per-plugin reload alone will not pick up edits to `config.yml`.
 
 ### plugin_config.yml Structure
 
