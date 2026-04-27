@@ -647,9 +647,7 @@ class PluginCore:
         if not isinstance(endpoints_cfg, list):
             await warn_config(f"endpoints must be a list in plugin_config.yml")
             endpoints_cfg = []
-        # Keep only valid endpoint dicts
         plugin.endpoints = [e for e in endpoints_cfg if isinstance(e, dict)]
-        # Build quick lookup by access_name
         try:
             plugin._endpoint_by_access = {
                 e.get("access_name"): e
@@ -1548,12 +1546,20 @@ class PluginCore:
 
     @async_log_errors
     async def cleanup_requests(self):
-        """Remove collected requests older than 10 seconds."""
+        """Remove collected requests older than 10 seconds.
+
+        Uses created_at as the fallback when finished_at is unset — a few exit
+        paths in Request.wait_for_result_async finalize state without setting
+        finished_at (timeout/exception branches), and the previous filter
+        (`finished_at is None` → keep forever) was leaking those forever.
+        Falling back to created_at means even un-finalized-but-collected
+        requests get reaped 10 s after creation.
+        """
         _timer = time.time() - 10
         async with self.request_lock:
             self.requests = {
                 rid: req for rid, req in self.requests.items()
-                if not req.collected or (req.finished_at is None or req.finished_at > _timer)
+                if not req.collected or (req.finished_at or req.created_at) > _timer
             }
 
     # One-liner methods for plugin communication
@@ -1602,15 +1608,19 @@ class PluginCore:
             author_host,
             request_id,
         )
-        result, error, _ = await request.wait_for_result_async()
-        await request.set_collected()  # Mark for cleanup
-
-        if error:
-            self._logger.warning(
-                f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}. You can check the logs for this Req-ID."
-            )
-            raise RequestException(result)
-        return result
+        try:
+            result, error, _ = await request.wait_for_result_async()
+            if error:
+                self._logger.warning(
+                    f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}. You can check the logs for this Req-ID."
+                )
+                raise RequestException(result)
+            return result
+        finally:
+            # Mark for cleanup. Runs on normal return, RequestException, AND
+            # CancelledError — without this, a cancelled caller would leave the
+            # Request lingering in self.requests forever.
+            await request.set_collected()
 
     @log_errors
     def execute_sync(
@@ -1697,14 +1707,16 @@ class PluginCore:
             request_id,
         )
         request._call_chain = call_chain
-        result, error, _ = await request.wait_for_result_async()
-        await request.set_collected()
-        if error:
-            self._logger.warning(
-                f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}"
-            )
-            raise RequestException(result)
-        return result
+        try:
+            result, error, _ = await request.wait_for_result_async()
+            if error:
+                self._logger.warning(
+                    f"Error executing {plugin}.{method} (Req-ID: {request.id}): {result}"
+                )
+                raise RequestException(result)
+            return result
+        finally:
+            await request.set_collected()
 
     @async_gen_log_errors
     async def execute_stream(
@@ -1750,16 +1762,20 @@ class PluginCore:
             author_host,
             request_id,
         )
-        async for result, error, _ in request.get_queue_stream():
-
-            if error:
-                self._logger.warning(
-                    f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID."
-                )
-                raise RequestException(result)
-            yield result
-
-        await request.set_collected()  # Mark for cleanup
+        try:
+            async for result, error, _ in request.get_queue_stream():
+                if error:
+                    self._logger.warning(
+                        f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID."
+                    )
+                    raise RequestException(result)
+                yield result
+        finally:
+            # Mark for cleanup. Runs on normal completion, RequestException,
+            # AND CancelledError (e.g. when caller breaks out of `async for`
+            # early) — without this, cancelled stream consumers would leave
+            # the GeneratorRequest lingering forever.
+            await request.set_collected()
 
     @gen_log_errors
     def execute_stream_sync(
@@ -1813,16 +1829,16 @@ class PluginCore:
             request_id,
         )
 
-        for result, error, _ in request.get_queue_stream_sync():
-
-            if error:
-                self._logger.warning(
-                    f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID."
-                )
-                raise RequestException(result)
-            yield result
-
-        asyncio.run_coroutine_threadsafe(request.set_collected(), self.main_event_loop)
+        try:
+            for result, error, _ in request.get_queue_stream_sync():
+                if error:
+                    self._logger.warning(
+                        f"Error executing {plugin}.{method} (GenReq-ID: {request.id}): {result}. You can check the logs for this Req-ID."
+                    )
+                    raise RequestException(result)
+                yield result
+        finally:
+            asyncio.run_coroutine_threadsafe(request.set_collected(), self.main_event_loop)
 
     # ── Notifier system ───────────────────────────────────────────────
 

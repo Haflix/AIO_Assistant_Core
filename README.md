@@ -11,8 +11,13 @@
 7. [Configuration](#configuration)
 8. [API Reference](#api-reference)
 9. [Error Handling](#error-handling)
-10. [CLI Plugin](#cli-plugin)
+10. [CLI Dashboard Plugin](#cli-dashboard-plugin)
 11. [Examples](#examples)
+12. [Interop Test Plugins](#interop-test-plugins)
+13. [File Structure](#file-structure)
+14. [Logging](#logging)
+15. [Future Plans](#future-plans)
+16. [Contributing](#contributing)
 
 ---
 
@@ -54,8 +59,8 @@ pip install textual
 # Optional (enables CPU/memory sparkline graphs):
 pip install psutil
 
-# Plugin-specific dependencies are listed in requirements.txt
-# (only install what you need for the plugins you plan to use)
+# Plugin-specific dependencies (only install what you need for the plugins you plan to use)
+# are documented in each plugin's own README or comments inside its plugin.py
 ```
 
 ### Basic Usage
@@ -246,7 +251,9 @@ Manages network communication between multiple nodes for distributed plugin exec
 - Binary message protocol using pickle serialization
 - Node discovery (auto-discovery and manual node IPs)
 - Endpoint availability checking across nodes via `node_has_endpoint()`
+- Tag-based endpoint discovery on remote nodes via `node_get_tagged_endpoints()`
 - Remote plugin execution and streaming
+- Cross-node topic notify/request via `notify_remote()`, `request_topic_remote()`, and `request_topic_stream_remote()`
 - Heartbeat-based liveness monitoring
 - Background loops for discovery and heartbeat
 
@@ -261,11 +268,18 @@ Each message uses a binary format: `[4-byte length][1-byte message_type][pickle 
 | Has Endpoint | `MSG_HAS_ENDPOINT` (3) | Check if a node has a specific endpoint |
 | Ping | `MSG_PING` (4) | Health check / heartbeat |
 | Info | `MSG_INFO` (5) | Exchange node information and discovery data |
+| Find Tagged Endpoints | `MSG_FIND_TAGGED_ENDPOINTS` (6) | Query endpoints by tag on a remote node |
+| Notify | `MSG_NOTIFY` (7) | Fire-and-forget topic publish to remote nodes |
+| Topic Request | `MSG_TOPIC_REQUEST` (8) | Request-by-topic call to a remote node |
+| Topic Request Stream | `MSG_TOPIC_REQUEST_STREAM` (9) | Streaming request-by-topic to a remote node |
 | Result | `MSG_RESULT` (10) | Response with result data |
 | Stream Chunk | `MSG_STREAM_CHUNK` (11) | A chunk of streaming data |
 | Error | `MSG_ERROR` (12) | Error response |
 | End Stream | `MSG_END_STREAM` (13) | Marks end of a stream |
+| Stream Item End | `MSG_STREAM_ITEM_END` (14) | Marks end of an individual streamed item |
 | Auth | `MSG_AUTH` (20) | Authentication message (shared secret) |
+
+A `REMOTE_NO_RESULT` sentinel distinguishes "handler returned `None`" from "no remote handler responded" for `request_topic` calls across nodes.
 
 ### Plugin Base Class
 
@@ -489,7 +503,7 @@ The notifier system provides topic-based pub/sub and request-by-topic routing, d
 
 | Pattern | Method | Description |
 |---|---|---|
-| Fire-and-forget | `notify()` / `notify_sync()` | One-to-many. All subscribers called, errors logged, no return value. |
+| Fire-and-forget | `notify()` / `notify_sync()` | One-to-many. All subscribers called concurrently, errors logged. Returns the number of subscribers that were notified (int). |
 | Request-by-topic | `request_topic()` / `request_topic_sync()` | One-to-one. First matching handler called, result returned. |
 | Streaming request | `request_topic_stream()` / `request_topic_stream_sync()` | One-to-one streaming. |
 
@@ -538,28 +552,26 @@ async for chunk in self.request_topic_stream("ai/stream", args):
 
 **Cross-node:** Topic operations support the same `host` parameter as `execute()` (`"any"`, `"local"`, `"remote"`, or a specific hostname). Remote nodes are queried when no local handler is found.
 
-### Tags and AI Modes
+### Tags and Endpoint Discovery
 
-Endpoint `tags` serve two purposes: general categorization and AI tool discovery. The AI system (`AI_Interaction` plugin) uses `find_endpoints_by_tag()` to discover endpoints at runtime via a four-mode system:
+Endpoint `tags` serve two purposes:
 
-| Mode | Model | Tags Loaded | Use Case |
-|------|-------|-------------|----------|
-| **Minimum** | grok-4.1-fast (fallback: Haiku) | `AI-minimum` | Quick voice tasks (device control, weather). Short TTS-optimized responses. Separate non-Genesis identity. |
-| **Conversation** | kimi-k2.5 (fallback: Haiku) | `AI-minimum` + `AI-conversation` | Default mode. Normal chatting and personal assistant tasks (memory, tasks, appointments, sessions). |
-| **Working** | kimi-k2.5 (fallback: Sonnet) | + `AI-working` | High-accuracy workflows, document processing, web search. Activated via `/mode working`. |
-| **Debug** | kimi-k2.5 (fallback: Sonnet) | + `AI-debug` | Full system access including all raw CRUD endpoints. For debugging and administration. |
+1. **General categorization** — group endpoints by topic, capability, or trust level so callers can enumerate them.
+2. **Runtime discovery** — `PluginCore.find_endpoints_by_tag(tag)` returns every local *and* remote endpoint that carries a given tag, as a list of `(plugin, endpoint_dict, description, arguments)` tuples.
 
-Each endpoint is explicitly tagged with every mode it belongs to (no inheritance). Modes are configured per-session and reset on inactivity timeout. Users switch modes via the `/mode` slash command in Discord or Telegram.
+Tags are set per-endpoint in `plugin_config.yml`:
 
-Key technical details:
-- `disable_parallel_tool_use: true` for minimum mode (prevents tool accuracy issues with simpler models)
-- Per-mode configuration: model, max_tokens, temperature, system_prompt_file, enable_reasoning, prompt_caching, inject flags (person context, memories, session info), summarization
-- Conversation history caching for Working/Debug modes
-- Daily cost tracking with configurable EUR threshold warning
+```yaml
+endpoints:
+  - internal_name: my_method
+    access_name: my_method
+    tags: ["sensors", "weather"]    # arbitrary strings — define your own taxonomy
+    ...
+```
 
-- **Empty `[]`**: The endpoint is invisible to the AI and only callable by other plugins directly.
+A common pattern is to use tags as a capability gate for AI / orchestrator plugins: the orchestrator queries `find_endpoints_by_tag("AI-conversation")` (or any tag of its choosing) to discover which tools it is allowed to expose to the model in a given mode. Endpoints with empty `tags: []` are invisible to tag-based lookups and only callable by plugins that already know the access name.
 
-This replaces the old three-tier system (AI-1/AI-2/AI-3) with explicit per-endpoint mode tags.
+Tags are matched as exact strings — there is no hierarchy or wildcard. An endpoint that should appear under multiple tags simply lists all of them.
 
 ### Endpoint Access Control
 
@@ -687,7 +699,6 @@ networking:
 - `enabled`: Whether to load and enable this plugin on startup
 - `path`: Optional explicit path to plugin directory. If omitted, resolves to `{plugin_package}/{name}`
 - `arguments`: Optional dict that overrides values from the plugin's own `plugin_config.yml`. Deep-merged into the plugin's base arguments — see [Argument Overrides](#argument-overrides) for the merge rules and the `__replace__` marker
-- `arguments`: Optional data passed to the plugin's `on_load()` method
 
 **Networking**:
 
@@ -787,13 +798,18 @@ endpoints:
     tags: []                     # Optional categorization tags
     remote: boolean              # Allow this endpoint to be called remotely
     accessible_by_other_plugins: boolean  # Allow other local plugins to call this
+    topic: "some/topic"          # Optional: auto-subscribe this endpoint to a topic on plugin load
     description: str             # What the endpoint does
     arguments:
       - name: param_name
         type: str                # int, str, dict, list, any, etc.
-        description: str         # Include "Optional" or "Omit" to auto-exclude from required
-        required: boolean        # Optional: explicit override (true/false) for auto-detection
+        description: str         # Free-form description of the argument
+        required: boolean        # Optional: marks the argument as required (read by the CLI dashboard
+                                 # and available to any orchestrator that builds AI tool schemas
+                                 # from the endpoint metadata)
 ```
+
+Additional fields (e.g. a `default:` value, or other schema hints) are ignored by core. They are passed through verbatim in `endpoint["arguments"]`, so an orchestrator plugin is free to define and consume its own extra keys.
 
 ---
 
@@ -1089,7 +1105,7 @@ Sync generator one-liner to stream from another plugin's generator method. Must 
 
 **Location**: `decorators.py`
 
-All decorators include automatic type checking -- using the wrong decorator (e.g., `@async_log_errors` on a sync function) raises `PluginTypeMissmatchError` with a message indicating the correct decorator. The `async_handle_errors` decorator also lets `RequestException` propagate (re-raised instead of caught), so callers can handle plugin/request errors upstream.
+All decorators include automatic type checking -- using the wrong decorator (e.g., `@async_log_errors` on a sync function) raises `PluginTypeMissmatchError` with a message indicating the correct decorator.
 
 **For sync functions:**
 
@@ -1098,8 +1114,8 @@ All decorators include automatic type checking -- using the wrong decorator (e.g
 
 **For async functions:**
 
-- `@async_log_errors`: Log exceptions without stopping execution, then re-raise
-- `@async_handle_errors` / `@async_handle_errors(default_return=...)`: Catch exceptions, log them, and return a default value (can be used with or without parentheses; defaults to `None`)
+- `@async_log_errors`: Log exceptions without stopping execution, then re-raise. Bare-decorator form only — do not call with parentheses.
+- `@async_handle_errors` / `@async_handle_errors(default_return=...)`: Catch exceptions, log them, and return a default value (can be used with or without parentheses; defaults to `None`). `RequestException` is intentionally re-raised so callers can handle plugin/request errors upstream.
 
 **For sync generators:**
 
@@ -1144,8 +1160,9 @@ The CLI plugin provides a Textual-based terminal dashboard (TUI) for managing an
 | **Home** | System stats (CPU, memory, uptime) with live sparkline graphs. Active requests and network node tables with empty-state labels |
 | **Plugins** | DataTable of all loaded plugins with enable/disable/reload/remove buttons |
 | **Config** | Edit `config.yml` and per-plugin `plugin_config.yml` files via PluginCore's config editing API (`list_config_files`, `read_config_file`, `save_config_file`). YAML validation, backup-on-save, dirty tracking warns on unsaved changes when switching files or tabs |
-| **Logs** | Live log viewer with level filtering, text search, and auto-scroll. Incremental DataTable updates (append/remove) preserve scroll position. Record count indicator shows filtered/total with "(filtered)" suffix. Per-level color styling (ERROR red, WARNING amber, INFO gray, DEBUG dim) |
-| **Per-Plugin** | Auto-generated tabs for each plugin (from endpoints or custom registration) |
+| **Logs** | Live log viewer with level filtering, text search, and auto-scroll. Incremental DataTable updates (append/remove) preserve scroll position. Record count indicator shows filtered/total with "(filtered)" suffix. Per-level color styling (ERROR red, WARNING amber, INFO gray, DEBUG dim). Backed by an in-memory record store (5000 records) so filters can be applied retroactively |
+| **Settings** | Adjust the dashboard's own runtime settings: stats/plugin/request poll intervals, console log level, and live PluginCore + networking info panels |
+| **Per-Plugin** | Auto-generated tabs for each plugin (from endpoints or custom registration). Each tab includes a "Close Tab" button to detach the panel without affecting the underlying plugin |
 
 ### Plugin Registration API
 
@@ -1163,7 +1180,10 @@ See `plugins_test/CLI/CUSTOM_TABS.md` for full API documentation and examples.
 
 | Key | Action |
 |---|---|
-| `q` | Quit the dashboard (triggers system shutdown) |
+| `q` | Request quit — opens a confirmation dialog before exiting |
+| `ctrl+q` | Force-quit immediately (no confirmation) |
+| `r` | Refresh stats, plugin table, requests, and config file list |
+| `1`–`5` | Jump directly to the Home / Plugins / Config / Logs / Settings tabs |
 
 ---
 
@@ -1345,15 +1365,16 @@ AIO_Assistant_Core/
 ├── PluginCore.py              # Main plugin management class
 ├── networking.py              # Network communication manager (TLS/TCP sockets)
 ├── networking_classes.py      # Node and RemotePlugin classes
+├── notifier.py                # Topic-based pub/sub registry + matching engine
 ├── utils.py                   # Plugin base class, Request, GeneratorRequest,
-│                              #   ConfigUtil, LogUtil, EndOfQueue
+│                              #   ConfigUtil, LogUtil, FDRedirector, EndOfQueue
 ├── decorators.py              # Error handling decorators (sync, async, generators)
 ├── exceptions.py              # Custom exception classes
 ├── main_application.py        # Example application entry point
 ├── config.yml                 # Main configuration file
-├── requirements.txt           # Python package dependencies
 ├── notes.txt                  # Development notes and TODOs
 ├── README.md                  # This documentation file
+├── CLAUDE.md                  # Repo-wide guidance for AI coding assistants
 ├── copypasta/                 # Plugin templates and examples
 │   ├── README.md              # Template usage guide
 │   ├── AveragePlugin/         # Example plugin template
@@ -1370,24 +1391,7 @@ AIO_Assistant_Core/
 │   ├── NetTest/               # Network testing plugin (echo, big objects, streaming)
 │   ├── NotifierPublisher/     # Topic-based notifier test publisher
 │   └── NotifierSubscriber/    # Topic-based notifier test subscriber
-├── _private/                  # Production plugins (not part of open-source core)
-│   ├── AI_Interaction/         # Multi-provider AI assistant (4-mode system, OpenRouter/Anthropic)
-│   ├── MemoryPlugin/          # Memory orchestration (working memory, projects, facts)
-│   ├── DataCollection/        # Centralized life-data storage (PostgreSQL + MinIO)
-│   ├── DiscordBot/            # Discord bot interface with approval system and AI modes
-│   ├── TelegramBot/           # Telegram bot for document scanning and AI chat
-│   ├── VoicePipeline/         # Voice-to-text with speaker diarization
-│   ├── WakeWord/              # Always-on wake-word detection (openwakeword)
-│   ├── STT_AI_Plugin/         # Speech-to-text (faster-whisper)
-│   ├── TTS/                   # Piper text-to-speech plugin
-│   ├── VoiceDiarization/      # Speaker identification (pyannote/speechbrain)
-│   ├── DATABASE/              # PostgreSQL, MinIO, and Backup database plugins
-│   ├── DeviceControl/         # Smart home IR/BT control
-│   ├── Websearch/             # Web search, news, weather, URL fetch
-│   ├── DocumentAnalyzer/      # Document scanning pipeline (OCR, classification)
-│   ├── Geocoding/             # Address/coordinate conversion (OSM)
-│   ├── MCPClient/             # Model Context Protocol client
-│   └── AudioPlayer/           # Audio clip playback from MinIO
+└── logs/                      # Auto-generated log files (AIO_AI_<timestamp>.log)
 ```
 
 ---
@@ -1399,12 +1403,13 @@ The system uses a custom logging utility (`LogUtil` in `utils.py`) that provides
 - **Non-blocking I/O**: Uses `QueueHandler` and `QueueListener` for thread-safe, non-blocking log output
 - **Colored console output**: Uses `colorama` for color-coded log levels and components
 - **File logging**: Timestamped log files in the `logs/` directory with plain-text formatting
-- **Hierarchical loggers**: Each plugin and component gets its own child logger (e.g., `root.PluginA`, `root.networking`)
-- **Dynamic log level**: `LogUtil.change_level()` adjusts console output level at runtime without affecting file logging
+- **Independent levels**: `LogUtil.change_level()` adjusts the console level at runtime; `LogUtil.change_file_level()` adjusts the file level. The two are tracked separately so you can run a quiet console with verbose file logs (or the reverse).
+- **OS-level fd capture (`FDRedirector`)**: Intercepts stdout/stderr at the file-descriptor level (fd 1/2) so log lines emitted by C extensions (HuggingFace, ONNX, llama.cpp, etc.) — which bypass Python's `sys.stdout` — are still routed into the logging pipeline. Includes mute/unmute hooks for terminal capture (e.g. when the Textual TUI takes over the screen).
+- **`_MutableStream`**: Wraps `sys.stdout` / `sys.stderr` so Python-level prints can be switched between terminal output and the log pipeline at runtime, with per-thread exemptions (used by Textual's render thread).
 - **Per-logger Level Control**: Independent thresholds per logger and per handler, fully driven from `config.yml` (see subsection below). Replaces the older hardcoded `propagate = False` block — noisy third-party libs are now clamped, not silenced, and the user can adjust them at any time.
-- **Automatic cleanup**: The `QueueListener` is stopped via `atexit` hook
+- **Automatic cleanup**: `QueueListener` and `FDRedirector` are stopped via an `atexit` hook.
 
-Log files are automatically created in the `logs/` directory with format: `AIO_AI_YYYY-MM-DD_HH-MM-SS.log`
+Log files are automatically created in the `logs/` directory with format: `AIO_AI_YYYY-MM-DD_HH-MM-SS.log`. Each plugin and component gets its own child logger via standard Python logger naming (e.g., `root.PluginA`, `root.networking`).
 
 ### Per-logger Level Control
 
@@ -1449,47 +1454,6 @@ levels = self.list_logger_levels()                              # debug snapshot
 Owner identity is auto-filled from `self.plugin_name` / `self.plugin_uuid`; plugins never pass it manually. A plugin's overrides only persist while the plugin is loaded — hot-swap creates a fresh instance with a new uuid, so the old uuid's entries clear automatically. The new instance can re-set thresholds in `on_load` or `on_enable`.
 
 **Migration note.** Earlier versions used a hardcoded `propagate = False` block in `LogUtil.create()` for `httpx`, `httpcore`, `psycopg`, `psycopg.pool`, `asyncio`, `urllib3` — that block fully silenced those libs. The new system replaces it with config-driven thresholds (defaults shown above ship in this repo's `config.yml`). If you keep a custom `config.yml`, copy the six default `logger_levels` entries into it on first upgrade — otherwise those libraries will become noisy on the first run after the upgrade. WARNING+ records that were previously invisible will now surface; this is intentional.
-
----
-
-## Private Plugins
-
-The `_private/` directory contains production plugins that build on top of the core framework. These are not part of the open-source core but demonstrate the framework's capabilities. Each plugin has its own documentation in its directory.
-
-### AI_Interaction (`_private/AI_Interaction/`)
-
-A multi-provider AI assistant with a four-mode system. Primary models: kimi-k2.5 via OpenRouter (conversation/working/debug), grok-4.1-fast via OpenRouter (minimum). Fallback: Anthropic Haiku/Sonnet. Key features:
-
-- **Provider abstraction layer** (`providers/`): Supports Anthropic, OpenAI-compatible (including OpenRouter), and LlamaCPP backends with automatic fallback (including streaming fallback for provider outages). Requires `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` environment variables. Message normalization (`_normalize_messages`) ensures proper user/assistant alternation.
-- **Inference lock and cancellation**: An `_inference_lock` (threading.Lock) serializes all `ai_chat` / `ai_chat_stream` calls so only one inference runs at a time across all consumers (Discord, voice, API). A `_cancel_event` is checked every token and tool iteration. The `cancel_generation` endpoint allows any consumer to stop the current generation immediately.
-- **Four-mode AI system**: Mode-aware routing selects model, tools, and context per task complexity. Minimum (Haiku, device control), Conversation (Haiku, personal assistant), Working (Sonnet, documents/web), Debug (Sonnet/Opus, full access). Each mode defines its own model, max_tokens, temperature, system prompt, tool tags, and context injection flags. Modes are per-session and reset on inactivity timeout. See [Tags and AI Modes](#tags-and-ai-modes) for details.
-- **Prompt caching**: `_inject_context` returns a `(system_blocks, messages)` tuple. The system prompt is fully static and cacheable (including owner/family person records fetched once on load). Dynamic context (time, channel, memories, semantic results) is prepended as a `[System Context]` message in the messages array. Cache structure: system (cached) -> tools (cached) -> messages (dynamic). Conversation history caching enabled for Working/Debug modes.
-- **Smart optional parameters**: Tool definitions auto-detect optional parameters from argument descriptions containing "optional" or "omit". These parameters are not marked as `required` in the JSON schema, so the LLM does not have to fill them with placeholder values.
-- **Endpoint approval system**: Before executing a tool call, the AI checks the endpoint's approval policy (prompt/auto_approve/deny) from the database. Users approve via Discord buttons.
-- **Tool call visibility**: Conversation history includes `[Tools used: ...]` summaries from metadata, so the AI can reference previous tool results across turns.
-- **Context injection**: Dynamic context is injected per-message (configurable per mode) from: (1) general knowledge memory, (2) active short-term memories, (3) semantically relevant notes, and (4) pending/in-progress tasks semantically related to the user's message.
-- **Daily cost tracking**: Per-call API cost tracking with configurable EUR threshold warning via Discord DM.
-- **Error handling**: Explicit handling for API errors (authentication, rate limits, etc.) that yields/returns visible error messages instead of silent failures.
-
-### DataCollection (`_private/DataCollection/`)
-
-Centralized data storage for all "life data" (people, organizations, documents, appointments, tasks, notes, logs, etc.) backed by PostgreSQL and MinIO. Supports vector-based semantic search (fastembed) over notes, short-term memories, tasks, and documents. See `_private/DataCollection/DOCS.md` for full technical documentation.
-
-### VoicePipeline (`_private/VoicePipeline/`)
-
-Voice-to-text pipeline with speaker diarization (pyannote or speechbrain), Whisper-based STT, and Piper TTS. Uses the current `token=` parameter (not the deprecated `use_auth_token=`) for `Model.from_pretrained` calls. See `_private/VoicePipeline/SETUP_GUIDE.md`.
-
-### DiscordBot (`_private/DiscordBot/`)
-
-Discord bot interface that bridges users to the AI assistant with approval buttons, conversation management, proactive reminders, and AI mode control. Key features:
-
-- **`!ais <message>` (stop+replace)**: Cancels the current AI generation and processes the new message instead.
-- **`!ai` while busy**: The message is queued (hourglass reaction), then processed after the current response finishes. Maximum queue depth: 5 per channel.
-- **`/stop` slash command**: Cancels the current AI generation without sending a new message.
-- **`/mode <minimum|conversation|working|debug>`**: Switch AI mode per channel. Shows confirmation embed with mode name, model, and tool count.
-- **`/debuginfo on|off`**: Toggle debug overlay on AI responses (shows mode, model, token usage).
-- **Per-channel state tracking**: Each channel tracks busy status, a cancel event, a message queue, and active AI mode independently.
-- **Auto-registration of DM channels**: When a user DMs the bot, the DM channel is automatically registered in the DataCollection database with `is_private: True` and `belongs_to` set to the user's person ID.
 
 ---
 
