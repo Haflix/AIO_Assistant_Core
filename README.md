@@ -654,6 +654,8 @@ general:
     hostname: ""              # Unique identifier for this node (empty = system hostname)
     plugin_package: plugins_test  # Base directory for plugins
     console_log_level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    file_log_level: "DEBUG"   # Log level for file output (independent of console)
+    asyncio_debug: false      # Enable Python's asyncio debug mode (slower, more verbose)
 
 # Networking Configuration
 networking:
@@ -676,6 +678,8 @@ networking:
 - `hostname`: Unique identifier for this node (used in network communication). If empty, defaults to the system hostname.
 - `plugin_package`: Default directory where plugins are located if `path` is not specified per plugin
 - `console_log_level`: Logging level for console output (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- `file_log_level`: Logging level for the rotating log files in `logs/`, independent from `console_log_level`. You can run a quiet console with verbose file logs (or the reverse).
+- `asyncio_debug`: Enable Python's asyncio debug mode. Useful for diagnosing slow callbacks and unawaited coroutines, but adds overhead — keep `false` in production.
 
 **Plugins**:
 
@@ -1326,9 +1330,54 @@ The system uses a custom logging utility (`LogUtil` in `utils.py`) that provides
 - **File logging**: Timestamped log files in the `logs/` directory with plain-text formatting
 - **Hierarchical loggers**: Each plugin and component gets its own child logger (e.g., `root.PluginA`, `root.networking`)
 - **Dynamic log level**: `LogUtil.change_level()` adjusts console output level at runtime without affecting file logging
+- **Per-logger Level Control**: Independent thresholds per logger and per handler, fully driven from `config.yml` (see subsection below). Replaces the older hardcoded `propagate = False` block — noisy third-party libs are now clamped, not silenced, and the user can adjust them at any time.
 - **Automatic cleanup**: The `QueueListener` is stopped via `atexit` hook
 
 Log files are automatically created in the `logs/` directory with format: `AIO_AI_YYYY-MM-DD_HH-MM-SS.log`
+
+### Per-logger Level Control
+
+Set thresholds per logger (and optionally split between console and file) under `general.logger_levels` in `config.yml`:
+
+```yaml
+general:
+    console_log_level: "DEBUG"
+    file_log_level: "DEBUG"
+    logger_levels:
+        asyncio: "MUTE"             # shorthand → both handlers
+        urllib3: "MUTE"
+        httpx: "WARNING"
+        httpcore: "WARNING"
+        psycopg: "WARNING"
+        psycopg.pool: "WARNING"
+        # explicit per-handler split:
+        myverbose.lib:
+            console: "WARNING"
+            file: "DEBUG"
+```
+
+**Levels.** `DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE`. `MUTE` drops the record entirely (and skips even the queue, so muted high-volume loggers cost almost nothing).
+
+**Prefix matching.** Keys match by prefix with a dot boundary — `httpx` covers `httpx`, `httpx.client`, `httpx.client.send`, but does NOT match `httpxlib`. Longest matching prefix wins, so `httpx.client: ERROR` overrides a broader `httpx: DEBUG` for that subtree. Use `httpx` (no `.*` suffix) — the prefix already covers all sub-loggers; wildcards are rejected at load time.
+
+**Sources.** Two sources can set thresholds:
+- **Config-driven** — entries under `general.logger_levels`. Replaced wholesale on every `load_config_yaml()` (including hot-reload via `async_load_config_yaml()`).
+- **Plugin-driven** — runtime overrides set by plugins. These survive config reloads but auto-clear when the owning plugin is disabled, popped, purged, or shut down.
+
+For the same prefix, plugin-driven wins over config-driven.
+
+**Plugin API.** Inside any `Plugin` subclass:
+
+```python
+self.set_logger_level("myplugin.foo", console="ERROR")          # split is optional
+self.set_logger_level("noisylib", console="MUTE", file="MUTE")
+self.clear_logger_level("myplugin.foo")                         # or per-handler
+levels = self.list_logger_levels()                              # debug snapshot
+```
+
+Owner identity is auto-filled from `self.plugin_name` / `self.plugin_uuid`; plugins never pass it manually. A plugin's overrides only persist while the plugin is loaded — hot-swap creates a fresh instance with a new uuid, so the old uuid's entries clear automatically. The new instance can re-set thresholds in `on_load` or `on_enable`.
+
+**Migration note.** Earlier versions used a hardcoded `propagate = False` block in `LogUtil.create()` for `httpx`, `httpcore`, `psycopg`, `psycopg.pool`, `asyncio`, `urllib3` — that block fully silenced those libs. The new system replaces it with config-driven thresholds (defaults shown above ship in this repo's `config.yml`). If you keep a custom `config.yml`, copy the six default `logger_levels` entries into it on first upgrade — otherwise those libraries will become noisy on the first run after the upgrade. WARNING+ records that were previously invisible will now surface; this is intentional.
 
 ---
 

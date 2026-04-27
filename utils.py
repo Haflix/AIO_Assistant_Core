@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 import asyncio
+import contextlib
 import datetime
 import logging
 from logging.handlers import QueueHandler, QueueListener
@@ -19,59 +22,58 @@ from exceptions import RequestException, ConfigException
 from colorama import Fore, Style
 
 
-# class LogUtil(logging.Logger):
-#    __FORMATTER = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
-#    def __init__(
-#            self,
-#            name: str,
-#            log_format: str = __FORMATTER,
-#            level: Union[int, str] = DEBUG,
-#            *args,
-#            **kwargs
-#    ) -> None:
-#        super().__init__(name, level)
-#        self.formatter = logging.Formatter(log_format)
-#
-#    @staticmethod
-#    def create(log_level: str = 'DEBUG') -> logging.Logger:
-#        """Create and configure the root logger."""
-#        logging.setLoggerClass(LogUtil)
-#        root_logger = logging.getLogger()
-#        root_logger.setLevel(log_level)
-#
-#        # Remove existing handlers to avoid duplicates
-#        for handler in root_logger.handlers[:]:
-#            root_logger.removeHandler(handler)
-#
-#        # Create logs directory if it doesn't exist
-#        logs_dir = "logs"
-#        os.makedirs(logs_dir, exist_ok=True)
-#
-#        # Generate log filename with current timestamp
-#        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-#        log_filename = f"AIO_AI_{timestamp}.log"
-#        log_file_path = os.path.join(logs_dir, log_filename)
-#
-#        formatter = logging.Formatter(LogUtil.__FORMATTER)
-#
-#        # Add console handler
-#        stream_handler = logging.StreamHandler(sys.stdout)
-#        stream_handler.setFormatter(formatter)
-#        root_logger.addHandler(stream_handler)
-#
-#        # Add file handler
-#        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-#        file_handler.setFormatter(formatter)
-#        root_logger.addHandler(file_handler)
-#
-#        root_logger.info(f"Logging initialized. Log file: {log_file_path}")
-#        return root_logger
+class _Mute:
+    """Sentinel for fully-muted threshold; never compares >= record.levelno."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return "MUTE"
+
+
+_MUTE = _Mute()
+
+_LEVEL_NAMES: dict = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+    "MUTE": _MUTE,
+}
+
+
+def _parse_level(value, *, ctx_logger=None, ctx_label: str = ""):
+    """Parse a level string into an int level or _MUTE.
+
+    Returns the parsed level, or None if value is None / invalid.
+    On invalid input, logs a warning via ctx_logger when supplied.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        if ctx_logger:
+            ctx_logger.warning(
+                "Invalid logger level type for %s: %r (expected str). Skipped.",
+                ctx_label or "<entry>", value,
+            )
+        return None
+    upper = value.strip().upper()
+    if upper in _LEVEL_NAMES:
+        return _LEVEL_NAMES[upper]
+    if ctx_logger:
+        ctx_logger.warning(
+            "Invalid logger level for %s: %r. Allowed: %s. Skipped.",
+            ctx_label or "<entry>", value, ", ".join(_LEVEL_NAMES.keys()),
+        )
+    return None
+
+
 class ColoredFormatter(logging.Formatter):
     LEVEL_COLORS = {
-        logging.DEBUG:    Fore.CYAN,
-        logging.INFO:     Fore.GREEN,
-        logging.WARNING:  Fore.YELLOW,
-        logging.ERROR:    Fore.RED,
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
         logging.CRITICAL: Fore.RED + Style.BRIGHT,
     }
 
@@ -217,12 +219,12 @@ class FDRedirector:
 
     def __init__(self):
         self._active = False
-        self._saved_fds = {}          # {fd_num: dup'd copy of original fd}
-        self._pipes = {}              # {fd_num: pipe_read_fd}
+        self._saved_fds = {}  # {fd_num: dup'd copy of original fd}
+        self._pipes = {}  # {fd_num: pipe_read_fd}
         self._threads = []
-        self._original_streams = {}   # {fd_num: original sys.stdout / sys.stderr}
-        self._original_dunder = {}    # {fd_num: original sys.__stdout__ / sys.__stderr__}
-        self._redirect_streams = {}   # {fd_num: _MutableStream wrapping saved fd}
+        self._original_streams = {}  # {fd_num: original sys.stdout / sys.stderr}
+        self._original_dunder = {}  # {fd_num: original sys.__stdout__ / sys.__stderr__}
+        self._redirect_streams = {}  # {fd_num: _MutableStream wrapping saved fd}
 
     def start(self):
         """Begin intercepting fd 1 and fd 2.
@@ -250,8 +252,9 @@ class FDRedirector:
             # Create a real stream wrapping the saved fd, then wrap in
             # _MutableStream so all references can be muted collectively.
             encoding = getattr(original_stream, "encoding", "utf-8") or "utf-8"
-            real_stream = open(saved_fd, "w", encoding=encoding,
-                               closefd=False, buffering=1)
+            real_stream = open(
+                saved_fd, "w", encoding=encoding, closefd=False, buffering=1
+            )
             logger = logging.getLogger(log_name)
             new_stream = _MutableStream(real_stream, logger, log_level)
             self._redirect_streams[fd_num] = new_stream
@@ -379,6 +382,171 @@ class FDRedirector:
         self._active = False
 
 
+class _PerLoggerLevelFilter(logging.Filter):
+    """Per-logger threshold filter with prefix matching, longest-match wins.
+
+    Holds two source dicts:
+      _config: replaced wholesale on every apply_logger_levels_config().
+      _plugin: mutated only by plugin API; survives config reloads.
+
+    Plugin source wins over config for the same prefix. Effective threshold
+    for a given record name is found by walking prefixes (longest match first).
+
+    A unique _MUTE sentinel is used in place of a numeric level for muted
+    entries — the filter short-circuits to drop before any numeric compare,
+    avoiding the `record.levelno >= MUTE_INT` loophole.
+    """
+
+    def __init__(self, handler_label: str):
+        super().__init__()
+        self.handler_label = handler_label
+        self._config: dict = {}
+        self._plugin: dict = {}
+        self._owners: dict[str, list[tuple[str, str]]] = {}
+        self._resolved_cache: dict = {}
+        self._lock = threading.RLock()
+
+    def _resolve(self, logger_name: str):
+        """Find effective threshold for logger_name. Returns int, _MUTE, or None.
+
+        None means "no entry matches" — filter passes record (handler.level decides).
+        Caller MUST hold self._lock.
+        """
+        cached = self._resolved_cache.get(logger_name)
+        if cached is not None or logger_name in self._resolved_cache:
+            return cached
+
+        def _longest_match(mapping: dict):
+            best_prefix = None
+            best_len = -1
+            for prefix in mapping:
+                if logger_name == prefix or logger_name.startswith(prefix + "."):
+                    if len(prefix) > best_len:
+                        best_prefix = prefix
+                        best_len = len(prefix)
+            return best_prefix
+
+        plugin_match = _longest_match(self._plugin)
+        if plugin_match is not None:
+            eff = self._plugin[plugin_match]
+        else:
+            config_match = _longest_match(self._config)
+            eff = self._config[config_match] if config_match is not None else None
+
+        self._resolved_cache[logger_name] = eff
+        return eff
+
+    def _eff_for(self, logger_name: str):
+        with self._lock:
+            return self._resolve(logger_name)
+
+    def filter(self, record):
+        eff = self._eff_for(record.name)
+        if eff is _MUTE:
+            return False
+        if eff is None:
+            return True
+        return record.levelno >= eff
+
+    def would_drop(self, record) -> bool:
+        eff = self._eff_for(record.name)
+        if eff is _MUTE:
+            return True
+        if eff is None:
+            return False
+        return record.levelno < eff
+
+    def set_config(self, mapping: dict) -> None:
+        """Wholesale replace of config-source state. Plugin state untouched."""
+        with self._lock:
+            self._config = dict(mapping)
+            self._resolved_cache.clear()
+
+    def set_plugin(self, name: str, level, owner: tuple[str, str]) -> None:
+        with self._lock:
+            owners = self._owners.setdefault(name, [])
+            if owner not in owners:
+                owners.append(owner)
+            self._plugin[name] = level
+            self._resolved_cache.clear()
+
+    def clear_plugin(self, name: str, owner: tuple[str, str] | None = None) -> None:
+        with self._lock:
+            if owner is None:
+                self._plugin.pop(name, None)
+                self._owners.pop(name, None)
+            else:
+                owners = self._owners.get(name)
+                if owners and owner in owners:
+                    owners.remove(owner)
+                    if not owners:
+                        self._plugin.pop(name, None)
+                        self._owners.pop(name, None)
+            self._resolved_cache.clear()
+
+    def clear_owned_by(self, plugin_name: str, plugin_uuid: str) -> None:
+        # Matches by plugin_uuid only — uuid4 is unique, and entries set during
+        # Plugin.on_load may be registered with the placeholder name "UNKNOWN"
+        # (PluginCore assigns the real plugin_name AFTER __init__ returns).
+        # plugin_name is accepted for API symmetry but ignored for matching.
+        with self._lock:
+            mutated = False
+            empties: list[str] = []
+            for name, owners in self._owners.items():
+                stale = [o for o in owners if o[1] == plugin_uuid]
+                for o in stale:
+                    owners.remove(o)
+                    mutated = True
+                if not owners:
+                    empties.append(name)
+            for name in empties:
+                self._plugin.pop(name, None)
+                self._owners.pop(name, None)
+            if mutated:
+                self._resolved_cache.clear()
+
+    def snapshot(self) -> dict:
+        """Return a snapshot mapping prefix -> (level, owners-list)."""
+        with self._lock:
+            return {
+                name: {
+                    "config": self._config.get(name),
+                    "plugin": self._plugin.get(name),
+                    "owners": list(self._owners.get(name, [])),
+                }
+                for name in set(self._config) | set(self._plugin)
+            }
+
+
+class _EarlyDropFilter(logging.Filter):
+    """Drops records on the caller thread when both per-handler filters would drop.
+
+    Attached to the QueueHandler so fully-muted records never enter the queue —
+    preserves perf parity with the old `propagate = False` shortcut.
+    """
+
+    def __init__(self, console_filter: _PerLoggerLevelFilter, file_filter: _PerLoggerLevelFilter):
+        super().__init__()
+        self._console = console_filter
+        self._file = file_filter
+
+    def filter(self, record):
+        if self._console.would_drop(record) and self._file.would_drop(record):
+            return False
+        return True
+
+
+def _level_to_display(value):
+    """Render a stored level value (int / _MUTE / None) back to a string."""
+    if value is None:
+        return None
+    if value is _MUTE:
+        return "MUTE"
+    if isinstance(value, int):
+        return logging.getLevelName(value)
+    return str(value)
+
+
 class LogUtil(logging.Logger):
     __FORMATTER = f"{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| %(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s"
     __FORMATTER_FILE = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
@@ -412,13 +580,38 @@ class LogUtil(logging.Logger):
             root_logger.info(f"Changed file handler level to {log_level}")
 
     @staticmethod
-    def create(log_level: str = "DEBUG") -> logging.Logger:
-        """Create and configure the root logger with non-blocking I/O"""
+    def create(
+        log_level: str = "DEBUG",
+        file_level: str = "DEBUG",
+        logger_levels: Optional[dict] = None,
+    ) -> logging.Logger:
+        """Create and configure the root logger with non-blocking I/O.
+
+        Args:
+            log_level: Threshold for the console handler.
+            file_level: Threshold for the file handler.
+            logger_levels: Optional per-logger threshold mapping (see
+                apply_logger_levels_config for schema). Applied immediately so
+                there's no bootstrap window before filters take effect.
+        """
         logging.setLoggerClass(LogUtil)
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level)
 
         # logging.root.setLevel(log_level)  # NOTE: FOR TESTING
+
+        # If a previous create() ran (e.g. test setUp/tearDown cycle), tear
+        # its listener and FD redirector down before installing new ones —
+        # otherwise the old QueueListener thread blocks forever on its
+        # orphaned queue and FDRedirector keeps the dup'd fds alive.
+        old_listener = getattr(root_logger, "_queue_listener", None)
+        if old_listener is not None:
+            with contextlib.suppress(Exception):
+                old_listener.stop()
+        old_redirector = getattr(root_logger, "_fd_redirector", None)
+        if old_redirector is not None:
+            with contextlib.suppress(Exception):
+                old_redirector.stop()
 
         # Remove existing handlers
         for handler in root_logger.handlers[:]:
@@ -453,7 +646,18 @@ class LogUtil(logging.Logger):
         log_file_path = os.path.join(logs_dir, log_filename)
         file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
         file_handler.setFormatter(formatterFile)
-        file_handler.setLevel(logging.DEBUG)
+        file_handler.setLevel(file_level)
+
+        # Per-handler threshold filters + early-drop filter on the queue.
+        # Replaces the old hardcoded `propagate = False` block — config-driven
+        # thresholds now govern the six previously-silenced libs (and any others
+        # the user adds in config.yml under general.logger_levels).
+        console_filter = _PerLoggerLevelFilter("console")
+        file_filter = _PerLoggerLevelFilter("file")
+        early_drop = _EarlyDropFilter(console_filter, file_filter)
+        stream_handler.addFilter(console_filter)
+        file_handler.addFilter(file_filter)
+        queue_handler.addFilter(early_drop)
 
         # Create and start listener
         listener = QueueListener(
@@ -467,11 +671,13 @@ class LogUtil(logging.Logger):
         root_logger._custom_handlers = [stream_handler]
         root_logger._file_handler = file_handler
         root_logger._fd_redirector = redirector
+        root_logger._console_level_filter = console_filter
+        root_logger._file_level_filter = file_filter
+        root_logger._early_drop_filter = early_drop
 
-        # Prevent noisy third-party loggers from propagating
-        for _name in ("httpx", "httpcore", "psycopg", "psycopg.pool",
-                       "asyncio", "urllib3"):
-            logging.getLogger(_name).propagate = False
+        # Apply initial logger_levels from bootstrap config so the window
+        # between filter attach and config application is zero.
+        LogUtil.apply_logger_levels_config(logger_levels or {})
 
         # Ensure proper shutdown — redirector must stop before listener
         # so final captured output can still route through the pipeline.
@@ -488,6 +694,196 @@ class LogUtil(logging.Logger):
             f"Non-blocking logging initialized with level '{log_level}'. Log file: {log_file_path}"
         )
         return root_logger
+
+    @staticmethod
+    def _get_filters() -> tuple[Optional[_PerLoggerLevelFilter], Optional[_PerLoggerLevelFilter]]:
+        root = logging.getLogger()
+        return (
+            getattr(root, "_console_level_filter", None),
+            getattr(root, "_file_level_filter", None),
+        )
+
+    @staticmethod
+    def apply_logger_levels_config(mapping) -> None:
+        """Replace config-source per-logger thresholds with the supplied mapping.
+
+        Schema (each value either a string shorthand or a per-handler dict):
+            {
+                "asyncio": "MUTE",                       # both handlers muted
+                "psycopg": {"console": "WARNING", "file": "DEBUG"},
+            }
+
+        Levels: DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE.
+        Match is by prefix with dot boundary (longest match wins). Wildcards and
+        empty-string keys are rejected with a warning. Invalid level strings are
+        logged + skipped; sibling entries still apply.
+
+        Plugin-source thresholds (set via Plugin.set_logger_level / PluginCore
+        wrapper) are NOT touched — only the config source is replaced.
+        """
+        root = logging.getLogger()
+        console_filter, file_filter = LogUtil._get_filters()
+        if console_filter is None or file_filter is None:
+            return
+
+        if mapping is None:
+            mapping = {}
+        if not isinstance(mapping, dict):
+            root.warning(
+                "general.logger_levels must be a dict, got %s. Treating as empty.",
+                type(mapping).__name__,
+            )
+            mapping = {}
+
+        console_cfg: dict = {}
+        file_cfg: dict = {}
+        for key, value in mapping.items():
+            if not isinstance(key, str) or not key.strip():
+                root.warning("Invalid logger_levels key %r (empty or non-string). Skipped.", key)
+                continue
+            prefix = key.strip()
+            if "*" in prefix or "?" in prefix:
+                root.warning(
+                    "Wildcards not supported in logger_levels key %r — use the bare prefix "
+                    "(it already covers all sub-loggers). Skipped.",
+                    prefix,
+                )
+                continue
+
+            if isinstance(value, dict):
+                console_val = _parse_level(
+                    value.get("console"), ctx_logger=root, ctx_label=f"{prefix}.console"
+                )
+                file_val = _parse_level(
+                    value.get("file"), ctx_logger=root, ctx_label=f"{prefix}.file"
+                )
+                if console_val is not None:
+                    console_cfg[prefix] = console_val
+                if file_val is not None:
+                    file_cfg[prefix] = file_val
+            else:
+                shared = _parse_level(value, ctx_logger=root, ctx_label=prefix)
+                if shared is not None:
+                    console_cfg[prefix] = shared
+                    file_cfg[prefix] = shared
+
+        console_filter.set_config(console_cfg)
+        file_filter.set_config(file_cfg)
+
+    @staticmethod
+    def set_logger_level(
+        name: str,
+        *,
+        console=None,
+        file=None,
+        owner: tuple[str, str],
+    ) -> None:
+        """Set a plugin-source threshold for `name` on console and/or file.
+
+        owner is required and must be (plugin_name, plugin_uuid). None for either
+        of console/file means leave that side unchanged.
+        """
+        root = logging.getLogger()
+        console_filter, file_filter = LogUtil._get_filters()
+        if console_filter is None or file_filter is None:
+            return
+        if not isinstance(name, str) or not name.strip():
+            root.warning("set_logger_level: invalid name %r. Ignored.", name)
+            return
+        prefix = name.strip()
+
+        if console is not None:
+            parsed = _parse_level(console, ctx_logger=root, ctx_label=f"{prefix}.console")
+            if parsed is not None:
+                console_filter.set_plugin(prefix, parsed, owner)
+        if file is not None:
+            parsed = _parse_level(file, ctx_logger=root, ctx_label=f"{prefix}.file")
+            if parsed is not None:
+                file_filter.set_plugin(prefix, parsed, owner)
+
+    @staticmethod
+    def clear_logger_level(
+        name: str,
+        *,
+        console: bool = True,
+        file: bool = True,
+        owner: Optional[tuple[str, str]] = None,
+    ) -> None:
+        """Clear a plugin-source threshold for `name`.
+
+        owner=None clears the entry unconditionally regardless of which plugins
+        own it (admin/CLI use case). When owner is supplied, only that owner is
+        removed from the prefix's owner list; the entry persists if other owners
+        remain.
+        """
+        console_filter, file_filter = LogUtil._get_filters()
+        if console_filter is None or file_filter is None:
+            return
+        if console:
+            console_filter.clear_plugin(name, owner)
+        if file:
+            file_filter.clear_plugin(name, owner)
+
+    @staticmethod
+    def clear_logger_levels_owned_by(plugin_name: str, plugin_uuid: str) -> None:
+        """Remove all plugin-source entries owned by (plugin_name, plugin_uuid)."""
+        console_filter, file_filter = LogUtil._get_filters()
+        if console_filter is None or file_filter is None:
+            return
+        console_filter.clear_owned_by(plugin_name, plugin_uuid)
+        file_filter.clear_owned_by(plugin_name, plugin_uuid)
+
+    @staticmethod
+    def list_logger_levels() -> dict:
+        """Snapshot of all configured prefixes across both handlers.
+
+        Shape per prefix:
+            {
+                "config":    {"console": "...", "file": "..."},
+                "plugin":    {"console": "...", "file": "..."},
+                "effective": {"console": "...", "file": "..."},
+                "owners":    [(plugin_name, plugin_uuid), ...],
+            }
+        """
+        console_filter, file_filter = LogUtil._get_filters()
+        if console_filter is None or file_filter is None:
+            return {}
+
+        console_snap = console_filter.snapshot()
+        file_snap = file_filter.snapshot()
+        all_prefixes = set(console_snap) | set(file_snap)
+
+        def _effective(snap_entry):
+            if snap_entry is None:
+                return None
+            return snap_entry["plugin"] if snap_entry["plugin"] is not None else snap_entry["config"]
+
+        result: dict = {}
+        for prefix in sorted(all_prefixes):
+            c = console_snap.get(prefix)
+            f = file_snap.get(prefix)
+            seen: dict = {}
+            for o in (c["owners"] if c else []):
+                seen[o] = None
+            for o in (f["owners"] if f else []):
+                seen[o] = None
+            owners = list(seen.keys())
+            result[prefix] = {
+                "config": {
+                    "console": _level_to_display(c["config"]) if c else None,
+                    "file": _level_to_display(f["config"]) if f else None,
+                },
+                "plugin": {
+                    "console": _level_to_display(c["plugin"]) if c else None,
+                    "file": _level_to_display(f["plugin"]) if f else None,
+                },
+                "effective": {
+                    "console": _level_to_display(_effective(c)),
+                    "file": _level_to_display(_effective(f)),
+                },
+                "owners": owners,
+            }
+        return result
 
 
 class ConfigUtil:
@@ -659,6 +1055,46 @@ class Plugin(ABC):
         info_dict["arguments"] = self.arguments
         # TODO: Include endpoint info. For now use PluginCore.get_plugin_info() instead.
         raise NotImplementedError
+
+    def set_logger_level(
+        self,
+        name: str,
+        *,
+        console: Optional[str] = None,
+        file: Optional[str] = None,
+    ) -> None:
+        """Override per-logger threshold(s) at runtime.
+
+        Plugin-source overrides survive config.yml reloads but are auto-cleared
+        when this plugin is disabled, popped, purged, or shut down.
+        """
+        self._plugin_core.set_logger_level(
+            name,
+            console=console,
+            file=file,
+            plugin_name=self.plugin_name,
+            plugin_uuid=self.plugin_uuid,
+        )
+
+    def clear_logger_level(
+        self,
+        name: str,
+        *,
+        console: bool = True,
+        file: bool = True,
+    ) -> None:
+        """Remove this plugin's override for `name` (other plugins' overrides survive)."""
+        self._plugin_core.clear_logger_level(
+            name,
+            console=console,
+            file=file,
+            plugin_name=self.plugin_name,
+            plugin_uuid=self.plugin_uuid,
+        )
+
+    def list_logger_levels(self) -> dict:
+        """Snapshot of all configured per-logger thresholds (config + plugin sources)."""
+        return self._plugin_core.list_logger_levels()
 
     @async_log_errors
     async def execute(
@@ -840,7 +1276,11 @@ class Plugin(ABC):
             Number of subscribers that were called.
         """
         return await self._plugin_core.notify(
-            topic, args, host, self.plugin_name, self.plugin_uuid,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
         )
 
     @log_errors
@@ -852,7 +1292,11 @@ class Plugin(ABC):
     ) -> int:
         """Synchronous variant of notify()."""
         return self._plugin_core.notify_sync(
-            topic, args, host, self.plugin_name, self.plugin_uuid,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
         )
 
     # ── Notifier: request-by-topic (one-to-one with response) ─────────
@@ -879,7 +1323,12 @@ class Plugin(ABC):
             The result from the handler.
         """
         return await self._plugin_core.request_topic(
-            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
         )
 
     @log_errors
@@ -892,7 +1341,12 @@ class Plugin(ABC):
     ) -> Any:
         """Synchronous variant of request_topic()."""
         return self._plugin_core.request_topic_sync(
-            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
         )
 
     async def request_topic_stream(
@@ -909,7 +1363,12 @@ class Plugin(ABC):
             Each value yielded by the handler.
         """
         async for i in self._plugin_core.request_topic_stream(
-            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
         ):
             yield i
 
@@ -922,7 +1381,12 @@ class Plugin(ABC):
     ) -> Any:
         """Synchronous streaming variant of request_topic()."""
         for i in self._plugin_core.request_topic_stream_sync(
-            topic, args, host, self.plugin_name, self.plugin_uuid, timeout,
+            topic,
+            args,
+            host,
+            self.plugin_name,
+            self.plugin_uuid,
+            timeout,
         ):
             yield i
 
@@ -940,7 +1404,10 @@ class Plugin(ABC):
             Subscription ID (use with unsubscribe() to remove).
         """
         return await self._plugin_core.subscribe(
-            topic, self.plugin_name, self.plugin_uuid, handler=handler,
+            topic,
+            self.plugin_name,
+            self.plugin_uuid,
+            handler=handler,
         )
 
     async def unsubscribe(self, subscription_id: str) -> bool:

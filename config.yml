@@ -26,75 +26,75 @@ plugins:
 
   - name: PostgreSQL
     enabled: true
-    path: ./_private/DATABASE/PostgreSQL
+    path: ./_private/BASE_PLUGINS/DATABASE/PostgreSQL
 
   - name: MinIO
     enabled: true
-    path: ./_private/DATABASE/MinIO
+    path: ./_private/BASE_PLUGINS/DATABASE/MinIO
 
   - name: Backup
     enabled: true
-    path: ./_private/DATABASE/Backup
+    path: ./_private/BASE_PLUGINS/DATABASE/Backup
 
   - name: DataCollection
     enabled: true
-    path: ./_private/DataCollection
+    path: ./_private/AI/DataCollection
 
   - name: DeviceControl
     enabled: false
-    path: ./_private/DeviceControl
+    path: ./_private/AI/DeviceControl
 
   - name: MemoryPlugin
     enabled: true
-    path: ./_private/MemoryPlugin
+    path: ./_private/AI/MemoryPlugin
 
   - name: AI_Interaction
     enabled: true
-    path: ./_private/AI_Plugin
+    path: ./_private/AI/AI_Interaction
 
   - name: DiscordBot
     enabled: true
-    path: ./_private/DiscordBot
+    path: ./_private/AI/DiscordBot
 
   - name: Websearch
     enabled: true
-    path: ./_private/Websearch
+    path: ./_private/AI/Websearch
 
   - name: Geocoding
     enabled: true
-    path: ./_private/Geocoding
+    path: ./_private/AI/Geocoding
 
   - name: MCPClient
     enabled: true
-    path: ./_private/MCPClient
+    path: ./_private/AI/MCPClient
 
   - name: STT_AI_Plugin
     enabled: true
-    path: ./_private/STT_AI_Plugin
+    path: ./_private/AI/STT_AI_Plugin
 
   - name: WakeWord
     enabled: true
-    path: ./_private/WakeWord
+    path: ./_private/AI/WakeWord
 
   - name: TTS
     enabled: true
-    path: ./_private/TTS
+    path: ./_private/AI/TTS
 
   - name: VoiceDiarization
     enabled: true
-    path: ./_private/VoiceDiarization
+    path: ./_private/AI/VoiceDiarization
 
   - name: VoicePipeline
     enabled: true
-    path: ./_private/VoicePipeline
+    path: ./_private/AI/VoicePipeline
 
   - name: TelegramBot
-    enabled: false
-    path: ./_private/TelegramBot
+    enabled: true
+    path: ./_private/AI/TelegramBot
 
   - name: DocumentAnalyzer
-    enabled: false
-    path: ./_private/DocumentAnalyzer
+    enabled: true
+    path: ./_private/AI/DocumentAnalyzer
 
 
 
@@ -102,6 +102,20 @@ general:
     hostname: ""
     plugin_package: plugins_test  # Base directory for plugins if path is omitted
     console_log_level: "DEBUG"
+    file_log_level: "DEBUG"       # Log level written to file (DEBUG, INFO, WARNING, etc.)
+    asyncio_debug: false           # Enable asyncio debug mode (tracks coroutine creation, slow callbacks)
+
+    # Per-logger thresholds. String value = same level for both handlers; or use
+    # explicit form { console: ..., file: ... } for an independent split.
+    # Levels: DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE.
+    # Match is by prefix with dot boundary, longest match wins.
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+        httpx: "WARNING"
+        httpcore: "WARNING"
+        psycopg: "WARNING"
+        psycopg.pool: "WARNING"
 
 
 networking:

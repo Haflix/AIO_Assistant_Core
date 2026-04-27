@@ -50,15 +50,33 @@ class PluginCore:
     """Manages all plugins and facilitates communication between them."""
 
     def __init__(self, config_path: str):
-        self._logger = LogUtil.create(log_level="DEBUG")
+        self.config_path = config_path
+
+        # Pre-read config for logger bootstrap so the filter system has its
+        # thresholds in place from the very first record. quickget_config
+        # handles integrity failures; the try/except handles file-missing /
+        # YAML parse errors — neither emits a log line at this point because
+        # no logger exists yet, but load_config_yaml below will surface a
+        # useful error if the YAML is genuinely broken.
+        try:
+            bootstrap_cfg = ConfigUtil.quickget_config(config_path, fallback_value={}) or {}
+        except Exception:
+            bootstrap_cfg = {}
+        if not isinstance(bootstrap_cfg, dict):
+            bootstrap_cfg = {}
+        bootstrap_general = bootstrap_cfg.get("general", {})
+        if not isinstance(bootstrap_general, dict):
+            bootstrap_general = {}
+        self._logger = LogUtil.create(
+            log_level=bootstrap_general.get("console_log_level", "DEBUG"),
+            file_level=bootstrap_general.get("file_log_level", "DEBUG"),
+            logger_levels=bootstrap_general.get("logger_levels", {}),
+        )
 
         self.yaml_config = None
-        self.config_path = config_path
         self.load_config_yaml(self.config_path)
-
-        general = self.yaml_config.get("general", {})
-        LogUtil.change_level(general.get("console_log_level", "DEBUG"))
-        LogUtil.change_file_level(general.get("file_log_level", "DEBUG"))
+        # change_level / change_file_level / apply_logger_levels_config now
+        # live inside load_config_yaml so hot-reload picks up changes too.
 
         self.requests = {}
         self.request_lock = asyncio.Lock()
@@ -207,6 +225,14 @@ class PluginCore:
                 self._logger.error("Shutdown: %s on_disable failed: %s", name, e)
                 plugin.enabled = False
 
+        # Sweep any plugin-source per-logger thresholds. Covers never-enabled
+        # plugins (the disable loop above skips them via the `enabled` guard)
+        # and is idempotent for plugins already cleaned via pop_plugin.
+        for sweep_name, sweep_plugin in list(self.plugins.items()):
+            sweep_uuid = getattr(sweep_plugin, "plugin_uuid", None)
+            if sweep_uuid:
+                LogUtil.clear_logger_levels_owned_by(sweep_name, sweep_uuid)
+
         # 4. Stop networking
         if hasattr(self, "network") and self.network is not None:
             stop = getattr(self.network, "stop", None)
@@ -231,9 +257,57 @@ class PluginCore:
 
         ConfigUtil.apply_configvalues(self)
 
+        # Apply logging-related config last so hot-reload picks up changes.
+        # On first boot LogUtil.create() already used the same values from the
+        # bootstrap pre-read; on async_load_config_yaml() this is the only
+        # place that re-applies them.
+        general = self.yaml_config.get("general", {})
+        if not isinstance(general, dict):
+            general = {}
+        LogUtil.change_level(general.get("console_log_level", "DEBUG"))
+        LogUtil.change_file_level(general.get("file_log_level", "DEBUG"))
+        LogUtil.apply_logger_levels_config(general.get("logger_levels", {}))
+
     async def async_load_config_yaml(self, config_path: str):
         """Async wrapper around load_config_yaml for use outside __init__."""
         self.load_config_yaml(config_path)
+
+    # ── Per-logger threshold API (delegates to LogUtil) ─────────────
+    # Plugins should call self.set_logger_level / self.clear_logger_level /
+    # self.list_logger_levels via the Plugin base helpers — those auto-fill
+    # the owner tuple. These wrappers exist so the helpers have something to
+    # delegate to and so admin/CLI code can pass owner explicitly if needed.
+
+    def set_logger_level(
+        self,
+        name: str,
+        *,
+        console: Optional[str] = None,
+        file: Optional[str] = None,
+        plugin_name: str,
+        plugin_uuid: str,
+    ) -> None:
+        LogUtil.set_logger_level(
+            name, console=console, file=file, owner=(plugin_name, plugin_uuid)
+        )
+
+    def clear_logger_level(
+        self,
+        name: str,
+        *,
+        console: bool = True,
+        file: bool = True,
+        plugin_name: Optional[str] = None,
+        plugin_uuid: Optional[str] = None,
+    ) -> None:
+        if plugin_name is None or plugin_uuid is None:
+            owner = None
+        else:
+            owner = (plugin_name, plugin_uuid)
+        LogUtil.clear_logger_level(name, console=console, file=file, owner=owner)
+
+    def list_logger_levels(self) -> dict:
+        return LogUtil.list_logger_levels()
 
     # ── Config file editing ──────────────────────────────────────────
 
@@ -541,6 +615,7 @@ class PluginCore:
                     # Remove all topic subscriptions for this plugin
                     if plugin_uuid:
                         await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+                        LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
             else:
                 self._logger.warning(f'Plugin with name "{plugin_name}" doesnt exist')
         except Exception as error:
@@ -553,10 +628,11 @@ class PluginCore:
             for plugin_name in list(self.plugins.keys()):
                 await self._disable_plugin(plugin_name)
             async with self.plugin_lock:
-                for plugin in self.plugins.values():
+                for plugin_name, plugin in self.plugins.items():
                     plugin_uuid = getattr(plugin, "plugin_uuid", None)
                     if plugin_uuid:
                         await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+                        LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
                 self.plugins.clear()
                 self.plugins_by_uuid.clear()
             self._logger.info("Purged all plugins")
@@ -584,6 +660,7 @@ class PluginCore:
                             await self.topic_registry.unsubscribe_plugin(
                                 plugin_uuid
                             )
+                            LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
             self._logger.info(
                 f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
             )
