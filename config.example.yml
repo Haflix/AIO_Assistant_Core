@@ -24,6 +24,23 @@ plugins:
     enabled: false
     path: ./plugins_test/InteropCaller
 
+  # ── Test framework (Phase 1 — see plugins_test/test_suite_plan.md) ──
+  - name: TestRunner
+    enabled: true                         # default ON so REPL/CLI can call run_all
+    path: ./plugins_test/TestRunner
+
+  - name: TestExecuteSuite
+    enabled: false
+    path: ./plugins_test/TestExecuteSuite
+
+  - name: TestExecuteTarget
+    enabled: false
+    path: ./plugins_test/TestExecuteTarget
+
+  - name: TestExecuteTarget2              # multi-instance: same path, different name
+    enabled: false
+    path: ./plugins_test/TestExecuteTarget
+
   - name: CLI
     enabled: true
     path: ./plugins_test/CLI

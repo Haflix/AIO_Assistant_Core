@@ -1,0 +1,173 @@
+description: Phase 1 fixture providing predictable sync/async/error endpoints for TestExecuteSuite
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: ea_add
+    access_name: ea_add
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async add a + b
+    arguments:
+      - name: a
+      - name: b
+
+  - internal_name: es_add
+    access_name: es_add
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sync add a + b
+    arguments:
+      - name: a
+      - name: b
+
+  - internal_name: ea_no_args
+    access_name: ea_no_args
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async with no args, returns "ok"
+    arguments:
+
+  - internal_name: es_no_args
+    access_name: es_no_args
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sync with no args, returns "ok"
+    arguments:
+
+  - internal_name: ea_kwargs_only
+    access_name: ea_kwargs_only
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async kwargs-only function
+    arguments:
+      - name: name
+      - name: value
+
+  - internal_name: ea_positional_only
+    access_name: ea_positional_only
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async positional-only function
+    arguments:
+      - name: a
+      - name: b
+
+  - internal_name: ea_raises
+    access_name: ea_raises
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, raises ValueError("intentional")
+    arguments:
+
+  - internal_name: es_raises
+    access_name: es_raises
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sync, raises ValueError("intentional")
+    arguments:
+
+  - internal_name: ea_raises_request_exc
+    access_name: ea_raises_request_exc
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, raises RequestException("specific")
+    arguments:
+
+  - internal_name: ea_returns_none
+    access_name: ea_returns_none
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, returns None
+    arguments:
+
+  - internal_name: ea_returns_future
+    access_name: ea_returns_future
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, returns a successfully-resolved Future
+    arguments:
+
+  - internal_name: ea_returns_failing_future
+    access_name: ea_returns_failing_future
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, returns a Future whose await raises (B-013 trigger)
+    arguments:
+
+  - internal_name: ea_hang
+    access_name: ea_hang
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async, awaits asyncio.sleep(seconds)
+    arguments:
+      - name: seconds
+
+  - internal_name: ea_private
+    access_name: ea_private
+    tags:
+    remote: True
+    accessible_by_other_plugins: False
+    description: Async, accessible_by_other_plugins=False (B-017 boundary)
+    arguments:
+      - name: value
+
+  - internal_name: ea_self_call
+    access_name: ea_self_call
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async; calls self.execute("TestExecuteTarget", target_method, plugin_uuid=plugin_uuid). Default plugin_uuid pins to self for multi-instance correctness.
+    arguments:
+      - name: target_method
+      - name: target_args
+      - name: plugin_uuid
+
+  - internal_name: ea_large_return
+    access_name: ea_large_return
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async; returns bytes of the requested size for in-process payload sanity
+    arguments:
+      - name: size_bytes
+
+  - internal_name: ea_returns_arg
+    access_name: ea_returns_arg
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async; returns whatever single positional argument it received (used to detect silent contract violations like B-015)
+    arguments:
+      - name: x
+
+  - internal_name: ea_chain_step
+    access_name: ea_chain_step
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async; calls another endpoint at depth-N to test deep error propagation
+    arguments:
+      - name: depth
+      - name: target_method
+
+  - internal_name: get_uuid
+    access_name: get_uuid
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Returns this instance's plugin_uuid (multi-instance smoke aid)
+    arguments:

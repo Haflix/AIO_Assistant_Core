@@ -1,0 +1,71 @@
+description: Orchestrator that drives the AIO Assistant Core test framework's per-suite plugins
+version: 0.1.0
+remote: False
+arguments:
+  suites:
+    - TestExecuteSuite
+    - TestStreamSuite
+    - TestNotifierSuite
+    - TestLifecycleSuite
+    - TestRemoteSuite
+endpoints:
+  - internal_name: run_all
+    access_name: run_all
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: Run all (or selected) test suites and aggregate results
+    arguments:
+      - name: suites
+        type: list
+        description: Suite plugin names to run; default = configured list
+      - name: category
+        type: str
+        description: 'basic | edge | null (both)'
+      - name: host
+        type: str
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        type: list
+        description: Filter cases within selected suites
+      - name: bug_ids
+        type: list
+        description: Filter cases by bug tag
+      - name: dump_path
+        type: str
+        description: Optional path to write JSON dump
+      - name: dump_compact
+        type: bool
+        description: Use compact JSON instead of indented
+      - name: fail_fast
+        type: bool
+        description: Stop on first failed suite
+      - name: skip_slow
+        type: bool
+        description: Skip cases tagged 'slow'
+      - name: allow_destructive
+        type: bool
+        description: If False, destructive cases are skipped
+
+  - internal_name: run_suite
+    access_name: run_suite
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: Run a single suite by name
+    arguments:
+      - name: suite
+        type: str
+        description: Suite plugin name
+      - name: category
+        type: str
+      - name: host
+        type: str
+      - name: case_ids
+        type: list
+      - name: bug_ids
+        type: list
+      - name: skip_slow
+        type: bool
+      - name: allow_destructive
+        type: bool

@@ -1,0 +1,41 @@
+# Local-only test framework config — used by test_application.py.
+# Enables only TestRunner + Phase 1 fixtures. Networking off (no peer node).
+plugins:
+  - name: TestRunner
+    enabled: true
+    path: ./plugins_test/TestRunner
+
+  - name: TestExecuteSuite
+    enabled: true
+    path: ./plugins_test/TestExecuteSuite
+
+  - name: TestExecuteTarget
+    enabled: true
+    path: ./plugins_test/TestExecuteTarget
+
+  - name: TestExecuteTarget2          # multi-instance: same path, different name
+    enabled: true
+    path: ./plugins_test/TestExecuteTarget
+
+
+general:
+    hostname: ""                      # Empty = use system hostname
+    plugin_package: plugins_test
+    console_log_level: "INFO"         # Quiet for cleaner test output
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+        httpx: "WARNING"
+        httpcore: "WARNING"
+
+
+networking:
+    enabled: false                    # No peer node available; Phase 5 cases will skip
+    node_ips: []
+    port: 2510
+    discover_nodes: false
+    direct_discoverable: false
+    auto_discoverable: false
