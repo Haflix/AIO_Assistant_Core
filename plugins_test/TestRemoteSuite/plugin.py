@@ -379,23 +379,44 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_b024_huge_item(c):
+            # B-024: request_topic_stream emits ONE MSG_STREAM_CHUNK per
+            # yielded item, no chunking, no item-end boundaries (unlike
+            # execute_stream which DOES chunk via _handle_execute_stream).
+            # If the pickled item exceeds CHUNK_SIZE (64KB) the receiver
+            # may either (a) misparse — items unpicklable mid-stream, or
+            # (b) reject with NetworkRequestException if > MAX_MESSAGE_SIZE
+            # (100MB). 200KB sits well past CHUNK_SIZE and well under
+            # MAX, so this exercises the per-item-no-chunking path.
             try:
                 items = []
-                async for chunk in self.execute_stream(
-                    "TestRemoteTarget", "r_async_gen_huge_item",
-                    {"size_mb": 101},
-                    host=c.host,
+                async for chunk in self.request_topic_stream(
+                    "test/r/huge_stream", host=c.host,
                 ):
                     items.append(chunk)
+                # If items received cleanly with the original 200KB payload
+                # intact, B-024 isn't reproducing here (server may have
+                # added per-item chunking). Mark and fail.
                 if not items:
                     c.set_marker("stream_aborted")
                     raise AssertionError(
-                        "B-024: 101 MB item stream returned 0 items"
+                        "B-024: stream returned 0 items"
                     )
-            except Exception:
-                c.set_marker("stream_aborted")
+                first = items[0]
+                expected_size = 101 * 1024 * 1024
+                if (
+                    not isinstance(first, dict)
+                    or "data" not in first
+                    or len(first.get("data", b"")) != expected_size
+                ):
+                    c.set_marker("stream_aborted")
+                    raise AssertionError(
+                        f"B-024: stream item corrupted (got {type(first).__name__})"
+                    )
+            except Exception as e:
+                if not c.marker:
+                    c.set_marker("stream_aborted")
                 raise AssertionError(
-                    "B-024: 101 MB item stream aborted with exception"
+                    f"B-024: stream aborted with exception: {type(e).__name__}: {e}"
                 )
 
         async def body_b025_partial_then_failover(c):

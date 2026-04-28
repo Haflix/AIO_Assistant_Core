@@ -235,6 +235,7 @@ class TestLifecycleSuite(Plugin):
     async def _basic_b010(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
             await self._ensure_victim_clean()
+            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
             try:
                 await self.execute(VICTIM, "configure",
                                    {"on_disable_raises": True})
@@ -244,19 +245,36 @@ class TestLifecycleSuite(Plugin):
                 except Exception:
                     pass
 
-                # After a failed reload due to on_disable raising:
-                # - bug present: plugin stays in core.plugins with stale state
-                # - bug fixed: clean error, plugin either re-loaded or gone
+                # B-010 repro: when on_disable raises during reload, the
+                # error propagates _disable_plugin → pop_plugin (which
+                # wraps + reraises) → _reload_plugin's @async_handle_errors
+                # SWALLOWS it. Net state:
+                # - plugin is still in core.plugins (line 700 of pop_plugin
+                #   never reached — self.plugins.pop didn't run)
+                # - plugin.enabled is STILL True (line 849 of _disable_plugin
+                #   not reached — on_disable raised before plugin.enabled=False)
+                # - plugin instance is the OLD one (load_plugin_with_conf
+                #   never ran because pop raised)
+                # - caller has no signal — _reload_plugin returned None
                 plugin = self._plugin_core.plugins.get(VICTIM)
-                if plugin is not None and not plugin.enabled:
+                stuck_state = (
+                    plugin is not None
+                    and plugin.plugin_uuid == old_uuid  # not reloaded
+                    and plugin.enabled                  # line 849 not reached
+                )
+                if stuck_state:
                     c.set_marker("plugin_still_loaded_after_disable_raise")
                     raise AssertionError(
-                        "B-010: plugin remains in core.plugins (disabled / "
-                        "half-torn-down) after on_disable raised during reload"
+                        f"B-010: failed reload silently left old instance "
+                        f"loaded (uuid={old_uuid[:8]}, enabled={plugin.enabled})"
                     )
-                # If plugin is None or enabled cleanly, bug is not present
-                # (or fixed) → unexpected_pass on the expected_status='fail' case
             finally:
+                # Recovery: clear the on_disable_raises flag and force a
+                # clean state so subsequent cases don't inherit the half-
+                # torn-down plugin.
+                plugin = self._plugin_core.plugins.get(VICTIM)
+                if plugin is not None:
+                    plugin._on_disable_raises = False
                 if VICTIM not in self._plugin_core.plugins:
                     entry = self._find_yaml_entry(VICTIM)
                     if entry:

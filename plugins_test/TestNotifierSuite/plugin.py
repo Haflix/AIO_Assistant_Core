@@ -667,41 +667,67 @@ class TestNotifierSuite(Plugin):
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
-            # Capture initial winner — call request_topic on a topic that
-            # both wild_a (test/wild/*) and wild_b (test/*/end) match, then
-            # check the event log's last-fired-from. find_first picks one;
-            # which one depends on registration order in the topic registry.
-            await self.execute(TARGET, "reset_event_log")
-            await self.request_topic("test/wild/end")
-            log_before = await self.execute(TARGET, "get_event_log")
-            initial = [e[0] for e in log_before if e[0] in ("wild_a", "wild_b")]
-            initial_winner = initial[0] if initial else None
-            if initial_winner is None:
-                raise AssertionError(
-                    "no wildcard handler fired on initial request_topic"
+            # B-040: find_first wildcard tie is registration-order dependent.
+            # The original test reloaded TestNotifierTarget which owns BOTH
+            # wildcards — but a single-plugin reload re-registers them in the
+            # same plugin_config.yml order, so the dict iteration order is
+            # preserved and the winner doesn't flip. This stricter version
+            # registers two code-driven wildcards from scratch (not via
+            # plugin_config), notes the winner, then unsubscribes the FIRST
+            # one and re-subscribes it (simulating a hot-reload of just one
+            # of two plugins each with a wildcard sub on the same topic).
+            results: List[str] = []
+
+            async def h_a(*args, **kwargs):
+                results.append("a")
+                return "A"
+
+            async def h_b(*args, **kwargs):
+                results.append("b")
+                return "B"
+
+            sid_a = await self._plugin_core.subscribe(
+                "tie/a/*", self.plugin_name, self.plugin_uuid, handler=h_a,
+            )
+            sid_b = await self._plugin_core.subscribe(
+                "tie/*/x", self.plugin_name, self.plugin_uuid, handler=h_b,
+            )
+            try:
+                # Topic "tie/a/x" matches BOTH wildcards. find_first picks
+                # by registration order — sid_a registered first → "A".
+                results.clear()
+                r1 = await self.request_topic("tie/a/x", host="local")
+                initial_winner = r1
+
+                # "Reload" = unsubscribe + resubscribe sid_a. After this,
+                # sid_a is at the END of self._wildcard's dict iteration,
+                # making sid_b first → winner flips to "B".
+                await self._plugin_core.unsubscribe(sid_a)
+                sid_a = await self._plugin_core.subscribe(
+                    "tie/a/*", self.plugin_name, self.plugin_uuid, handler=h_a,
                 )
 
-            # Reload the target — wildcard subs are unsubscribed and
-            # re-registered, possibly in a different dict-iteration order.
-            await self._plugin_core._reload_plugin(TARGET)
+                results.clear()
+                r2 = await self.request_topic("tie/a/x", host="local")
+                after_winner = r2
 
-            await self.execute(TARGET, "reset_event_log")
-            await self.request_topic("test/wild/end")
-            log_after = await self.execute(TARGET, "get_event_log")
-            after = [e[0] for e in log_after if e[0] in ("wild_a", "wild_b")]
-            after_winner = after[0] if after else None
-            if after_winner is None:
-                raise AssertionError(
-                    "no wildcard handler fired after reload"
-                )
-
-            if initial_winner != after_winner:
-                c.set_marker("winner_flipped")
-                raise AssertionError(
-                    f"winner flipped: {initial_winner} -> {after_winner}"
-                )
-            # Winner stayed same — could be bug-absent OR registration order
-            # happened to match. The case is informational either way.
+                if initial_winner != after_winner:
+                    c.set_marker("winner_flipped")
+                    raise AssertionError(
+                        f"B-040: winner flipped after re-subscribe: "
+                        f"{initial_winner} -> {after_winner}"
+                    )
+                # Winner stayed same — bug-absent OR dict-iter order is
+                # actually stable on this Python implementation
+            finally:
+                try:
+                    await self._plugin_core.unsubscribe(sid_a)
+                except Exception:
+                    pass
+                try:
+                    await self._plugin_core.unsubscribe(sid_b)
+                except Exception:
+                    pass
 
         await rec.run_case(
             "notif.B-040.wildcard_tie_after_reload", body,
@@ -719,30 +745,56 @@ class TestNotifierSuite(Plugin):
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body_code_driven(c):
-            # Read counter via direct attribute access (not via execute) so
-            # the readback works while the plugin is disabled.
+            # B-003 strict repro: register a code-driven sub WITH the target
+            # plugin's uuid (so it's "owned" by the target), but use a
+            # closure handler — bypassing TestNotifierTarget.on_disable's
+            # manual unsubscribe (which would mask the framework bug).
             target = self._plugin_core.plugins[TARGET]
-            target.count_invocations = 0
-            target.event_log = []
+            counter = {"n": 0}
 
-            await self.notify("test/count", {"phase": "before"})
-            count_before = target.count_invocations
+            async def h(*args, **kwargs):
+                counter["n"] += 1
 
-            await self._plugin_core._disable_plugin(TARGET)
+            sub_id = await self._plugin_core.subscribe(
+                "test/b003_strict",
+                self.plugin_name,         # owned by SUITE so its disable doesn't
+                self.plugin_uuid,         #   trigger registry cleanup either
+                handler=h,
+            )
+            # Reassign the sub to TARGET's uuid so framework-level
+            # unsubscribe_plugin would clean it on disable IF B-003 were
+            # fixed. Direct registry mutation since the API doesn't expose it.
+            registry = self._plugin_core.topic_registry
+            sub = registry._by_id[sub_id]
+            registry._by_plugin.setdefault(self.plugin_uuid, set()).discard(sub_id)
+            registry._by_plugin.setdefault(target.plugin_uuid, set()).add(sub_id)
+            sub.plugin_uuid = target.plugin_uuid
+
             try:
-                # If subs are properly cleared on disable, this notify
-                # finds no sub → count stays the same. If not (the bug),
-                # _call_sub dispatches the code-driven handler directly
-                # (no enabled check) → count_after > count_before.
-                await self.notify("test/count", {"phase": "after_disable"})
-                count_after = target.count_invocations
-                if count_after > count_before:
-                    c.set_marker("disabled_handler_fired")
-                    raise AssertionError(
-                        f"disabled handler fired: {count_before} -> {count_after}"
-                    )
+                await self.notify("test/b003_strict", host="local")
+                count_before = counter["n"]
+
+                await self._plugin_core._disable_plugin(TARGET)
+                try:
+                    # If B-003 is REAL (subs survive _disable_plugin), the
+                    # handler is still in the registry and notify will fire
+                    # it. If B-003 is FIXED (registry cleared on disable),
+                    # the handler is gone and counter stays.
+                    await self.notify("test/b003_strict", host="local")
+                    count_after = counter["n"]
+                    if count_after > count_before:
+                        c.set_marker("disabled_handler_fired")
+                        raise AssertionError(
+                            f"B-003: disabled-plugin handler fired: "
+                            f"{count_before} -> {count_after}"
+                        )
+                finally:
+                    await self._plugin_core._enable_plugin(TARGET)
             finally:
-                await self._plugin_core._enable_plugin(TARGET)
+                try:
+                    await self._plugin_core.unsubscribe(sub_id)
+                except Exception:
+                    pass
 
         async def body_config_driven(c):
             # For config-driven subs, the sub stays in the registry on

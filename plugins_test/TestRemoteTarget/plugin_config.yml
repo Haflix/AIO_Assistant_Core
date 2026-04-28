@@ -39,6 +39,15 @@ endpoints:
     arguments:
       - name: size_mb
 
+  - internal_name: r_topic_huge_stream
+    access_name: r_topic_huge_stream
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    topic: test/r/huge_stream
+    description: Async gen subscribed to test/r/huge_stream — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_topic_stream
+    arguments:
+
   - internal_name: r_async_gen_raises_after
     access_name: r_async_gen_raises_after
     tags:
