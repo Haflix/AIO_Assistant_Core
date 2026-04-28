@@ -103,9 +103,10 @@ general:
 
 
 networking:
-    enabled: false                    # No peer node available; Phase 5 cases will skip
-    node_ips: []
+    enabled: true                     # Phase 5 will spawn a localhost subnode on port 2511
+    node_ips: ["127.0.0.1:2511"]
     port: 2510
-    discover_nodes: false
-    direct_discoverable: false
-    auto_discoverable: false
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true
+    secret: "aio_test_secret_local"   # local-only test secret; forwarded to subnode

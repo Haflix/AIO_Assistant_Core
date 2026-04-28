@@ -344,7 +344,10 @@ class TestNotifierSuite(Plugin):
                 "test/dup", self.plugin_name, self.plugin_uuid, handler=h,
             )
             try:
-                count = await self.notify("test/dup")
+                # host="local" so a peer node (if networking is enabled)
+                # doesn't add +1 per remote dispatch and break the count
+                # assertion. The test's intent is local fan-out only.
+                count = await self.notify("test/dup", host="local")
                 c.expect(count, 2)
                 c.expect(counter["n"], 2)
             finally:
@@ -544,7 +547,9 @@ class TestNotifierSuite(Plugin):
     ) -> None:
         async def body(c):
             await self.execute(TARGET, "reset_event_log")
-            count = await self.notify("test/wild/end")  # matches both wildcards
+            # host="local" so a peer node (if networking is enabled)
+            # doesn't add +1 per remote dispatch and inflate the count.
+            count = await self.notify("test/wild/end", host="local")
             c.expect(count, 2)
             log = await self.execute(TARGET, "get_event_log")
             relevant = [e for e in log if e[0] in ("wild_a", "wild_b")]

@@ -5,6 +5,32 @@ and drives wire-bug repros against it. If networking is disabled OR the
 subprocess fails to come up, all cases are recorded as skip with a clear
 reason.
 
+KNOWN FIXTURE GAPS (2026-04-28, after first end-to-end run with networking on):
+- TestRemoteVictim has plugin-level remote=False on purpose (it's the bug
+  target for B-001 / B-042 — code-driven sub on a remote=False plugin).
+  But its readback endpoints (get_bypass_count / reset_bypass) inherit
+  remote=False, so the parent CANNOT call them via execute(host="remote").
+  Catch-22: testing the bypass requires reading a counter that's only
+  reachable via the bypass we're testing. Fix path: split into two plugins
+  — Victim with remote=False holds the topic sub; a separate remote=True
+  plugin exposes the readback. Several B-001 / B-042 / B-018 cases
+  currently fail with "Endpoint reset_bypass not found" until that split
+  lands.
+- B-028.no_client_timeout case calls execute(timeout=2.0) — but execute_remote
+  DOES have request-level timeout. B-028 is specifically about notify_remote /
+  request_topic_remote NOT having client-side timeout. The case body needs
+  to call those APIs directly to repro.
+- access_false_blocked case expects RequestException for a remote=True +
+  accessible_by_other_plugins=False endpoint. find_endpoint only checks
+  accessible_by_other_plugins for LOCAL cross-plugin calls; remote callers
+  pass through plugin.remote + endpoint.remote. The test expectation is
+  wrong; either redesign or remove the case.
+- B-020.notify_sync_blocks_on_remote subnode has no sub on test/r/hang
+  topic, so notify_sync doesn't block waiting for any remote handler.
+  Need a hanging sub on the subnode to repro the bug.
+
+Phase 5.1 cleanup: redesign these fixtures to repro the bugs they claim.
+
 Phase 5 cases all declare hosts=["remote"]. The recorder auto-skips a remote
 sub-case when remote_available is False. The suite passes that flag based on
 subprocess startup success.
