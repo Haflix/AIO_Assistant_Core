@@ -17,6 +17,14 @@ plugins:
     enabled: true
     path: ./plugins_test/TestExecuteTarget
 
+  - name: TestStreamSuite
+    enabled: true
+    path: ./plugins_test/TestStreamSuite
+
+  - name: TestStreamTarget
+    enabled: true
+    path: ./plugins_test/TestStreamTarget
+
 
 general:
     hostname: ""                      # Empty = use system hostname

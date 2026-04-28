@@ -1,0 +1,86 @@
+description: Phase 2 fixture providing predictable async/sync generator endpoints for TestStreamSuite
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: ea_gen
+    access_name: ea_gen
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator yielding prefix+index strings
+    arguments:
+      - name: n
+      - name: prefix
+      - name: delay_ms
+
+  - internal_name: es_gen
+    access_name: es_gen
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sync generator yielding prefix+index strings
+    arguments:
+      - name: n
+      - name: prefix
+      - name: delay_ms
+
+  - internal_name: ea_gen_raises_after
+    access_name: ea_gen_raises_after
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator that yields N items then raises ValueError("midstream")
+    arguments:
+      - name: n_yielded
+
+  - internal_name: ea_gen_infinite
+    access_name: ea_gen_infinite
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator that yields integers forever (B-002 abandonment test)
+    arguments:
+
+  - internal_name: ea_gen_one_item
+    access_name: ea_gen_one_item
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator yielding exactly one item
+    arguments:
+
+  - internal_name: ea_gen_empty
+    access_name: ea_gen_empty
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator yielding zero items
+    arguments:
+
+  - internal_name: es_gen_with_delay
+    access_name: es_gen_with_delay
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Sync generator with deterministic delay between items
+    arguments:
+      - name: n
+      - name: delay_ms
+
+  - internal_name: ea_gen_returns_one_large_item
+    access_name: ea_gen_returns_one_large_item
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator yielding exactly one bytes payload of the requested size
+    arguments:
+      - name: size_bytes
+
+  - internal_name: ea_gen_hangs
+    access_name: ea_gen_hangs
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator that never yields (asyncio.Event().wait()) for stream timeout test
+    arguments:

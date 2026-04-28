@@ -41,6 +41,14 @@ plugins:
     enabled: false
     path: ./plugins_test/TestExecuteTarget
 
+  - name: TestStreamSuite
+    enabled: false
+    path: ./plugins_test/TestStreamSuite
+
+  - name: TestStreamTarget
+    enabled: false
+    path: ./plugins_test/TestStreamTarget
+
   - name: CLI
     enabled: true
     path: ./plugins_test/CLI
