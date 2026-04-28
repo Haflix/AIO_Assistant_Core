@@ -25,6 +25,21 @@ plugins:
     enabled: true
     path: ./plugins_test/TestStreamTarget
 
+  - name: TestNotifierSuite
+    enabled: true
+    path: ./plugins_test/TestNotifierSuite
+
+  - name: TestNotifierTarget
+    enabled: true
+    path: ./plugins_test/TestNotifierTarget
+
+  # TestNotifierBadActor is loaded on demand by the suite (§5.4 idiom);
+  # config entry must exist so load_plugin_with_conf can find the path,
+  # but enabled=false so it doesn't auto-load at startup.
+  - name: TestNotifierBadActor
+    enabled: false
+    path: ./plugins_test/TestNotifierBadActor
+
 
 general:
     hostname: ""                      # Empty = use system hostname

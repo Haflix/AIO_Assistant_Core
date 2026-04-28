@@ -49,6 +49,18 @@ plugins:
     enabled: false
     path: ./plugins_test/TestStreamTarget
 
+  - name: TestNotifierSuite
+    enabled: false
+    path: ./plugins_test/TestNotifierSuite
+
+  - name: TestNotifierTarget
+    enabled: false
+    path: ./plugins_test/TestNotifierTarget
+
+  - name: TestNotifierBadActor       # loaded on-demand by TestNotifierSuite
+    enabled: false
+    path: ./plugins_test/TestNotifierBadActor
+
   - name: CLI
     enabled: true
     path: ./plugins_test/CLI

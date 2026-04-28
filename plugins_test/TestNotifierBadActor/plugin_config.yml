@@ -1,0 +1,22 @@
+description: Phase 3 misbehaving handlers (raises / cancels / hangs) loaded on demand by TestNotifierSuite
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: register_handler
+    access_name: register_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Subscribe a named bad-handler to a topic; returns sub_id
+    arguments:
+      - name: topic
+      - name: handler_name
+
+  - internal_name: unregister_all
+    access_name: unregister_all
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Unsubscribe everything this plugin registered
+    arguments:
