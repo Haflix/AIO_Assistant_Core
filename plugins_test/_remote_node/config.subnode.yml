@@ -25,8 +25,13 @@ general:
 
 networking:
     enabled: true
-    node_ips: ["127.0.0.1"]             # parent on localhost
-    port: 0                             # overridden via --port
+    # Parent's listener port — required so the subnode connects to the parent
+    # rather than its own listener (which would happen with bare "127.0.0.1").
+    # The suite passes the parent's port explicitly; default 2510 here.
+    node_ips: ["127.0.0.1:2510"]
+    port: 0                             # overridden via run_node.py --port
     discover_nodes: true
     direct_discoverable: true
     auto_discoverable: true
+    # secret is read from the NETWORKING_SECRET env var which run_node.py
+    # forwards from the parent process. No literal secret in this config.

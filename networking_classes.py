@@ -26,7 +26,14 @@ class RemotePlugin:
 
 
 class Node:
-    def __init__(self, IP: str, hostname: str, enabled: bool, auto_discoverable: bool):
+    def __init__(
+        self,
+        IP: str,
+        hostname: str,
+        enabled: bool,
+        auto_discoverable: bool,
+        port: Optional[int] = None,
+    ):
         """Node class for the networking system that represents another device with this script running
 
         Args:
@@ -34,25 +41,29 @@ class Node:
             hostname (str): The hostname of the node
             enabled (bool): Whether the node is enabled
             auto_discoverable (bool): Whether the node is auto-discoverable (can be discovered by other nodes with the automatic discovery feature)
+            port (Optional[int]): Per-node port; None means use the cluster default port.
         """
         self.IP = IP
         self.hostname = hostname
         self.enabled = enabled
         self.last_heartbeat = 0
         self.auto_discoverable = auto_discoverable
+        self.port = port  # None → use NetworkManager.port default
 
     def __str__(self) -> str:
         """String-representation of a node"""
-        return f"   IP: {self.IP}\n     Hostname: {self.hostname}\n     Enabled: {self.enabled}\n    Last Heartbeat: {self.is_alive_sync()}\n     Discoverable: {self.auto_discoverable}\n"
+        port_str = f":{self.port}" if self.port is not None else ""
+        return f"   IP: {self.IP}{port_str}\n     Hostname: {self.hostname}\n     Enabled: {self.enabled}\n    Last Heartbeat: {self.is_alive_sync()}\n     Discoverable: {self.auto_discoverable}\n"
 
-    async def _to_tuple(self) -> Tuple[str, str]:
+    async def _to_tuple(self) -> Tuple[str, Optional[int], str]:
         """
         Returns:
-            Tuple[str, str]: A tuple where:
-                - The first element is the node's IP address.
-                - The second element is the node's hostname.
+            Tuple[str, Optional[int], str]: A 3-tuple of:
+                - IP address
+                - port (None if the node uses the cluster default port)
+                - hostname
         """
-        return (self.IP, self.hostname)
+        return (self.IP, self.port, self.hostname)
 
     async def heartbeat(self):
         """Updates heartbeat timestamp"""

@@ -60,7 +60,16 @@ class NetworkManager:
         self.plugin_core = plugin_core
         self._logger = logger
 
-        self.node_ips = node_ips
+        # Internal node_ips is normalized to list[tuple[str, Optional[int]]].
+        # Each entry is (ip, port_or_None); port=None means "use the cluster
+        # default port self.port". External callers can pass either the legacy
+        # form (list of "IP" or "IP:PORT" strings, mixed) or the new form
+        # (list of {"ip": ..., "port": ...} dicts) — see _parse_endpoint.
+        self.node_ips: list[tuple[str, Optional[int]]] = [
+            self._parse_endpoint(e) for e in (node_ips or [])
+        ]
+        # De-duplicate on (ip, port).
+        self.node_ips = list(dict.fromkeys(self.node_ips))
 
         self.discover_nodes = discover_nodes
         self.direct_discoverable = direct_discoverable
@@ -82,8 +91,10 @@ class NetworkManager:
         self.key_file = key_file
         self.pool_size = pool_size
 
-        # Connection pools: dict[IP -> asyncio.Queue[Tuple[reader, writer]]]
-        self.connection_pools: dict[str, asyncio.Queue] = {}
+        # Connection pools: keyed by (IP, port) tuple so that two peers on
+        # the same IP but different ports (e.g. parent + subnode on the same
+        # machine) get separate pools. _pool_key(IP) resolves the port.
+        self.connection_pools: dict[tuple[str, int], asyncio.Queue] = {}
 
         # Server state
         self.server = None
@@ -99,6 +110,81 @@ class NetworkManager:
         self.heartbeat_interval: float = 10.0
         self.lookup_interval: float = 60.0
         self.liveness_timeout: float = 30.0
+
+    # ── Per-node port helpers ──────────────────────────────────────────
+
+    def _parse_endpoint(self, entry) -> tuple[str, Optional[int]]:
+        """Normalise a node_ips entry into (ip, port_or_None).
+
+        Accepts:
+          - "10.0.0.1"                       → ("10.0.0.1", None)
+          - "10.0.0.1:2511"                  → ("10.0.0.1", 2511)
+          - {"ip": "10.0.0.1"}               → ("10.0.0.1", None)
+          - {"ip": "10.0.0.1", "port": 2511} → ("10.0.0.1", 2511)
+          - ("10.0.0.1", 2511)               → ("10.0.0.1", 2511)
+          - ("10.0.0.1", 2511, "host")       → ("10.0.0.1", 2511) [3-tuple from _to_tuple]
+          - already-parsed tuple             → returned as-is
+        """
+        if isinstance(entry, tuple):
+            if len(entry) >= 2:
+                ip, port = entry[0], entry[1]
+                return (
+                    str(ip),
+                    int(port) if port is not None else None,
+                )
+            if len(entry) == 1:
+                return (str(entry[0]), None)
+        if isinstance(entry, dict):
+            ip = entry.get("ip") or entry.get("IP")
+            port = entry.get("port")
+            return (
+                str(ip),
+                int(port) if port is not None else None,
+            )
+        if isinstance(entry, str):
+            # IPv4-style "host:port". Bracketed IPv6 ([::1]:2511) is not
+            # supported yet — log a warning so the silent drop is visible.
+            colon_count = entry.count(":")
+            if colon_count == 1:
+                ip, port_s = entry.rsplit(":", 1)
+                try:
+                    return (ip, int(port_s))
+                except ValueError:
+                    return (entry, None)
+            if colon_count > 1:
+                # Likely IPv6. We don't parse [::1]:2511 yet — log and treat
+                # the whole string as the IP (port falls back to default).
+                self._logger.warning(
+                    f"[CONFIG] node_ips entry {entry!r} looks like IPv6 with "
+                    f"port; bracketed-IPv6 form not supported, port ignored"
+                )
+            return (entry, None)
+        # Unknown type — coerce to string and treat as IP-only.
+        return (str(entry), None)
+
+    def _resolve_port(self, IP: str) -> int:
+        """Return the port to use when connecting to a peer at this IP.
+
+        Walks self.nodes for the first matching IP and returns its `port`
+        (falling back to self.port if the Node was created without one).
+        Falls back to self.port if no Node matches yet — the discovery flow
+        creates Nodes lazily, so the first connection-attempt to an IP we
+        haven't yet promoted to Node uses the cluster default port.
+        """
+        for node in self.nodes:
+            if node.IP == IP:
+                return node.port if node.port is not None else self.port
+        # No matching node yet — also check raw node_ips entries
+        for ip, port in self.node_ips:
+            if ip == IP and port is not None:
+                return port
+        return self.port
+
+    def _pool_key(self, IP: str) -> tuple[str, int]:
+        """Connection-pool key for an IP. Always (IP, port) — two peers on
+        the same IP but different ports get separate pools.
+        """
+        return (IP, self._resolve_port(IP))
 
     # Message Protocol Utilities
 
@@ -451,8 +537,8 @@ class NetworkManager:
             except asyncio.CancelledError:
                 pass
 
-        # Close all pooled connections
-        for ip, pool in self.connection_pools.items():
+        # Close all pooled connections (key is (ip, port))
+        for key, pool in self.connection_pools.items():
             closed = 0
             while not pool.empty():
                 try:
@@ -463,8 +549,9 @@ class NetworkManager:
                 except (asyncio.TimeoutError, Exception):
                     break
             if closed:
+                ip_, port_ = key
                 self._logger.debug(
-                    f"[CONNECTION] Closed {closed} pooled connections for {ip}"
+                    f"[CONNECTION] Closed {closed} pooled connections for {ip_}:{port_}"
                 )
 
         # Clean up temp SSL files
@@ -961,9 +1048,14 @@ class NetworkManager:
         try:
             hostname = data.get("hostname")
             discover_nodes_info = data.get("discover_nodes_info")
+            # Sender's listener port (tells us where to call them back).
+            # Optional for forward-compat with senders that don't include it.
+            client_listener_port = data.get("listener_port")
 
             self._logger.debug(
-                f"[INFO] Received INFO request: hostname={hostname}, discover_nodes_info={discover_nodes_info}"
+                f"[INFO] Received INFO request: hostname={hostname}, "
+                f"discover_nodes_info={discover_nodes_info}, "
+                f"listener_port={client_listener_port}"
             )
 
             if not isinstance(hostname, str):
@@ -981,8 +1073,40 @@ class NetworkManager:
             client_addr = writer.get_extra_info("peername")
             if client_addr:
                 client_ip = client_addr[0]
-                if self.discover_nodes and client_ip not in self.node_ips:
-                    self.node_ips.append(client_ip)
+                # Use the sender-provided listener_port if valid; fall back to
+                # None (→ resolves to cluster default). Without listener_port
+                # we'd record (client_ip, None), and on same-machine setups
+                # _resolve_port returns OUR self.port → connect-back hits our
+                # own server (self-loop).
+                resolved_port: Optional[int]
+                if (
+                    isinstance(client_listener_port, int)
+                    and client_listener_port > 0
+                ):
+                    resolved_port = client_listener_port
+                else:
+                    resolved_port = None
+                client_entry = (client_ip, resolved_port)
+                if self.discover_nodes:
+                    # Dedupe: drop existing (client_ip, None) when we now
+                    # have an explicit port; otherwise dedupe by exact tuple.
+                    if resolved_port is not None:
+                        self.node_ips = [
+                            e for e in self.node_ips
+                            if not (e[0] == client_ip and e[1] is None)
+                        ]
+                        # Also patch any existing Node for this IP that was
+                        # created before we knew its listener port. Without
+                        # this, _resolve_port walks self.nodes first and
+                        # finds the stale port=None Node — masking the
+                        # corrected node_ips entry forever.
+                        for n in self.nodes:
+                            if n.IP == client_ip and n.port is None:
+                                n.port = resolved_port
+                                if n.hostname is None and hostname:
+                                    n.hostname = hostname
+                    if client_entry not in self.node_ips:
+                        self.node_ips.append(client_entry)
 
             response = {
                 "hostname": self.plugin_core.hostname,
@@ -1012,9 +1136,14 @@ class NetworkManager:
     async def _create_connection(
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Create a new TLS connection to a node."""
+        """Create a new TLS connection to a node.
+
+        Resolves the per-node port via _resolve_port(IP). Connections to two
+        peers on the same IP with different ports are tracked separately.
+        """
+        port = self._resolve_port(IP)
         self._logger.debug(
-            f"[CONNECTION] Creating new TLS connection to {IP}:{self.port}"
+            f"[CONNECTION] Creating new TLS connection to {IP}:{port}"
         )
         # Create SSL context for client
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -1026,15 +1155,15 @@ class NetworkManager:
         try:
             reader, writer = await asyncio.open_connection(
                 IP,
-                self.port,
+                port,
                 ssl=ssl_context,
             )
             self._logger.debug(
-                f"[CONNECTION] TLS connection established to {IP}:{self.port}"
+                f"[CONNECTION] TLS connection established to {IP}:{port}"
             )
         except Exception as e:
             self._logger.warning(
-                f"[CONNECTION] Failed to establish connection to {IP}:{self.port}: {e}"
+                f"[CONNECTION] Failed to establish connection to {IP}:{port}: {e}"
             )
             raise
 
@@ -1063,12 +1192,19 @@ class NetworkManager:
     async def _get_connection(
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Get a connection from pool or create new one."""
-        if IP not in self.connection_pools:
-            self.connection_pools[IP] = asyncio.Queue(maxsize=self.pool_size)
-            self._logger.debug(f"[CONNECTION] Created new connection pool for {IP}")
+        """Get a connection from pool or create new one.
 
-        pool = self.connection_pools[IP]
+        Pool is keyed by (IP, port) so two peers on the same IP but different
+        ports do not share the same connection slots.
+        """
+        key = self._pool_key(IP)
+        if key not in self.connection_pools:
+            self.connection_pools[key] = asyncio.Queue(maxsize=self.pool_size)
+            self._logger.debug(
+                f"[CONNECTION] Created new connection pool for {key[0]}:{key[1]}"
+            )
+
+        pool = self.connection_pools[key]
         pool_size = pool.qsize()
         self._logger.debug(
             f"[CONNECTION] Pool for {IP}: size={pool_size}/{self.pool_size}, "
@@ -1129,11 +1265,12 @@ class NetworkManager:
     async def _return_connection(
         self, IP: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        """Return a connection to the pool."""
-        if IP not in self.connection_pools:
-            self.connection_pools[IP] = asyncio.Queue(maxsize=self.pool_size)
+        """Return a connection to the pool (keyed by (IP, port))."""
+        key = self._pool_key(IP)
+        if key not in self.connection_pools:
+            self.connection_pools[key] = asyncio.Queue(maxsize=self.pool_size)
 
-        pool = self.connection_pools[IP]
+        pool = self.connection_pools[key]
         pool_size_before = pool.qsize()
 
         try:
@@ -1805,7 +1942,7 @@ class NetworkManager:
     @async_handle_errors(None)
     async def update_all_nodes(
         self,
-        additional_IP_list: list[str] = None,
+        additional_IP_list: Optional[list] = None,  # entries: str | "IP:PORT" | dict | (ip, port)
         timeout: int = 5,
         ignore_enabled_status: bool = False,
         concurrency: int = 20,
@@ -1814,9 +1951,11 @@ class NetworkManager:
         self._logger.info(
             f"[DISCOVERY] update_all_nodes start: existing_ips={len(self.node_ips)}, additional={len(additional_IP_list) if additional_IP_list else 0}, concurrency={concurrency}"
         )
-        # Merge and deduplicate IPs
+        # Merge and deduplicate endpoints — additional may contain raw strings
+        # ("IP" / "IP:PORT") or dicts; normalise all to (ip, port) tuples.
         if additional_IP_list:
-            self.node_ips.extend(additional_IP_list)
+            for entry in additional_IP_list:
+                self.node_ips.append(self._parse_endpoint(entry))
         self.node_ips = list(dict.fromkeys(self.node_ips))
 
         # Ensure Node objects exist
@@ -1831,7 +1970,8 @@ class NetworkManager:
                 if node and (node.enabled or ignore_enabled_status):
                     await self.update_single(ip, timeout)
 
-        for ip in self.node_ips:
+        for endpoint in self.node_ips:
+            ip, _port = endpoint
             update_tasks.append(asyncio.create_task(_guarded_update(ip)))
 
         if update_tasks:
@@ -1882,22 +2022,68 @@ class NetworkManager:
                 node.enabled = True
                 await node.update(response, self.plugin_core.hostname)
 
-            # Cascade discovery for returned auto_discoverable nodes
+            # Cascade discovery for returned auto_discoverable nodes.
+            # Wire format: 3-tuple (IP, port, hostname).
             followups = []
             for sub_node in response.get("nodes", []):
-                sub_ip, sub_hostname = sub_node[0], sub_node[1]
-                if (
-                    sub_ip not in self.node_ips
-                    and sub_hostname != self.plugin_core.hostname
-                ):
-                    await self._add_ip(sub_ip)
-                    await self._create_new_node(sub_ip, sub_hostname)
-                    followups.append(self.update_single(sub_ip))
-
-                if sub_hostname != self.plugin_core.hostname:
-                    self._logger.info(f"[DISCOVERY] Node found at {sub_ip}")
+                if len(sub_node) < 2:
+                    continue
+                sub_ip = sub_node[0]
+                if len(sub_node) >= 3:
+                    sub_port, sub_hostname = sub_node[1], sub_node[2]
                 else:
-                    self._logger.info(f"[DISCOVERY] Found own node at {sub_ip}")
+                    # Defensive: a peer without port in the tuple. Fall back
+                    # to None (→ cluster default).
+                    sub_port, sub_hostname = None, sub_node[1]
+
+                if sub_hostname == self.plugin_core.hostname:
+                    self._logger.info(
+                        f"[DISCOVERY] Found own node at {sub_ip} (skipping)"
+                    )
+                    continue
+
+                # Look for an existing Node for this peer (matching IP and
+                # hostname, or IP-only if hostname not yet known).
+                existing = next(
+                    (
+                        n for n in self.nodes
+                        if n.IP == sub_ip
+                        and (n.hostname == sub_hostname or n.hostname is None)
+                    ),
+                    None,
+                )
+
+                if existing is not None:
+                    # Update Node.port if the cascade just told us a port we
+                    # didn't have. Fix node_ips dedupe at the same time so
+                    # (IP, None) and (IP, port) don't both linger.
+                    if existing.port is None and sub_port is not None:
+                        existing.port = sub_port
+                        self.node_ips = [
+                            e for e in self.node_ips
+                            if not (e[0] == sub_ip and e[1] is None)
+                        ]
+                        new_entry = (sub_ip, sub_port)
+                        if new_entry not in self.node_ips:
+                            self.node_ips.append(new_entry)
+                    if existing.hostname is None and sub_hostname:
+                        existing.hostname = sub_hostname
+                    self._logger.info(
+                        f"[DISCOVERY] Updated existing node {sub_ip}"
+                        + (f":{sub_port}" if sub_port is not None else "")
+                    )
+                    continue
+
+                # New peer — add and schedule a follow-up update.
+                await self._add_ip(sub_ip, port=sub_port)
+                await self._create_new_node(
+                    sub_ip, hostname=sub_hostname, port=sub_port,
+                )
+                followups.append(self.update_single(sub_ip))
+                self._logger.info(
+                    f"[DISCOVERY] Node found at {sub_ip}"
+                    + (f":{sub_port}" if sub_port is not None else "")
+                )
 
             if followups:
                 self._logger.debug(
@@ -1909,25 +2095,50 @@ class NetworkManager:
             self._logger.debug(f"[DISCOVERY] Failed to reach {IP}: {e}")
 
     @async_log_errors
-    async def _add_ip(self, IP):
-        self._logger.debug(f"[DISCOVERY] Adding IP to list: {IP}")
-        self.node_ips.append(IP)
-
-    @async_log_errors
-    async def _create_nodes(self, IP_list: list):
-        self._logger.debug(f"[DISCOVERY] Creating Node objects for {len(IP_list)} IPs")
-        for IP in IP_list:
-            await self._create_new_node(IP)
-
-    @async_log_errors
-    async def _create_new_node(self, IP: str, hostname: Union[str, None] = None):
-        if not await self.node_exists(IP):
-
+    async def _add_ip(self, IP, port: Optional[int] = None):
+        """Add an endpoint to node_ips. Accepts a string IP, an "IP:PORT"
+        string, a dict, or an explicit (IP, port) — all normalized via
+        _parse_endpoint. Idempotent: dedupes on (ip, port).
+        """
+        if port is not None:
+            entry = (str(IP), int(port))
+        else:
+            entry = self._parse_endpoint(IP)
+        if entry not in self.node_ips:
             self._logger.debug(
-                f"[DISCOVERY] Creating new Node: ip={IP}, hostname={hostname}"
+                f"[DISCOVERY] Adding endpoint to list: {entry[0]}:{entry[1] or self.port}"
+            )
+            self.node_ips.append(entry)
+
+    @async_log_errors
+    async def _create_nodes(self, endpoints: list):
+        """Create Node objects for each (ip, port) endpoint."""
+        self._logger.debug(
+            f"[DISCOVERY] Creating Node objects for {len(endpoints)} endpoints"
+        )
+        for entry in endpoints:
+            ip, port = self._parse_endpoint(entry)
+            await self._create_new_node(ip, port=port)
+
+    @async_log_errors
+    async def _create_new_node(
+        self,
+        IP: str,
+        hostname: Union[str, None] = None,
+        port: Optional[int] = None,
+    ):
+        if not await self.node_exists(IP):
+            self._logger.debug(
+                f"[DISCOVERY] Creating new Node: ip={IP}, port={port}, hostname={hostname}"
             )
             self.nodes.append(
-                Node(IP=IP, hostname=hostname, enabled=True, auto_discoverable=False)
+                Node(
+                    IP=IP,
+                    hostname=hostname,
+                    enabled=True,
+                    auto_discoverable=False,
+                    port=port,
+                )
             )
 
     @async_handle_errors(None)
@@ -1946,6 +2157,13 @@ class NetworkManager:
             request_data = {
                 "hostname": self.plugin_core.hostname,
                 "discover_nodes_info": self.discover_nodes,
+                # Tell the receiver which port WE listen on. The TCP source
+                # port of an inbound connection is ephemeral, so the receiver
+                # cannot determine our listener-port from the socket alone.
+                # Without this, a peer would record our IP with port=None
+                # and try to connect back on its own self.port — a self-loop
+                # in same-machine setups.
+                "listener_port": self.port,
             }
 
             self._logger.debug(f"[GET_INFO] Sending INFO to {IP}: {request_data}")

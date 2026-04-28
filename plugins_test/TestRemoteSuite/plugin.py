@@ -104,11 +104,33 @@ class TestRemoteSuite(Plugin):
                 "--ready-file", self._ready_file,
             ]
             self._logger.info(f"TestRemoteSuite: spawning subnode: {cmd}")
+            # Forward NETWORKING_SECRET so the subprocess can authenticate
+            # with the parent. NetworkManager refuses to start without one.
+            child_env = dict(os.environ)
+            parent_secret = (
+                getattr(self._plugin_core.network, "secret", None)
+                if getattr(self._plugin_core, "network", None) is not None
+                else None
+            )
+            if parent_secret:
+                # NetworkManager stores secret as bytes; decode for env var.
+                if isinstance(parent_secret, bytes):
+                    child_env["NETWORKING_SECRET"] = parent_secret.decode(
+                        "utf-8", errors="replace",
+                    )
+                else:
+                    child_env["NETWORKING_SECRET"] = str(parent_secret)
+            elif "NETWORKING_SECRET" not in child_env:
+                self._logger.warning(
+                    "TestRemoteSuite: no NETWORKING_SECRET in parent env or "
+                    "NetworkManager; subnode will fail to authenticate"
+                )
             self._subproc = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_ROOT),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=child_env,
             )
 
             deadline = time.perf_counter() + 15.0
