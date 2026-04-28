@@ -1,0 +1,67 @@
+description: Phase 5 fixture — remote=True endpoints + streaming generators for wire-bug repros
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: r_open
+    access_name: r_open
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Plain remote-callable endpoint
+    arguments:
+      - name: value
+
+  - internal_name: r_remote_only
+    access_name: r_remote_only
+    tags:
+    remote: True
+    accessible_by_other_plugins: False
+    description: remote=True but accessible_by_other_plugins=False
+    arguments:
+      - name: value
+
+  - internal_name: r_async_gen
+    access_name: r_async_gen
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async generator yielding N items
+    arguments:
+      - name: n
+
+  - internal_name: r_async_gen_huge_item
+    access_name: r_async_gen_huge_item
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding one huge bytes item (B-024)
+    arguments:
+      - name: size_mb
+
+  - internal_name: r_async_gen_raises_after
+    access_name: r_async_gen_raises_after
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async gen yielding N items then raising (B-025 driver)
+    arguments:
+      - name: n_yielded
+
+  - internal_name: r_hang
+    access_name: r_hang
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Awaits asyncio.Event().wait() forever (B-028 driver)
+    arguments:
+
+  - internal_name: r_topic_open
+    access_name: r_topic_open
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    topic: test/r/open
+    description: Config-driven topic handler subscribed to test/r/open
+    arguments:
+      - name: payload

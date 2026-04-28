@@ -110,9 +110,13 @@ async def run_tests() -> int:
                     "TestStreamSuite",
                     "TestNotifierSuite",
                     "TestLifecycleSuite",
+                    "TestRemoteSuite",
                 ],
                 "category": None,        # both basic and edge
-                "host": "local",         # no peer node available
+                # Don't filter by host — let matrix-expanded `.remote`
+                # sub-cases auto-skip via remote_available=False so we keep
+                # an accurate record of what's deferred.
+                "host": None,
                 "dump_path": DUMP_PATH,
                 "skip_slow": False,
                 "allow_destructive": True,

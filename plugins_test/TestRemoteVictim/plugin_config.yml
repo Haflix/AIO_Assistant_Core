@@ -1,0 +1,47 @@
+description: Phase 5 fixture — remote=False plugin used to demonstrate B-001 / B-042 access bypass via topics
+version: 0.1.0
+remote: False
+arguments:
+endpoints:
+  - internal_name: r_local_only
+    access_name: r_local_only
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: Plugin-level remote=False blocks remote callers
+    arguments:
+      - name: value
+
+  - internal_name: r_topic_local_only
+    access_name: r_topic_local_only
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    topic: test/r/local
+    description: Config-driven sub on remote=False plugin (B-001 boundary)
+    arguments:
+      - name: payload
+
+  - internal_name: get_bypass_count
+    access_name: get_bypass_count
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Returns the number of times the code-driven bypass handler fired
+    arguments:
+
+  - internal_name: get_stream_bypass_count
+    access_name: get_stream_bypass_count
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Returns the number of items the code-driven bypass stream yielded
+    arguments:
+
+  - internal_name: reset_bypass
+    access_name: reset_bypass
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Resets bypass counters to 0
+    arguments:

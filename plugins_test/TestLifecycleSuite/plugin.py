@@ -452,15 +452,16 @@ class TestLifecycleSuite(Plugin):
             )
             await asyncio.sleep(0.1)
 
+            # Keepers = every currently-loaded plugin EXCEPT VICTIM. This
+            # preserves whatever the suite was loaded with (TestRemoteSuite,
+            # other suites/targets, etc.) and only purges the one plugin
+            # whose pending task we want to test against.
+            keepers = [
+                name for name in self._plugin_core.plugins.keys()
+                if name != VICTIM
+            ]
             try:
-                await self._plugin_core.purge_plugins_except(
-                    [self.plugin_name, "TestRunner",
-                     "TestExecuteSuite", "TestStreamSuite",
-                     "TestNotifierSuite", "TestExecuteTarget",
-                     "TestExecuteTarget2", "TestStreamTarget",
-                     "TestNotifierTarget", VICTIM2,
-                     SENTINEL, BROKEN_VERSION]
-                )
+                await self._plugin_core.purge_plugins_except(keepers)
                 # If purge fails the pending task with "unloaded", bug is
                 # NOT present. If task hangs/timeouts → bug present.
                 try:

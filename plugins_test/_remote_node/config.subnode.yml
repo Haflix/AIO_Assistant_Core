@@ -1,0 +1,32 @@
+# Minimal config for the Phase 5 subprocess (run_node.py).
+# Loads only the TestRemote* fixtures; no plugins from the parent's main config.
+plugins:
+  - name: TestRemoteTarget
+    enabled: true
+    path: ./plugins_test/TestRemoteTarget
+
+  - name: TestRemoteVictim
+    enabled: true
+    path: ./plugins_test/TestRemoteVictim
+
+  - name: TestRemoteSpoofer
+    enabled: true
+    path: ./plugins_test/TestRemoteSpoofer
+
+general:
+    hostname: "test-subnode"           # MUST differ from parent hostname
+    plugin_package: plugins_test
+    console_log_level: "WARNING"       # Quiet sub-process console
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    node_ips: ["127.0.0.1"]             # parent on localhost
+    port: 0                             # overridden via --port
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true

@@ -81,6 +81,22 @@ plugins:
     enabled: false
     path: ./plugins_test/TestLifecycleSentinel
 
+  - name: TestRemoteSuite
+    enabled: false
+    path: ./plugins_test/TestRemoteSuite
+
+  - name: TestRemoteTarget              # loaded by the Phase 5 subprocess only
+    enabled: false
+    path: ./plugins_test/TestRemoteTarget
+
+  - name: TestRemoteVictim              # loaded by the Phase 5 subprocess only
+    enabled: false
+    path: ./plugins_test/TestRemoteVictim
+
+  - name: TestRemoteSpoofer             # loaded by the Phase 5 subprocess only
+    enabled: false
+    path: ./plugins_test/TestRemoteSpoofer
+
   - name: CLI
     enabled: true
     path: ./plugins_test/CLI

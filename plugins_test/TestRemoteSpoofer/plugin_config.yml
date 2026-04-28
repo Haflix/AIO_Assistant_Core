@@ -1,0 +1,17 @@
+description: Phase 5 peer-side helper — emits raw notify_remote / request_topic_remote with arbitrary author / author_id (B-018)
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: spoof_notify
+    access_name: spoof_notify
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Issue notify_remote(IP, topic, args, author, author_id) directly bypassing Plugin.notify
+    arguments:
+      - name: target_ip
+      - name: topic
+      - name: args
+      - name: author
+      - name: author_id
