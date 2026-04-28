@@ -1,0 +1,12 @@
+description: Phase 4 static fixture — Sentinel listed AFTER TestLifecycleBrokenVersion to detect B-007's load-loop abort
+version: 0.1.0
+remote: True
+arguments:
+endpoints:
+  - internal_name: get_loaded
+    access_name: get_loaded
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Returns self.loaded — True if on_load ran
+    arguments:

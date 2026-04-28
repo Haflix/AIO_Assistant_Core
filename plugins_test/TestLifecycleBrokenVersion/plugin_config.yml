@@ -1,0 +1,11 @@
+description: Phase 4 static fixture — plugin_config.yml WITHOUT a version field (B-007 trigger)
+remote: True
+arguments:
+endpoints:
+  - internal_name: ping
+    access_name: ping
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Trivial endpoint; the bug is detected by Sentinel's absence after this plugin breaks the load loop
+    arguments:

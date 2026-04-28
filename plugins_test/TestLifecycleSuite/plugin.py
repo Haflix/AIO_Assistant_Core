@@ -1,0 +1,933 @@
+"""TestLifecycleSuite — Phase 4.
+
+Exercises plugin lifecycle: load, enable, disable, reload, pop, purge plus
+bug repros B-004 / B-005 / B-006 / B-007 / B-008 / B-009 / B-010 / B-016 /
+B-037 / B-043 and the disable-reverse-order regression lock.
+
+Args-override merging cases (8) and per-logger level cases (7) from the plan
+are deferred to a follow-up phase — they need fixture-heavy yaml manipulation
+and log-record interception machinery that's out of scope here. They are
+recorded as `skip` with explicit reasons so the suite still enumerates them.
+
+The B-006 case is destructive=True (running_loop dies) and runs LAST. Its
+finally restarts the maintenance loop via core._running_loop_task =
+asyncio.create_task(core.running_loop()) per the plan.
+"""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import asyncio  # noqa: E402
+import time  # noqa: E402
+from typing import Any, Dict, List, Optional  # noqa: E402
+
+from utils import Plugin  # noqa: E402
+from decorators import async_log_errors, log_errors  # noqa: E402
+from exceptions import RequestException  # noqa: E402
+
+from _test_helpers import CaseRecorder  # noqa: E402
+
+
+SUITE_VERSION = "0.1.0"
+VICTIM = "TestLifecycleVictim"
+VICTIM2 = "TestLifecycleVictim2"
+VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
+SENTINEL = "TestLifecycleSentinel"
+BROKEN_VERSION = "TestLifecycleBrokenVersion"
+
+
+class TestLifecycleSuite(Plugin):
+    """Phase 4 suite plugin. See test_suite_plan.md §6 Phase 4."""
+
+    @log_errors
+    def on_load(self, *args, **kwargs):
+        pass
+
+    @async_log_errors
+    async def on_enable(self):
+        self._logger.info("TestLifecycleSuite enabled")
+
+    @async_log_errors
+    async def on_disable(self):
+        self._logger.info("TestLifecycleSuite disabled")
+
+    @async_log_errors
+    async def run(
+        self,
+        category: Optional[str] = None,
+        host: Optional[str] = None,
+        case_ids: Optional[List[str]] = None,
+        bug_ids: Optional[List[str]] = None,
+        skip_slow: bool = False,
+        allow_destructive: bool = True,
+    ) -> Dict[str, Any]:
+        rec = CaseRecorder("TestLifecycleSuite", SUITE_VERSION, self._plugin_core)
+
+        kw = dict(
+            case_ids_filter=case_ids,
+            bug_ids_filter=bug_ids,
+            category_filter=category,
+            host_filter=host,
+            skip_slow=skip_slow,
+            allow_destructive=allow_destructive,
+            remote_available=False,
+        )
+
+        await self._basic_load(rec, kw)
+        await self._basic_enable_disable(rec, kw)
+        await self._basic_b004(rec, kw)
+        await self._basic_b010(rec, kw)
+        await self._basic_b009(rec, kw)
+        await self._basic_reload(rec, kw)
+        await self._basic_b016(rec, kw)
+        await self._basic_pop_pending(rec, kw)
+        await self._basic_b005_purge(rec, kw)
+        await self._basic_b008_concurrent_enable(rec, kw)
+        await self._basic_b037_notify_during_pop(rec, kw)
+        await self._basic_b043_pop_failed_reaped(rec, kw)
+        await self._basic_b007_missing_version(rec, kw)
+        await self._basic_disable_disabled_endpoint(rec, kw)
+        await self._basic_disable_reverse_order(rec, kw)
+        await self._basic_args_overrides_skip(rec, kw)
+        await self._basic_logger_levels_skip(rec, kw)
+        await self._basic_async_reload_skip(rec, kw)
+        # Destructive case MUST run last
+        await self._basic_b006_running_loop(rec, kw)
+
+        return rec.to_dict()
+
+    # ====================================================================
+    # Helpers
+    # ====================================================================
+
+    async def _ensure_victim_clean(self) -> None:
+        # Defensive: re-enable VICTIM if a prior case left it disabled, then
+        # reset all behavior flags. Direct attribute access works even when
+        # the plugin is disabled (configure endpoint would fail then).
+        victim = self._plugin_core.plugins.get(VICTIM)
+        if victim is None:
+            entry = self._find_yaml_entry(VICTIM)
+            if entry:
+                entry["enabled"] = True
+                try:
+                    await self._plugin_core.load_plugin_with_conf(entry)
+                except Exception:
+                    pass
+                victim = self._plugin_core.plugins.get(VICTIM)
+        if victim is not None:
+            victim._on_enable_raises_after_setup = False
+            victim._on_disable_raises = False
+            victim._on_disable_hangs_secs = 0.0
+            victim._on_enable_delay_secs = 0.0
+            victim._cross_call_during_enable = False
+            victim.db_open = True if victim.enabled else False
+            if not victim.enabled:
+                try:
+                    await self._plugin_core._enable_plugin(VICTIM)
+                except Exception:
+                    pass
+
+    async def _reload_victim(self) -> None:
+        await self._plugin_core._reload_plugin(VICTIM)
+
+    # ====================================================================
+    # BASIC load
+    # ====================================================================
+
+    async def _basic_load(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_valid_config(c):
+            if VICTIM not in self._plugin_core.plugins:
+                raise AssertionError(f"{VICTIM} not in core.plugins")
+            plugin = self._plugin_core.plugins[VICTIM]
+            c.expect(plugin.plugin_name, VICTIM)
+            assert plugin.enabled
+
+        await rec.run_case(
+            "lifecycle.load.valid_config", body_valid_config,
+            tags=("basic",), **kw,
+        )
+
+    # ====================================================================
+    # BASIC enable / disable
+    # ====================================================================
+
+    async def _basic_enable_disable(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_enable_success(c):
+            await self._ensure_victim_clean()
+            plugin = self._plugin_core.plugins[VICTIM]
+            if not plugin.enabled:
+                await self._plugin_core._enable_plugin(VICTIM)
+            assert plugin.enabled
+
+        async def body_disable_success(c):
+            await self._ensure_victim_clean()
+            plugin = self._plugin_core.plugins[VICTIM]
+            await self._plugin_core._disable_plugin(VICTIM)
+            try:
+                assert not plugin.enabled
+            finally:
+                await self._plugin_core._enable_plugin(VICTIM)
+
+        await rec.run_case(
+            "lifecycle.enable.success", body_enable_success,
+            tags=("basic",), **kw,
+        )
+        await rec.run_case(
+            "lifecycle.disable.success", body_disable_success,
+            tags=("basic",), **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-004 — on_enable raises mid-setup, no on_disable cleanup
+    # ====================================================================
+
+    async def _basic_b004(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            try:
+                # Configure WHILE enabled (configure endpoint requires it).
+                # Then disable, then re-enable to trigger the raise during
+                # on_enable's partial-setup phase.
+                await self.execute(VICTIM, "configure",
+                                   {"on_enable_raises_after_setup": True})
+                await self._plugin_core._disable_plugin(VICTIM)
+
+                try:
+                    await self._plugin_core._enable_plugin(VICTIM)
+                except Exception:
+                    pass  # @async_handle_errors swallows; this is defensive
+
+                plugin = self._plugin_core.plugins[VICTIM]
+                if plugin.db_open:
+                    c.set_marker("db_was_open_after_failed_enable")
+                    raise AssertionError(
+                        f"db_open={plugin.db_open} after failed on_enable; "
+                        f"enabled={plugin.enabled} (B-004: on_enable raised "
+                        f"after partial setup, no on_disable cleanup)"
+                    )
+            finally:
+                # Recovery: directly close partial state, re-enable.
+                plugin = self._plugin_core.plugins.get(VICTIM)
+                if plugin is not None:
+                    plugin.db_open = False
+                    plugin._on_enable_raises_after_setup = False
+                    if not plugin.enabled:
+                        try:
+                            await self._plugin_core._enable_plugin(VICTIM)
+                        except Exception:
+                            pass
+                await self._ensure_victim_clean()
+
+        await rec.run_case(
+            "lifecycle.B-004.on_enable_raises_no_undo", body,
+            tags=("bug_repro",), bug_ids=("B-004",),
+            expected_status="fail",
+            expected_signature={"marker": "db_was_open_after_failed_enable"},
+            hard_timeout_s=20.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-010 — on_disable raises during reload
+    # ====================================================================
+
+    async def _basic_b010(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            try:
+                await self.execute(VICTIM, "configure",
+                                   {"on_disable_raises": True})
+
+                try:
+                    await self._plugin_core._reload_plugin(VICTIM)
+                except Exception:
+                    pass
+
+                # After a failed reload due to on_disable raising:
+                # - bug present: plugin stays in core.plugins with stale state
+                # - bug fixed: clean error, plugin either re-loaded or gone
+                plugin = self._plugin_core.plugins.get(VICTIM)
+                if plugin is not None and not plugin.enabled:
+                    c.set_marker("plugin_still_loaded_after_disable_raise")
+                    raise AssertionError(
+                        "B-010: plugin remains in core.plugins (disabled / "
+                        "half-torn-down) after on_disable raised during reload"
+                    )
+                # If plugin is None or enabled cleanly, bug is not present
+                # (or fixed) → unexpected_pass on the expected_status='fail' case
+            finally:
+                if VICTIM not in self._plugin_core.plugins:
+                    entry = self._find_yaml_entry(VICTIM)
+                    if entry:
+                        entry["enabled"] = True
+                        try:
+                            await self._plugin_core.load_plugin_with_conf(entry)
+                            await self._plugin_core._enable_plugin(VICTIM)
+                        except Exception:
+                            pass
+                await self._ensure_victim_clean()
+
+        await rec.run_case(
+            "lifecycle.B-010.on_disable_raises", body,
+            tags=("bug_repro",), bug_ids=("B-010",),
+            expected_status="fail",
+            expected_signature={"marker": "plugin_still_loaded_after_disable_raise"},
+            hard_timeout_s=20.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-009 — _disable_plugin no timeout
+    # ====================================================================
+
+    async def _basic_b009(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            # Configure a 120s on_disable hang while VICTIM is enabled
+            # (configure endpoint requires it).
+            await self.execute(VICTIM, "configure",
+                               {"on_disable_hangs_secs": 120.0})
+
+            try:
+                await asyncio.wait_for(
+                    self._plugin_core._reload_plugin(VICTIM),
+                    timeout=10.0,
+                )
+                # Reload completed within 10s — bug fixed (or hang config didn't take)
+                return
+            except asyncio.TimeoutError:
+                c.set_marker("outer_wait_for_fired")
+                # Recovery: forcibly clear the hang flag on the (still
+                # reachable) victim instance, then pop it cleanly.
+                victim = self._plugin_core.plugins.get(VICTIM)
+                if victim is not None:
+                    victim._on_disable_hangs_secs = 0.0
+                    victim.enabled = False
+                    try:
+                        await self._plugin_core.pop_plugin(VICTIM)
+                    except Exception:
+                        pass
+                # Re-load via yaml entry for subsequent cases
+                entry = self._find_yaml_entry(VICTIM)
+                if entry:
+                    entry["enabled"] = True
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+                raise AssertionError("hang_guard fired: outer_wait_for_fired")
+
+        await rec.run_case(
+            "lifecycle.B-009.disable_no_timeout", body,
+            tags=("bug_repro",), bug_ids=("B-009",),
+            expected_status="fail",
+            expected_signature={"marker": "outer_wait_for_fired"},
+            hard_timeout_s=25.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC reload (preserves enabled)
+    # ====================================================================
+
+    async def _basic_reload(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            assert self._plugin_core.plugins[VICTIM].enabled
+            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
+
+            await self._plugin_core._reload_plugin(VICTIM)
+
+            new_plugin = self._plugin_core.plugins[VICTIM]
+            assert new_plugin.enabled
+            # New instance has a new uuid
+            c.expect(new_plugin.plugin_uuid != old_uuid, True)
+
+        await rec.run_case(
+            "lifecycle.reload.preserves_enabled", body,
+            tags=("reload",), hard_timeout_s=15.0, **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-016 — reload with newly-disabled config
+    # ====================================================================
+
+    async def _basic_b016(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            entry = self._find_yaml_entry(VICTIM)
+            if not entry:
+                c.skip(f"{VICTIM} entry missing from yaml_config")
+            original_enabled = entry["enabled"]
+            entry["enabled"] = False
+
+            try:
+                # _reload_plugin captures previously_enabled, pops, re-loads
+                # (which now returns at the disabled-short-circuit), then
+                # tries to _enable_plugin — KeyError since plugin is gone.
+                # @async_handle_errors swallows; user sees nothing.
+                result = await self._plugin_core._reload_plugin(VICTIM)
+                # If the plugin is now absent and result is None, the bug
+                # silently swallowed the KeyError.
+                still_loaded = VICTIM in self._plugin_core.plugins
+                if not still_loaded:
+                    c.set_marker("silent_keyerror_swallowed")
+                    raise AssertionError(
+                        "B-016: reload with newly-disabled config silently "
+                        "popped the plugin and swallowed the re-enable KeyError"
+                    )
+                # If plugin is still loaded, the bug-fixed path was taken
+            finally:
+                entry["enabled"] = original_enabled
+                if VICTIM not in self._plugin_core.plugins:
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+                await self._ensure_victim_clean()
+
+        await rec.run_case(
+            "lifecycle.B-016.reload_disabled_in_new_config", body,
+            tags=("bug_repro",), bug_ids=("B-016",),
+            expected_status="fail",
+            expected_signature={"marker": "silent_keyerror_swallowed"},
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC pop_plugin fails pending
+    # ====================================================================
+
+    async def _basic_pop_pending(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            task = asyncio.create_task(
+                self.execute(VICTIM, "victim_hang_endpoint", {"secs": 30.0})
+            )
+            await asyncio.sleep(0.1)  # let request register
+
+            try:
+                await self._plugin_core.pop_plugin(VICTIM)
+                # The pending task should now error with "unloaded while pending"
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except RequestException as e:
+                    if "unloaded" not in str(e).lower():
+                        raise AssertionError(
+                            f"unexpected RequestException: {e}"
+                        )
+                except asyncio.TimeoutError:
+                    raise AssertionError(
+                        "pending task did not get unloaded error within 5s"
+                    )
+            finally:
+                # Re-load victim for subsequent cases
+                entry = self._find_yaml_entry(VICTIM)
+                if entry:
+                    entry["enabled"] = True
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+
+        await rec.run_case(
+            "lifecycle.pop_plugin.fails_pending", body,
+            tags=("basic",), hard_timeout_s=15.0, **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-005 — purge_plugins / purge_plugins_except skip pending
+    # ====================================================================
+
+    async def _basic_b005_purge(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_purge(c):
+            await self._ensure_victim_clean()
+            task = asyncio.create_task(
+                self.execute(VICTIM, "victim_hang_endpoint", {"secs": 30.0})
+            )
+            await asyncio.sleep(0.1)
+
+            try:
+                await self._plugin_core.purge_plugins_except(
+                    [self.plugin_name, "TestRunner",
+                     "TestExecuteSuite", "TestStreamSuite",
+                     "TestNotifierSuite", "TestExecuteTarget",
+                     "TestExecuteTarget2", "TestStreamTarget",
+                     "TestNotifierTarget", VICTIM2,
+                     SENTINEL, BROKEN_VERSION]
+                )
+                # If purge fails the pending task with "unloaded", bug is
+                # NOT present. If task hangs/timeouts → bug present.
+                try:
+                    await asyncio.wait_for(task, timeout=3.0)
+                    # task completed (or errored) within 3s → check kind
+                    return
+                except asyncio.TimeoutError:
+                    c.set_marker("task_did_not_get_unloaded_error")
+                    raise AssertionError(
+                        "B-005: purge_plugins_except did not fail the pending "
+                        "task; it hung past 3s after purge"
+                    )
+                except RequestException:
+                    return  # got an error of some kind — bug not present
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except Exception:
+                        pass
+                # Re-load victim
+                entry = self._find_yaml_entry(VICTIM)
+                if entry:
+                    entry["enabled"] = True
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+
+        await rec.run_case(
+            "lifecycle.B-005.purge_except_skips_pending", body_purge,
+            tags=("bug_repro",), bug_ids=("B-005",),
+            expected_status="fail",
+            expected_signature={"marker": "task_did_not_get_unloaded_error"},
+            hard_timeout_s=20.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-008 — concurrent enable race
+    # ====================================================================
+
+    async def _basic_b008_concurrent_enable(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            # Verify config-order requirement (Victim before Victim2)
+            plugins = self._plugin_core.yaml_config.get("plugins", [])
+            try:
+                v_idx = next(i for i, p in enumerate(plugins)
+                             if p.get("name") == VICTIM)
+                v2_idx = next(i for i, p in enumerate(plugins)
+                              if p.get("name") == VICTIM2)
+            except StopIteration:
+                c.skip(f"{VICTIM} or {VICTIM2} missing from config")
+                return
+            if v_idx >= v2_idx:
+                c.skip(
+                    f"config order: {VICTIM} (idx={v_idx}) must precede "
+                    f"{VICTIM2} (idx={v2_idx})"
+                )
+                return
+
+            try:
+                # Configure WHILE both plugins are enabled (configure
+                # endpoint requires it).
+                await self.execute(VICTIM, "configure", {
+                    "cross_call_during_enable": True,
+                })
+                await self.execute(VICTIM2, "configure", {
+                    "on_enable_delay_secs": 1.0,
+                })
+
+                # Now disable both, then re-enable concurrently
+                await self._plugin_core._disable_plugin(VICTIM)
+                await self._plugin_core._disable_plugin(VICTIM2)
+
+                await asyncio.gather(
+                    self._plugin_core._enable_plugin(VICTIM),
+                    self._plugin_core._enable_plugin(VICTIM2),
+                    return_exceptions=True,
+                )
+
+                # Read state via direct attribute (configure may not be
+                # available yet if VICTIM is still in mid-enable).
+                victim = self._plugin_core.plugins.get(VICTIM)
+                cross_result = (
+                    victim._cross_call_result if victim is not None else None
+                )
+                if isinstance(cross_result, str) and "Endpoint" in cross_result:
+                    c.set_marker("endpoint_not_found_during_concurrent_enable")
+                    raise AssertionError(
+                        f"B-008: cross-plugin call during concurrent enable "
+                        f"saw endpoint-not-found: {cross_result!r}"
+                    )
+            finally:
+                # Reset config state directly via attribute access
+                v = self._plugin_core.plugins.get(VICTIM)
+                v2 = self._plugin_core.plugins.get(VICTIM2)
+                if v is not None:
+                    v._cross_call_during_enable = False
+                    v._cross_call_result = None
+                if v2 is not None:
+                    v2._on_enable_delay_secs = 0.0
+                if v is not None and not v.enabled:
+                    try:
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+                if v2 is not None and not v2.enabled:
+                    try:
+                        await self._plugin_core._enable_plugin(VICTIM2)
+                    except Exception:
+                        pass
+
+        await rec.run_case(
+            "lifecycle.B-008.concurrent_enable_race", body,
+            tags=("bug_repro",), bug_ids=("B-008",),
+            expected_status="fail",
+            expected_signature={
+                "marker": "endpoint_not_found_during_concurrent_enable"
+            },
+            hard_timeout_s=20.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-037 — notify during pop
+    # ====================================================================
+
+    async def _basic_b037_notify_during_pop(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            # Subscribe a code-driven sub on victim that we can detect firing
+            # mid-pop. Use the Victim's own on_enable to register a sub via
+            # core.subscribe — but Victim doesn't have one. Instead, register
+            # one externally and bind it to victim's plugin_uuid.
+            victim_obj = self._plugin_core.plugins[VICTIM]
+            fired_after = {"flag": False}
+
+            async def h(*args, **kw_):
+                fired_after["flag"] = True
+
+            sub_id = await self._plugin_core.subscribe(
+                "lifecycle/notify_during_pop",
+                victim_obj.plugin_name,
+                victim_obj.plugin_uuid,
+                handler=h,
+            )
+
+            try:
+                # Concurrently pop + notify
+                pop_task = asyncio.create_task(
+                    self._plugin_core.pop_plugin(VICTIM)
+                )
+                await asyncio.sleep(0.001)
+                await self.notify("lifecycle/notify_during_pop")
+                await pop_task
+
+                if fired_after["flag"]:
+                    c.set_marker("handler_ran_after_disable")
+                    raise AssertionError(
+                        "B-037: handler ran during pop_plugin (race)"
+                    )
+            finally:
+                try:
+                    await self._plugin_core.unsubscribe(sub_id)
+                except Exception:
+                    pass
+                entry = self._find_yaml_entry(VICTIM)
+                if entry:
+                    entry["enabled"] = True
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+
+        await rec.run_case(
+            "lifecycle.B-037.notify_during_pop", body,
+            tags=("bug_repro",), bug_ids=("B-037",),
+            expected_status="fail",
+            expected_signature={"marker": "handler_ran_after_disable"},
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-043 — pop_plugin failed-pending request reaped
+    # ====================================================================
+
+    async def _basic_b043_pop_failed_reaped(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            # Start a long-running call against Victim; capture its req_id;
+            # cancel the caller; pop the plugin; assert request entry is reaped.
+            req = await self._plugin_core.create_request(
+                VICTIM, "victim_hang_endpoint", {"secs": 60.0},
+                "", "any", self.plugin_name, self.plugin_uuid,
+            )
+            req_id = req.id
+
+            task = asyncio.create_task(req.wait_for_result_async())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, RequestException):
+                pass
+            await req.set_collected()
+
+            try:
+                await self._plugin_core.pop_plugin(VICTIM)
+
+                deadline = time.perf_counter() + 30.0
+                while time.perf_counter() < deadline:
+                    if req_id not in self._plugin_core.requests:
+                        return
+                    await asyncio.sleep(0.5)
+                raise AssertionError(
+                    f"request {req_id} not reaped within 30s after pop"
+                )
+            finally:
+                entry = self._find_yaml_entry(VICTIM)
+                if entry:
+                    entry["enabled"] = True
+                    try:
+                        await self._plugin_core.load_plugin_with_conf(entry)
+                        await self._plugin_core._enable_plugin(VICTIM)
+                    except Exception:
+                        pass
+
+        await rec.run_case(
+            "lifecycle.B-043.pop_plugin_failed_requests_eventually_reaped", body,
+            tags=("bug_repro",), bug_ids=("B-043",),
+            hard_timeout_s=45.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-007 — missing version aborts load loop
+    # ====================================================================
+
+    async def _basic_b007_missing_version(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            c.skip(
+                "B-007 (missing-version KeyError aborts get_plugins loop) "
+                "cannot be reproduced from inside a running suite: enabling "
+                "TestLifecycleBrokenVersion + Sentinel in test_config.yml "
+                "kills wait_until_ready before any case runs. Repro requires "
+                "a controlled-startup harness (subprocess) — Phase 5 "
+                "scaffold could host this once it lands."
+            )
+
+        await rec.run_case(
+            "lifecycle.B-007.missing_version_aborts_load_loop", body,
+            tags=("bug_repro", "deferred"), bug_ids=("B-007",),
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC disable error — disabled endpoint not callable
+    # ====================================================================
+
+    async def _basic_disable_disabled_endpoint(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            await self._plugin_core._disable_plugin(VICTIM)
+            try:
+                c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
+                await self.execute(VICTIM, "is_db_open")
+            finally:
+                await self._plugin_core._enable_plugin(VICTIM)
+
+        await rec.run_case(
+            "lifecycle.disable.error.disabled_plugin_not_callable", body,
+            tags=("error",), hard_timeout_s=15.0, **kw,
+        )
+
+    # ====================================================================
+    # BASIC contract — disable reverse order via _disable_plugin
+    # ====================================================================
+
+    async def _basic_disable_reverse_order(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            await self._ensure_victim_clean()
+            try:
+                await self.execute(VICTIM2, "configure", {})
+            except Exception:
+                c.skip(f"{VICTIM2} not loaded")
+                return
+
+            v1 = self._plugin_core.plugins[VICTIM]
+            v2 = self._plugin_core.plugins[VICTIM2]
+            v1.disable_count = 0
+            v2.disable_count = 0
+
+            # Drive disable in reverse config order: Victim2 first, then Victim
+            # (matches what core.close() does at PluginCore.py:255 .reverse()).
+            await self._plugin_core._disable_plugin(VICTIM2)
+            t_v2_disabled = time.perf_counter()
+            await self._plugin_core._disable_plugin(VICTIM)
+            t_v1_disabled = time.perf_counter()
+
+            try:
+                c.expect(v2.disable_count, 1)
+                c.expect(v1.disable_count, 1)
+                if not (t_v2_disabled < t_v1_disabled):
+                    raise AssertionError(
+                        f"reverse-order disable not observed: "
+                        f"v2={t_v2_disabled} v1={t_v1_disabled}"
+                    )
+            finally:
+                await self._plugin_core._enable_plugin(VICTIM2)
+                await self._plugin_core._enable_plugin(VICTIM)
+
+        await rec.run_case(
+            "lifecycle.contract.disable_reverse_order_via_disable_plugin",
+            body,
+            tags=("shutdown", "contract"), hard_timeout_s=15.0, **kw,
+        )
+
+    # ====================================================================
+    # BASIC args overrides — deferred (skip block)
+    # ====================================================================
+
+    async def _basic_args_overrides_skip(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        skip_reason = (
+            "args-override merging cases require fixture-heavy yaml_config "
+            "manipulation + reload cycles per case; deferred to a follow-up "
+            "phase. The merge logic at PluginCore._deep_merge_args is "
+            "well-documented in commit 5c16050; tests will land alongside "
+            "any fix that touches it."
+        )
+
+        case_ids_to_skip = [
+            "lifecycle.args.deep_merge_preserves_siblings",
+            "lifecycle.args.replace_marker_clears",
+            "lifecycle.args.replace_marker_with_keys",
+            "lifecycle.args.list_fully_replaces",
+            "lifecycle.args.type_mismatch_warns_applies",
+            "lifecycle.args.base_none_not_mismatch",
+            "lifecycle.args.main_invalid_override_warns_ignored",
+            "lifecycle.args.plugin_invalid_hard_fails",
+            "lifecycle.args.replace_marker_at_root",
+        ]
+
+        for cid in case_ids_to_skip:
+            async def body(c, _r=skip_reason):
+                c.skip(_r)
+            await rec.run_case(
+                cid, body,
+                tags=("args_override", "contract", "deferred"),
+                **kw,
+            )
+
+    # ====================================================================
+    # BASIC per-logger levels — deferred (skip block)
+    # ====================================================================
+
+    async def _basic_logger_levels_skip(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        skip_reason = (
+            "per-logger level cases require log-record interception (mock "
+            "handler installed on root) to verify a record at INFO is "
+            "dropped while the override is active. Deferred to follow-up."
+        )
+        case_ids_to_skip = [
+            "lifecycle.logger.set_level_persists_during_runtime",
+            "lifecycle.logger.set_level_clears_on_disable",
+            "lifecycle.logger.set_level_clears_on_pop",
+            "lifecycle.logger.longest_prefix_dot_boundary",
+            "lifecycle.logger.mute_level",
+            "lifecycle.logger.set_level_survives_config_reload",
+            "lifecycle.logger.set_level_clears_on_purge",
+        ]
+        for cid in case_ids_to_skip:
+            async def body(c, _r=skip_reason):
+                c.skip(_r)
+            await rec.run_case(
+                cid, body,
+                tags=("logger", "contract", "deferred"),
+                **kw,
+            )
+
+    # ====================================================================
+    # BASIC config hot-reload — deferred (skip block)
+    # ====================================================================
+
+    async def _basic_async_reload_skip(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            c.skip(
+                "async_load_config_yaml regression test requires writing the "
+                "config file mid-test (out of scope for unit-style suite); "
+                "deferred to follow-up"
+            )
+        await rec.run_case(
+            "lifecycle.config.async_reload_preserves_plugins", body,
+            tags=("config", "contract", "deferred"), **kw,
+        )
+
+    # ====================================================================
+    # BASIC B-006 running_loop guard — DESTRUCTIVE, MUST be last
+    # ====================================================================
+
+    async def _basic_b006_running_loop(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        async def body(c):
+            old_task = self._plugin_core._running_loop_task
+            req_id = "lifecycle.b006.bad-test-id"
+            self._plugin_core.requests[req_id] = object()
+
+            try:
+                # cleanup_requests runs every 10s; sleep 13s gives one tick
+                # plus a slack buffer for slow Windows scheduler.
+                await asyncio.sleep(13.0)
+
+                if old_task.done() and old_task.exception() is not None:
+                    c.set_marker("running_loop_died")
+                    raise AssertionError(
+                        f"running_loop died: {type(old_task.exception()).__name__}: "
+                        f"{old_task.exception()}"
+                    )
+                # Bug fixed (loop survived) → unexpected_pass
+            finally:
+                # Restart the maintenance loop per plan §6 Phase 4 B-006.
+                self._plugin_core.requests.pop(req_id, None)
+                if self._plugin_core._running_loop_task.done():
+                    self._plugin_core._running_loop_task = asyncio.create_task(
+                        self._plugin_core.running_loop()
+                    )
+
+        await rec.run_case(
+            "lifecycle.B-006.running_loop_guard", body,
+            tags=("bug_repro", "terminal"), bug_ids=("B-006",),
+            expected_status="fail",
+            expected_signature={"marker": "running_loop_died"},
+            hard_timeout_s=30.0,
+            destructive=True,
+            **kw,
+        )
+
+    # ====================================================================
+    # Internal helper: find yaml entry
+    # ====================================================================
+
+    def _find_yaml_entry(self, name: str) -> Optional[Dict[str, Any]]:
+        for entry in self._plugin_core.yaml_config.get("plugins", []):
+            if entry.get("name") == name:
+                return entry
+        return None

@@ -40,6 +40,33 @@ plugins:
     enabled: false
     path: ./plugins_test/TestNotifierBadActor
 
+  - name: TestLifecycleSuite
+    enabled: true
+    path: ./plugins_test/TestLifecycleSuite
+
+  - name: TestLifecycleVictim
+    enabled: true
+    path: ./plugins_test/TestLifecycleVictim
+
+  - name: TestLifecycleVictim2          # multi-instance for B-008 race
+    enabled: true
+    path: ./plugins_test/TestLifecycleVictim
+
+  # B-007 fixtures (BrokenVersion + Sentinel) are NOT enabled in
+  # test_config.yml because B-007 itself breaks startup — the KeyError from
+  # the missing-version plugin aborts get_plugins's for loop, taking down
+  # the entire test framework before any case runs. The B-007 case in
+  # TestLifecycleSuite c.skip()s with a note that the bug requires a
+  # controlled-startup harness (e.g. a separate subprocess invocation with
+  # only these two plugins) to test.
+  - name: TestLifecycleBrokenVersion
+    enabled: false
+    path: ./plugins_test/TestLifecycleBrokenVersion
+
+  - name: TestLifecycleSentinel
+    enabled: false
+    path: ./plugins_test/TestLifecycleSentinel
+
 
 general:
     hostname: ""                      # Empty = use system hostname

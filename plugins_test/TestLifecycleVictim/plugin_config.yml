@@ -1,0 +1,70 @@
+description: Phase 4 fixture — controllable lifecycle victim with configurable on_enable / on_disable behaviors
+version: 0.1.0
+remote: True
+arguments:
+  level: "info"
+  nested:
+    a: 1
+    b: 2
+endpoints:
+  - internal_name: configure
+    access_name: configure
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Set behavioral flags on the victim
+    arguments:
+      - name: on_enable_raises_after_setup
+      - name: on_disable_raises
+      - name: on_disable_hangs_secs
+      - name: on_enable_delay_secs
+
+  - internal_name: get_state
+    access_name: get_state
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return current state (db_open, enable_count, disable_count)
+    arguments:
+
+  - internal_name: get_arguments
+    access_name: get_arguments
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return self.arguments (after override merge)
+    arguments:
+
+  - internal_name: victim_hang_endpoint
+    access_name: victim_hang_endpoint
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Awaits asyncio.sleep(secs) — used to hold a pending request open for B-005
+    arguments:
+      - name: secs
+
+  - internal_name: inject_bad_request
+    access_name: inject_bad_request
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Insert a bare object() into core.requests under the given id (B-006)
+    arguments:
+      - name: req_id
+
+  - internal_name: is_db_open
+    access_name: is_db_open
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Return self.db_open
+    arguments:
+
+  - internal_name: cross_call_victim2
+    access_name: cross_call_victim2
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Async; calls execute("TestLifecycleVictim2", "is_db_open") — used during on_enable for B-008
+    arguments:

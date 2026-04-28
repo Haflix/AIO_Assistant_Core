@@ -61,6 +61,26 @@ plugins:
     enabled: false
     path: ./plugins_test/TestNotifierBadActor
 
+  - name: TestLifecycleSuite
+    enabled: false
+    path: ./plugins_test/TestLifecycleSuite
+
+  - name: TestLifecycleVictim
+    enabled: false
+    path: ./plugins_test/TestLifecycleVictim
+
+  - name: TestLifecycleVictim2          # for B-008 race; same path
+    enabled: false
+    path: ./plugins_test/TestLifecycleVictim
+
+  - name: TestLifecycleBrokenVersion    # ORDER MATTERS for B-007
+    enabled: false
+    path: ./plugins_test/TestLifecycleBrokenVersion
+
+  - name: TestLifecycleSentinel         # MUST be after BrokenVersion
+    enabled: false
+    path: ./plugins_test/TestLifecycleSentinel
+
   - name: CLI
     enabled: true
     path: ./plugins_test/CLI

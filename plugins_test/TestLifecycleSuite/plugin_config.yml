@@ -1,0 +1,24 @@
+description: Phase 4 suite — load/enable/disable/reload + B-007/B-004/B-005/B-006/B-008/B-009/B-010/B-016/B-037/B-043
+version: 0.1.0
+remote: False
+arguments:
+endpoints:
+  - internal_name: run
+    access_name: run
+    tags:
+    remote: False
+    accessible_by_other_plugins: True
+    description: Run the lifecycle-suite cases and return a structured suite result dict
+    arguments:
+      - name: category
+        description: 'basic | edge | null (both)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged 'slow'
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

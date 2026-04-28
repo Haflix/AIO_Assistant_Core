@@ -105,7 +105,12 @@ async def run_tests() -> int:
             "run_all",
             args={
                 # Phases built so far; later phases extend this list.
-                "suites": ["TestExecuteSuite", "TestStreamSuite", "TestNotifierSuite"],
+                "suites": [
+                    "TestExecuteSuite",
+                    "TestStreamSuite",
+                    "TestNotifierSuite",
+                    "TestLifecycleSuite",
+                ],
                 "category": None,        # both basic and edge
                 "host": "local",         # no peer node available
                 "dump_path": DUMP_PATH,
