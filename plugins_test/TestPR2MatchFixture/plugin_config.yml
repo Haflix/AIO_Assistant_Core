@@ -1,0 +1,11 @@
+description: PR2 test fixture — access_name field equals dict key (no warning expected)
+version: 0.1.0
+remote: false
+arguments:
+endpoints:
+  ping:
+    internal_name: ping
+    access_name: ping
+    remote: false
+    accessible_by_other_plugins: true
+    description: access_name field intentionally matches key

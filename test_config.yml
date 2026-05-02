@@ -87,6 +87,33 @@ plugins:
     enabled: false
     path: ./plugins_test/TestRemoteSpoofer
 
+  # PR2 config-restructure regression suite (Phase PR2.1)
+  - name: TestPR2Suite
+    enabled: true
+    path: ./plugins_test/TestPR2Suite
+
+  # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
+  # enabled:false so they don't auto-start at test framework boot.
+  - name: TestPR2Fixture
+    enabled: false
+    path: ./plugins_test/TestPR2Fixture
+
+  - name: TestPR2ListFixture
+    enabled: false
+    path: ./plugins_test/TestPR2ListFixture
+
+  - name: TestPR2NullEpFixture
+    enabled: false
+    path: ./plugins_test/TestPR2NullEpFixture
+
+  - name: TestPR2MismatchFixture
+    enabled: false
+    path: ./plugins_test/TestPR2MismatchFixture
+
+  - name: TestPR2MatchFixture
+    enabled: false
+    path: ./plugins_test/TestPR2MatchFixture
+
 
 general:
     hostname: ""                      # Empty = use system hostname

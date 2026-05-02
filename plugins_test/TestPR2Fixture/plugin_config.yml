@@ -1,0 +1,9 @@
+description: PR2 test fixture — dict-form endpoints, no internal_name, no access_name field
+version: 0.1.0
+remote: false
+arguments:
+endpoints:
+  ping:
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns pong
