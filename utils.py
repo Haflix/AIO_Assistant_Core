@@ -12,6 +12,7 @@ import queue
 import socket
 import sys
 import threading
+import warnings
 from logging import Logger, StreamHandler, DEBUG
 from uuid import uuid4
 import time
@@ -24,6 +25,7 @@ from colorama import Fore, Style
 
 class _Mute:
     """Sentinel for fully-muted threshold; never compares >= record.levelno."""
+
     __slots__ = ()
 
     def __repr__(self):
@@ -54,7 +56,8 @@ def _parse_level(value, *, ctx_logger=None, ctx_label: str = ""):
         if ctx_logger:
             ctx_logger.warning(
                 "Invalid logger level type for %s: %r (expected str). Skipped.",
-                ctx_label or "<entry>", value,
+                ctx_label or "<entry>",
+                value,
             )
         return None
     upper = value.strip().upper()
@@ -63,7 +66,9 @@ def _parse_level(value, *, ctx_logger=None, ctx_label: str = ""):
     if ctx_logger:
         ctx_logger.warning(
             "Invalid logger level for %s: %r. Allowed: %s. Skipped.",
-            ctx_label or "<entry>", value, ", ".join(_LEVEL_NAMES.keys()),
+            ctx_label or "<entry>",
+            value,
+            ", ".join(_LEVEL_NAMES.keys()),
         )
     return None
 
@@ -525,7 +530,9 @@ class _EarlyDropFilter(logging.Filter):
     preserves perf parity with the old `propagate = False` shortcut.
     """
 
-    def __init__(self, console_filter: _PerLoggerLevelFilter, file_filter: _PerLoggerLevelFilter):
+    def __init__(
+        self, console_filter: _PerLoggerLevelFilter, file_filter: _PerLoggerLevelFilter
+    ):
         super().__init__()
         self._console = console_filter
         self._file = file_filter
@@ -696,7 +703,9 @@ class LogUtil(logging.Logger):
         return root_logger
 
     @staticmethod
-    def _get_filters() -> tuple[Optional[_PerLoggerLevelFilter], Optional[_PerLoggerLevelFilter]]:
+    def _get_filters() -> (
+        tuple[Optional[_PerLoggerLevelFilter], Optional[_PerLoggerLevelFilter]]
+    ):
         root = logging.getLogger()
         return (
             getattr(root, "_console_level_filter", None),
@@ -739,7 +748,9 @@ class LogUtil(logging.Logger):
         file_cfg: dict = {}
         for key, value in mapping.items():
             if not isinstance(key, str) or not key.strip():
-                root.warning("Invalid logger_levels key %r (empty or non-string). Skipped.", key)
+                root.warning(
+                    "Invalid logger_levels key %r (empty or non-string). Skipped.", key
+                )
                 continue
             prefix = key.strip()
             if "*" in prefix or "?" in prefix:
@@ -793,7 +804,9 @@ class LogUtil(logging.Logger):
         prefix = name.strip()
 
         if console is not None:
-            parsed = _parse_level(console, ctx_logger=root, ctx_label=f"{prefix}.console")
+            parsed = _parse_level(
+                console, ctx_logger=root, ctx_label=f"{prefix}.console"
+            )
             if parsed is not None:
                 console_filter.set_plugin(prefix, parsed, owner)
         if file is not None:
@@ -856,16 +869,20 @@ class LogUtil(logging.Logger):
         def _effective(snap_entry):
             if snap_entry is None:
                 return None
-            return snap_entry["plugin"] if snap_entry["plugin"] is not None else snap_entry["config"]
+            return (
+                snap_entry["plugin"]
+                if snap_entry["plugin"] is not None
+                else snap_entry["config"]
+            )
 
         result: dict = {}
         for prefix in sorted(all_prefixes):
             c = console_snap.get(prefix)
             f = file_snap.get(prefix)
             seen: dict = {}
-            for o in (c["owners"] if c else []):
+            for o in c["owners"] if c else []:
                 seen[o] = None
-            for o in (f["owners"] if f else []):
+            for o in f["owners"] if f else []:
                 seen[o] = None
             owners = list(seen.keys())
             result[prefix] = {
@@ -1103,7 +1120,10 @@ class Plugin(ABC):
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1116,7 +1136,8 @@ class Plugin(ABC):
             method: Method name to call on the plugin.
             args: Arguments to pass (tuple, dict, or None).
             plugin_uuid: Optional UUID to target a specific plugin instance.
-            host: Where to run: "any", "remote", "local", or a hostname.
+            hosts: Where to run — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
             author: Caller identifier (default "system").
             author_id: Caller ID (default "system").
             timeout: Optional timeout in seconds.
@@ -1129,7 +1150,8 @@ class Plugin(ABC):
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1142,7 +1164,10 @@ class Plugin(ABC):
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1155,7 +1180,8 @@ class Plugin(ABC):
             method: Method name to call on the plugin.
             args: Arguments to pass (tuple, dict, or None).
             plugin_uuid: Optional UUID to target a specific plugin instance.
-            host: Where to run: "any", "remote", "local", or a hostname.
+            hosts: Where to run — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
             author: Caller identifier (default "system").
             author_id: Caller ID (default "system").
             timeout: Optional timeout in seconds.
@@ -1168,7 +1194,8 @@ class Plugin(ABC):
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1181,7 +1208,10 @@ class Plugin(ABC):
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1194,7 +1224,8 @@ class Plugin(ABC):
             method: Method name to call on the plugin.
             args: Arguments to pass (tuple, dict, or None).
             plugin_uuid: Optional UUID to target a specific plugin instance.
-            host: Where to run: "any", "remote", "local", or a hostname.
+            hosts: Where to run — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
             author: Caller identifier (default "system").
             author_id: Caller ID (default "system").
             timeout: Optional timeout in seconds.
@@ -1207,7 +1238,8 @@ class Plugin(ABC):
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1221,7 +1253,10 @@ class Plugin(ABC):
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1234,7 +1269,8 @@ class Plugin(ABC):
             method: Method name to call on the plugin.
             args: Arguments to pass (tuple, dict, or None).
             plugin_uuid: Optional UUID to target a specific plugin instance.
-            host: Where to run: "any", "remote", "local", or a hostname.
+            hosts: Where to run — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
             author: Caller identifier (default "system").
             author_id: Caller ID (default "system").
             timeout: Optional timeout in seconds.
@@ -1247,7 +1283,8 @@ class Plugin(ABC):
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1255,13 +1292,16 @@ class Plugin(ABC):
             yield i
 
     # ── Notifier: fire-and-forget (one-to-many) ──────────────────────────
+    # NOTE: All notifier methods on Plugin are deprecated pending the
+    # notifier rework. See notes.txt for the redesign plan.
 
     @async_log_errors
     async def notify(
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
     ) -> int:
         """
         Publish to a topic (fire-and-forget). All subscribers are called
@@ -1270,15 +1310,26 @@ class Plugin(ABC):
         Args:
             topic: Topic string (e.g. "ai/chat", "sensor/bathroom/temperature").
             args: Arguments forwarded to every subscriber.
-            host: Where to dispatch: "any", "local", "remote", or a hostname.
+            hosts: Where to dispatch — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
 
         Returns:
             Number of subscribers that were called.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
+        warnings.warn(
+            "Plugin.notify() uses the legacy notifier subsystem which is "
+            "being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._plugin_core.notify(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
         )
@@ -1288,13 +1339,25 @@ class Plugin(ABC):
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
     ) -> int:
-        """Synchronous variant of notify()."""
+        """Synchronous variant of notify().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "Plugin.notify_sync() uses the legacy notifier subsystem which "
+            "is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._plugin_core.notify_sync(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
         )
@@ -1306,26 +1369,38 @@ class Plugin(ABC):
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
         Request a topic — the first matching handler is called and its
-        result returned. Same discovery logic as execute() with host="any".
+        result returned. Same discovery logic as execute() with hosts="any".
 
         Args:
             topic: Topic string to request.
             args: Arguments forwarded to the handler.
-            host: Where to search: "any", "local", "remote", or a hostname.
+            hosts: Where to search — "any", "local", "remote", a hostname, or a list of hostnames.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
             timeout: Optional timeout in seconds.
 
         Returns:
             The result from the handler.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
+        warnings.warn(
+            "Plugin.request_topic() uses the legacy notifier subsystem which "
+            "is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._plugin_core.request_topic(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1336,14 +1411,26 @@ class Plugin(ABC):
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
     ) -> Any:
-        """Synchronous variant of request_topic()."""
+        """Synchronous variant of request_topic().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "Plugin.request_topic_sync() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._plugin_core.request_topic_sync(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1353,7 +1440,8 @@ class Plugin(ABC):
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """
@@ -1361,11 +1449,21 @@ class Plugin(ABC):
 
         Yields:
             Each value yielded by the handler.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
+        warnings.warn(
+            "Plugin.request_topic_stream() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         async for i in self._plugin_core.request_topic_stream(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1376,14 +1474,26 @@ class Plugin(ABC):
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
     ) -> Any:
-        """Synchronous streaming variant of request_topic()."""
+        """Synchronous streaming variant of request_topic().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "Plugin.request_topic_stream_sync() uses the legacy notifier "
+            "subsystem which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         for i in self._plugin_core.request_topic_stream_sync(
             topic,
             args,
-            host,
+            hosts,
+            blocked_hosts,
             self.plugin_name,
             self.plugin_uuid,
             timeout,
@@ -1402,7 +1512,18 @@ class Plugin(ABC):
 
         Returns:
             Subscription ID (use with unsubscribe() to remove).
+
+        .. deprecated::
+            handler= will be removed in the rework — subscriptions will
+            require declaring an endpoint and subscribing it by access_name.
+            See notes.txt.
         """
+        warnings.warn(
+            "Plugin.subscribe() uses the legacy notifier subsystem which is "
+            "being redesigned (handler= will be removed). See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._plugin_core.subscribe(
             topic,
             self.plugin_name,
@@ -1416,7 +1537,16 @@ class Plugin(ABC):
 
         Returns:
             True if the subscription was found and removed.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
+        warnings.warn(
+            "Plugin.unsubscribe() uses the legacy notifier subsystem which "
+            "is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._plugin_core.unsubscribe(subscription_id)
 
     @log_errors
@@ -1448,7 +1578,10 @@ class Request:
         method: str,
         args: tuple = None,
         plugin_uuid: Optional[str] = "",
-        target_host: str = "any",
+        target_hosts: Union[
+            str, list
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1462,7 +1595,8 @@ class Request:
         self.target_plugin = plugin
         self.target_method = method
         self.target_plugin_uuid = plugin_uuid
-        self.target_host = target_host
+        self.target_hosts = target_hosts
+        self.blocked_hosts = blocked_hosts
         self.args = args
         self.collected = False
         self.timeout = False
@@ -1554,7 +1688,10 @@ class GeneratorRequest:
         method: str,
         args: tuple = None,
         plugin_uuid: Optional[str] = "",
-        target_host: str = "any",
+        target_hosts: Union[
+            str, list
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1568,7 +1705,8 @@ class GeneratorRequest:
         self.target_plugin = plugin
         self.target_method = method
         self.target_plugin_uuid = plugin_uuid
-        self.target_host = target_host
+        self.target_hosts = target_hosts
+        self.blocked_hosts = blocked_hosts
         self.args = args
         self.collected = False
         self.timeout = False

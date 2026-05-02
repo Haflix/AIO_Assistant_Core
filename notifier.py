@@ -6,7 +6,7 @@ Provides two communication patterns for decoupling plugin-to-plugin calls:
     are called concurrently, errors are logged but do not propagate.
   - Request-by-topic (one-to-one, with response): request a topic, the first
     matching handler is called and its result returned (same discovery logic as
-    PluginCore.execute with host="any").
+    PluginCore.execute with hosts="any").
 
 Topics use "/" as separator (e.g. "ai/chat", "sensor/bathroom/temperature").
 Single-level wildcard "*" is supported: "sensor/*/temperature" matches

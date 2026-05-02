@@ -2038,7 +2038,7 @@ class DashboardApp(App):
     async def _execute_toggle(self, entry: Dict[str, str], state: bool) -> None:
         try:
             await self._run_on_main(self.plugin_instance.execute(
-                entry["plugin"], entry["endpoint"], {"state": state}, host="any"
+                entry["plugin"], entry["endpoint"], {"state": state}, hosts="any"
             ))
         except Exception as e:
             logging.getLogger().error(f"Toggle error: {e}")
@@ -2097,7 +2097,7 @@ class DashboardApp(App):
         # Execute
         try:
             result = await self._run_on_main(self.plugin_instance.execute(
-                plugin_name, access_name, args, host="any"
+                plugin_name, access_name, args, hosts="any"
             ))
             try:
                 rl = self.query_one(f"#{result_id}", RichLog)
@@ -2119,7 +2119,7 @@ class DashboardApp(App):
     @work(thread=False)
     async def _handle_menu_action(self, btn_id: str, entry: Dict[str, str]) -> None:
         try:
-            await self._run_on_main(self.plugin_instance.execute(entry["plugin"], entry["endpoint"], host="any"))
+            await self._run_on_main(self.plugin_instance.execute(entry["plugin"], entry["endpoint"], hosts="any"))
         except Exception as e:
             logging.getLogger().error(f"Menu action error: {e}")
 
@@ -2131,7 +2131,7 @@ class DashboardApp(App):
             val = self.query_one(f"#{inp_id}", Input).value.strip()
             args = {"input": val} if val else None
             result = await self._run_on_main(self.plugin_instance.execute(
-                entry["plugin"], entry["endpoint"], args, host="any"
+                entry["plugin"], entry["endpoint"], args, hosts="any"
             ))
             try:
                 self.query_one(f"#{res_id}", Static).update(f"[green]{escape(str(result))}[/green]")

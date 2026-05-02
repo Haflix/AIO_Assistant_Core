@@ -192,15 +192,15 @@ Within each suite, basic cases are listed first, edge cases follow in a separate
 
 Each case declares a `hosts: List[str]` (default `["local"]`). The recorder expands a case at execution time into N sub-cases, one per host:
 
-- `hosts=["local"]` (default) — case body invoked once with `host="local"`. Sub-case ID = base ID (no suffix).
+- `hosts=["local"]` (default) — case body invoked once with `hosts="local"`. Sub-case ID = base ID (no suffix).
 - `hosts=["local", "remote"]` — case body invoked twice. Sub-cases get suffixes: `<id>.local` and `<id>.remote`.
-- `hosts=["remote"]` — case body invoked once with `host="remote"`. Sub-case ID = `<id>.remote`.
+- `hosts=["remote"]` — case body invoked once with `hosts="remote"`. Sub-case ID = `<id>.remote`.
 - Specific hostname (e.g. `"test-subnode"`) is also valid.
 
 **Case body API:** the recorder passes the chosen `host` value into the case context (`c.host`). Test code uses `c.host` when constructing calls:
 ```python
 with rec.case("notif.notify.exact_one_sub", hosts=["local", "remote"]) as c:
-    count = await self.notify("test/greet", "World", host=c.host)
+    count = await self.notify("test/greet", "World", hosts=c.host)
     c.expect(count, 1)
 ```
 
@@ -208,7 +208,7 @@ with rec.case("notif.notify.exact_one_sub", hosts=["local", "remote"]) as c:
 
 **When a case can't matrix-expand cleanly:**
 - Different fixture setup per host (e.g. local-side vs subnode-side sub registration) → keep as separate single-host case
-- Assertion depends on host (e.g. "calling host='remote' with no peer raises X") → keep as `hosts=["remote"]` only
+- Assertion depends on host (e.g. "calling hosts='remote' with no peer raises X") → keep as `hosts=["remote"]` only
 - Mechanism is intrinsically local (B-002 producer task identity, B-006 running_loop, multi-instance uuid handling, sync chain, lifecycle private-API) → `hosts=["local"]`
 - Mechanism is intrinsically remote/wire (B-024 chunk corruption, B-025 partial yield, B-018 spoofing) → `hosts=["remote"]`
 
@@ -548,8 +548,8 @@ These are boundary-condition / unusual-input variants. All `category="edge"`. Fa
 | `notif.basic.local_count_correct` | count returned == actual local subs that fired (sanity for non-remote path; NOT B-019) | — | basic |
 | `notif.sync.notify_sync` | from sync context | — | sync |
 | `notif.sync.request_topic_sync` | from sync context | — | sync |
-| `notif.sync.request_topic_stream_sync_no_remote` | host="any" no local sub → currently raises | B-014 | bug_repro |
-| `notif.sync.request_topic_stream_sync_host_remote_routes_local` | host="remote" silently routes local; SKIP if no peer (Phase 5) | B-033 | bug_repro, requires_remote |
+| `notif.sync.request_topic_stream_sync_no_remote` | hosts="any" no local sub → currently raises | B-014 | bug_repro |
+| `notif.sync.request_topic_stream_sync_host_remote_routes_local` | hosts="remote" silently routes local; SKIP if no peer (Phase 5) | B-033 | bug_repro, requires_remote |
 | `notif.B-039.sync_chain_via_topic_hop` | suite calls `core.execute_sync("TestNotifierTarget", "trigger_topic_hop")`; trigger calls `self.request_topic_sync("topic/hop", ...)` → topic_hop_observer fires → reads `_sync_call_chain.chain` on entry → stores in `target.observed_chain`; suite reads back via `execute("TestNotifierTarget", "get_observed_chain")` and asserts the chain is empty → `c.set_marker("chain_was_empty")`; expected_status=fail, signature marker="chain_was_empty" | B-039 | bug_repro |
 
 (All cases above are `category="basic"`.)
@@ -562,7 +562,7 @@ These are boundary-condition / unusual-input variants. All `category="edge"`. Fa
 | `notif.contract.find_all_exact_before_wildcard` | exact subs returned before wildcard subs in `find_all` order (lock current behavior) | — | priority, contract |
 | `notif.contract.find_first_code_driven_registration_order` | two code-driven subs same topic; first registered wins | — | priority, contract |
 | `notif.contract.self_publish_self_delivers` | plugin notifies a topic it has subscribed to; handler fires (no `plugin_uuid != publisher` filter today; lock that) | — | self_publish, contract |
-| `notif.contract.notify_disabled_networking_no_remote_attempt` | `networking_enabled=False` → notify host="any" doesn't iterate `network.nodes` | — | networking, contract |
+| `notif.contract.notify_disabled_networking_no_remote_attempt` | `networking_enabled=False` → notify hosts="any" doesn't iterate `network.nodes` | — | networking, contract |
 | `notif.plugin_api.subscribe_unsubscribe_via_plugin_helpers` | `Plugin.subscribe(...)` returns sub_id; `Plugin.unsubscribe(sub_id)` removes it; verify via notify | — | api, contract |
 | `notif.plugin_api.notify_returns_int_through_plugin_wrapper` | `Plugin.notify(...)` returns the int from PluginCore.notify (decorator doesn't swallow) | — | api, contract |
 
@@ -744,7 +744,7 @@ networking:
   port: 2510
 ```
 
-Subnode port chosen by suite at runtime (e.g. `2511`) and passed via `--port`. Suite reads `ready_file` to confirm subnode is up, then issues remote calls via `host="test-subnode"`.
+Subnode port chosen by suite at runtime (e.g. `2511`) and passed via `--port`. Suite reads `ready_file` to confirm subnode is up, then issues remote calls via `hosts="test-subnode"`.
 
 #### 6.5.3 Subprocess lifecycle
 
@@ -790,7 +790,7 @@ If networking uses a shared secret or TLS material, the subnode must read the sa
 - `r_topic_local_only` ← `test/r/local` (config-driven, remote=False)
 
 **TestRemoteSpoofer endpoints (peer-side only):**
-- `spoof_notify(topic, args, author, author_id)` — uses `self._plugin_core.network.notify_remote(IP, topic, args, author, author_id)` directly to inject arbitrary author/author_id values. Suite calls into it via legitimate `execute(..., host="test-subnode")` to TRIGGER the spoof, which then originates from the peer back to the local node. Hard-guard: if `not self._plugin_core.networking_enabled or self._plugin_core.network is None`, skip cleanly.
+- `spoof_notify(topic, args, author, author_id)` — uses `self._plugin_core.network.notify_remote(IP, topic, args, author, author_id)` directly to inject arbitrary author/author_id values. Suite calls into it via legitimate `execute(..., hosts="test-subnode")` to TRIGGER the spoof, which then originates from the peer back to the local node. Hard-guard: if `not self._plugin_core.networking_enabled or self._plugin_core.network is None`, skip cleanly.
 
 #### 6.5.6 Test cases (~22)
 
@@ -805,7 +805,7 @@ All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Gen
 | `remote.B-042.code_driven_stream_bypass` | code-driven async-gen sub on `remote=False` plugin IS iterated by remote `request_topic_stream`; readback via counter; expected_status=fail, marker="bypass_succeeded". Companion to B-001 for the streaming path. | B-042 | bug_repro, security |
 | `remote.B-018.spoof_system_string` | TestRemoteSpoofer issues notify_remote with author="system"; expected_status=fail, marker="bypass_succeeded" | B-018 | bug_repro, security |
 | `remote.B-018.spoof_known_uuid` | same with `author_id=<known local uuid>`; suite passes uuid via args | B-018 | bug_repro, security |
-| `remote.B-019.notify_count_per_node_not_per_sub` | peer subscribes 3 handlers to `test/r/multi`; from local, `count = await core.notify("test/r/multi", host="remote")`; assert `count == 3`; today gives 1 per remote node; expected_status=fail, marker="count_was_node_not_subs" | B-019 | bug_repro |
+| `remote.B-019.notify_count_per_node_not_per_sub` | peer subscribes 3 handlers to `test/r/multi`; from local, `count = await core.notify("test/r/multi", hosts="remote")`; assert `count == 3`; today gives 1 per remote node; expected_status=fail, marker="count_was_node_not_subs" | B-019 | bug_repro |
 | `remote.B-021.first_sub_not_remote_eligible` | local has two subs: first remote=False, second remote=True; remote request → assert RequestException; expected_status=fail, exception_type=RequestException, message_regex="No handler" | B-021 | bug_repro |
 | `remote.B-024.huge_item` | server yields 101 MB item; expected_status=fail, marker="stream_aborted" | B-024 | bug_repro, slow |
 | `remote.B-025.partial_then_failover` | A yields 5 then raises, B yields 3; assert N>5 items received; expected_status=fail, marker="duplicate_items_silently_appended" | B-025 | bug_repro |
@@ -816,7 +816,7 @@ All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Gen
 | `remote.B-030.unpicklable_args` | local fires, remote silently misses; expected_status=fail, marker="state_diverged" | B-030 | bug_repro |
 | `remote.B-027.notify_return_count_misleading` | remote returns 0 from transport fail; assert PluginCore counted as +1; expected_status=fail, marker="counted_as_success" | B-027 | bug_repro |
 | `remote.B-032.head_of_line_blocking` | slow sub blocks fast call on same connection; expected_status=fail, marker="fast_call_blocked" | B-032 | bug_repro, slow |
-| `remote.B-033.request_topic_stream_sync_host_remote` | host="remote" silently routes local | B-033 | bug_repro |
+| `remote.B-033.request_topic_stream_sync_host_remote` | hosts="remote" silently routes local | B-033 | bug_repro |
 | `remote.B-020.notify_sync_blocks_on_remote` | notify_sync from sync context with slow remote sub; assert calling thread blocked; expected_status=fail, marker="thread_blocked" | B-020 | bug_repro |
 | `remote.find_endpoints_by_tag` | tag discovery cross-node returns peer endpoints | — | discovery, basic |
 
@@ -967,7 +967,7 @@ class _CaseContext:
                  category="basic", hosts=("local",),
                  expected_status="pass", expected_signature=None,
                  hard_timeout_s=30.0, destructive=False,
-                 host="local"):
+                 hosts="local"):
         self.recorder = recorder
         self.id = id
         self.tags = list(tags)

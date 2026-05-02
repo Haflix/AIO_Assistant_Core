@@ -126,19 +126,19 @@ class TestNotifierSuite(Plugin):
 
     async def _basic_notify(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_no_subs(c):
-            count = await self.notify("test/no/subs", host=c.host)
+            count = await self.notify("test/no/subs", hosts=c.hosts)
             c.expect(count, 0)
 
         async def body_exact_one_sub(c):
             await self.execute(TARGET, "reset_event_log")
-            count = await self.notify("test/greet", {"name": "X"}, host=c.host)
+            count = await self.notify("test/greet", {"name": "X"}, hosts=c.hosts)
             c.expect(count, 1)
             log = await self.execute(TARGET, "get_event_log")
             assert ("greet", "X") in log
 
         async def body_wildcard_match(c):
             await self.execute(TARGET, "reset_event_log")
-            count = await self.notify("test/wild/x", host=c.host)
+            count = await self.notify("test/wild/x", hosts=c.hosts)
             c.expect(count, 1)
             log = await self.execute(TARGET, "get_event_log")
             assert any(e[0] == "wild_a" for e in log)
@@ -146,7 +146,7 @@ class TestNotifierSuite(Plugin):
         async def body_multiple_subs_via_two_wildcards(c):
             await self.execute(TARGET, "reset_event_log")
             # "test/wild/end" matches BOTH "test/wild/*" and "test/*/end"
-            count = await self.notify("test/wild/end", host=c.host)
+            count = await self.notify("test/wild/end", hosts=c.hosts)
             c.expect(count, 2)
             log = await self.execute(TARGET, "get_event_log")
             tags = {e[0] for e in log}
@@ -155,7 +155,7 @@ class TestNotifierSuite(Plugin):
         async def body_exact_and_wildcard(c):
             await self.execute(TARGET, "reset_event_log")
             # "test/greet" hits the exact greet; the wildcards do not match.
-            count = await self.notify("test/greet", {"name": "Y"}, host=c.host)
+            count = await self.notify("test/greet", {"name": "Y"}, hosts=c.hosts)
             c.expect(count, 1)
 
         await rec.run_case(
@@ -185,21 +185,21 @@ class TestNotifierSuite(Plugin):
 
     async def _basic_wildcard_edges(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_empty_segment(c):
-            count = await self.notify("", host=c.host)
+            count = await self.notify("", hosts=c.hosts)
             c.expect(count, 0)
 
         async def body_leading_slash(c):
-            count = await self.notify("/test/x", host=c.host)
+            count = await self.notify("/test/x", hosts=c.hosts)
             c.expect(count, 0)
 
         async def body_double_slash(c):
-            count = await self.notify("test//x", host=c.host)
+            count = await self.notify("test//x", hosts=c.hosts)
             c.expect(count, 0)
 
         async def body_mid_segment(c):
             # "test/wi*ld" — literal segment, NOT a wildcard pattern (suite
             # subscribed to "test/wild/*" at config time)
-            count = await self.notify("test/wi*ld", host=c.host)
+            count = await self.notify("test/wi*ld", hosts=c.hosts)
             c.expect(count, 0)
 
         await rec.run_case(
@@ -226,13 +226,13 @@ class TestNotifierSuite(Plugin):
     async def _basic_request_topic(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_basic(c):
             r = await self.request_topic(
-                "test/math/add", {"a": 3, "b": 4}, host=c.host,
+                "test/math/add", {"a": 3, "b": 4}, hosts=c.hosts,
             )
             c.expect(r, 7)
 
         async def body_no_sub(c):
             c.expect_exception(RequestException, match=r"[Nn]o handler")
-            await self.request_topic("test/no/handler", host=c.host)
+            await self.request_topic("test/no/handler", hosts=c.hosts)
 
         async def body_priority_config_first(c):
             # Suite registers a code-driven sub on "test/priority"; the target
@@ -246,7 +246,7 @@ class TestNotifierSuite(Plugin):
                 handler=lambda *a, **kw_: "code-priority",
             )
             try:
-                r = await self.request_topic("test/priority", host=c.host)
+                r = await self.request_topic("test/priority", hosts=c.hosts)
                 c.expect(r, "code-priority")
             finally:
                 await self._plugin_core.unsubscribe(sub_id)
@@ -275,7 +275,7 @@ class TestNotifierSuite(Plugin):
         async def body_stream_basic(c):
             items = []
             async for chunk in self.request_topic_stream(
-                "test/stream", {"n": 3}, host=c.host,
+                "test/stream", {"n": 3}, hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, ["async_0", "async_1", "async_2"])
@@ -283,7 +283,7 @@ class TestNotifierSuite(Plugin):
         async def body_stream_sync_gen(c):
             items = []
             async for chunk in self.request_topic_stream(
-                "test/sync_stream", {"n": 3}, host=c.host,
+                "test/sync_stream", {"n": 3}, hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, ["sync_0", "sync_1", "sync_2"])
@@ -304,7 +304,7 @@ class TestNotifierSuite(Plugin):
     async def _basic_code_driven(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_code_driven_fires(c):
             await self.execute(TARGET, "reset_event_log")
-            count = await self.notify("test/count", {"x": 1}, host=c.host)
+            count = await self.notify("test/count", {"x": 1}, hosts=c.hosts)
             c.expect(count, 1)
             n = await self.execute(TARGET, "get_count")
             c.expect(n, 1)
@@ -344,10 +344,10 @@ class TestNotifierSuite(Plugin):
                 "test/dup", self.plugin_name, self.plugin_uuid, handler=h,
             )
             try:
-                # host="local" so a peer node (if networking is enabled)
+                # hosts="local" so a peer node (if networking is enabled)
                 # doesn't add +1 per remote dispatch and break the count
                 # assertion. The test's intent is local fan-out only.
-                count = await self.notify("test/dup", host="local")
+                count = await self.notify("test/dup", hosts="local")
                 c.expect(count, 2)
                 c.expect(counter["n"], 2)
             finally:
@@ -456,7 +456,7 @@ class TestNotifierSuite(Plugin):
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
-            r = await self.notify("test/no/subs", host=c.host)
+            r = await self.notify("test/no/subs", hosts=c.hosts)
             if not isinstance(r, int):
                 raise AssertionError(
                     f"notify did not return int; got {type(r).__name__}: {r!r}"
@@ -478,7 +478,7 @@ class TestNotifierSuite(Plugin):
             # Notify with the suite's own author_id (Plugin.notify default).
             await self.execute(TARGET, "reset_event_log")
             count = await self.notify(
-                "test/priv", {"data": "from_other"}, host=c.host,
+                "test/priv", {"data": "from_other"}, hosts=c.hosts,
             )
             log = await self.execute(TARGET, "get_event_log")
             priv_calls = [e for e in log if e[0] == "priv"]
@@ -547,9 +547,9 @@ class TestNotifierSuite(Plugin):
     ) -> None:
         async def body(c):
             await self.execute(TARGET, "reset_event_log")
-            # host="local" so a peer node (if networking is enabled)
+            # hosts="local" so a peer node (if networking is enabled)
             # doesn't add +1 per remote dispatch and inflate the count.
-            count = await self.notify("test/wild/end", host="local")
+            count = await self.notify("test/wild/end", hosts="local")
             c.expect(count, 2)
             log = await self.execute(TARGET, "get_event_log")
             relevant = [e for e in log if e[0] in ("wild_a", "wild_b")]
@@ -611,7 +611,7 @@ class TestNotifierSuite(Plugin):
         async def body_host_remote_routes_local(c):
             c.skip(
                 "Phase 5 subprocess not up; B-033 verification requires a peer "
-                "node so we can prove the host='remote' arg is silently ignored"
+                "node so we can prove the hosts='remote' arg is silently ignored"
             )
 
         await rec.run_case(
@@ -696,7 +696,7 @@ class TestNotifierSuite(Plugin):
                 # Topic "tie/a/x" matches BOTH wildcards. find_first picks
                 # by registration order — sid_a registered first → "A".
                 results.clear()
-                r1 = await self.request_topic("tie/a/x", host="local")
+                r1 = await self.request_topic("tie/a/x", hosts="local")
                 initial_winner = r1
 
                 # "Reload" = unsubscribe + resubscribe sid_a. After this,
@@ -708,7 +708,7 @@ class TestNotifierSuite(Plugin):
                 )
 
                 results.clear()
-                r2 = await self.request_topic("tie/a/x", host="local")
+                r2 = await self.request_topic("tie/a/x", hosts="local")
                 after_winner = r2
 
                 if initial_winner != after_winner:
@@ -771,7 +771,7 @@ class TestNotifierSuite(Plugin):
             sub.plugin_uuid = target.plugin_uuid
 
             try:
-                await self.notify("test/b003_strict", host="local")
+                await self.notify("test/b003_strict", hosts="local")
                 count_before = counter["n"]
 
                 await self._plugin_core._disable_plugin(TARGET)
@@ -780,7 +780,7 @@ class TestNotifierSuite(Plugin):
                     # handler is still in the registry and notify will fire
                     # it. If B-003 is FIXED (registry cleared on disable),
                     # the handler is gone and counter stays.
-                    await self.notify("test/b003_strict", host="local")
+                    await self.notify("test/b003_strict", hosts="local")
                     count_after = counter["n"]
                     if count_after > count_before:
                         c.set_marker("disabled_handler_fired")
@@ -1081,10 +1081,10 @@ class TestNotifierSuite(Plugin):
 
         async def body_networking_disabled_no_remote_attempt(c):
             # networking_enabled is False in test_config.yml; notify with
-            # host="any" should not iterate self.network.nodes (which doesn't
+            # hosts="any" should not iterate self.network.nodes (which doesn't
             # even exist when networking off). A clean execution with no
             # exception is the assertion.
-            await self.notify("test/greet", {"name": "ND"}, host="any")
+            await self.notify("test/greet", {"name": "ND"}, hosts="any")
 
         await rec.run_case(
             "notif.contract.wildcard_does_not_cross_segments",

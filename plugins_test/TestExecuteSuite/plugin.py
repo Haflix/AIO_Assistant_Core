@@ -42,7 +42,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -98,6 +98,8 @@ class TestExecuteSuite(Plugin):
         await self._basic_arg_shapes(rec, kw)
         await self._basic_args_contract_violations(rec, kw)
         await self._basic_errors(rec, kw)
+        await self._basic_hosts_validation(rec, kw)
+        await self._basic_blocked_hosts_behavior(rec, kw)
         await self._basic_timeout(rec, kw)
         await self._basic_accessibility(rec, kw)
         await self._basic_sync(rec, kw)
@@ -150,23 +152,23 @@ class TestExecuteSuite(Plugin):
 
     async def _basic_value(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_aa_tuple(c):
-            r = await self.execute(TARGET, "ea_add", (2, 3), host=c.host)
+            r = await self.execute(TARGET, "ea_add", (2, 3), hosts=c.hosts)
             c.expect(r, 5)
 
         async def body_aa_dict(c):
-            r = await self.execute(TARGET, "ea_add", {"a": 7, "b": 8}, host=c.host)
+            r = await self.execute(TARGET, "ea_add", {"a": 7, "b": 8}, hosts=c.hosts)
             c.expect(r, 15)
 
         async def body_aa_none_for_zero_args(c):
-            r = await self.execute(TARGET, "ea_no_args", None, host=c.host)
+            r = await self.execute(TARGET, "ea_no_args", None, hosts=c.hosts)
             c.expect(r, "ok")
 
         async def body_as_tuple(c):
-            r = await self.execute(TARGET, "es_add", (4, 6), host=c.host)
+            r = await self.execute(TARGET, "es_add", (4, 6), hosts=c.hosts)
             c.expect(r, 10)
 
         async def body_as_dict(c):
-            r = await self.execute(TARGET, "es_add", {"a": 9, "b": 1}, host=c.host)
+            r = await self.execute(TARGET, "es_add", {"a": 9, "b": 1}, hosts=c.hosts)
             c.expect(r, 10)
 
         await rec.run_case(
@@ -197,22 +199,22 @@ class TestExecuteSuite(Plugin):
     async def _basic_arg_shapes(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_kwargs_only_with_dict(c):
             r = await self.execute(
-                TARGET, "ea_kwargs_only", {"name": "k", "value": 9}, host=c.host,
+                TARGET, "ea_kwargs_only", {"name": "k", "value": 9}, hosts=c.hosts,
             )
             c.expect(r, "k=9")
 
         async def body_kwargs_only_with_tuple_mismatch(c):
             c.expect_exception(RequestException)
-            await self.execute(TARGET, "ea_kwargs_only", (1, 2), host=c.host)
+            await self.execute(TARGET, "ea_kwargs_only", (1, 2), hosts=c.hosts)
 
         async def body_positional_only_with_tuple(c):
-            r = await self.execute(TARGET, "ea_positional_only", (3, 4), host=c.host)
+            r = await self.execute(TARGET, "ea_positional_only", (3, 4), hosts=c.hosts)
             c.expect(r, 7)
 
         async def body_positional_only_with_dict_mismatch(c):
             c.expect_exception(RequestException)
             await self.execute(
-                TARGET, "ea_positional_only", {"a": 1, "b": 2}, host=c.host,
+                TARGET, "ea_positional_only", {"a": 1, "b": 2}, hosts=c.hosts,
             )
 
         await rec.run_case(
@@ -242,15 +244,15 @@ class TestExecuteSuite(Plugin):
         self, rec: CaseRecorder, kw: Dict
     ) -> None:
         async def body_single_int(c):
-            r = await self.execute(TARGET, "ea_returns_arg", 42, host=c.host)
+            r = await self.execute(TARGET, "ea_returns_arg", 42, hosts=c.hosts)
             c.expect(r, 42)
 
         async def body_list(c):
-            r = await self.execute(TARGET, "ea_returns_arg", [1, 2, 3], host=c.host)
+            r = await self.execute(TARGET, "ea_returns_arg", [1, 2, 3], hosts=c.hosts)
             c.expect(r, [1, 2, 3])
 
         async def body_string(c):
-            r = await self.execute(TARGET, "ea_returns_arg", "hello", host=c.host)
+            r = await self.execute(TARGET, "ea_returns_arg", "hello", hosts=c.hosts)
             c.expect(r, "hello")
 
         # These currently PASS because the framework silently accepts non-tuple/non-dict.
@@ -275,26 +277,26 @@ class TestExecuteSuite(Plugin):
     async def _basic_errors(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_no_endpoint(c):
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
-            await self.execute(TARGET, "does_not_exist", host=c.host)
+            await self.execute(TARGET, "does_not_exist", hosts=c.hosts)
 
         async def body_no_plugin(c):
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
-            await self.execute("DoesNotExist", "ea_add", (1, 2), host=c.host)
+            await self.execute("DoesNotExist", "ea_add", (1, 2), hosts=c.hosts)
 
         async def body_endpoint_raises(c):
             c.expect_exception(RequestException, match=r"intentional")
-            await self.execute(TARGET, "ea_raises", host=c.host)
+            await self.execute(TARGET, "ea_raises", hosts=c.hosts)
 
         async def body_endpoint_raises_request_exc(c):
             c.expect_exception(RequestException, match=r"specific")
-            await self.execute(TARGET, "ea_raises_request_exc", host=c.host)
+            await self.execute(TARGET, "ea_raises_request_exc", hosts=c.hosts)
 
         async def body_returns_none(c):
-            r = await self.execute(TARGET, "ea_returns_none", host=c.host)
+            r = await self.execute(TARGET, "ea_returns_none", hosts=c.hosts)
             c.expect(r, None)
 
         async def body_returns_future(c):
-            r = await self.execute(TARGET, "ea_returns_future", host=c.host)
+            r = await self.execute(TARGET, "ea_returns_future", hosts=c.hosts)
             c.expect(r, "future_value")
 
         async def body_returns_failing_future(c):
@@ -302,7 +304,7 @@ class TestExecuteSuite(Plugin):
             # @async_handle_errors swallows; request._future stays pending; caller hangs.
             # Wrap in outer wait_for to detect.
             await c.assert_hang(
-                self.execute(TARGET, "ea_returns_failing_future", host=c.host),
+                self.execute(TARGET, "ea_returns_failing_future", hosts=c.hosts),
                 timeout_s=2.0,
                 marker="outer_wait_for_fired",
             )
@@ -341,6 +343,209 @@ class TestExecuteSuite(Plugin):
         )
 
     # ====================================================================
+    # BASIC hosts validation (rejects + normalization happy paths)
+    # ====================================================================
+
+    async def _basic_hosts_validation(self, rec: CaseRecorder, kw: Dict) -> None:
+        # ── Rejects ──
+        async def body_empty_list(c):
+            c.expect_exception(ValueError, match=r"empty list")
+            await self.execute(TARGET, "ea_no_args", hosts=[])
+
+        async def body_empty_string(c):
+            c.expect_exception(ValueError, match=r"empty string")
+            await self.execute(TARGET, "ea_no_args", hosts="")
+
+        async def body_any_in_list(c):
+            c.expect_exception(ValueError, match=r"'any'")
+            await self.execute(TARGET, "ea_no_args", hosts=["any", "nodeA"])
+
+        async def body_remote_in_list(c):
+            c.expect_exception(ValueError, match=r"'remote'")
+            await self.execute(TARGET, "ea_no_args", hosts=["remote", "nodeA"])
+
+        async def body_invalid_type(c):
+            c.expect_exception(ValueError, match=r"must be str, list")
+            await self.execute(TARGET, "ea_no_args", hosts=42)
+
+        async def body_blocked_empty_list(c):
+            c.expect_exception(ValueError, match=r"empty list")
+            await self.execute(TARGET, "ea_no_args", hosts="any", blocked_hosts=[])
+
+        async def body_blocked_remote_in_list(c):
+            c.expect_exception(ValueError, match=r"'remote'")
+            await self.execute(
+                TARGET, "ea_no_args",
+                hosts="any", blocked_hosts=["remote", "nodeA"],
+            )
+
+        # ── Happy paths (normalize + dispatch succeeds) ──
+        async def body_local_in_list(c):
+            # ["local", "nodeA"] is allowed; "nodeA" doesn't exist locally,
+            # but "local" matches → endpoint found locally.
+            r = await self.execute(
+                TARGET, "ea_no_args", hosts=["local", "nodeA"]
+            )
+            c.expect(r, "ok")
+
+        async def body_collapse_single_any(c):
+            # ["any"] should collapse to "any" string; works.
+            r = await self.execute(TARGET, "ea_no_args", hosts=["any"])
+            c.expect(r, "ok")
+
+        async def body_collapse_single_local(c):
+            r = await self.execute(TARGET, "ea_no_args", hosts=["local"])
+            c.expect(r, "ok")
+
+        async def body_dedup_duplicates(c):
+            # Duplicate keywords collapse via dedup — should NOT raise.
+            r = await self.execute(TARGET, "ea_no_args", hosts=["local", "local"])
+            c.expect(r, "ok")
+
+        async def body_dedup_hostnames_with_local(c):
+            r = await self.execute(
+                TARGET, "ea_no_args",
+                hosts=["nodeA", "nodeA", "local"],
+            )
+            c.expect(r, "ok")
+
+        # ── Register cases ──
+        await rec.run_case(
+            "exec.hosts.validate.empty_list", body_empty_list,
+            tags=("hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.validate.empty_string", body_empty_string,
+            tags=("hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.validate.any_in_list", body_any_in_list,
+            tags=("hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.validate.remote_in_list", body_remote_in_list,
+            tags=("hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.validate.invalid_type", body_invalid_type,
+            tags=("hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.validate.empty_list", body_blocked_empty_list,
+            tags=("blocked_hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.validate.remote_in_list",
+            body_blocked_remote_in_list,
+            tags=("blocked_hosts", "validation"), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.normalize.local_in_list", body_local_in_list,
+            tags=("hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.normalize.collapse_single_any", body_collapse_single_any,
+            tags=("hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.normalize.collapse_single_local",
+            body_collapse_single_local,
+            tags=("hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.normalize.dedup_duplicates", body_dedup_duplicates,
+            tags=("hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.hosts.normalize.dedup_hostnames_with_local",
+            body_dedup_hostnames_with_local,
+            tags=("hosts",), **kw,
+        )
+
+    # ====================================================================
+    # BASIC blocked_hosts behavior (excludes the right targets)
+    # ====================================================================
+
+    async def _basic_blocked_hosts_behavior(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_block_local_keyword(c):
+            # hosts="local" + blocked_hosts="local" → no candidates left.
+            c.expect_exception(RequestException, match=r"not found")
+            await self.execute(
+                TARGET, "ea_no_args",
+                hosts="local", blocked_hosts="local",
+            )
+
+        async def body_block_self_hostname(c):
+            # hosts="any" + blocked_hosts=<own hostname> → local skipped.
+            # No remote subnode hosts this target → not found.
+            own_host = self._plugin_core.hostname
+            c.expect_exception(RequestException, match=r"not found")
+            await self.execute(
+                TARGET, "ea_no_args",
+                hosts="any", blocked_hosts=own_host,
+            )
+
+        async def body_block_remote_keeps_local(c):
+            # hosts="any" + blocked_hosts="remote" → local still works.
+            r = await self.execute(
+                TARGET, "ea_no_args",
+                hosts="any", blocked_hosts="remote",
+            )
+            c.expect(r, "ok")
+
+        async def body_block_any_blocks_everything(c):
+            # blocked_hosts="any" blocks both local and remote.
+            c.expect_exception(RequestException, match=r"not found")
+            await self.execute(
+                TARGET, "ea_no_args",
+                hosts="any", blocked_hosts="any",
+            )
+
+        async def body_block_unrelated_hostname_keeps_local(c):
+            # blocked_hosts="someUnknownNode" doesn't affect local dispatch.
+            r = await self.execute(
+                TARGET, "ea_no_args",
+                hosts="any", blocked_hosts="someUnknownNode",
+            )
+            c.expect(r, "ok")
+
+        async def body_block_local_in_list(c):
+            # blocked_hosts=["local", "nodeA"] excludes local.
+            c.expect_exception(RequestException, match=r"not found")
+            await self.execute(
+                TARGET, "ea_no_args",
+                hosts="local", blocked_hosts=["local", "nodeA"],
+            )
+
+        await rec.run_case(
+            "exec.blocked_hosts.block_local_keyword", body_block_local_keyword,
+            tags=("blocked_hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.block_self_hostname", body_block_self_hostname,
+            tags=("blocked_hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.remote_keeps_local",
+            body_block_remote_keeps_local,
+            tags=("blocked_hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.any_blocks_everything",
+            body_block_any_blocks_everything,
+            tags=("blocked_hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.unrelated_hostname_keeps_local",
+            body_block_unrelated_hostname_keeps_local,
+            tags=("blocked_hosts",), **kw,
+        )
+        await rec.run_case(
+            "exec.blocked_hosts.list_form_local", body_block_local_in_list,
+            tags=("blocked_hosts",), **kw,
+        )
+
+    # ====================================================================
     # BASIC timeout
     # ====================================================================
 
@@ -350,7 +555,7 @@ class TestExecuteSuite(Plugin):
             try:
                 await self.execute(
                     TARGET, "ea_hang", {"seconds": 30.0},
-                    host=c.host, timeout=2.0,
+                    hosts=c.hosts, timeout=2.0,
                 )
                 raise AssertionError("expected RequestException from timeout")
             except RequestException:
@@ -373,13 +578,13 @@ class TestExecuteSuite(Plugin):
     async def _basic_accessibility(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_priv_from_other(c):
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
-            await self.execute(TARGET, "ea_private", {"value": 7}, host=c.host)
+            await self.execute(TARGET, "ea_private", {"value": 7}, hosts=c.hosts)
 
         async def body_priv_from_self_pinned(c):
             r = await self.execute(
                 TARGET, "ea_self_call",
                 {"target_method": "ea_private", "target_args": {"value": 7}},
-                host=c.host,
+                hosts=c.hosts,
             )
             c.expect(r, 7)
 
@@ -495,7 +700,7 @@ class TestExecuteSuite(Plugin):
     async def _basic_payload(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_large_return(c):
             r = await self.execute(
-                TARGET, "ea_large_return", {"size_bytes": 100_000}, host=c.host,
+                TARGET, "ea_large_return", {"size_bytes": 100_000}, hosts=c.hosts,
             )
             c.expect(len(r), 100_000)
             c.expect(r[0:1], b"\xab")
@@ -515,7 +720,7 @@ class TestExecuteSuite(Plugin):
                 await self.execute(
                     TARGET, "ea_chain_step",
                     {"depth": 3, "target_method": "ea_raises_request_exc"},
-                    host=c.host,
+                    hosts=c.hosts,
                 )
                 raise AssertionError("expected RequestException, got no error")
             except RequestException as e:

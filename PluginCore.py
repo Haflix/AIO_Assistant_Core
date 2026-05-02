@@ -11,6 +11,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # async and other libraries. Switch to SelectorEventLoop before any loop is created.
 if sys.platform == "win32":
     import asyncio as _asyncio
+
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 
 import contextlib
@@ -20,6 +21,7 @@ import inspect
 import asyncio
 import time
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
@@ -47,8 +49,12 @@ from notifier import TopicRegistry, Subscription
 
 
 def _deep_merge_args(
-    base: dict, override: dict, plugin_name: str, logger,
-    counters: dict, _path: str = "",
+    base: dict,
+    override: dict,
+    plugin_name: str,
+    logger,
+    counters: dict,
+    _path: str = "",
 ) -> dict:
     """Deep-merge override into a copy of base. Lists fully replaced.
     Logs each change at DEBUG (key path only — never values).
@@ -79,7 +85,9 @@ def _deep_merge_args(
             counters["added"] += 1
             logger.debug(f"Plugin '{plugin_name}': arg added '{path}'")
         elif isinstance(out[key], dict) and isinstance(ov, dict):
-            out[key] = _deep_merge_args(out[key], ov, plugin_name, logger, counters, path)
+            out[key] = _deep_merge_args(
+                out[key], ov, plugin_name, logger, counters, path
+            )
         elif type(out[key]) == type(ov) and out[key] == ov:
             # No-op: same type AND same value. Type guard prevents `True == 1`
             # (bool vs int) from being treated as no-op — that pair must reach
@@ -102,6 +110,87 @@ def _deep_merge_args(
     return out
 
 
+def _normalize_hosts(
+    value: Any,
+    *,
+    param_name: str = "hosts",
+    default: Optional[Union[str, List[str]]],
+) -> Optional[Union[str, List[str]]]:
+    """Normalize a hosts/blocked_hosts value into canonical form.
+
+    Returns canonical value (str, list, or None). Raises ValueError on
+    structural errors. Caller is responsible for passing normalized values
+    to find_endpoint and to _warn_redundant_host_combos.
+    """
+    if value is None:
+        return default
+
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"{param_name}: empty string not allowed")
+        return value
+
+    if isinstance(value, list):
+        if not value:
+            raise ValueError(f"{param_name}: empty list not allowed")
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"{param_name}: list entries must be str, "
+                    f"got {type(item).__name__}"
+                )
+            if not item.strip():
+                raise ValueError(f"{param_name}: empty string in list not allowed")
+
+        # Dedup first (preserves first-occurrence order).
+        seen = set()
+        deduped = []
+        for item in value:
+            if item not in seen:
+                seen.add(item)
+                deduped.append(item)
+
+        # Single-element list collapses to bare string.
+        if len(deduped) == 1:
+            return deduped[0]
+
+        # Keyword-in-list guard runs against the deduped list — duplicate
+        # keywords like ["remote", "remote"] collapse first and never reach
+        # this guard.
+        for keyword in ("any", "remote"):
+            if keyword in deduped:
+                raise ValueError(
+                    f"{param_name}: keyword '{keyword}' cannot appear in a "
+                    f"list with other elements (it already covers them)"
+                )
+        return deduped
+
+    raise ValueError(
+        f"{param_name}: must be str, list[str], or None, " f"got {type(value).__name__}"
+    )
+
+
+def _warn_redundant_host_combos(hosts, blocked_hosts, logger) -> None:
+    """Warn on hosts/blocked_hosts combinations that simplify to a single
+    keyword. Run AFTER both values are normalized.
+    """
+    if hosts != "any":
+        return
+    block_set = (
+        {blocked_hosts} if isinstance(blocked_hosts, str) else set(blocked_hosts or [])
+    )
+    if "local" in block_set:
+        logger.warning(
+            "hosts='any' + blocked_hosts contains 'local' — simpler form is "
+            "hosts='remote'."
+        )
+    if "remote" in block_set:
+        logger.warning(
+            "hosts='any' + blocked_hosts contains 'remote' — simpler form is "
+            "hosts='local'."
+        )
+
+
 class PluginCore:
     """Manages all plugins and facilitates communication between them."""
 
@@ -115,7 +204,9 @@ class PluginCore:
         # no logger exists yet, but load_config_yaml below will surface a
         # useful error if the YAML is genuinely broken.
         try:
-            bootstrap_cfg = ConfigUtil.quickget_config(config_path, fallback_value={}) or {}
+            bootstrap_cfg = (
+                ConfigUtil.quickget_config(config_path, fallback_value={}) or {}
+            )
         except Exception:
             bootstrap_cfg = {}
         if not isinstance(bootstrap_cfg, dict):
@@ -146,7 +237,8 @@ class PluginCore:
         # Python's default executor to prevent deadlock under load.
         # See README "Sync vs Async Plugins: Thread Pool Deadlock Risk".
         self._plugin_executor = ThreadPoolExecutor(
-            max_workers=32, thread_name_prefix="plugin",
+            max_workers=32,
+            thread_name_prefix="plugin",
         )
         self._init_tasks = []
         self._running_loop_task = None
@@ -544,7 +636,9 @@ class PluginCore:
                 "accessible_by_other_plugins",
             ]:
                 if field not in endpoint:
-                    await error_config(f"{endpoint} is missing {field} in plugin_config.yml")
+                    await error_config(
+                        f"{endpoint} is missing {field} in plugin_config.yml"
+                    )
                     return
 
             for check in [
@@ -602,9 +696,15 @@ class PluginCore:
         else:
             counters = {"added": 0, "replaced": 0, "type_mismatched": 0}
             merged_args = _deep_merge_args(
-                base_args or {}, override, name, self._logger, counters,
+                base_args or {},
+                override,
+                name,
+                self._logger,
+                counters,
             )
-            total = counters["added"] + counters["replaced"] + counters["type_mismatched"]
+            total = (
+                counters["added"] + counters["replaced"] + counters["type_mismatched"]
+            )
             if total:
                 self._logger.info(
                     f"Plugin '{name}': applied {total} override(s) "
@@ -747,10 +847,10 @@ class PluginCore:
                         if plugin_uuid:
                             if plugin_uuid in self.plugins_by_uuid:
                                 self.plugins_by_uuid.pop(plugin_uuid, None)
-                            await self.topic_registry.unsubscribe_plugin(
-                                plugin_uuid
+                            await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+                            LogUtil.clear_logger_levels_owned_by(
+                                plugin_name, plugin_uuid
                             )
-                            LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
             self._logger.info(
                 f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
             )
@@ -833,7 +933,9 @@ class PluginCore:
                 if asyncio.iscoroutinefunction(plugin.on_enable):
                     await plugin.on_enable()
                 else:
-                    await self.main_event_loop.run_in_executor(self._plugin_executor, plugin.on_enable)
+                    await self.main_event_loop.run_in_executor(
+                        self._plugin_executor, plugin.on_enable
+                    )
                 plugin.enabled = True
 
     @async_log_errors
@@ -845,7 +947,9 @@ class PluginCore:
                 if asyncio.iscoroutinefunction(plugin.on_disable):
                     await plugin.on_disable()
                 else:
-                    await self.main_event_loop.run_in_executor(self._plugin_executor, plugin.on_disable)
+                    await self.main_event_loop.run_in_executor(
+                        self._plugin_executor, plugin.on_disable
+                    )
                 plugin.enabled = False
 
     @async_handle_errors(None)
@@ -904,7 +1008,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -922,7 +1029,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -949,7 +1057,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -962,7 +1073,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -979,7 +1091,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -997,7 +1112,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1024,7 +1140,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or hostname
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1037,7 +1156,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1046,59 +1166,6 @@ class PluginCore:
         )
         future = asyncio.run_coroutine_threadsafe(coro, self.main_event_loop)
         return future.result()
-
-    @async_log_errors
-    async def find_plugin(
-        self, name: str, host: str = "any", plugin_uuid: Union[str, None] = None
-    ) -> Optional[Union[Plugin, tuple]]:
-        """
-        Tries to find a plugin locally first, then on remote nodes if networking is enabled.
-        """
-        raise DeprecationWarning
-        # NOTE: Check if endpoint is accessible by other plugins (add plugin_uuid of requester to find_plugin), remote, check for the access_name and then get the method via internal_name
-        # NOTE: If host != this host then its remote
-        # NOTE: Add requester_id
-        # FIXME: Change to find_plugin_endpoint
-
-        # check locally first
-        if host in ["local", "any", self.hostname]:
-            for plugin in self.plugins.values():
-                plugin: Plugin
-
-                if plugin.plugin_name == name and (
-                    not plugin_uuid or plugin.plugin_uuid == plugin_uuid
-                ):
-                    # if plugin.plugin_name == name and (not plugin_uuid or plugin.plugin_uuid == plugin_uuid):
-                    return plugin, None
-
-        # if not found ask remote nodes
-        if self.networking_enabled and host != "local" and host != self.hostname:
-            for node in self.network.nodes:
-                node: Node
-                if not node.enabled or not await node.is_alive():
-                    continue
-
-                if host in ["remote", "any"] or node.hostname == host:
-
-                    result = await self.network.node_has_plugin(
-                        node.IP, name, plugin_uuid if plugin_uuid != "remote" else ""
-                    )
-                    if result and result.get("available") and result.get("remote"):
-                        return (
-                            RemotePlugin(
-                                name=name,
-                                version="unknown",  # could fetch real version later
-                                uuid=result.get("plugin_uuid"),
-                                enabled=True,
-                                remote=True,
-                                description="Remote plugin",
-                                arguments=[],
-                                hostname=result.get("hostname", node.hostname),
-                            ),
-                            node,
-                        )
-
-        return None, None
 
     @async_log_errors
     async def find_endpoints_by_tag(self, tag: str) -> Optional[List[Dict[str, Any]]]:
@@ -1141,7 +1208,10 @@ class PluginCore:
     async def find_endpoint(
         self,
         access_name: str,
-        host: str = "any",
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         plugin_uuid: Optional[str] = None,
         requester_id: Optional[str] = None,
         target_plugin: Optional[str] = None,
@@ -1151,9 +1221,14 @@ class PluginCore:
 
         Args:
             access_name: The access_name of the endpoint to find
-            host: Target host ("local", "remote", "any", or specific hostname)
+            hosts: Target hosts — "local", "remote", "any", a hostname, or a
+                list of hostnames (whitelist). Caller is expected to have
+                already passed this through _validate_host_args.
+            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None
+                for no blocking.
             plugin_uuid: Specific plugin UUID to search for (optional)
             requester_id: UUID of the plugin making the request (for access control)
+            target_plugin: Optional plugin name filter
 
         Returns:
             Tuple of (plugin, endpoint_dict, node) or None if not found
@@ -1162,9 +1237,9 @@ class PluginCore:
         """
 
         self._logger.debug(
-            f"Finding endpoint: access_name='{access_name}', host='{host}', "
-            f"plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
-            f"target_plugin={target_plugin}"
+            f"Finding endpoint: access_name='{access_name}', hosts={hosts!r}, "
+            f"blocked_hosts={blocked_hosts!r}, plugin_uuid={plugin_uuid}, "
+            f"requester_id={requester_id}, target_plugin={target_plugin}"
         )
 
         # Determine request provenance
@@ -1179,11 +1254,27 @@ class PluginCore:
                 f"Remote request detected from requester_id: {requester_id}"
             )
 
+        def _matches_local():
+            if isinstance(hosts, str):
+                return hosts in ("local", "any", self.hostname)
+            if isinstance(hosts, list):
+                return "local" in hosts or self.hostname in hosts
+            return False
+
+        def _is_local_blocked():
+            if blocked_hosts is None:
+                return False
+            if isinstance(blocked_hosts, str):
+                return blocked_hosts in ("local", "any", self.hostname)
+            if isinstance(blocked_hosts, list):
+                return "local" in blocked_hosts or self.hostname in blocked_hosts
+            return False
+
         # Check locally first (only if host includes local)
         # Note: Remote accessibility checks for OUR endpoints should only happen
         # when a remote node is querying us (is_remote_request=True).
         # When WE are searching for remote endpoints, we don't check remote accessibility here.
-        if host in ["local", "any", self.hostname]:
+        if _matches_local() and not _is_local_blocked():
             for plugin in self.plugins.values():
                 # Skip if plugin doesn't match UUID filter
                 if plugin_uuid and plugin.plugin_uuid != plugin_uuid:
@@ -1218,17 +1309,43 @@ class PluginCore:
                         else:
                             return plugin, endpoint, None
 
-        # Check remote nodes if networking is enabled and host isn't local
-        if getattr(self, "networking_enabled", False) and host not in [
-            "local",
-            self.hostname,
-        ]:
+        def _matches_remote_node(node_hostname):
+            if isinstance(hosts, str):
+                return hosts in ("remote", "any") or hosts == node_hostname
+            if isinstance(hosts, list):
+                return node_hostname in hosts
+            return False
+
+        def _is_remote_node_blocked(node_hostname):
+            if blocked_hosts is None:
+                return False
+            if isinstance(blocked_hosts, str):
+                return (
+                    blocked_hosts in ("remote", "any") or blocked_hosts == node_hostname
+                )
+            if isinstance(blocked_hosts, list):
+                return node_hostname in blocked_hosts
+            return False
+
+        def _other_than_local():
+            if isinstance(hosts, str):
+                return not hosts in ("local", self.hostname)
+            if isinstance(hosts, list):
+                return (
+                    len(hosts) - hosts.count("local") - hosts.count(self.hostname)
+                ) > 0
+            return True
+
+        # Check remote nodes if networking is enabled
+        if getattr(self, "networking_enabled", False) and _other_than_local():
 
             for node in self.network.nodes:
                 if not (node.enabled and await node.is_alive()):
                     continue
 
-                if host not in ["remote", "any"] and node.hostname != host:
+                if not _matches_remote_node(node.hostname) or _is_remote_node_blocked(
+                    node.hostname
+                ):
                     continue
 
                 # Check remote node for endpoint
@@ -1291,12 +1408,10 @@ class PluginCore:
             plugin_name = request.target_plugin
             function_name = request.target_method
 
-            # plugin, node = await self.find_plugin(
-            #    plugin_name, request.target_host, request.target_plugin_uuid
-            # )
             plugin, endpoint, node = await self.find_endpoint(
                 request.target_method,
-                request.target_host,
+                request.target_hosts,
+                request.blocked_hosts,
                 request.target_plugin_uuid,
                 request.author_id,
                 request.target_plugin,
@@ -1308,13 +1423,13 @@ class PluginCore:
                 )
                 return
 
-            host = (
+            host_label = (
                 f"(local) {self.hostname}"
                 if isinstance(plugin, Plugin)
                 else f"{node.IP}#{node.hostname}"
             )
             self._logger.debug(
-                f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}"
+                f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host_label}"
             )
 
             if isinstance(
@@ -1391,14 +1506,20 @@ class PluginCore:
                 _sync_call_chain.chain = ()
 
         if isinstance(args, tuple):
-            return await self.main_event_loop.run_in_executor(self._plugin_executor, _tracked, *args)
+            return await self.main_event_loop.run_in_executor(
+                self._plugin_executor, _tracked, *args
+            )
         if isinstance(args, dict):
             return await self.main_event_loop.run_in_executor(
                 self._plugin_executor, functools.partial(_tracked, **args)
             )
         if args is None:
-            return await self.main_event_loop.run_in_executor(self._plugin_executor, _tracked)
-        return await self.main_event_loop.run_in_executor(self._plugin_executor, _tracked, args)
+            return await self.main_event_loop.run_in_executor(
+                self._plugin_executor, _tracked
+            )
+        return await self.main_event_loop.run_in_executor(
+            self._plugin_executor, _tracked, args
+        )
 
     # @async_handle_errors(None)
     async def _process_request_stream(self, request: GeneratorRequest) -> None:
@@ -1407,12 +1528,10 @@ class PluginCore:
             plugin_name = request.target_plugin
             function_name = request.target_method
 
-            # plugin, node = await self.find_plugin(
-            #    plugin_name, request.target_host, request.target_plugin_uuid
-            # )
             plugin, endpoint, node = await self.find_endpoint(
                 request.target_method,
-                request.target_host,
+                request.target_hosts,
+                request.blocked_hosts,
                 request.target_plugin_uuid,
                 request.author_id,
                 request.target_plugin,
@@ -1424,13 +1543,13 @@ class PluginCore:
                 )
                 return
 
-            host = (
+            host_label = (
                 f"(local) {self.hostname}"
                 if isinstance(plugin, Plugin)
                 else f"{node.IP}#{node.hostname}"
             )
             self._logger.debug(
-                f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host}"
+                f"Found {plugin_name} (ID: {plugin.plugin_uuid}) for Request with ID {request.id} on host {host_label}"
             )
 
             if isinstance(plugin, RemotePlugin):
@@ -1558,9 +1677,24 @@ class PluginCore:
         _timer = time.time() - 10
         async with self.request_lock:
             self.requests = {
-                rid: req for rid, req in self.requests.items()
+                rid: req
+                for rid, req in self.requests.items()
                 if not req.collected or (req.finished_at or req.created_at) > _timer
             }
+
+    def _validate_host_args(self, hosts, blocked_hosts):
+        """Normalize hosts/blocked_hosts and warn on redundant combos.
+
+        Returns (hosts, blocked_hosts) ready to pass to find_endpoint.
+        Raises ValueError on structural input errors. Idempotent — safe to
+        call on already-normalized values.
+        """
+        hosts = _normalize_hosts(hosts, param_name="hosts", default="local")
+        blocked_hosts = _normalize_hosts(
+            blocked_hosts, param_name="blocked_hosts", default=None,
+        )
+        _warn_redundant_host_combos(hosts, blocked_hosts, self._logger)
+        return hosts, blocked_hosts
 
     # One-liner methods for plugin communication
     # @async_handle_errors(default_return=None)
@@ -1572,7 +1706,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or host_uuid
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1592,6 +1729,8 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+
         if author == "system":
             author = self.hostname
             author_id = self.hostname
@@ -1601,7 +1740,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1629,7 +1769,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or host_uuid
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1648,6 +1791,8 @@ class PluginCore:
         Returns:
             The result from the plugin method or None if any error occurs
         """
+
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
 
         if author == "system":
             author = self.hostname
@@ -1668,7 +1813,8 @@ class PluginCore:
                 method,
                 args,
                 plugin_uuid,
-                host,
+                hosts,
+                blocked_hosts,
                 author,
                 author_id,
                 timeout,
@@ -1682,16 +1828,19 @@ class PluginCore:
     async def _execute_sync_tracked(
         self,
         call_chain,
-        plugin,
-        method,
-        args,
-        plugin_uuid,
-        host,
-        author,
-        author_id,
-        timeout,
-        author_host,
-        request_id,
+        plugin: str,
+        method: str,
+        args: Union[tuple, dict, None] = None,
+        plugin_uuid: Optional[str] = "",
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        author: str = "system",
+        author_id: str = "system",
+        timeout: Union[float, tuple] = None,
+        author_host: str = None,
+        request_id: str = None,
     ) -> Any:
         """Like execute(), but attaches the sync call chain to the request."""
         request = await self.create_request(
@@ -1699,7 +1848,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1725,7 +1875,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or host_uuid
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1746,6 +1899,8 @@ class PluginCore:
             The result from the plugin method or None if any error occurs
         """
 
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+
         if author == "system":
             author = self.hostname
             author_id = self.hostname
@@ -1755,7 +1910,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1784,7 +1940,10 @@ class PluginCore:
         method: str,
         args: Union[tuple, dict, None] = None,
         plugin_uuid: Optional[str] = "",
-        host: str = "any",  # "any", "remote", "local", or host_uuid
+        hosts: Union[
+            str, list, None
+        ] = "any",  # "any", "remote", "local", or list of allowed hosts
+        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1804,6 +1963,8 @@ class PluginCore:
             The result from the plugin method or None if any error occurs
         """
 
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+
         if author == "system":
             author = self.hostname
             author_id = self.hostname
@@ -1821,7 +1982,8 @@ class PluginCore:
             method,
             args,
             plugin_uuid,
-            host,
+            hosts,
+            blocked_hosts,
             author,
             author_id,
             timeout,
@@ -1838,7 +2000,9 @@ class PluginCore:
                     raise RequestException(result)
                 yield result
         finally:
-            asyncio.run_coroutine_threadsafe(request.set_collected(), self.main_event_loop)
+            asyncio.run_coroutine_threadsafe(
+                request.set_collected(), self.main_event_loop
+            )
 
     # ── Notifier system ───────────────────────────────────────────────
 
@@ -1857,7 +2021,8 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
     ) -> int:
@@ -1866,7 +2031,27 @@ class PluginCore:
         concurrently; errors are logged but do not propagate.
 
         Returns the number of subscribers that were called.
+
+        .. deprecated::
+            The notifier subsystem is being redesigned. List-form
+            hosts/blocked_hosts is rejected on this legacy path; full list
+            support arrives with the rework. See notes.txt.
         """
+        warnings.warn(
+            "PluginCore.notify() uses the legacy notifier subsystem which is "
+            "being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
+            raise ValueError(
+                "Legacy notifier methods do not yet support list-form hosts/"
+                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
+                "or a single hostname. Full list support arrives with the "
+                "notifier rework."
+            )
+
         subs = await self.topic_registry.find_all(topic)
         if not subs:
             self._logger.debug(f"Notify '{topic}': no subscribers")
@@ -1877,7 +2062,9 @@ class PluginCore:
         async def _call_sub(sub: Subscription):
             nonlocal called
             try:
-                plugin_name, access_name, handler = await self._resolve_subscription(sub)
+                plugin_name, access_name, handler = await self._resolve_subscription(
+                    sub
+                )
 
                 if handler is not None:
                     # Code-driven: call handler directly
@@ -1885,10 +2072,13 @@ class PluginCore:
                 elif access_name:
                     # Config-driven: route through execute()
                     await self.execute(
-                        plugin_name, access_name, args,
+                        plugin_name,
+                        access_name,
+                        args,
                         plugin_uuid=sub.plugin_uuid,
-                        host="local",
-                        author=author, author_id=author_id,
+                        hosts="local",
+                        author=author,
+                        author_id=author_id,
                     )
                 called += 1
             except Exception as e:
@@ -1898,22 +2088,37 @@ class PluginCore:
 
         # Local subscribers
         local_subs = [s for s in subs if s.plugin_uuid in self.plugins_by_uuid]
-        if host in ("any", "local", self.hostname) and local_subs:
+        local_targeted = hosts in ("any", "local", self.hostname)
+        local_blocked = (
+            blocked_hosts in ("any", "local", self.hostname)
+            if blocked_hosts
+            else False
+        )
+        if local_targeted and not local_blocked and local_subs:
             await asyncio.gather(*[_call_sub(s) for s in local_subs])
 
         # Remote notify (broadcast to all nodes)
-        remote_needed = host in ("any", "remote") or (
-            host not in ("local", self.hostname)
+        remote_needed = hosts in ("any", "remote") or (
+            hosts not in ("local", self.hostname)
         )
         if remote_needed and getattr(self, "networking_enabled", False):
             for node in self.network.nodes:
                 if not (node.enabled and await node.is_alive()):
                     continue
-                if host not in ("any", "remote") and node.hostname != host:
+                if hosts not in ("any", "remote") and node.hostname != hosts:
+                    continue
+                if blocked_hosts is not None and (
+                    blocked_hosts in ("any", "remote")
+                    or blocked_hosts == node.hostname
+                ):
                     continue
                 try:
                     await self.network.notify_remote(
-                        node.IP, topic, args, author, author_id,
+                        node.IP,
+                        topic,
+                        args,
+                        author,
+                        author_id,
                     )
                     called += 1  # Count remote dispatch as one call
                 except Exception as e:
@@ -1928,13 +2133,24 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
     ) -> int:
-        """Synchronous variant of notify()."""
+        """Synchronous variant of notify().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "PluginCore.notify_sync() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         future = asyncio.run_coroutine_threadsafe(
-            self.notify(topic, args, host, author, author_id),
+            self.notify(topic, args, hosts, blocked_hosts, author, author_id),
             self.main_event_loop,
         )
         return future.result()
@@ -1944,18 +2160,43 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
     ) -> Any:
         """
         Request-by-topic: find the first matching handler and return its result.
-        Same discovery logic as execute() with host="any" (local first).
+        Same discovery logic as execute() with hosts="any" (local first).
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
-        # Try local subscription first (only if host includes local)
+        warnings.warn(
+            "PluginCore.request_topic() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
+            raise ValueError(
+                "Legacy notifier methods do not yet support list-form hosts/"
+                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
+                "or a single hostname. Full list support arrives with the "
+                "notifier rework."
+            )
+
+        # Try local subscription first (only if hosts includes local and not blocked)
         sub = None
-        if host in ("any", "local", self.hostname):
+        local_targeted = hosts in ("any", "local", self.hostname)
+        local_blocked = (
+            blocked_hosts in ("any", "local", self.hostname)
+            if blocked_hosts
+            else False
+        )
+        if local_targeted and not local_blocked:
             sub = await self.topic_registry.find_first(topic)
 
         if sub is not None:
@@ -1965,25 +2206,39 @@ class PluginCore:
                 return await self._call_endpoint(handler, args)
 
             return await self.execute(
-                plugin_name, access_name, args,
+                plugin_name,
+                access_name,
+                args,
                 plugin_uuid=sub.plugin_uuid,
-                host="local",
-                author=author, author_id=author_id,
+                hosts="local",
+                author=author,
+                author_id=author_id,
                 timeout=timeout,
             )
 
-        # No local match (or host excludes local) — check remote
-        if getattr(self, "networking_enabled", False) and host not in (
-            "local", self.hostname,
+        # No local match (or hosts excludes local) — check remote
+        if getattr(self, "networking_enabled", False) and hosts not in (
+            "local",
+            self.hostname,
         ):
             for node in self.network.nodes:
                 if not (node.enabled and await node.is_alive()):
                     continue
-                if host not in ("any", "remote") and node.hostname != host:
+                if hosts not in ("any", "remote") and node.hostname != hosts:
+                    continue
+                if blocked_hosts is not None and (
+                    blocked_hosts in ("any", "remote")
+                    or blocked_hosts == node.hostname
+                ):
                     continue
                 try:
                     result = await self.network.request_topic_remote(
-                        node.IP, topic, args, author, author_id, timeout,
+                        node.IP,
+                        topic,
+                        args,
+                        author,
+                        author_id,
+                        timeout,
                     )
                     if result is not REMOTE_NO_RESULT:
                         return result
@@ -1999,12 +2254,23 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
     ) -> Any:
-        """Synchronous variant of request_topic()."""
+        """Synchronous variant of request_topic().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "PluginCore.request_topic_sync() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         chain = getattr(_sync_call_chain, "chain", ())
         target = f"topic:{topic}"
         if target in chain:
@@ -2013,7 +2279,9 @@ class PluginCore:
             )
 
         future = asyncio.run_coroutine_threadsafe(
-            self.request_topic(topic, args, host, author, author_id, timeout),
+            self.request_topic(
+                topic, args, hosts, blocked_hosts, author, author_id, timeout
+            ),
             self.main_event_loop,
         )
         return future.result()
@@ -2023,7 +2291,8 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -2031,23 +2300,58 @@ class PluginCore:
         """
         Request-by-topic with streaming: find the first matching handler
         and yield its results.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
         """
+        warnings.warn(
+            "PluginCore.request_topic_stream() uses the legacy notifier "
+            "subsystem which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
+            raise ValueError(
+                "Legacy notifier methods do not yet support list-form hosts/"
+                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
+                "or a single hostname. Full list support arrives with the "
+                "notifier rework."
+            )
+
         sub = None
-        if host in ("any", "local", self.hostname):
+        local_targeted = hosts in ("any", "local", self.hostname)
+        local_blocked = (
+            blocked_hosts in ("any", "local", self.hostname)
+            if blocked_hosts
+            else False
+        )
+        if local_targeted and not local_blocked:
             sub = await self.topic_registry.find_first(topic)
 
         if sub is None:
-            if getattr(self, "networking_enabled", False) and host not in (
-                "local", self.hostname,
+            if getattr(self, "networking_enabled", False) and hosts not in (
+                "local",
+                self.hostname,
             ):
                 for node in self.network.nodes:
                     if not (node.enabled and await node.is_alive()):
                         continue
-                    if host not in ("any", "remote") and node.hostname != host:
+                    if hosts not in ("any", "remote") and node.hostname != hosts:
+                        continue
+                    if blocked_hosts is not None and (
+                        blocked_hosts in ("any", "remote")
+                        or blocked_hosts == node.hostname
+                    ):
                         continue
                     try:
                         async for chunk in self.network.request_topic_stream_remote(
-                            node.IP, topic, args, author, author_id, timeout,
+                            node.IP,
+                            topic,
+                            args,
+                            author,
+                            author_id,
+                            timeout,
                         ):
                             yield chunk
                         return
@@ -2095,10 +2399,13 @@ class PluginCore:
                 )
         else:
             async for chunk in self.execute_stream(
-                plugin_name, access_name, args,
+                plugin_name,
+                access_name,
+                args,
                 plugin_uuid=sub.plugin_uuid,
-                host="local",
-                author=author, author_id=author_id,
+                hosts="local",
+                author=author,
+                author_id=author_id,
                 timeout=timeout,
             ):
                 yield chunk
@@ -2108,21 +2415,43 @@ class PluginCore:
         self,
         topic: str,
         args: Union[tuple, dict, None] = None,
-        host: str = "any",
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
     ) -> Any:
-        """Synchronous streaming variant of request_topic()."""
+        """Synchronous streaming variant of request_topic().
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "PluginCore.request_topic_stream_sync() uses the legacy notifier "
+            "subsystem which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
+        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
+            raise ValueError(
+                "Legacy notifier methods do not yet support list-form hosts/"
+                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
+                "or a single hostname. Full list support arrives with the "
+                "notifier rework."
+            )
+
         sub = asyncio.run_coroutine_threadsafe(
-            self.topic_registry.find_first(topic), self.main_event_loop,
+            self.topic_registry.find_first(topic),
+            self.main_event_loop,
         ).result()
 
         if sub is None:
             raise RequestException(f"No handler found for topic '{topic}'")
 
         plugin_name, access_name, handler = asyncio.run_coroutine_threadsafe(
-            self._resolve_subscription(sub), self.main_event_loop,
+            self._resolve_subscription(sub),
+            self.main_event_loop,
         ).result()
 
         if handler is not None:
@@ -2141,10 +2470,13 @@ class PluginCore:
                 )
         else:
             for chunk in self.execute_stream_sync(
-                plugin_name, access_name, args,
+                plugin_name,
+                access_name,
+                args,
                 plugin_uuid=sub.plugin_uuid,
-                host="local",
-                author=author, author_id=author_id,
+                hosts="local",
+                author=author,
+                author_id=author_id,
                 timeout=timeout,
             ):
                 yield chunk
@@ -2158,7 +2490,19 @@ class PluginCore:
         handler: Optional[Callable] = None,
         config_driven: bool = False,
     ) -> str:
-        """Register a topic subscription. Returns subscription ID."""
+        """Register a topic subscription. Returns subscription ID.
+
+        .. deprecated::
+            The notifier subsystem is being redesigned. ``handler=`` will be
+            removed and subscriptions will require an endpoint access_name
+            target. See notes.txt.
+        """
+        warnings.warn(
+            "PluginCore.subscribe() uses the legacy notifier subsystem which "
+            "is being redesigned (handler= will be removed). See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self.topic_registry.subscribe(
             topic_pattern=topic,
             plugin_name=plugin_name,
@@ -2169,5 +2513,15 @@ class PluginCore:
         )
 
     async def unsubscribe(self, subscription_id: str) -> bool:
-        """Remove a topic subscription by ID."""
+        """Remove a topic subscription by ID.
+
+        .. deprecated::
+            See notes.txt — the notifier subsystem is being redesigned.
+        """
+        warnings.warn(
+            "PluginCore.unsubscribe() uses the legacy notifier subsystem "
+            "which is being redesigned. See notes.txt.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self.topic_registry.unsubscribe(subscription_id)

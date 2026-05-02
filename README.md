@@ -76,7 +76,7 @@ async def main():
     await plugin_core.wait_until_ready()
 
     # Execute a plugin method
-    result = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
+    result = await plugin_core.execute("PluginB", "calculate_square", 6, hosts="local")
     print(f"Result: {result}")
 
     # Graceful shutdown
@@ -145,7 +145,7 @@ async def main():
     # start() initializes background tasks, loads plugins, and starts networking
     await plugin_core.start()
 
-    result = await plugin_core.execute("PluginB", "calculate_square", 6, host="local")
+    result = await plugin_core.execute("PluginB", "calculate_square", 6, hosts="local")
     print(f"Result: {result}")
 
     await plugin_core.close()
@@ -467,16 +467,16 @@ From within a plugin:
 
 ```python
 # Async execution
-result = await self.execute("PluginName", "method_access_name", args, host="local")
+result = await self.execute("PluginName", "method_access_name", args, hosts="local")
 
 # Sync execution (call from sync context, must not be called from async)
-result = self.execute_sync("PluginName", "method_access_name", args, host="local")
+result = self.execute_sync("PluginName", "method_access_name", args, hosts="local")
 
 # With keyword arguments
-result = await self.execute("PluginName", "method_name", {"key": "value"}, host="any")
+result = await self.execute("PluginName", "method_name", {"key": "value"}, hosts="any")
 
 # With positional arguments as tuple
-result = await self.execute("PluginName", "method_name", (arg1, arg2), host="any")
+result = await self.execute("PluginName", "method_name", (arg1, arg2), hosts="any")
 
 # Host options: "local", "remote", "any", or specific hostname
 ```
@@ -487,11 +487,11 @@ Plugins can expose both sync and async generators. Callers can consume them from
 
 ```python
 # Async context -> async generator endpoint
-async for item in self.execute_stream("PluginA", "streaming_method", args, host="any"):
+async for item in self.execute_stream("PluginA", "streaming_method", args, hosts="any"):
     print(item)
 
 # Sync context -> any generator endpoint
-for item in self.execute_stream_sync("PluginA", "streaming_method", args, host="any"):
+for item in self.execute_stream_sync("PluginA", "streaming_method", args, hosts="any"):
     print(item)
 ```
 
@@ -633,16 +633,16 @@ When networking is enabled, you can execute plugins on remote nodes:
 
 ```python
 # Execute on any available node (local first, then remote)
-result = await plugin_core.execute("RemotePlugin", "method", args, host="any")
+result = await plugin_core.execute("RemotePlugin", "method", args, hosts="any")
 
 # Execute only on remote nodes
-result = await plugin_core.execute("RemotePlugin", "method", args, host="remote")
+result = await plugin_core.execute("RemotePlugin", "method", args, hosts="remote")
 
 # Execute on specific node by hostname
-result = await plugin_core.execute("RemotePlugin", "method", args, host="my-hostname")
+result = await plugin_core.execute("RemotePlugin", "method", args, hosts="my-hostname")
 
 # Stream from a remote node
-async for item in plugin_core.execute_stream("RemotePlugin", "stream_method", args, host="remote"):
+async for item in plugin_core.execute_stream("RemotePlugin", "stream_method", args, hosts="remote"):
     print(item)
 ```
 
@@ -839,7 +839,7 @@ Gracefully shutdown the system by calling `close()`. The main application is res
 
 **Returns**: None (coroutine)
 
-#### `execute(plugin, method, args=None, plugin_uuid="", host="any", author="system", author_id="system", timeout=None, author_host=None, request_id=None)`
+#### `execute(plugin, method, args=None, plugin_uuid="", hosts="any", author="system", author_id="system", timeout=None, author_hosts=None, request_id=None)`
 
 Execute a plugin method asynchronously.
 
@@ -886,7 +886,7 @@ Synchronous version of `execute_stream()`. Returns a sync generator. Must not be
 
 **Yields**: Results from the plugin's generator method
 
-#### `notify(topic, args=None, host="any", author="system", author_id="system")`
+#### `notify(topic, args=None, hosts="any", author="system", author_id="system")`
 
 Fire-and-forget publish to a topic. All matching subscribers are called concurrently; errors are logged but do not propagate.
 
@@ -898,13 +898,13 @@ Fire-and-forget publish to a topic. All matching subscribers are called concurre
 
 **Returns**: Number of subscribers that were called (int)
 
-#### `notify_sync(topic, args=None, host="any", ...)`
+#### `notify_sync(topic, args=None, hosts="any", ...)`
 
 Synchronous variant of `notify()`.
 
-#### `request_topic(topic, args=None, host="any", author="system", author_id="system", timeout=None)`
+#### `request_topic(topic, args=None, hosts="any", author="system", author_id="system", timeout=None)`
 
-Request-by-topic: find the first matching handler and return its result. Same discovery logic as `execute()` with `host="any"` (local first, then remote).
+Request-by-topic: find the first matching handler and return its result. Same discovery logic as `execute()` with `hosts="any"` (local first, then remote).
 
 **Parameters**:
 
@@ -921,7 +921,7 @@ Request-by-topic: find the first matching handler and return its result. Same di
 
 Synchronous variant of `request_topic()`.
 
-#### `request_topic_stream(topic, args=None, host="any", ...)`
+#### `request_topic_stream(topic, args=None, hosts="any", ...)`
 
 Request-by-topic with streaming. Finds the first matching handler and yields its results.
 
@@ -993,7 +993,7 @@ Check whether a path points to the main `config.yml`.
 
 **Returns**: `True` if the path resolves to the main config file.
 
-#### `find_endpoint(access_name, host="any", plugin_uuid=None, requester_id=None, target_plugin=None)`
+#### `find_endpoint(access_name, hosts="any", plugin_uuid=None, requester_id=None, target_plugin=None)`
 
 Find a plugin endpoint locally or on remote nodes with access control.
 
@@ -1071,19 +1071,19 @@ Remove a specific plugin by name. Disables it first if currently enabled.
 
 These methods are available on every plugin instance for calling other plugins:
 
-#### `execute(plugin, method, args=None, plugin_uuid="", host="any", ...)`
+#### `execute(plugin, method, args=None, plugin_uuid="", hosts="any", ...)`
 
 Async one-liner to call another plugin's method. Automatically sets `author` and `author_id` to this plugin's name and UUID.
 
-#### `execute_sync(plugin, method, args=None, plugin_uuid="", host="any", ...)`
+#### `execute_sync(plugin, method, args=None, plugin_uuid="", hosts="any", ...)`
 
 Sync one-liner to call another plugin's method. Must not be called from async context.
 
-#### `execute_stream(plugin, method, args=None, plugin_uuid="", host="any", ...)`
+#### `execute_stream(plugin, method, args=None, plugin_uuid="", hosts="any", ...)`
 
 Async generator one-liner to stream from another plugin's generator method.
 
-#### `execute_stream_sync(plugin, method, args=None, plugin_uuid="", host="any", ...)`
+#### `execute_stream_sync(plugin, method, args=None, plugin_uuid="", hosts="any", ...)`
 
 Sync generator one-liner to stream from another plugin's generator method. Must not be called from async context.
 
@@ -1203,7 +1203,7 @@ async def main():
         "PluginB",
         "calculate_square",
         6,
-        host="local"
+        hosts="local"
     )
     print(f"Square of 6: {result}")
 
@@ -1223,7 +1223,7 @@ async def main():
         "PluginA",
         "perform_operation_stream",
         9,
-        host="any"
+        hosts="any"
     ):
         print(f"Received: {item}")
 
@@ -1247,7 +1247,7 @@ class PluginA(Plugin):
             "PluginB",
             "calculate_square",
             5,
-            host="local"
+            hosts="local"
         )
         self._logger.info(f"Got result: {result}")
 
@@ -1313,7 +1313,7 @@ async def main():
         "RemotePlugin",
         "remote_method",
         args,
-        host="any"
+        hosts="any"
     )
 
     # Stream from a remote node
@@ -1321,7 +1321,7 @@ async def main():
         "RemotePlugin",
         "stream_method",
         args,
-        host="remote"
+        hosts="remote"
     ):
         print(item)
 

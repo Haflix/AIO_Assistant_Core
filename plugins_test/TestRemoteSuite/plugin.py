@@ -9,7 +9,7 @@ KNOWN FIXTURE GAPS (2026-04-28, after first end-to-end run with networking on):
 - TestRemoteVictim has plugin-level remote=False on purpose (it's the bug
   target for B-001 / B-042 — code-driven sub on a remote=False plugin).
   But its readback endpoints (get_bypass_count / reset_bypass) inherit
-  remote=False, so the parent CANNOT call them via execute(host="remote").
+  remote=False, so the parent CANNOT call them via execute(hosts="remote").
   Catch-22: testing the bypass requires reading a counter that's only
   reachable via the bypass we're testing. Fix path: split into two plugins
   — Victim with remote=False holds the topic sub; a separate remote=True
@@ -246,7 +246,7 @@ class TestRemoteSuite(Plugin):
         async def body_remote_open(c):
             r = await self.execute(
                 "TestRemoteTarget", "r_open", {"value": "x"},
-                host=c.host,
+                hosts=c.hosts,
             )
             c.expect(r, "x")
 
@@ -255,7 +255,7 @@ class TestRemoteSuite(Plugin):
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
             await self.execute(
                 "TestRemoteVictim", "r_local_only", {"value": "x"},
-                host=c.host,
+                hosts=c.hosts,
             )
 
         async def body_access_false_blocked(c):
@@ -263,22 +263,22 @@ class TestRemoteSuite(Plugin):
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
             await self.execute(
                 "TestRemoteTarget", "r_remote_only", {"value": "x"},
-                host=c.host,
+                hosts=c.hosts,
             )
 
         async def body_notify_remote_false_blocked_for_config(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", host=c.host)
-            await self.notify("test/r/local", {"data": "x"}, host=c.host)
+            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
+            await self.notify("test/r/local", {"data": "x"}, hosts=c.hosts)
             cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", host=c.host,
+                "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
             )
             c.expect(cnt, 0)
 
         async def body_b001_code_driven_bypass(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", host=c.host)
-            await self.notify("test/r/code", {"data": "bypass"}, host=c.host)
+            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
+            await self.notify("test/r/code", {"data": "bypass"}, hosts=c.hosts)
             cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", host=c.host,
+                "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
             )
             if cnt > 0:
                 c.set_marker("bypass_succeeded")
@@ -288,16 +288,16 @@ class TestRemoteSuite(Plugin):
                 )
 
         async def body_b042_code_driven_stream_bypass(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", host=c.host)
+            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
             try:
                 async for _ in self.request_topic_stream(
-                    "test/r/code_stream", host=c.host,
+                    "test/r/code_stream", hosts=c.hosts,
                 ):
                     pass
             except Exception:
                 pass
             cnt = await self.execute(
-                "TestRemoteVictim", "get_stream_bypass_count", host=c.host,
+                "TestRemoteVictim", "get_stream_bypass_count", hosts=c.hosts,
             )
             if cnt > 0:
                 c.set_marker("bypass_succeeded")
@@ -311,7 +311,7 @@ class TestRemoteSuite(Plugin):
             # calls notify_remote(IP=parent, topic, author='system'). The
             # parent's _handle_notify forwards author='system' which gets
             # rewritten to hostname → bypass remote-eligibility check.
-            await self.execute("TestRemoteVictim", "reset_bypass", host="local")
+            await self.execute("TestRemoteVictim", "reset_bypass", hosts="local")
             await self.execute(
                 "TestRemoteSpoofer", "spoof_notify",
                 {
@@ -321,10 +321,10 @@ class TestRemoteSuite(Plugin):
                     "author": "system",
                     "author_id": "system",
                 },
-                host=c.host,
+                hosts=c.hosts,
             )
             cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", host="local",
+                "TestRemoteVictim", "get_bypass_count", hosts="local",
             )
             if cnt > 0:
                 c.set_marker("bypass_succeeded")
@@ -334,7 +334,7 @@ class TestRemoteSuite(Plugin):
                 )
 
         async def body_b018_spoof_known_uuid(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", host="local")
+            await self.execute("TestRemoteVictim", "reset_bypass", hosts="local")
             local_victim = self._plugin_core.plugins.get("TestRemoteVictim")
             if local_victim is None:
                 c.skip("TestRemoteVictim not loaded locally")
@@ -349,10 +349,10 @@ class TestRemoteSuite(Plugin):
                     "author": "remote",
                     "author_id": local_uuid,
                 },
-                host=c.host,
+                hosts=c.hosts,
             )
             cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", host="local",
+                "TestRemoteVictim", "get_bypass_count", hosts="local",
             )
             if cnt > 0:
                 c.set_marker("bypass_succeeded")
@@ -364,7 +364,7 @@ class TestRemoteSuite(Plugin):
         async def body_b019_count_per_node(c):
             # On the parent's side we have one local sub for test/r/multi (set up
             # by code below); on the peer we'd register 3 more. Then notify
-            # host=any returns count == 1 + 1 (one per remote node) instead of
+            # hosts=any returns count == 1 + 1 (one per remote node) instead of
             # 1 + 3 (one per actual sub).
             c.skip(
                 "B-019 case requires registering N peer-side subs at runtime; "
@@ -390,7 +390,7 @@ class TestRemoteSuite(Plugin):
             try:
                 items = []
                 async for chunk in self.request_topic_stream(
-                    "test/r/huge_stream", host=c.host,
+                    "test/r/huge_stream", hosts=c.hosts,
                 ):
                     items.append(chunk)
                 # If items received cleanly with the original 200KB payload
@@ -435,7 +435,7 @@ class TestRemoteSuite(Plugin):
             await c.assert_hang(
                 self.execute(
                     "TestRemoteTarget", "r_hang",
-                    host=c.host, timeout=2.0,
+                    hosts=c.hosts, timeout=2.0,
                 ),
                 timeout_s=4.0,
                 marker="outer_wait_for_fired",

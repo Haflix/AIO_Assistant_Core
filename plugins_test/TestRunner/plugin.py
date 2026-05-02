@@ -65,7 +65,7 @@ class TestRunner(Plugin):
             suite_result = await self._run_suite_dispatch(
                 suite_name,
                 category=category,
-                host=host,
+                hosts=host,
                 case_ids=case_ids,
                 bug_ids=bug_ids,
                 skip_slow=skip_slow,
@@ -137,7 +137,7 @@ class TestRunner(Plugin):
         return await self._run_suite_dispatch(
             suite,
             category=category,
-            host=host,
+            hosts=host,
             case_ids=case_ids,
             bug_ids=bug_ids,
             skip_slow=skip_slow,
@@ -149,7 +149,7 @@ class TestRunner(Plugin):
         suite_name: str,
         *,
         category: Optional[str],
-        host: Optional[str],
+        hosts: Optional[str],
         case_ids: Optional[List[str]],
         bug_ids: Optional[List[str]],
         skip_slow: bool,
@@ -167,7 +167,7 @@ class TestRunner(Plugin):
                 "run",
                 args={
                     "category": category,
-                    "host": host,
+                    "host": hosts,
                     "case_ids": case_ids,
                     "bug_ids": bug_ids,
                     "skip_slow": skip_slow,

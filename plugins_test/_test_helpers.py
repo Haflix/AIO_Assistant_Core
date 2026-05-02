@@ -11,7 +11,7 @@ Usage from a suite plugin:
     rec = CaseRecorder("TestExecuteSuite", "0.0.1", self._plugin_core)
 
     async def body(c):
-        result = await self.execute("TestExecuteTarget", "ea_add", (2, 3), host=c.host)
+        result = await self.execute("TestExecuteTarget", "ea_add", (2, 3), hosts=c.hosts)
         c.expect(result, 5)
 
     await rec.run_case("exec.value.aa.tuple", body, hosts=("local",))
@@ -53,7 +53,7 @@ class _CaseContext:
         base_id: str,
         *,
         category: str,
-        host: str,
+        hosts: str,
         tags: Tuple[str, ...],
         bug_ids: Tuple[str, ...],
         expected_status: str,
@@ -64,7 +64,7 @@ class _CaseContext:
     ):
         self.recorder = recorder
         self.base_id = base_id
-        self.host = host
+        self.hosts = hosts
         self.category = category
         self.tags = list(tags)
         self.bug_ids = list(bug_ids)
@@ -89,7 +89,7 @@ class _CaseContext:
 
     @property
     def case_id(self) -> str:
-        return f"{self.base_id}.{self.host}"
+        return f"{self.base_id}.{self.hosts}"
 
     def expect(self, actual: Any, expected: Any) -> None:
         """Assert equality. Records actual/expected on the case."""
@@ -307,7 +307,7 @@ class _CaseContext:
             {
                 "id": self.case_id,
                 "base_id": self.base_id,
-                "host": self.host,
+                "host": self.hosts,
                 "status": status,
                 "category": self.category,
                 "expected_status": self.expected_status,
@@ -397,7 +397,7 @@ class CaseRecorder:
                 self,
                 base_id,
                 category=category,
-                host=host,
+                hosts=host,
                 tags=tags,
                 bug_ids=bug_ids,
                 expected_status=expected_status,

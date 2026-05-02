@@ -75,7 +75,7 @@ From within your plugin:
 
 ```python
 # Call another plugin's method (direct — you must know the plugin name)
-result = await self.execute("PluginName", "method_name", args, host="any")
+result = await self.execute("PluginName", "method_name", args, hosts="any")
 
 # Host options:
 # - "local": Only call locally loaded plugins
@@ -84,7 +84,7 @@ result = await self.execute("PluginName", "method_name", args, host="any")
 # - "hostname": Call on specific node by hostname
 
 # Stream from another plugin
-async for item in self.execute_stream("PluginName", "stream_method", args, host="any"):
+async for item in self.execute_stream("PluginName", "stream_method", args, hosts="any"):
     print(item)
 ```
 
@@ -212,7 +212,7 @@ async def my_stream(self, count):
 @async_log_errors
 async def call_other(self):
     """Call another plugin's method."""
-    result = await self.execute("OtherPlugin", "method_name", {"arg": "value"}, host="any")
+    result = await self.execute("OtherPlugin", "method_name", {"arg": "value"}, hosts="any")
     return result
 ```
 

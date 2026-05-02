@@ -105,7 +105,7 @@ class TestStreamSuite(Plugin):
             items = []
             async for chunk in self.execute_stream(
                 TARGET, "ea_gen", {"n": 5, "prefix": "x", "delay_ms": 0},
-                host=c.host,
+                hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, ["x0", "x1", "x2", "x3", "x4"])
@@ -114,7 +114,7 @@ class TestStreamSuite(Plugin):
             items = []
             async for chunk in self.execute_stream(
                 TARGET, "es_gen", {"n": 5, "prefix": "y", "delay_ms": 0},
-                host=c.host,
+                hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, ["y0", "y1", "y2", "y3", "y4"])
@@ -136,7 +136,7 @@ class TestStreamSuite(Plugin):
         async def body_empty(c):
             items = []
             async for chunk in self.execute_stream(
-                TARGET, "ea_gen_empty", host=c.host,
+                TARGET, "ea_gen_empty", hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, [])
@@ -144,7 +144,7 @@ class TestStreamSuite(Plugin):
         async def body_one(c):
             items = []
             async for chunk in self.execute_stream(
-                TARGET, "ea_gen_one_item", host=c.host,
+                TARGET, "ea_gen_one_item", hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(items, ["only"])
@@ -174,7 +174,7 @@ class TestStreamSuite(Plugin):
             try:
                 async for chunk in self.execute_stream(
                     TARGET, "ea_gen_raises_after", {"n_yielded": 2},
-                    host=c.host,
+                    hosts=c.hosts,
                 ):
                     items.append(chunk)
             except RequestException:
@@ -308,7 +308,7 @@ class TestStreamSuite(Plugin):
             items = []
             async for chunk in self.execute_stream(
                 TARGET, "ea_gen_returns_one_large_item",
-                {"size_bytes": 100_000}, host=c.host,
+                {"size_bytes": 100_000}, hosts=c.hosts,
             ):
                 items.append(chunk)
             c.expect(len(items), 1)
@@ -357,7 +357,7 @@ class TestStreamSuite(Plugin):
             try:
                 async for _ in self.execute_stream(
                     TARGET, "ea_gen_hangs",
-                    host=c.host, timeout=2.0,
+                    hosts=c.hosts, timeout=2.0,
                 ):
                     raise AssertionError("hanging gen yielded unexpectedly")
             except (RequestException, asyncio.TimeoutError):
@@ -415,7 +415,7 @@ class TestStreamSuite(Plugin):
             items = []
             try:
                 async for chunk in self.execute_stream(
-                    EXEC_TARGET, "ea_add", (1, 2), host=c.host,
+                    EXEC_TARGET, "ea_add", (1, 2), hosts=c.hosts,
                 ):
                     items.append(chunk)
             except RequestException:

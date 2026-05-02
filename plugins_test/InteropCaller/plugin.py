@@ -39,7 +39,7 @@ class InteropCaller(Plugin):
         # ---- Value calls ----
         try:
             # async -> async (tuple)
-            res = await self.execute("InteropTarget", "it_async_add", (2, 3), host=host)
+            res = await self.execute("InteropTarget", "it_async_add", (2, 3), hosts=host)
             ok = res == 5
             await self._log_case(
                 "val_async_to_async_tuple", ok, f"got={res} expected=5"
@@ -54,7 +54,7 @@ class InteropCaller(Plugin):
         try:
             # async -> sync (kwargs)
             res = await self.execute(
-                "InteropTarget", "it_sync_add", {"a": 7, "b": 8}, host=host
+                "InteropTarget", "it_sync_add", {"a": 7, "b": 8}, hosts=host
             )
             ok = res == 15
             await self._log_case(
@@ -69,8 +69,8 @@ class InteropCaller(Plugin):
 
         try:
             # single-arg async calls (should use default b=1)
-            res1 = await self.execute("InteropTarget", "it_sync_add", 5, host=host)
-            res2 = await self.execute("InteropTarget", "it_async_add", 6, host=host)
+            res1 = await self.execute("InteropTarget", "it_sync_add", 5, hosts=host)
+            res2 = await self.execute("InteropTarget", "it_async_add", 6, hosts=host)
             ok = (res1 == 6) and (res2 == 7)
             await self._log_case(
                 "val_single_arg_async", ok, f"got=({res1},{res2}) expected=(6,7)"
@@ -85,7 +85,7 @@ class InteropCaller(Plugin):
             # async stream of async-gen
             items = []
             async for it in self.execute_stream(
-                "InteropTarget", "it_async_gen", {"n": 3, "prefix": "ag"}, host=host
+                "InteropTarget", "it_async_gen", {"n": 3, "prefix": "ag"}, hosts=host
             ):
                 items.append(it)
             ok = items == ["ag0", "ag1", "ag2"]
@@ -101,7 +101,7 @@ class InteropCaller(Plugin):
             # async stream of sync-gen
             items = []
             async for it in self.execute_stream(
-                "InteropTarget", "it_sync_gen", {"n": 3, "prefix": "g"}, host=host
+                "InteropTarget", "it_sync_gen", {"n": 3, "prefix": "g"}, hosts=host
             ):
                 items.append(it)
             ok = items == ["g0", "g1", "g2"]
@@ -132,7 +132,7 @@ class InteropCaller(Plugin):
 
         # ---- Value calls (sync context) ----
         try:
-            res = self.execute_sync("InteropTarget", "it_async_add", (4, 6), host=host)
+            res = self.execute_sync("InteropTarget", "it_async_add", (4, 6), hosts=host)
             ok = res == 10
             self._log_case_sync("val_sync_to_async_tuple", ok, f"got={res} expected=10")
             failures += 0 if ok else 1
@@ -142,7 +142,7 @@ class InteropCaller(Plugin):
 
         try:
             res = self.execute_sync(
-                "InteropTarget", "it_sync_add", {"a": 9, "b": 1}, host=host
+                "InteropTarget", "it_sync_add", {"a": 9, "b": 1}, hosts=host
             )
             ok = res == 10
             self._log_case_sync("val_sync_to_sync_kwargs", ok, f"got={res} expected=10")
@@ -152,8 +152,8 @@ class InteropCaller(Plugin):
             failures += 1
 
         try:
-            res1 = self.execute_sync("InteropTarget", "it_sync_add", 5, host=host)
-            res2 = self.execute_sync("InteropTarget", "it_async_add", 6, host=host)
+            res1 = self.execute_sync("InteropTarget", "it_sync_add", 5, hosts=host)
+            res2 = self.execute_sync("InteropTarget", "it_async_add", 6, hosts=host)
             ok = (res1 == 6) and (res2 == 7)
             self._log_case_sync(
                 "val_single_arg_sync", ok, f"got=({res1},{res2}) expected=(6,7)"
@@ -167,7 +167,7 @@ class InteropCaller(Plugin):
         try:
             items = []
             for it in self.execute_stream_sync(
-                "InteropTarget", "it_async_gen", {"n": 2, "prefix": "ax"}, host=host
+                "InteropTarget", "it_async_gen", {"n": 2, "prefix": "ax"}, hosts=host
             ):
                 items.append(it)
             ok = items == ["ax0", "ax1"]
@@ -182,7 +182,7 @@ class InteropCaller(Plugin):
         try:
             items = []
             for it in self.execute_stream_sync(
-                "InteropTarget", "it_sync_gen", (2, "sx"), host=host
+                "InteropTarget", "it_sync_gen", (2, "sx"), hosts=host
             ):
                 items.append(it)
             ok = items == ["sx0", "sx1"]

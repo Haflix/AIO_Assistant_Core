@@ -26,8 +26,8 @@ MSG_STREAM_CHUNK = 11
 MSG_ERROR = 12
 MSG_END_STREAM = 13
 
-MSG_NOTIFY = 7             # Fire-and-forget topic notification
-MSG_TOPIC_REQUEST = 8      # Request-by-topic (one-to-one with response)
+MSG_NOTIFY = 7  # Fire-and-forget topic notification
+MSG_TOPIC_REQUEST = 8  # Request-by-topic (one-to-one with response)
 MSG_TOPIC_REQUEST_STREAM = 9  # Streaming request-by-topic
 
 MSG_STREAM_ITEM_END = 14  # Marks end of one item in a streaming response
@@ -676,7 +676,7 @@ class NetworkManager:
                 method,
                 args=args if args else None,
                 plugin_uuid=plugin_uuid,
-                host="local",
+                hosts="local",
                 timeout=timeout,
                 author=author,
                 author_id=author_id,
@@ -755,7 +755,7 @@ class NetworkManager:
                 method=method,
                 args=args if args else None,
                 plugin_uuid=plugin_uuid,
-                host="local",
+                hosts="local",
                 author=author,
                 author_id=author_id,
                 timeout=timeout,
@@ -837,12 +837,12 @@ class NetworkManager:
             # Use find_endpoint which already does both checks
             self._logger.debug(
                 f"[ENDPOINT] Calling find_endpoint: access_name='{access_name}', "
-                f"host='local', plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
+                f"hosts='local', plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
                 f"target_plugin={target_plugin}"
             )
             plugin, endpoint, node = await self.plugin_core.find_endpoint(
                 access_name=access_name,
-                host="local",
+                hosts="local",
                 plugin_uuid=plugin_uuid,
                 requester_id=requester_id,
                 target_plugin=target_plugin,
@@ -916,8 +916,12 @@ class NetworkManager:
                                 {
                                     "plugin_name": plugin.plugin_name,
                                     "plugin_uuid": plugin.plugin_uuid,
-                                    "plugin_version": getattr(plugin, "version", "unknown"),
-                                    "plugin_description": getattr(plugin, "description", ""),
+                                    "plugin_version": getattr(
+                                        plugin, "version", "unknown"
+                                    ),
+                                    "plugin_description": getattr(
+                                        plugin, "description", ""
+                                    ),
                                     "endpoint": endpoint,
                                 }
                             )
@@ -953,8 +957,11 @@ class NetworkManager:
             self._logger.info(f"[NOTIFY] Remote notify for topic '{topic}'")
 
             count = await self.plugin_core.notify(
-                topic, args, host="local",
-                author=author, author_id=author_id,
+                topic,
+                args,
+                hosts="local",
+                author=author,
+                author_id=author_id,
             )
             await self._send_message(writer, MSG_RESULT, {"count": count})
         except Exception as e:
@@ -975,8 +982,11 @@ class NetworkManager:
             self._logger.info(f"[TOPIC_REQUEST] Remote request for topic '{topic}'")
 
             result = await self.plugin_core.request_topic(
-                topic, args, host="local",
-                author=author, author_id=author_id,
+                topic,
+                args,
+                hosts="local",
+                author=author,
+                author_id=author_id,
                 timeout=timeout,
             )
 
@@ -985,7 +995,7 @@ class NetworkManager:
             if len(payload) > CHUNK_SIZE:
                 offset = 0
                 while offset < len(payload):
-                    chunk_data = payload[offset:offset + CHUNK_SIZE]
+                    chunk_data = payload[offset : offset + CHUNK_SIZE]
                     chunk_length = len(chunk_data) + 1
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
@@ -1013,11 +1023,16 @@ class NetworkManager:
             author_id = data.get("author_id", "remote")
             timeout = data.get("timeout")
 
-            self._logger.info(f"[TOPIC_STREAM] Remote stream request for topic '{topic}'")
+            self._logger.info(
+                f"[TOPIC_STREAM] Remote stream request for topic '{topic}'"
+            )
 
             async for chunk in self.plugin_core.request_topic_stream(
-                topic, args, host="local",
-                author=author, author_id=author_id,
+                topic,
+                args,
+                hosts="local",
+                author=author,
+                author_id=author_id,
                 timeout=timeout,
             ):
                 payload = pickle.dumps(chunk)
@@ -1079,10 +1094,7 @@ class NetworkManager:
                 # _resolve_port returns OUR self.port → connect-back hits our
                 # own server (self-loop).
                 resolved_port: Optional[int]
-                if (
-                    isinstance(client_listener_port, int)
-                    and client_listener_port > 0
-                ):
+                if isinstance(client_listener_port, int) and client_listener_port > 0:
                     resolved_port = client_listener_port
                 else:
                     resolved_port = None
@@ -1092,7 +1104,8 @@ class NetworkManager:
                     # have an explicit port; otherwise dedupe by exact tuple.
                     if resolved_port is not None:
                         self.node_ips = [
-                            e for e in self.node_ips
+                            e
+                            for e in self.node_ips
                             if not (e[0] == client_ip and e[1] is None)
                         ]
                         # Also patch any existing Node for this IP that was
@@ -1142,9 +1155,7 @@ class NetworkManager:
         peers on the same IP with different ports are tracked separately.
         """
         port = self._resolve_port(IP)
-        self._logger.debug(
-            f"[CONNECTION] Creating new TLS connection to {IP}:{port}"
-        )
+        self._logger.debug(f"[CONNECTION] Creating new TLS connection to {IP}:{port}")
         # Create SSL context for client
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False  # Allow self-signed certs
@@ -1660,7 +1671,9 @@ class NetworkManager:
 
             msg_type, data = await self._receive_message(reader)
             if msg_type == MSG_ERROR:
-                self._logger.warning(f"[NOTIFY_REMOTE] Node {IP} returned error: {data}")
+                self._logger.warning(
+                    f"[NOTIFY_REMOTE] Node {IP} returned error: {data}"
+                )
                 return 0
 
             await self._return_connection(IP, reader, writer)
@@ -1724,7 +1737,9 @@ class NetworkManager:
                         error_data = pickle.loads(payload)
                         raise NetworkRequestException(str(error_data))
                     else:
-                        raise NetworkRequestException(f"Unexpected msg type: {msg_type}")
+                        raise NetworkRequestException(
+                            f"Unexpected msg type: {msg_type}"
+                        )
                 elif msg_type == MSG_END_STREAM:
                     break
 
@@ -1791,7 +1806,9 @@ class NetworkManager:
                         error_data = pickle.loads(payload)
                         raise NetworkRequestException(str(error_data))
                     else:
-                        raise NetworkRequestException(f"Unexpected msg type: {msg_type}")
+                        raise NetworkRequestException(
+                            f"Unexpected msg type: {msg_type}"
+                        )
                 elif msg_type == MSG_END_STREAM:
                     break
 
@@ -1942,7 +1959,9 @@ class NetworkManager:
     @async_handle_errors(None)
     async def update_all_nodes(
         self,
-        additional_IP_list: Optional[list] = None,  # entries: str | "IP:PORT" | dict | (ip, port)
+        additional_IP_list: Optional[
+            list
+        ] = None,  # entries: str | "IP:PORT" | dict | (ip, port)
         timeout: int = 5,
         ignore_enabled_status: bool = False,
         concurrency: int = 20,
@@ -2046,7 +2065,8 @@ class NetworkManager:
                 # hostname, or IP-only if hostname not yet known).
                 existing = next(
                     (
-                        n for n in self.nodes
+                        n
+                        for n in self.nodes
                         if n.IP == sub_ip
                         and (n.hostname == sub_hostname or n.hostname is None)
                     ),
@@ -2060,7 +2080,8 @@ class NetworkManager:
                     if existing.port is None and sub_port is not None:
                         existing.port = sub_port
                         self.node_ips = [
-                            e for e in self.node_ips
+                            e
+                            for e in self.node_ips
                             if not (e[0] == sub_ip and e[1] is None)
                         ]
                         new_entry = (sub_ip, sub_port)
@@ -2077,7 +2098,9 @@ class NetworkManager:
                 # New peer — add and schedule a follow-up update.
                 await self._add_ip(sub_ip, port=sub_port)
                 await self._create_new_node(
-                    sub_ip, hostname=sub_hostname, port=sub_port,
+                    sub_ip,
+                    hostname=sub_hostname,
+                    port=sub_port,
                 )
                 followups.append(self.update_single(sub_ip))
                 self._logger.info(
@@ -2406,16 +2429,12 @@ class NetworkManager:
         writer = None
         connection_returned = False
 
-        self._logger.info(
-            f"[TAG_SEARCH] Querying node {IP} for tag '{tag}'"
-        )
+        self._logger.info(f"[TAG_SEARCH] Querying node {IP} for tag '{tag}'")
 
         try:
             reader, writer = await self._get_connection(IP)
 
-            await self._send_message(
-                writer, MSG_FIND_TAGGED_ENDPOINTS, {"tag": tag}
-            )
+            await self._send_message(writer, MSG_FIND_TAGGED_ENDPOINTS, {"tag": tag})
 
             msg_type, data = await self._receive_message(reader)
 
@@ -2444,9 +2463,7 @@ class NetworkManager:
                 return remote_endpoints
 
             elif msg_type == MSG_ERROR:
-                self._logger.warning(
-                    f"[TAG_SEARCH] Node {IP} returned error: {data}"
-                )
+                self._logger.warning(f"[TAG_SEARCH] Node {IP} returned error: {data}")
                 return None
 
             return None
@@ -2480,7 +2497,9 @@ class NetworkManager:
         Ask a node if it has the specified plugin.
         DEPRECATED: Use node_has_endpoint instead.
         """
-        raise NotImplementedError("node_has_plugin is deprecated. Use node_has_endpoint instead.")
+        raise NotImplementedError(
+            "node_has_plugin is deprecated. Use node_has_endpoint instead."
+        )
         # For backward compatibility, use node_has_endpoint with access_name=None
         # This will check plugin existence but not endpoint
         result = await self.node_has_endpoint(
@@ -2503,61 +2522,3 @@ class NetworkManager:
                 ),
             }
         return None
-
-
-#    async def discover_nodes(self, cidr_range=None, timeout=10):
-#        if cidr_range is None:
-#            #hostname = socket.gethostname()
-#            #local_ip = socket.gethostbyname(hostname)
-#            networks = [ipaddress.ip_network(f"{self.network_ip}/24", strict=False)]
-#        else:
-#            networks = [ipaddress.ip_network(cidr_range, strict=False)]
-#
-#        ips_to_scan = [str(ip) for network in networks for ip in network.hosts()]
-#        sem = asyncio.Semaphore(20)
-#        active_nodes = []
-#
-#        @async_handle_errors(None)
-#        async def _probe_node(ip, client, sem):
-#            async with sem:
-#                try:
-#                    self._logger.debug(f"Trying to find node on http://{ip}:{self.port}/plugins")
-#                    response = await client.get(
-#                        f"http://{ip}:{self.port}/plugins"
-#                    )
-#                    if response.status_code == 200:
-#                        return ip
-#                except (httpx.ConnectError, httpx.TimeoutException):
-#                    pass
-#                except Exception:
-#                    self._logger.warning(f"Exception while trying to find node on http://{ip}:{self.port}/plugins: ")
-#                    pass
-#            return None
-#
-#        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout=timeout)) as client:
-#        #async with httpx.AsyncClient(timeout=httpx.Timeout(connect=0.1, read=0.2, write=0.2, pool=0.5)) as client:
-#            tasks = [asyncio.create_task(_probe_node(ip, client, sem)) for ip in ips_to_scan]
-#
-#            for task in asyncio.as_completed(tasks):
-#                result = await task
-#                if result:
-#                    active_nodes.append(result)
-#                    self._logger.info(f"[DISCOVERY] Found active node: {result}")
-#
-#        self.nodes = active_nodes
-#        return active_nodes
-
-
-#    async def find_plugin_on_nodes(self, plugin_name: str):
-#        """Check all known nodes for the requested plugin."""
-#        found_hosts = []
-#        for node in self.nodes:
-#            try:
-#                async with httpx.AsyncClient(timeout=2.0) as client:
-#                    response = await client.get(f"http://{node.ip}:{self.port}/plugins")
-#                    if response.status_code == 200:
-#                        if plugin_name in response.json():
-#                            found_hosts.append(node)
-#            except:
-#                continue
-#        return found_hosts

@@ -74,7 +74,7 @@ class AveragePlugin(Plugin):
 
         # Execute method on another plugin
         # host options: "local", "remote", "any", or specific hostname
-        result = await self.execute(plugin_name, method_name, args, host="any")
+        result = await self.execute(plugin_name, method_name, args, hosts="any")
 
         return result
 
