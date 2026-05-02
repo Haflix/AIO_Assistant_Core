@@ -13,6 +13,7 @@ __pycache__/
 _old/
 _private/
 bugtracker.md
+notes.txt
 
 # Distribution / packaging
 .Python
