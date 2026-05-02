@@ -427,7 +427,7 @@ class MyPlugin(Plugin):
 description: My custom plugin
 version: 1.0.0
 remote: True
-arguments: []
+arguments:                          # optional load-time arguments dict; omit or null for none
 endpoints:
   # Dict keyed by access_name. internal_name defaults to the key when omitted.
   my_method:

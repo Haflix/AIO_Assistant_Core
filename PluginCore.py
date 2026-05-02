@@ -793,7 +793,12 @@ class PluginCore:
             if field not in plugin_config:
                 await warn_config(f"{name} missing {field} in plugin_config.yml")
 
-        # Validate endpoints config (PR2: dict keyed by access_name).
+        # Early shape check on RAW endpoints config (PR2: dict keyed by
+        # access_name). Catches the legacy list-form before override
+        # merge runs — overrides on a list-shaped base would silently
+        # discard the base. Detail validation (required fields, types,
+        # access_name keys, internal_name shape) runs AFTER override
+        # merge so override-introduced violations are also caught (C12).
         endpoints_raw = plugin_config.get("endpoints")
         if endpoints_raw is None:
             # Absent or null endpoints -> plugin has 0 endpoints. Skip rest.
@@ -801,18 +806,74 @@ class PluginCore:
         elif isinstance(endpoints_raw, list):
             await error_config(
                 "endpoints: must be a dict keyed by access_name; list-form was "
-                "removed in PR2. Run tools/migrate_pr2_config.py to convert."
+                "removed in PR2. Convert each list entry to a dict entry "
+                "keyed by its access_name."
             )
             return
         elif not isinstance(endpoints_raw, dict):
             await error_config(
                 f"endpoints: must be a dict keyed by access_name; got "
-                f"{type(endpoints_raw).__name__}. Run tools/migrate_pr2_config.py "
-                f"to convert."
+                f"{type(endpoints_raw).__name__}."
+            )
+            return
+
+        # ── Argument override application ────────────────────────────────
+        # Base args from plugin_config.yml. Must be dict-or-null.
+        base_args = plugin_config.get("arguments")
+        if base_args is not None and not isinstance(base_args, dict):
+            await error_config(
+                f"top-level 'arguments' in plugin_config.yml must be a mapping (dict) "
+                f"or omitted; got {type(base_args).__name__}"
+            )
+            return
+
+        # Detect legacy top-level `arguments:` on the plugin entry — Q22:
+        # field was renamed to `overrides.arguments:` in PR2.
+        if "arguments" in plugin_entry:
+            await warn_config(
+                "main config 'arguments:' on plugin entry is a legacy field; "
+                "use `overrides.arguments:` instead. Ignored."
+            )
+
+        # Apply broader `overrides:` block from main config plugin entry.
+        # Type-check (dict-or-None or warn-and-ignore deployment misconfig).
+        override = plugin_entry.get("overrides")
+        if override is None:
+            merged_config = dict(plugin_config)
+        elif not isinstance(override, dict):
+            await warn_config(
+                f"main config 'overrides' for '{name}' must be a mapping; "
+                f"got {type(override).__name__}; ignoring overrides"
+            )
+            merged_config = dict(plugin_config)
+        else:
+            try:
+                merged_config = apply_overrides(
+                    plugin_config, override, name, self._logger
+                )
+            except ValueError as e:
+                await error_config(f"override application failed: {e}")
+                return
+
+        # Validate MERGED endpoints (post-override). Override-introduced
+        # violations (e.g. `__replace__: true` that drops required fields,
+        # or a wrong-type boolean) are caught here. C12 contract.
+        merged_endpoints = merged_config.get("endpoints")
+        if merged_endpoints is None:
+            # No endpoints after merge - fine, plugin has 0 endpoints.
+            pass
+        elif not isinstance(merged_endpoints, dict):
+            # Should not happen given apply_overrides type checks, but
+            # defensive guard. apply_overrides would raise on a non-dict
+            # `endpoints:` override, and the early shape check above
+            # rejected list/non-dict raw form.
+            await error_config(
+                f"endpoints (post-override) must be a dict keyed by access_name; "
+                f"got {type(merged_endpoints).__name__}"
             )
             return
         else:
-            for ep_key, endpoint in endpoints_raw.items():
+            for ep_key, endpoint in merged_endpoints.items():
                 # The dict key is the canonical access_name. Validate it.
                 try:
                     _validate_identifier_name(
@@ -840,7 +901,8 @@ class PluginCore:
                             f"{ep_key!r}"
                         )
 
-                # remote, accessible_by_other_plugins still required.
+                # remote, accessible_by_other_plugins still required (C12:
+                # `__replace__: true` that omits these triggers this check).
                 for field in ["remote", "accessible_by_other_plugins"]:
                     if field not in endpoint:
                         await error_config(
@@ -883,44 +945,6 @@ class PluginCore:
                             f"as it must be a {check[1]}"
                         )
                         return
-
-        # ── Argument override application ────────────────────────────────
-        # Base args from plugin_config.yml. Must be dict-or-null.
-        base_args = plugin_config.get("arguments")
-        if base_args is not None and not isinstance(base_args, dict):
-            await error_config(
-                f"top-level 'arguments' in plugin_config.yml must be a mapping (dict) "
-                f"or omitted; got {type(base_args).__name__}"
-            )
-            return
-
-        # Detect legacy top-level `arguments:` on the plugin entry — Q22:
-        # field was renamed to `overrides.arguments:` in PR2.
-        if "arguments" in plugin_entry:
-            await warn_config(
-                "main config 'arguments:' on plugin entry is a legacy field; "
-                "use `overrides.arguments:` instead. Ignored."
-            )
-
-        # Apply broader `overrides:` block from main config plugin entry.
-        # Type-check (dict-or-None or warn-and-ignore deployment misconfig).
-        override = plugin_entry.get("overrides")
-        if override is None:
-            merged_config = dict(plugin_config)
-        elif not isinstance(override, dict):
-            await warn_config(
-                f"main config 'overrides' for '{name}' must be a mapping; "
-                f"got {type(override).__name__}; ignoring overrides"
-            )
-            merged_config = dict(plugin_config)
-        else:
-            try:
-                merged_config = apply_overrides(
-                    plugin_config, override, name, self._logger
-                )
-            except ValueError as e:
-                await error_config(f"override application failed: {e}")
-                return
 
         merged_args = merged_config.get("arguments")
 
