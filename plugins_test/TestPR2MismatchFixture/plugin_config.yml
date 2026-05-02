@@ -1,0 +1,11 @@
+description: PR2 test fixture — access_name field differs from dict key (triggers warn + key wins)
+version: 0.1.0
+remote: false
+arguments:
+endpoints:
+  ping:
+    internal_name: ping
+    access_name: wrong_name
+    remote: false
+    accessible_by_other_plugins: true
+    description: access_name field intentionally differs from key

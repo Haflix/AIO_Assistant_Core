@@ -1,0 +1,5 @@
+description: PR2 test fixture — null endpoints (plugin with no exposed endpoints)
+version: 0.1.0
+remote: false
+arguments:
+endpoints:
