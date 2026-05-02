@@ -48,6 +48,54 @@ from networking import NetworkManager, REMOTE_NO_RESULT
 from notifier import TopicRegistry, Subscription
 
 
+# Reserved identifier names — disallowed as plugin names AND endpoint
+# access_names because they are framework-reserved keywords used in
+# config/system contexts. Future-proof: extend as new framework-reserved
+# names are introduced.
+_RESERVED_IDENTIFIER_NAMES = frozenset({"system", "general"})
+
+
+def _validate_identifier_name(name, *, context: str) -> None:
+    """Validate that ``name`` is a Python-identifier-style string and not in
+    the reserved blacklist. Used for plugin names from config.yml and for
+    endpoint access_names (= dict keys in plugin_config.yml endpoints:).
+
+    Raises ValueError with a message that begins with ``context`` (e.g.
+    ``"plugin name"`` or ``"endpoint access_name"``) so the caller can tag
+    the error site without reformatting.
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            f"{context} {name!r} invalid: must be a string, got {type(name).__name__}"
+        )
+    if not name.isidentifier():
+        raise ValueError(
+            f"{context} {name!r} invalid: must be a valid Python identifier "
+            f"(letters, digits, underscores; cannot start with a digit)"
+        )
+    if name in _RESERVED_IDENTIFIER_NAMES:
+        raise ValueError(
+            f"{context} {name!r} invalid: reserved name "
+            f"(reserved: {sorted(_RESERVED_IDENTIFIER_NAMES)})"
+        )
+
+
+# Sections of plugin_config.yml that get DEEP-MERGED by apply_overrides.
+# Each section is a top-level mapping; per-key entries are merged via
+# _deep_merge_args. PR3 will add "events" and "subscriptions".
+_OVERRIDE_SECTIONS = ("arguments", "endpoints")
+
+# Sections that enforce STRICT unknown-subkey handling: an override naming
+# a subkey not present in the base plugin_config is a fail-load ERROR.
+# Other sections fall back to lenient (additive) deep-merge per Q14.
+_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})
+
+# Plugin-level scalar/list fields (top-level fields of plugin_config.yml)
+# that an `overrides:` block may VALUE-REPLACE. PR3 will add "prefix" and
+# "verbose_notifier".
+_PLUGIN_LEVEL_OVERRIDE_FIELDS = ("description", "remote", "version")
+
+
 def _deep_merge_args(
     base: dict,
     override: dict,
@@ -108,6 +156,120 @@ def _deep_merge_args(
                 logger.debug(f"Plugin '{plugin_name}': arg replaced '{path}'")
             out[key] = ov
     return out
+
+
+def apply_overrides(
+    plugin_config: dict,
+    overrides_block: Optional[dict],
+    plugin_name: str,
+    logger,
+) -> dict:
+    """Apply a main-config `overrides:` block to a copy of plugin_config.
+
+    Walks `overrides_block`'s top-level keys:
+
+      * Known SECTION (``arguments``, ``endpoints``) — deep-merged against
+        plugin_config[section] via ``_deep_merge_args``. For STRICT sections
+        (currently ``endpoints``), unknown subkeys (entries not present in
+        the base plugin_config[section]) are a fail-load ERROR per Q2.
+        For other sections, unknown subkeys are added per existing
+        ``_deep_merge_args`` behavior (lenient, Q14).
+      * Known PLUGIN-LEVEL FIELD (``description``, ``remote``, ``version``)
+        — value-replaces plugin_config[field] outright.
+      * Anything else at the top level — WARN and ignore (Q22).
+
+    Returns a new dict (does not mutate ``plugin_config``). On strict-section
+    error, raises ValueError so the caller can fail-load the plugin.
+
+    Existing behavior preserved across the generalization:
+      - ``__replace__: true`` directive (handled inside _deep_merge_args)
+      - type-mismatch warning + counter
+      - same DEBUG/INFO log shape as the previous narrow `arguments`
+        override path (logged here at the section level so the user still
+        sees the per-plugin "applied N override(s)" summary)
+    """
+    if overrides_block is None:
+        return dict(plugin_config)
+    if not isinstance(overrides_block, dict):
+        # Caller is expected to type-check `overrides:` itself and convert
+        # to None on warning. Defensive guard for direct callers (tests).
+        raise ValueError(
+            f"apply_overrides: overrides must be a mapping, "
+            f"got {type(overrides_block).__name__}"
+        )
+
+    merged = dict(plugin_config)
+    if not overrides_block:
+        # Empty `overrides: {}` block — no-op shallow copy.
+        return merged
+
+    counters = {"added": 0, "replaced": 0, "type_mismatched": 0}
+
+    for key, ov in overrides_block.items():
+        if key in _OVERRIDE_SECTIONS:
+            base_section = merged.get(key)
+            # Sections must be mappings (or None / absent). A list-valued
+            # override targeting a section is a hard error — covered for
+            # the `endpoints:` case explicitly to surface the migration
+            # mistake, applies generally to all sections.
+            if not isinstance(ov, dict):
+                raise ValueError(
+                    f"override section '{key}' must be a mapping; "
+                    f"got {type(ov).__name__}"
+                )
+            base_dict = base_section if isinstance(base_section, dict) else {}
+
+            if key in _STRICT_OVERRIDE_SECTIONS:
+                # Strict: every override subkey must exist in the base.
+                # Unknown subkey → fail-load (Q2).
+                unknown = [sk for sk in ov.keys() if sk not in base_dict]
+                if unknown:
+                    raise ValueError(
+                        f"override section '{key}' references unknown "
+                        f"entries {unknown!r}; known entries are "
+                        f"{sorted(base_dict.keys())!r}"
+                    )
+
+            merged[key] = _deep_merge_args(
+                base_dict, ov, plugin_name, logger, counters, _path=key
+            )
+        elif key in _PLUGIN_LEVEL_OVERRIDE_FIELDS:
+            base_val = merged.get(key)
+            if base_val is not None and type(base_val) != type(ov):
+                # Mirrors _deep_merge_args type-mismatch warning behavior
+                # for plugin-level fields. Override still applied (lenient).
+                counters["type_mismatched"] += 1
+                logger.warning(
+                    f"Plugin '{plugin_name}': override field '{key}' type "
+                    f"mismatch ({type(base_val).__name__} -> "
+                    f"{type(ov).__name__ if ov is not None else 'NoneType'}); "
+                    f"override applied"
+                )
+            else:
+                if key in merged:
+                    counters["replaced"] += 1
+                else:
+                    counters["added"] += 1
+            merged[key] = ov
+        else:
+            # Unknown top-level override key — Q22: warn + ignore.
+            logger.warning(
+                f"Plugin '{plugin_name}': unknown top-level override key "
+                f"'{key}'; ignored "
+                f"(known sections: {list(_OVERRIDE_SECTIONS)}, "
+                f"known plugin-level fields: {list(_PLUGIN_LEVEL_OVERRIDE_FIELDS)})"
+            )
+
+    total = counters["added"] + counters["replaced"] + counters["type_mismatched"]
+    if total:
+        logger.info(
+            f"Plugin '{plugin_name}': applied {total} override(s) "
+            f"({counters['added']} added, "
+            f"{counters['replaced']} replaced, "
+            f"{counters['type_mismatched']} type-mismatched)"
+        )
+
+    return merged
 
 
 def _normalize_hosts(
@@ -588,6 +750,14 @@ class PluginCore:
         # Get values
         name = plugin_entry["name"]
 
+        # Validate plugin name shape (identifier + non-reserved). Done up
+        # front so the rejection happens before file I/O.
+        try:
+            _validate_identifier_name(name, context="plugin name")
+        except ValueError as e:
+            await error_config(str(e))
+            return
+
         if not plugin_entry.get("enabled"):
             self._logger.debug(
                 f'Plugin "{name}" wont be loaded due to it being disabled'
@@ -623,48 +793,96 @@ class PluginCore:
             if field not in plugin_config:
                 await warn_config(f"{name} missing {field} in plugin_config.yml")
 
-        # Validate endpoints config
-        for endpoint in (
-            plugin_config.get("endpoints")
-            if isinstance(plugin_config.get("endpoints"), list)
-            else []
-        ):
-            for field in [
-                "internal_name",
-                "access_name",
-                "remote",
-                "accessible_by_other_plugins",
-            ]:
-                if field not in endpoint:
+        # Validate endpoints config (PR2: dict keyed by access_name).
+        endpoints_raw = plugin_config.get("endpoints")
+        if endpoints_raw is None:
+            # Absent or null endpoints -> plugin has 0 endpoints. Skip rest.
+            pass
+        elif isinstance(endpoints_raw, list):
+            await error_config(
+                "endpoints: must be a dict keyed by access_name; list-form was "
+                "removed in PR2. Run tools/migrate_pr2_config.py to convert."
+            )
+            return
+        elif not isinstance(endpoints_raw, dict):
+            await error_config(
+                f"endpoints: must be a dict keyed by access_name; got "
+                f"{type(endpoints_raw).__name__}. Run tools/migrate_pr2_config.py "
+                f"to convert."
+            )
+            return
+        else:
+            for ep_key, endpoint in endpoints_raw.items():
+                # The dict key is the canonical access_name. Validate it.
+                try:
+                    _validate_identifier_name(
+                        ep_key, context="endpoint access_name"
+                    )
+                except ValueError as e:
+                    await error_config(str(e))
+                    return
+
+                if not isinstance(endpoint, dict):
                     await error_config(
-                        f"{endpoint} is missing {field} in plugin_config.yml"
+                        f"endpoint '{ep_key}': value must be a mapping; got "
+                        f"{type(endpoint).__name__}"
                     )
                     return
 
-            for check in [
-                ("internal_name", str, True, True),
-                ("access_name", str, True, True),
-                ("remote", bool, False, False),
-                ("accessible_by_other_plugins", bool, False, False),
-            ]:  # ({config_option}, {type}, {empty_allowed}, {check_ascii})
+                # access_name field on the entry is optional; if present and
+                # different from the dict key, warn and use the key.
+                if "access_name" in endpoint:
+                    ep_access = endpoint.get("access_name")
+                    if ep_access != ep_key:
+                        await warn_config(
+                            f"endpoint '{ep_key}': 'access_name' field "
+                            f"{ep_access!r} differs from dict key; using key "
+                            f"{ep_key!r}"
+                        )
 
-                if type(endpoint[check[0]]) != check[1]:
-                    await error_config(
-                        f"{endpoint}: {check[0]} has wrong type {type(endpoint[check[0]])} in plugin_config.yml as it must be a {check[1]}"
-                    )
-                    return
+                # remote, accessible_by_other_plugins still required.
+                for field in ["remote", "accessible_by_other_plugins"]:
+                    if field not in endpoint:
+                        await error_config(
+                            f"endpoint '{ep_key}' is missing {field} in plugin_config.yml"
+                        )
+                        return
 
-                if check[2] and not endpoint[check[0]].strip():
-                    await error_config(
-                        f"{endpoint}: {check[0]} is empty in plugin_config.yml"
-                    )
-                    return
+                # internal_name optional; if present, validate as str/non-empty/ascii.
+                if "internal_name" in endpoint:
+                    iv = endpoint["internal_name"]
+                    if type(iv) != str:
+                        await error_config(
+                            f"endpoint '{ep_key}': internal_name has wrong type "
+                            f"{type(iv)} in plugin_config.yml as it must be a "
+                            f"{str}"
+                        )
+                        return
+                    if not iv.strip():
+                        await error_config(
+                            f"endpoint '{ep_key}': internal_name is empty in "
+                            f"plugin_config.yml"
+                        )
+                        return
+                    if not iv.isascii():
+                        await error_config(
+                            f"endpoint '{ep_key}': internal_name contains non "
+                            f"ascii chars in plugin_config.yml"
+                        )
+                        return
 
-                if check[3] and not endpoint[check[0]].isascii():
-                    await error_config(
-                        f"{endpoint}: {check[0]} contains non ascii chars in plugin_config.yml"
-                    )
-                    return
+                # Type checks for required boolean fields.
+                for check in [
+                    ("remote", bool, False, False),
+                    ("accessible_by_other_plugins", bool, False, False),
+                ]:  # ({config_option}, {type}, {empty_allowed}, {check_ascii})
+                    if type(endpoint[check[0]]) != check[1]:
+                        await error_config(
+                            f"endpoint '{ep_key}': {check[0]} has wrong type "
+                            f"{type(endpoint[check[0]])} in plugin_config.yml "
+                            f"as it must be a {check[1]}"
+                        )
+                        return
 
         # ── Argument override application ────────────────────────────────
         # Base args from plugin_config.yml. Must be dict-or-null.
@@ -676,42 +894,35 @@ class PluginCore:
             )
             return
 
-        # Override from main config.yml plugin entry. Must be dict-or-missing.
-        # Asymmetry intentional: invalid plugin_config is a hard error (plugin
-        # author bug). Invalid main-config override is a warning that ignores
-        # the override (deployment misconfig — let other plugins still load).
-        # Order matters: type-check BEFORE emptiness short-circuit, so wrong
-        # falsy types ([], "", 0, False) still warn instead of being silently dropped.
-        override = plugin_entry.get("arguments")
+        # Detect legacy top-level `arguments:` on the plugin entry — Q22:
+        # field was renamed to `overrides.arguments:` in PR2.
+        if "arguments" in plugin_entry:
+            await warn_config(
+                "main config 'arguments:' on plugin entry is a legacy field; "
+                "use `overrides.arguments:` instead. Ignored."
+            )
+
+        # Apply broader `overrides:` block from main config plugin entry.
+        # Type-check (dict-or-None or warn-and-ignore deployment misconfig).
+        override = plugin_entry.get("overrides")
         if override is None:
-            merged_args = base_args
+            merged_config = dict(plugin_config)
         elif not isinstance(override, dict):
             await warn_config(
-                f"main config 'arguments' for '{name}' must be a mapping; "
+                f"main config 'overrides' for '{name}' must be a mapping; "
                 f"got {type(override).__name__}; ignoring overrides"
             )
-            merged_args = base_args
-        elif not override:
-            merged_args = base_args
+            merged_config = dict(plugin_config)
         else:
-            counters = {"added": 0, "replaced": 0, "type_mismatched": 0}
-            merged_args = _deep_merge_args(
-                base_args or {},
-                override,
-                name,
-                self._logger,
-                counters,
-            )
-            total = (
-                counters["added"] + counters["replaced"] + counters["type_mismatched"]
-            )
-            if total:
-                self._logger.info(
-                    f"Plugin '{name}': applied {total} override(s) "
-                    f"({counters['added']} added, "
-                    f"{counters['replaced']} replaced, "
-                    f"{counters['type_mismatched']} type-mismatched)"
+            try:
+                merged_config = apply_overrides(
+                    plugin_config, override, name, self._logger
                 )
+            except ValueError as e:
+                await error_config(f"override application failed: {e}")
+                return
+
+        merged_args = merged_config.get("arguments")
 
         # Dynamic import
         module_path = os.path.join(path, "plugin.py")
@@ -740,22 +951,22 @@ class PluginCore:
         )
 
         plugin.plugin_name = name
-        plugin.version = plugin_config.get("version") or "0.0.0 - not given"
-        plugin.remote = plugin_config.get("remote") or False
+        plugin.version = merged_config.get("version") or "0.0.0 - not given"
+        plugin.remote = merged_config.get("remote") or False
+        plugin.description = merged_config.get("description") or "UNKNOWN"
         plugin.arguments = merged_args
-        endpoints_cfg = plugin_config.get("endpoints") or []
-        if not isinstance(endpoints_cfg, list):
-            await warn_config(f"endpoints must be a list in plugin_config.yml")
-            endpoints_cfg = []
-        plugin.endpoints = [e for e in endpoints_cfg if isinstance(e, dict)]
-        try:
-            plugin._endpoint_by_access = {
-                e.get("access_name"): e
-                for e in plugin.endpoints
-                if e.get("access_name")
-            }
-        except Exception:
-            plugin._endpoint_by_access = {}
+        endpoints_cfg = merged_config.get("endpoints") or {}
+        if not isinstance(endpoints_cfg, dict):
+            # apply_overrides + the validator above already enforce dict shape.
+            # Defensive guard against post-merge misshape.
+            await warn_config(
+                f"endpoints must be a dict keyed by access_name in "
+                f"plugin_config.yml; got {type(endpoints_cfg).__name__}"
+            )
+            endpoints_cfg = {}
+        plugin.endpoints = endpoints_cfg
+        # Alias retained for backward-compatible callsite naming. Same dict.
+        plugin._endpoint_by_access = plugin.endpoints
 
         async with self.plugin_lock:
             self.plugins[name] = plugin
@@ -765,19 +976,19 @@ class PluginCore:
                 self.plugins_by_uuid[plugin_uuid] = plugin
 
         # Register config-driven topic subscriptions
-        for endpoint in plugin.endpoints:
+        for ep_key, endpoint in plugin.endpoints.items():
             topic = endpoint.get("topic")
             if topic and isinstance(topic, str) and topic.strip():
                 await self.topic_registry.subscribe(
                     topic_pattern=topic.strip(),
                     plugin_name=name,
                     plugin_uuid=plugin.plugin_uuid,
-                    endpoint_access_name=endpoint.get("access_name"),
+                    endpoint_access_name=ep_key,
                     config_driven=True,
                 )
 
         self._logger.info(
-            f"Successfully loaded plugin: {name} (Version: {plugin_config['version']}, Path: {path})"
+            f"Successfully loaded plugin: {name} (Version: {plugin.version}, Path: {path})"
         )
 
     @async_log_errors
@@ -885,14 +1096,14 @@ class PluginCore:
             if not plugin:
                 return None
 
-            endpoints = getattr(plugin, "endpoints", [])
-            if not isinstance(endpoints, list):
+            endpoints = getattr(plugin, "endpoints", {})
+            if not isinstance(endpoints, dict):
                 return []
 
             return [
                 {
-                    "access_name": ep.get("access_name", ""),
-                    "internal_name": ep.get("internal_name", ""),
+                    "access_name": ep_key,
+                    "internal_name": ep.get("internal_name", ep_key),
                     "remote": ep.get("remote", False),
                     "accessible_by_other_plugins": ep.get(
                         "accessible_by_other_plugins", False
@@ -900,7 +1111,7 @@ class PluginCore:
                     "description": ep.get("description", ""),
                     "tags": ep.get("tags", []),
                 }
-                for ep in endpoints
+                for ep_key, ep in endpoints.items()
                 if isinstance(ep, dict)
             ]
 
@@ -1184,7 +1395,7 @@ class PluginCore:
         for plugin in self.plugins.values():
             plugin: Plugin
             if plugin.enabled:
-                for endpoint in plugin.endpoints:
+                for endpoint in plugin.endpoints.values():
                     if tag in (endpoint.get("tags") or []):
                         endpoints.append(
                             (
@@ -1448,11 +1659,14 @@ class PluginCore:
                 )
 
             else:
-                func = getattr(plugin, endpoint.get("internal_name"), None)
+                # PR2: internal_name is optional in plugin_config; defaults to
+                # access_name (the dict key, also the request target_method).
+                internal_name = endpoint.get("internal_name") or function_name
+                func = getattr(plugin, internal_name, None)
                 if not callable(func):
                     await self._set_request_result(
                         request,
-                        f"Function {endpoint.get('access_name')}({endpoint.get('internal_name')}) not found in plugin {plugin_name}",
+                        f"Function {function_name}({internal_name}) not found in plugin {plugin_name}",
                         True,
                     )
                     return
@@ -1570,12 +1784,15 @@ class PluginCore:
                 # if not plugin.remote and request.author_id:
                 #    await self._set_request_result(request, NetworkRequestException(f"Plugin {plugin_name} is not accessable anymore"), True)
                 #    return
-                func = getattr(plugin, endpoint.get("internal_name"), None)
+                # PR2: internal_name is optional in plugin_config; defaults to
+                # access_name (the dict key, also the request target_method).
+                internal_name = endpoint.get("internal_name") or function_name
+                func = getattr(plugin, internal_name, None)
                 if not callable(func):  # or not inspect.isfunction(func):
                     # await request.queue.put((result, False, False))
                     await self._set_gen_request_result(
                         request,
-                        f"Function {endpoint.get('access_name')}({endpoint.get('internal_name')}) not found in plugin {plugin_name}",
+                        f"Function {function_name}({internal_name}) not found in plugin {plugin_name}",
                         True,
                     )
                     return

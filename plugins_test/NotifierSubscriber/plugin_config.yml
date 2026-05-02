@@ -5,8 +5,8 @@ arguments:
 endpoints:
   # Config-driven subscription: this endpoint is automatically subscribed
   # to the "test/greet" topic when the plugin loads.
-  - internal_name: _handle_greet
-    access_name: handle_greet
+  handle_greet:
+    internal_name: _handle_greet
     topic: "test/greet"
     tags: []
     remote: True
@@ -18,8 +18,8 @@ endpoints:
         description: Name to greet
 
   # Config-driven wildcard subscription: matches any "test/math/*" topic
-  - internal_name: _handle_math
-    access_name: handle_math
+  handle_math:
+    internal_name: _handle_math
     topic: "test/math/*"
     tags: []
     remote: True
@@ -34,8 +34,8 @@ endpoints:
         description: Second operand
 
   # Streaming endpoint subscribed to a topic
-  - internal_name: _stream_count
-    access_name: stream_count
+  stream_count:
+    internal_name: _stream_count
     topic: "test/stream"
     tags: []
     remote: True
@@ -46,8 +46,8 @@ endpoints:
         type: int
         description: Number of items to stream
 
-  - internal_name: _get_log
-    access_name: get_log
+  get_log:
+    internal_name: _get_log
     tags: []
     remote: False
     accessible_by_other_plugins: True

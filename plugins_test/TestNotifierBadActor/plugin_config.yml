@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: register_handler
-    access_name: register_handler
+  register_handler:
+    internal_name: register_handler
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -13,8 +13,8 @@ endpoints:
       - name: topic
       - name: handler_name
 
-  - internal_name: unregister_all
-    access_name: unregister_all
+  unregister_all:
+    internal_name: unregister_all
     tags:
     remote: True
     accessible_by_other_plugins: True

@@ -309,7 +309,7 @@ All plugins must inherit from the `Plugin` base class.
 - `remote` - Whether the plugin supports remote execution
 - `description` - Plugin description
 - `arguments` - Arguments passed during loading
-- `endpoints` - List of endpoint configuration dicts
+- `endpoints` - Dict keyed by access_name; each value is the endpoint configuration dict
 - `_logger` - Logger instance for the plugin
 - `_plugin_core` - Reference to the PluginCore instance
 - `event_loop` - Reference to the main event loop
@@ -429,8 +429,8 @@ version: 1.0.0
 remote: True
 arguments: []
 endpoints:
-  - internal_name: my_method
-    access_name: my_method
+  # Dict keyed by access_name. internal_name defaults to the key when omitted.
+  my_method:
     tags: []
     remote: True
     accessible_by_other_plugins: True
@@ -519,8 +519,8 @@ The notifier system provides topic-based pub/sub and request-by-topic routing, d
 
 ```yaml
 endpoints:
-  - internal_name: _handle_chat
-    access_name: handle_chat
+  handle_chat:                    # access_name = key
+    internal_name: _handle_chat   # only needed when method name differs from key
     topic: "ai/chat"              # auto-subscribed on plugin load
     remote: True
     accessible_by_other_plugins: True
@@ -563,8 +563,7 @@ Tags are set per-endpoint in `plugin_config.yml`:
 
 ```yaml
 endpoints:
-  - internal_name: my_method
-    access_name: my_method
+  my_method:
     tags: ["sensors", "weather"]    # arbitrary strings — define your own taxonomy
     ...
 ```
@@ -698,7 +697,7 @@ networking:
 - `name`: Plugin name (must match class name)
 - `enabled`: Whether to load and enable this plugin on startup
 - `path`: Optional explicit path to plugin directory. If omitted, resolves to `{plugin_package}/{name}`
-- `arguments`: Optional dict that overrides values from the plugin's own `plugin_config.yml`. Deep-merged into the plugin's base arguments — see [Argument Overrides](#argument-overrides) for the merge rules and the `__replace__` marker
+- `overrides`: Optional dict overriding values from the plugin's own `plugin_config.yml` — covers `arguments`, `endpoints`, and plugin-level fields (`description`, `remote`, `version`). See [Argument Overrides](#argument-overrides) for the merge rules and the `__replace__` marker. (The pre-PR2 top-level `arguments:` field on plugin entries is now a legacy form: it logs a warning and is ignored — wrap it in `overrides: { arguments: ... }` instead.)
 
 **Networking**:
 
@@ -715,21 +714,38 @@ networking:
 
 ### Argument Overrides
 
-A plugin's default arguments live in its own `plugin_config.yml`. To change them per-deployment without editing the plugin's file, add an `arguments:` block to the plugin's entry in the main `config.yml`:
+A plugin's defaults live in its own `plugin_config.yml`. To change them per-deployment without editing the plugin's file, add an `overrides:` block to the plugin's entry in the main `config.yml`. The block covers three sections — `arguments`, `endpoints` — plus the plugin-level fields `description`, `remote`, and `version`:
 
 ```yaml
 plugins:
   - name: AI_Interaction
     enabled: true
     path: ./_private/AI/AI_Interaction
-    arguments:
-      modes:
-        conversation:
-          temperature: 0.3   # only this leaf is overridden
-      daily_cost_warning_eur: 5.0
+    overrides:
+      arguments:                          # deep-merges into plugin_config.yml's arguments
+        modes:
+          conversation:
+            temperature: 0.3              # only this leaf is overridden
+        daily_cost_warning_eur: 5.0
+      endpoints:                          # per-key deep-merge into endpoints dict
+        chat:
+          remote: True                    # change just this field on the `chat` endpoint
+        legacy_method:
+          __replace__: true               # wholesale-replace this entry
+          internal_name: legacy_method
+          remote: False
+          accessible_by_other_plugins: True
+      description: "AI for production node"   # plugin-level field replace
+      remote: True
 ```
 
-**Merge rules:**
+**Section-aware unknown-key behavior (Q2):**
+
+- `endpoints` is **strict**: an unknown endpoint key in the override (one that doesn't exist in `plugin_config.yml`'s endpoints dict) is an ERROR and the plugin fails to load. Catches typos in deployment configs that would otherwise silently miss the override target.
+- `arguments` is **lenient**: unknown subkeys are added to the merged dict. Plugin authors are free to read or ignore them.
+- Unknown TOP-LEVEL keys in the `overrides:` block (anything not in `{arguments, endpoints, description, remote, version}`) log a WARN and are ignored. PR3 will add `events`, `subscriptions`, `prefix`, and `verbose_notifier` to this set.
+
+**Merge rules (apply to `arguments` and `endpoints` deep-merges):**
 
 - **Dicts deep-merge.** Same key + both dict ⇒ recurse into both. Sibling keys in the base are preserved untouched at every depth. The example above replaces only `modes.conversation.temperature` and adds `daily_cost_warning_eur` — every other mode and every other field of `conversation` stays as declared in `plugin_config.yml`.
 - **Lists fully replace.** Override list wins wholesale. For list-of-dicts cases (e.g. `notifiers:`, `servers:` in MCPClient), you must restate every element you want to keep.
@@ -739,23 +755,31 @@ plugins:
 
 **`__replace__: true` marker — wholesale subtree replacement.**
 
-To bypass deep-merge at a specific node and replace its value entirely, include the special key `__replace__: true` inside the override dict at that level. The marker itself is stripped from the result.
+To bypass deep-merge at a specific node and replace its value entirely, include the special key `__replace__: true` inside the override dict at that level. The marker itself is stripped from the result. Works in both the `arguments` and `endpoints` sections.
 
 ```yaml
-arguments:
-  modes:
-    __replace__: true              # discard every existing mode
-    conversation: {model: x}       # this is the new modes dict
+overrides:
+  arguments:
+    modes:
+      __replace__: true              # discard every existing mode
+      conversation: {model: x}       # this is the new modes dict
 ```
 
 Two common uses:
 - **Clear a subtree:** `key: {__replace__: true}` ⇒ `key: {}`.
 - **Replace without inheriting siblings:** `key: {__replace__: true, a: 1}` ⇒ `key: {a: 1}` (any other keys the base had under `key` are gone).
 
+For endpoints, `__replace__: true` discards the base entry entirely; the override must then satisfy the required fields itself (`remote`, `accessible_by_other_plugins`).
+
+**Plugin-level field overrides:**
+
+`description`, `remote`, and `version` at the top of `overrides:` replace the corresponding values from `plugin_config.yml` outright (no merge — they are scalars). Useful when running two instances of the same plugin under different names with different remote-flag policies.
+
 **Constraints and corner cases:**
 
 - The top-level `arguments:` in `plugin_config.yml` must be a dict, `null`, or omitted. Lists and scalars at the root are rejected (the plugin fails to load).
-- The `arguments:` override in `config.yml` must also be a dict (or omitted). A wrong type logs a warning and the override is ignored — other plugins keep loading.
+- The `overrides:` block in `config.yml` must be a dict (or omitted). A wrong type logs a warning and the override is ignored — other plugins keep loading.
+- A legacy top-level `arguments:` field on the plugin entry in `config.yml` (the pre-PR2 form) logs a warning and is ignored. Wrap it inside `overrides: { arguments: ... }` to make it take effect.
 - `arguments: null` (or missing) + no override ⇒ `self.arguments is None` (unchanged from before this feature).
 - `arguments: {}` (explicit empty dict) + no override ⇒ `self.arguments == {}` (unchanged).
 - `arguments: null` + a real override dict ⇒ `self.arguments == <override>`.
@@ -792,9 +816,9 @@ description: str                 # What your plugin does
 version: str                     # Semantic version (e.g., "1.0.0")
 remote: boolean                  # Allow remote access to this plugin
 arguments:                       # Optional: Load-time arguments passed to on_load()
-endpoints:
-  - internal_name: method_name   # Actual method name in the plugin class
-    access_name: method_name     # Name used when calling from other plugins
+endpoints:                       # Dict keyed by access_name (the name other plugins call)
+  method_access_name:            # access_name = key; must be a valid Python identifier
+    internal_name: method_name   # Optional: actual method name on the class. Defaults to key.
     tags: []                     # Optional categorization tags
     remote: boolean              # Allow this endpoint to be called remotely
     accessible_by_other_plugins: boolean  # Allow other local plugins to call this
@@ -807,6 +831,27 @@ endpoints:
         required: boolean        # Optional: marks the argument as required (read by the CLI dashboard
                                  # and available to any orchestrator that builds AI tool schemas
                                  # from the endpoint metadata)
+```
+
+Per-plugin overrides go in `config.yml` under an `overrides:` block on the plugin entry:
+
+```yaml
+plugins:
+  - name: MyPlugin
+    enabled: true
+    overrides:
+      arguments:                 # Deep-merges into plugin_config.yml's `arguments`
+        api_key: "..."
+      endpoints:                 # Per-key deep-merge into the endpoints dict
+        my_method:
+          remote: True           # Override just this field
+        other_method:
+          __replace__: true      # Wholesale-replace the entry (rest must satisfy required fields)
+          internal_name: other_method
+          remote: True
+          accessible_by_other_plugins: True
+      description: "Override per-instance description"  # Plugin-level field replace
+      remote: True
 ```
 
 Additional fields (e.g. a `default:` value, or other schema hints) are ignored by core. They are passed through verbatim in `endpoint["arguments"]`, so an orchestrator plugin is free to define and consume its own extra keys.

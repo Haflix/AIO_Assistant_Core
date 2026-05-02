@@ -1252,16 +1252,16 @@ class DashboardApp(App):
         ))
         widgets.append(Rule())
 
-        endpoints = getattr(plugin, "endpoints", [])
+        endpoints = getattr(plugin, "endpoints", {})
         if not endpoints:
             widgets.append(Static("[dim]No endpoints defined.[/dim]", markup=True))
             return widgets
 
-        for ep in endpoints:
+        for ep_key, ep in endpoints.items():
             if not isinstance(ep, dict):
                 continue
-            access_name = ep.get("access_name", "unknown")
-            internal_name = ep.get("internal_name", "")
+            access_name = ep_key
+            internal_name = ep.get("internal_name", access_name)
             description = ep.get("description", "")
             remote = ep.get("remote", False)
             accessible = ep.get("accessible_by_other_plugins", False)

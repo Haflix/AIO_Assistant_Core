@@ -9,8 +9,8 @@ arguments:
     - TestLifecycleSuite
     - TestRemoteSuite
 endpoints:
-  - internal_name: run_all
-    access_name: run_all
+  run_all:
+    internal_name: run_all
     tags:
     remote: False
     accessible_by_other_plugins: True
@@ -47,8 +47,8 @@ endpoints:
         type: bool
         description: If False, destructive cases are skipped
 
-  - internal_name: run_suite
-    access_name: run_suite
+  run_suite:
+    internal_name: run_suite
     tags:
     remote: False
     accessible_by_other_plugins: True

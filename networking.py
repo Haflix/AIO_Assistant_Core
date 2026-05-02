@@ -910,7 +910,7 @@ class NetworkManager:
             endpoints = []
             for plugin in self.plugin_core.plugins.values():
                 if plugin.enabled:
-                    for endpoint in plugin.endpoints:
+                    for endpoint in plugin.endpoints.values():
                         if tag in endpoint.get("tags", []):
                             endpoints.append(
                                 {

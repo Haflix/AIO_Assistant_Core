@@ -3,8 +3,8 @@ version: 0.0.1
 remote: True
 arguments:
 endpoints:
-  - internal_name: sync_add
-    access_name: it_sync_add
+  it_sync_add:
+    internal_name: sync_add
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -17,8 +17,8 @@ endpoints:
         type: any
         description: Second addend (default 1)
 
-  - internal_name: async_add
-    access_name: it_async_add
+  it_async_add:
+    internal_name: async_add
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -31,8 +31,8 @@ endpoints:
         type: any
         description: Second addend (default 1)
 
-  - internal_name: sync_gen
-    access_name: it_sync_gen
+  it_sync_gen:
+    internal_name: sync_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -48,8 +48,8 @@ endpoints:
         type: int
         description: Delay between items in ms
 
-  - internal_name: async_gen
-    access_name: it_async_gen
+  it_async_gen:
+    internal_name: async_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -64,5 +64,3 @@ endpoints:
       - name: delay_ms
         type: int
         description: Delay between items in ms
-
-

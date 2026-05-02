@@ -96,7 +96,7 @@ def _make_mock_plugin(
     p.remote = remote
     p.description = description
     p.plugin_name = name
-    p.endpoints = endpoints or []
+    p.endpoints = endpoints or {}
     if not has_tui_module_info:
         del p.get_tui_module_info
     else:
@@ -511,7 +511,7 @@ class TestSanitizeId:
 class TestPluginViewGeneration:
     def test_auto_generate_no_endpoints(self):
         app = _make_dashboard_app()
-        plugin = _make_mock_plugin(endpoints=[])
+        plugin = _make_mock_plugin(endpoints={})
         widgets = app._auto_generate_plugin_view("TestPlugin", plugin)
         from textual.widgets import Static
         statics = [w for w in widgets if isinstance(w, Static)]
@@ -564,17 +564,19 @@ def mock_pc():
         "PluginA": MagicMock(
             enabled=True, version="1.0", remote=False,
             description="test A", plugin_name="PluginA",
-            endpoints=[{
-                "access_name": "greet", "internal_name": "_greet",
-                "description": "Says hi", "remote": False,
-                "accessible_by_other_plugins": True,
-                "arguments": [{"name": "name", "type": "str", "description": "Who to greet"}],
-                "tags": [],
-            }],
+            endpoints={
+                "greet": {
+                    "internal_name": "_greet",
+                    "description": "Says hi", "remote": False,
+                    "accessible_by_other_plugins": True,
+                    "arguments": [{"name": "name", "type": "str", "description": "Who to greet"}],
+                    "tags": [],
+                },
+            },
         ),
         "PluginB": MagicMock(
             enabled=False, version="0.5", remote=True,
-            description="test B", plugin_name="PluginB", endpoints=[],
+            description="test B", plugin_name="PluginB", endpoints={},
         ),
     }
     for p in pc.plugins.values():

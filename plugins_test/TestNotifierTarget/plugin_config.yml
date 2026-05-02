@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: n_handle_greet
-    access_name: n_handle_greet
+  n_handle_greet:
+    internal_name: n_handle_greet
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -13,8 +13,8 @@ endpoints:
     arguments:
       - name: name
 
-  - internal_name: n_handle_math
-    access_name: n_handle_math
+  n_handle_math:
+    internal_name: n_handle_math
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -24,8 +24,8 @@ endpoints:
       - name: a
       - name: b
 
-  - internal_name: n_handle_wild_a
-    access_name: n_handle_wild_a
+  n_handle_wild_a:
+    internal_name: n_handle_wild_a
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -33,8 +33,8 @@ endpoints:
     description: Wildcard handler A — pattern test/wild/*
     arguments:
 
-  - internal_name: n_handle_wild_b
-    access_name: n_handle_wild_b
+  n_handle_wild_b:
+    internal_name: n_handle_wild_b
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -42,8 +42,8 @@ endpoints:
     description: Wildcard handler B — pattern test/*/end
     arguments:
 
-  - internal_name: n_handle_priv
-    access_name: n_handle_priv
+  n_handle_priv:
+    internal_name: n_handle_priv
     tags:
     remote: False
     accessible_by_other_plugins: False
@@ -52,8 +52,8 @@ endpoints:
     arguments:
       - name: data
 
-  - internal_name: n_handle_count
-    access_name: n_handle_count
+  n_handle_count:
+    internal_name: n_handle_count
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -61,8 +61,8 @@ endpoints:
     arguments:
       - name: payload
 
-  - internal_name: n_handle_async_gen
-    access_name: n_handle_async_gen
+  n_handle_async_gen:
+    internal_name: n_handle_async_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -71,8 +71,8 @@ endpoints:
     arguments:
       - name: n
 
-  - internal_name: n_handle_sync_gen
-    access_name: n_handle_sync_gen
+  n_handle_sync_gen:
+    internal_name: n_handle_sync_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -81,16 +81,16 @@ endpoints:
     arguments:
       - name: n
 
-  - internal_name: trigger_topic_hop
-    access_name: trigger_topic_hop
+  trigger_topic_hop:
+    internal_name: trigger_topic_hop
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Sync; calls request_topic_sync("topic/hop") to trigger B-039 chain observation
     arguments:
 
-  - internal_name: topic_hop_observer
-    access_name: topic_hop_observer
+  topic_hop_observer:
+    internal_name: topic_hop_observer
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -98,16 +98,16 @@ endpoints:
     description: Sync handler subscribed to topic/hop; records observed _sync_call_chain.chain on entry
     arguments:
 
-  - internal_name: trigger_self_publish
-    access_name: trigger_self_publish
+  trigger_self_publish:
+    internal_name: trigger_self_publish
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async; calls self.notify("test/self") from inside the same plugin
     arguments:
 
-  - internal_name: self_publish_handler
-    access_name: self_publish_handler
+  self_publish_handler:
+    internal_name: self_publish_handler
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -115,48 +115,48 @@ endpoints:
     description: Increments self.self_publish_count
     arguments:
 
-  - internal_name: get_event_log
-    access_name: get_event_log
+  get_event_log:
+    internal_name: get_event_log
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns the event log
     arguments:
 
-  - internal_name: reset_event_log
-    access_name: reset_event_log
+  reset_event_log:
+    internal_name: reset_event_log
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Resets the event log
     arguments:
 
-  - internal_name: get_count
-    access_name: get_count
+  get_count:
+    internal_name: get_count
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns count_handler invocations
     arguments:
 
-  - internal_name: get_self_publish_count
-    access_name: get_self_publish_count
+  get_self_publish_count:
+    internal_name: get_self_publish_count
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns self_publish handler invocations
     arguments:
 
-  - internal_name: get_observed_chain
-    access_name: get_observed_chain
+  get_observed_chain:
+    internal_name: get_observed_chain
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns the chain observed by topic_hop_observer
     arguments:
 
-  - internal_name: notify_with_own_author
-    access_name: notify_with_own_author
+  notify_with_own_author:
+    internal_name: notify_with_own_author
     tags:
     remote: True
     accessible_by_other_plugins: True

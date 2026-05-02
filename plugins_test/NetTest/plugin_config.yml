@@ -3,8 +3,8 @@ version: 0.0.1
 remote: True
 arguments:
 endpoints:
-  - internal_name: echo
-    access_name: net_echo
+  net_echo:
+    internal_name: echo
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -14,8 +14,8 @@ endpoints:
         type: any
         description: Any picklable value
 
-  - internal_name: big_object
-    access_name: net_big_object
+  net_big_object:
+    internal_name: big_object
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -25,8 +25,8 @@ endpoints:
         type: int
         description: Size in MiB (default 8)
 
-  - internal_name: stream_count
-    access_name: net_stream_count
+  net_stream_count:
+    internal_name: stream_count
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -39,8 +39,8 @@ endpoints:
         type: int
         description: Delay between items in milliseconds (default 50)
 
-  - internal_name: stream_big
-    access_name: net_stream_big
+  net_stream_big:
+    internal_name: stream_big
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -55,5 +55,3 @@ endpoints:
       - name: delay_ms
         type: int
         description: Delay between chunks in ms (default 50)
-
-

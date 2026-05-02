@@ -2,4 +2,4 @@ description: "AIO Dashboard — Textual TUI for PluginCore management, monitorin
 version: 2.4.0
 remote: False
 arguments: []
-endpoints: []
+endpoints: {}

@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: r_open
-    access_name: r_open
+  r_open:
+    internal_name: r_open
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -12,8 +12,8 @@ endpoints:
     arguments:
       - name: value
 
-  - internal_name: r_remote_only
-    access_name: r_remote_only
+  r_remote_only:
+    internal_name: r_remote_only
     tags:
     remote: True
     accessible_by_other_plugins: False
@@ -21,8 +21,8 @@ endpoints:
     arguments:
       - name: value
 
-  - internal_name: r_async_gen
-    access_name: r_async_gen
+  r_async_gen:
+    internal_name: r_async_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -30,8 +30,8 @@ endpoints:
     arguments:
       - name: n
 
-  - internal_name: r_async_gen_huge_item
-    access_name: r_async_gen_huge_item
+  r_async_gen_huge_item:
+    internal_name: r_async_gen_huge_item
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -39,8 +39,8 @@ endpoints:
     arguments:
       - name: size_mb
 
-  - internal_name: r_topic_huge_stream
-    access_name: r_topic_huge_stream
+  r_topic_huge_stream:
+    internal_name: r_topic_huge_stream
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -48,8 +48,8 @@ endpoints:
     description: Async gen subscribed to test/r/huge_stream — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_topic_stream
     arguments:
 
-  - internal_name: r_async_gen_raises_after
-    access_name: r_async_gen_raises_after
+  r_async_gen_raises_after:
+    internal_name: r_async_gen_raises_after
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -57,16 +57,16 @@ endpoints:
     arguments:
       - name: n_yielded
 
-  - internal_name: r_hang
-    access_name: r_hang
+  r_hang:
+    internal_name: r_hang
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Awaits asyncio.Event().wait() forever (B-028 driver)
     arguments:
 
-  - internal_name: r_topic_open
-    access_name: r_topic_open
+  r_topic_open:
+    internal_name: r_topic_open
     tags:
     remote: True
     accessible_by_other_plugins: True

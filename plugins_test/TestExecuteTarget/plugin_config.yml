@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: ea_add
-    access_name: ea_add
+  ea_add:
+    internal_name: ea_add
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -13,8 +13,8 @@ endpoints:
       - name: a
       - name: b
 
-  - internal_name: es_add
-    access_name: es_add
+  es_add:
+    internal_name: es_add
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -23,24 +23,24 @@ endpoints:
       - name: a
       - name: b
 
-  - internal_name: ea_no_args
-    access_name: ea_no_args
+  ea_no_args:
+    internal_name: ea_no_args
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async with no args, returns "ok"
     arguments:
 
-  - internal_name: es_no_args
-    access_name: es_no_args
+  es_no_args:
+    internal_name: es_no_args
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Sync with no args, returns "ok"
     arguments:
 
-  - internal_name: ea_kwargs_only
-    access_name: ea_kwargs_only
+  ea_kwargs_only:
+    internal_name: ea_kwargs_only
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -49,8 +49,8 @@ endpoints:
       - name: name
       - name: value
 
-  - internal_name: ea_positional_only
-    access_name: ea_positional_only
+  ea_positional_only:
+    internal_name: ea_positional_only
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -59,56 +59,56 @@ endpoints:
       - name: a
       - name: b
 
-  - internal_name: ea_raises
-    access_name: ea_raises
+  ea_raises:
+    internal_name: ea_raises
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async, raises ValueError("intentional")
     arguments:
 
-  - internal_name: es_raises
-    access_name: es_raises
+  es_raises:
+    internal_name: es_raises
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Sync, raises ValueError("intentional")
     arguments:
 
-  - internal_name: ea_raises_request_exc
-    access_name: ea_raises_request_exc
+  ea_raises_request_exc:
+    internal_name: ea_raises_request_exc
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async, raises RequestException("specific")
     arguments:
 
-  - internal_name: ea_returns_none
-    access_name: ea_returns_none
+  ea_returns_none:
+    internal_name: ea_returns_none
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async, returns None
     arguments:
 
-  - internal_name: ea_returns_future
-    access_name: ea_returns_future
+  ea_returns_future:
+    internal_name: ea_returns_future
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async, returns a successfully-resolved Future
     arguments:
 
-  - internal_name: ea_returns_failing_future
-    access_name: ea_returns_failing_future
+  ea_returns_failing_future:
+    internal_name: ea_returns_failing_future
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async, returns a Future whose await raises (B-013 trigger)
     arguments:
 
-  - internal_name: ea_hang
-    access_name: ea_hang
+  ea_hang:
+    internal_name: ea_hang
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -116,8 +116,8 @@ endpoints:
     arguments:
       - name: seconds
 
-  - internal_name: ea_private
-    access_name: ea_private
+  ea_private:
+    internal_name: ea_private
     tags:
     remote: True
     accessible_by_other_plugins: False
@@ -125,8 +125,8 @@ endpoints:
     arguments:
       - name: value
 
-  - internal_name: ea_self_call
-    access_name: ea_self_call
+  ea_self_call:
+    internal_name: ea_self_call
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -136,8 +136,8 @@ endpoints:
       - name: target_args
       - name: plugin_uuid
 
-  - internal_name: ea_large_return
-    access_name: ea_large_return
+  ea_large_return:
+    internal_name: ea_large_return
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -145,8 +145,8 @@ endpoints:
     arguments:
       - name: size_bytes
 
-  - internal_name: ea_returns_arg
-    access_name: ea_returns_arg
+  ea_returns_arg:
+    internal_name: ea_returns_arg
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -154,8 +154,8 @@ endpoints:
     arguments:
       - name: x
 
-  - internal_name: ea_chain_step
-    access_name: ea_chain_step
+  ea_chain_step:
+    internal_name: ea_chain_step
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -164,8 +164,8 @@ endpoints:
       - name: depth
       - name: target_method
 
-  - internal_name: get_uuid
-    access_name: get_uuid
+  get_uuid:
+    internal_name: get_uuid
     tags:
     remote: True
     accessible_by_other_plugins: True

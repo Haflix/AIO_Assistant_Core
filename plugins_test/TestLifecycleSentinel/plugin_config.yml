@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: get_loaded
-    access_name: get_loaded
+  get_loaded:
+    internal_name: get_loaded
     tags:
     remote: True
     accessible_by_other_plugins: True

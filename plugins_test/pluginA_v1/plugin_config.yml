@@ -1,10 +1,10 @@
 description: Example async plugin
 version: 0.0.1
 remote: True
-arguments: 
+arguments:
 endpoints:
-  - internal_name: perform_operation
-    access_name: perform_operation
+  perform_operation:
+    internal_name: perform_operation
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -13,9 +13,9 @@ endpoints:
       - name: arguments
         type: int
         description:
-  
-  - internal_name: perform_operation_stream
-    access_name: perform_operation_stream_ABC
+
+  perform_operation_stream_ABC:
+    internal_name: perform_operation_stream
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -24,9 +24,9 @@ endpoints:
       - name: arguments
         type: int
         description:
-        
-  - internal_name: background_stream
-    access_name: background_stream
+
+  background_stream:
+    internal_name: background_stream
     tags:
     remote: True
     accessible_by_other_plugins: True

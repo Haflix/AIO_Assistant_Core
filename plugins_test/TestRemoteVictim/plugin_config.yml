@@ -3,8 +3,8 @@ version: 0.1.0
 remote: False
 arguments:
 endpoints:
-  - internal_name: r_local_only
-    access_name: r_local_only
+  r_local_only:
+    internal_name: r_local_only
     tags:
     remote: False
     accessible_by_other_plugins: True
@@ -12,8 +12,8 @@ endpoints:
     arguments:
       - name: value
 
-  - internal_name: r_topic_local_only
-    access_name: r_topic_local_only
+  r_topic_local_only:
+    internal_name: r_topic_local_only
     tags:
     remote: False
     accessible_by_other_plugins: True
@@ -22,24 +22,24 @@ endpoints:
     arguments:
       - name: payload
 
-  - internal_name: get_bypass_count
-    access_name: get_bypass_count
+  get_bypass_count:
+    internal_name: get_bypass_count
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns the number of times the code-driven bypass handler fired
     arguments:
 
-  - internal_name: get_stream_bypass_count
-    access_name: get_stream_bypass_count
+  get_stream_bypass_count:
+    internal_name: get_stream_bypass_count
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Returns the number of items the code-driven bypass stream yielded
     arguments:
 
-  - internal_name: reset_bypass
-    access_name: reset_bypass
+  reset_bypass:
+    internal_name: reset_bypass
     tags:
     remote: True
     accessible_by_other_plugins: True

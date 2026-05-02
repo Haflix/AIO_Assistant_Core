@@ -7,8 +7,8 @@ arguments:
     a: 1
     b: 2
 endpoints:
-  - internal_name: configure
-    access_name: configure
+  configure:
+    internal_name: configure
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -19,24 +19,24 @@ endpoints:
       - name: on_disable_hangs_secs
       - name: on_enable_delay_secs
 
-  - internal_name: get_state
-    access_name: get_state
+  get_state:
+    internal_name: get_state
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Return current state (db_open, enable_count, disable_count)
     arguments:
 
-  - internal_name: get_arguments
-    access_name: get_arguments
+  get_arguments:
+    internal_name: get_arguments
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Return self.arguments (after override merge)
     arguments:
 
-  - internal_name: victim_hang_endpoint
-    access_name: victim_hang_endpoint
+  victim_hang_endpoint:
+    internal_name: victim_hang_endpoint
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -44,8 +44,8 @@ endpoints:
     arguments:
       - name: secs
 
-  - internal_name: inject_bad_request
-    access_name: inject_bad_request
+  inject_bad_request:
+    internal_name: inject_bad_request
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -53,16 +53,16 @@ endpoints:
     arguments:
       - name: req_id
 
-  - internal_name: is_db_open
-    access_name: is_db_open
+  is_db_open:
+    internal_name: is_db_open
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Return self.db_open
     arguments:
 
-  - internal_name: cross_call_victim2
-    access_name: cross_call_victim2
+  cross_call_victim2:
+    internal_name: cross_call_victim2
     tags:
     remote: True
     accessible_by_other_plugins: True

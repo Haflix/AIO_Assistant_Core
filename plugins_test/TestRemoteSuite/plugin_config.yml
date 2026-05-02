@@ -3,8 +3,8 @@ version: 0.1.0
 remote: False
 arguments:
 endpoints:
-  - internal_name: run
-    access_name: run
+  run:
+    internal_name: run
     tags:
     remote: False
     accessible_by_other_plugins: True

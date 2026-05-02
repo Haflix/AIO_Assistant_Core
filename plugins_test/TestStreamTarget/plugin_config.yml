@@ -3,8 +3,8 @@ version: 0.1.0
 remote: True
 arguments:
 endpoints:
-  - internal_name: ea_gen
-    access_name: ea_gen
+  ea_gen:
+    internal_name: ea_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -14,8 +14,8 @@ endpoints:
       - name: prefix
       - name: delay_ms
 
-  - internal_name: es_gen
-    access_name: es_gen
+  es_gen:
+    internal_name: es_gen
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -25,8 +25,8 @@ endpoints:
       - name: prefix
       - name: delay_ms
 
-  - internal_name: ea_gen_raises_after
-    access_name: ea_gen_raises_after
+  ea_gen_raises_after:
+    internal_name: ea_gen_raises_after
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -34,32 +34,32 @@ endpoints:
     arguments:
       - name: n_yielded
 
-  - internal_name: ea_gen_infinite
-    access_name: ea_gen_infinite
+  ea_gen_infinite:
+    internal_name: ea_gen_infinite
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async generator that yields integers forever (B-002 abandonment test)
     arguments:
 
-  - internal_name: ea_gen_one_item
-    access_name: ea_gen_one_item
+  ea_gen_one_item:
+    internal_name: ea_gen_one_item
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async generator yielding exactly one item
     arguments:
 
-  - internal_name: ea_gen_empty
-    access_name: ea_gen_empty
+  ea_gen_empty:
+    internal_name: ea_gen_empty
     tags:
     remote: True
     accessible_by_other_plugins: True
     description: Async generator yielding zero items
     arguments:
 
-  - internal_name: es_gen_with_delay
-    access_name: es_gen_with_delay
+  es_gen_with_delay:
+    internal_name: es_gen_with_delay
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -68,8 +68,8 @@ endpoints:
       - name: n
       - name: delay_ms
 
-  - internal_name: ea_gen_returns_one_large_item
-    access_name: ea_gen_returns_one_large_item
+  ea_gen_returns_one_large_item:
+    internal_name: ea_gen_returns_one_large_item
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -77,8 +77,8 @@ endpoints:
     arguments:
       - name: size_bytes
 
-  - internal_name: ea_gen_hangs
-    access_name: ea_gen_hangs
+  ea_gen_hangs:
+    internal_name: ea_gen_hangs
     tags:
     remote: True
     accessible_by_other_plugins: True

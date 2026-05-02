@@ -3,8 +3,8 @@ version: 0.0.1
 remote: True
 arguments:
 endpoints:
-  - internal_name: _test_notify
-    access_name: test_notify
+  test_notify:
+    internal_name: _test_notify
     tags: []
     remote: False
     accessible_by_other_plugins: True
@@ -17,8 +17,8 @@ endpoints:
         type: any
         description: Arguments to send
 
-  - internal_name: _test_request
-    access_name: test_request
+  test_request:
+    internal_name: _test_request
     tags: []
     remote: False
     accessible_by_other_plugins: True
@@ -31,8 +31,8 @@ endpoints:
         type: any
         description: Arguments to send
 
-  - internal_name: _test_request_stream
-    access_name: test_request_stream
+  test_request_stream:
+    internal_name: _test_request_stream
     tags: []
     remote: False
     accessible_by_other_plugins: True
@@ -45,8 +45,8 @@ endpoints:
         type: any
         description: Arguments to send
 
-  - internal_name: _test_all
-    access_name: test_all
+  test_all:
+    internal_name: _test_all
     tags: []
     remote: False
     accessible_by_other_plugins: True

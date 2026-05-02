@@ -3,9 +3,11 @@ version: 1.0.0
 remote: True  # Set to True if this plugin should be accessible remotely
 arguments:  # Optional: Arguments passed during plugin loading
 endpoints:
+  # Endpoints are a dict keyed by access_name (the name other plugins call).
+  # `internal_name` is optional; if absent it defaults to the key.
 
-  - internal_name: example_method
-    access_name: example_method
+  example_method:
+    internal_name: example_method
     tags: []
     remote: True
     accessible_by_other_plugins: True
@@ -15,8 +17,8 @@ endpoints:
         type: any
         description: Input value to process
 
-  - internal_name: call_other_plugin
-    access_name: call_other_plugin
+  call_other_plugin:
+    internal_name: call_other_plugin
     tags: []
     remote: True
     accessible_by_other_plugins: True
@@ -32,8 +34,8 @@ endpoints:
         type: any
         description: Arguments to pass to the method
 
-  - internal_name: example_stream
-    access_name: example_stream
+  example_stream:
+    internal_name: example_stream
     tags: []
     remote: True
     accessible_by_other_plugins: True
@@ -47,8 +49,8 @@ endpoints:
   # Adding a "topic" field makes this endpoint callable via notify() or request_topic()
   # instead of hardcoding the plugin name. Topics use "/" as separator.
   # Wildcards: subscribe to "sensor/*/temperature" to match "sensor/bath/temperature" etc.
-  - internal_name: handle_event
-    access_name: handle_event
+  handle_event:
+    internal_name: handle_event
     topic: "example/event"  # <-- subscribes this endpoint to the topic
     tags: []
     remote: True

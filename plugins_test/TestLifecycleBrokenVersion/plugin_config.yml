@@ -2,8 +2,8 @@ description: Phase 4 static fixture — plugin_config.yml WITHOUT a version fiel
 remote: True
 arguments:
 endpoints:
-  - internal_name: ping
-    access_name: ping
+  ping:
+    internal_name: ping
     tags:
     remote: True
     accessible_by_other_plugins: True

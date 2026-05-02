@@ -3,8 +3,8 @@ version: 0.0.1
 remote: True
 arguments:
 endpoints:
-  - internal_name: run_suite
-    access_name: interop_run
+  interop_run:
+    internal_name: run_suite
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -14,8 +14,8 @@ endpoints:
         type: str
         description: Target host selection
 
-  - internal_name: run_suite_sync
-    access_name: interop_run_sync
+  interop_run_sync:
+    internal_name: run_suite_sync
     tags:
     remote: True
     accessible_by_other_plugins: True
@@ -24,5 +24,3 @@ endpoints:
       - name: host
         type: str
         description: Target host selection
-
-
