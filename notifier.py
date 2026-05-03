@@ -248,9 +248,13 @@ class TopicRegistry:
             if sub.declared_id is not None:
                 self._by_declared[(sub.plugin_uuid, sub.declared_id)] = sub.sub_uuid
 
-        # Q18: subscribe/unsubscribe events ALWAYS log at INFO regardless
-        # of verbose_notifier toggle (toggle only affects dispatch logging).
-        self._logger.info(f"Subscribed: {sub}")
+            # Q18: subscribe/unsubscribe events ALWAYS log at INFO regardless
+            # of verbose_notifier toggle (toggle only affects dispatch
+            # logging). Logged INSIDE the lock so concurrent
+            # subscribe/unsubscribe sequences emit log lines in the same
+            # order they mutate the registry — diagnostic ordering matches
+            # state ordering.
+            self._logger.info(f"Subscribed: {sub}")
         return sub.sub_uuid
 
     async def subscribe(
@@ -337,8 +341,10 @@ class TopicRegistry:
             if sub.declared_id is not None:
                 self._by_declared.pop((sub.plugin_uuid, sub.declared_id), None)
 
-        # Q18: subscribe/unsubscribe always log at INFO.
-        self._logger.info(f"Unsubscribed: {sub}")
+            # Q18: subscribe/unsubscribe always log at INFO. Logged
+            # INSIDE the lock so concurrent subscribe/unsubscribe log
+            # lines appear in the same order as the registry mutations.
+            self._logger.info(f"Unsubscribed: {sub}")
         return True
 
     async def unsubscribe_plugin(self, plugin_uuid: str) -> int:

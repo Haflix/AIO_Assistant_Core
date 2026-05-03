@@ -1197,6 +1197,23 @@ class PluginCore:
             prefix_val = name
         plugin.prefix = prefix_val
 
+        # Q5: warn (allow) when another already-loaded plugin uses the
+        # same prefix. Two instances sharing a prefix isn't an error
+        # (intentional use case for running two Discord bots etc.) but
+        # the warning helps the author spot accidental collisions.
+        for existing_name, existing_plugin in self.plugins.items():
+            if existing_name == name:
+                continue
+            existing_prefix = getattr(existing_plugin, "prefix", None)
+            if existing_prefix == prefix_val:
+                await warn_config(
+                    f"plugin {name!r} prefix {prefix_val!r} collides with "
+                    f"already-loaded plugin {existing_name!r} (Q5: warn + "
+                    f"allow). Topic templates using {{prefix}} on either "
+                    f"plugin will resolve to the same prefix segment — "
+                    f"intentional only if you want shared advertisement."
+                )
+
         verbose_val = merged_config.get("verbose_notifier", False)
         if not isinstance(verbose_val, bool):
             await warn_config(
