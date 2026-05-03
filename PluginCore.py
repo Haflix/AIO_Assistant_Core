@@ -3869,10 +3869,19 @@ class PluginCore:
             timeout=timeout,
         )
 
-        result, error, _ = await request.wait_for_result_async()
-        if error:
-            raise RequestException(result)
-        return result
+        try:
+            result, error, _ = await request.wait_for_result_async()
+            if error:
+                raise RequestException(result)
+            return result
+        finally:
+            # Defensive: matches execute() pattern at line 2554. Ensures
+            # set_collected runs even on caller cancellation /
+            # RequestException paths, so cleanup_requests can reap the
+            # Request entry. _run_and_collect (in _fanout_sub) also calls
+            # set_collected on dispatch completion, but that may take
+            # longer than the await here if the handler hangs. Idempotent.
+            await request.set_collected()
 
     @log_errors
     def request_event_sync(
@@ -4022,74 +4031,99 @@ class PluginCore:
         # subscriber-handler convention (LOCKED I).
         if inspect.isasyncgenfunction(func):
             ait = func(event_meta).__aiter__()
-            while True:
-                rem = _residual()
-                try:
-                    if rem is None:
-                        chunk = await ait.__anext__()
+            try:
+                while True:
+                    rem = _residual()
+                    try:
+                        if rem is None:
+                            chunk = await ait.__anext__()
+                        else:
+                            chunk = await asyncio.wait_for(
+                                ait.__anext__(), timeout=rem
+                            )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as e:
+                        raise RequestException(
+                            f"request_event_stream {event_id!r} timed out after "
+                            f"{timeout}s (whole-stream budget per Q8)"
+                        ) from e
+                    if first:
+                        first = False
+                        # Yield Event-shaped wrapper: event with payload =
+                        # first chunk.
+                        wrapped = Event(
+                            topic=resolved_topic,
+                            payload=chunk,
+                            author=publisher.plugin_name,
+                            author_id=publisher.plugin_uuid,
+                            author_host=self.hostname,
+                            subscription_id=event_meta.subscription_id,
+                            timestamp=event_meta.timestamp,
+                        )
+                        yield wrapped
                     else:
-                        chunk = await asyncio.wait_for(ait.__anext__(), timeout=rem)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError as e:
-                    raise RequestException(
-                        f"request_event_stream {event_id!r} timed out after "
-                        f"{timeout}s (whole-stream budget per Q8)"
-                    ) from e
-                if first:
-                    first = False
-                    # Yield Event-shaped wrapper: event with payload =
-                    # first chunk.
-                    wrapped = Event(
-                        topic=resolved_topic,
-                        payload=chunk,
-                        author=publisher.plugin_name,
-                        author_id=publisher.plugin_uuid,
-                        author_host=self.hostname,
-                        subscription_id=event_meta.subscription_id,
-                        timestamp=event_meta.timestamp,
-                    )
-                    yield wrapped
-                else:
-                    yield chunk
+                        yield chunk
+            finally:
+                # Close async generator on ANY exit path (timeout,
+                # caller-break, exception). Without aclose() the handler's
+                # `try/finally` and `async with` blocks never run, leaking
+                # resources held by the generator.
+                with contextlib.suppress(Exception):
+                    await ait.aclose()
         else:
             sentinel = object()
             gen = func(event_meta)
-            while True:
-                rem = _residual()
-                # Sync handler iteration runs on the SyncDispatcher pool
-                # per Q17 + C3 (NOT asyncio.to_thread, which uses the
-                # default executor and breaks the executor isolation
-                # invariant).
-                fut = loop.run_in_executor(
-                    self.sync_dispatcher.executor, next, gen, sentinel
-                )
-                try:
-                    if rem is None:
-                        chunk = await fut
-                    else:
-                        chunk = await asyncio.wait_for(fut, timeout=rem)
-                except asyncio.TimeoutError as e:
-                    raise RequestException(
-                        f"request_event_stream {event_id!r} timed out after "
-                        f"{timeout}s (whole-stream budget per Q8)"
-                    ) from e
-                if chunk is sentinel:
-                    break
-                if first:
-                    first = False
-                    wrapped = Event(
-                        topic=resolved_topic,
-                        payload=chunk,
-                        author=publisher.plugin_name,
-                        author_id=publisher.plugin_uuid,
-                        author_host=self.hostname,
-                        subscription_id=event_meta.subscription_id,
-                        timestamp=event_meta.timestamp,
+            try:
+                while True:
+                    rem = _residual()
+                    # Sync handler iteration runs on the SyncDispatcher pool
+                    # per Q17 + C3 (NOT asyncio.to_thread, which uses the
+                    # default executor and breaks the executor isolation
+                    # invariant).
+                    fut = loop.run_in_executor(
+                        self.sync_dispatcher.executor, next, gen, sentinel
                     )
-                    yield wrapped
-                else:
-                    yield chunk
+                    try:
+                        if rem is None:
+                            chunk = await fut
+                        else:
+                            chunk = await asyncio.wait_for(fut, timeout=rem)
+                    except asyncio.TimeoutError as e:
+                        # asyncio.wait_for cancels the future but the
+                        # underlying thread can't be interrupted — let
+                        # the finally below close the generator so its
+                        # try/finally blocks still run (best-effort: the
+                        # thread may still be advancing gen at this
+                        # moment, gen.close() races with that).
+                        raise RequestException(
+                            f"request_event_stream {event_id!r} timed out after "
+                            f"{timeout}s (whole-stream budget per Q8)"
+                        ) from e
+                    if chunk is sentinel:
+                        break
+                    if first:
+                        first = False
+                        wrapped = Event(
+                            topic=resolved_topic,
+                            payload=chunk,
+                            author=publisher.plugin_name,
+                            author_id=publisher.plugin_uuid,
+                            author_host=self.hostname,
+                            subscription_id=event_meta.subscription_id,
+                            timestamp=event_meta.timestamp,
+                        )
+                        yield wrapped
+                    else:
+                        yield chunk
+            finally:
+                # Close sync generator on ANY exit path. Mirrors the
+                # async branch's aclose() — invokes the handler's
+                # try/finally / with cleanup blocks. suppress because
+                # close() can raise GeneratorExit/RuntimeError if the
+                # generator is mid-step on a worker thread.
+                with contextlib.suppress(Exception):
+                    gen.close()
 
     @gen_log_errors
     def request_event_stream_sync(
@@ -4110,14 +4144,26 @@ class PluginCore:
             timeout,
         )
 
-        while True:
+        try:
+            while True:
+                try:
+                    chunk = asyncio.run_coroutine_threadsafe(
+                        async_gen.__anext__(), self.main_event_loop
+                    ).result()
+                except StopAsyncIteration:
+                    break
+                yield chunk
+        finally:
+            # Close the underlying async generator if the caller breaks
+            # out of the for loop early (without exhausting it). Without
+            # this aclose() the async gen's try/finally / async with
+            # blocks never run, leaking resources.
             try:
-                chunk = asyncio.run_coroutine_threadsafe(
-                    async_gen.__anext__(), self.main_event_loop
+                asyncio.run_coroutine_threadsafe(
+                    async_gen.aclose(), self.main_event_loop
                 ).result()
-            except StopAsyncIteration:
-                break
-            yield chunk
+            except Exception:
+                pass
 
     async def subscribe_event(
         self,
