@@ -3688,6 +3688,10 @@ class PluginCore:
             if blocked_hosts is not None
             else event_entry.get("blocked_hosts")
         )
+        # LOCKED IN — PUBLISHER hosts: emit WARNING for redundant combos
+        # (e.g. hosts="any" + blocked_hosts="local" → equivalent to
+        # hosts="remote", nudge caller toward the cleaner form).
+        _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
         # Stage C will read eff_hosts/eff_blocked for the peer-level
         # filter (PR3 PLAN F step 5a). Stage B uses them ONLY to gate
         # whether local fan-out happens at all (e.g. hosts="remote"
@@ -3777,7 +3781,16 @@ class PluginCore:
             event_loop=self.main_event_loop,
             kind=kind,
             topic=resolved_topic,
-            origin_subscription_id=sub.declared_id or sub.sub_uuid,
+            # C4: declared_id (YAML key) for config subs, sub_uuid for
+            # runtime. Use `is not None` instead of truthy `or` so an
+            # empty-string declared_id (impossible from YAML loader, but
+            # possible via direct topic_registry.subscribe(declared_id="")
+            # calls) doesn't silently fall through to sub_uuid.
+            origin_subscription_id=(
+                sub.declared_id
+                if sub.declared_id is not None
+                else sub.sub_uuid
+            ),
             timestamp=timestamp,
             requester_id=sub.plugin_uuid,  # C18
         )
@@ -3916,6 +3929,7 @@ class PluginCore:
             if blocked_hosts is not None
             else event_entry.get("blocked_hosts")
         )
+        _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
         if not self._publisher_targets_local(eff_hosts, eff_blocked):
             raise RequestException(
                 f"request_event {event_id!r}: publisher hosts={eff_hosts!r} "
@@ -4046,6 +4060,7 @@ class PluginCore:
             if blocked_hosts is not None
             else event_entry.get("blocked_hosts")
         )
+        _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
         if not self._publisher_targets_local(eff_hosts, eff_blocked):
             raise RequestException(
                 f"request_event_stream {event_id!r}: publisher hosts="
@@ -4113,7 +4128,11 @@ class PluginCore:
             author=publisher.plugin_name,
             author_id=publisher.plugin_uuid,
             author_host=self.hostname,
-            subscription_id=local_match.declared_id or local_match.sub_uuid,
+            subscription_id=(
+                local_match.declared_id
+                if local_match.declared_id is not None
+                else local_match.sub_uuid
+            ),
             timestamp=now_ts,
         )
 
