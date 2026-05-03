@@ -1048,6 +1048,20 @@ class Plugin(ABC):
         self.remote = False
         self.arguments = arguments
         self.endpoints = {}
+        # PR3 Stage B: events: + subscriptions: parsed from plugin_config
+        # by load_plugin_with_conf. Empty dicts here so plugin code in
+        # on_load can read them safely (load order: __init__ -> on_load,
+        # then PluginCore overwrites these attributes from YAML).
+        self.events = {}
+        self.subscriptions = {}
+        # PR3 Stage B: prefix + verbose_notifier — resolved final values
+        # set by PluginCore.load_plugin_with_conf.
+        self.prefix = ""
+        self.verbose_notifier = False
+        # PR3 Stage B: track sub_uuids registered on behalf of THIS plugin
+        # by the on_enable lifecycle wrapper. Used by on_disable wrapper
+        # to unregister exactly the subs that were registered.
+        self._sub_uuids: list = []
 
         self._logger = logger
         self._plugin_core = plugin_core
@@ -1540,126 +1554,298 @@ class Plugin(ABC):
             yield i
 
     # ── Notifier: subscription management ─────────────────────────────
+    # Plugin.subscribe / Plugin.unsubscribe are POLYMORPHIC during
+    # Stage B: they detect whether the caller is using the LEGACY
+    # ``subscribe(topic, handler)`` shape or the NEW PR3
+    # ``subscribe(topic, target_access_name, ...)`` shape and
+    # dispatch accordingly. Stage D removes the legacy path.
 
-    async def subscribe(self, topic: str, handler: Callable) -> str:
+    async def subscribe(
+        self,
+        topic: str,
+        target_access_name=None,
+        *,
+        target_plugin: Optional[str] = None,
+        target_plugin_uuid: Optional[str] = None,
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
+        authors: Union[str, list, None] = None,
+        blocked_authors: Union[str, list, None] = None,
+        # LEGACY kwarg — Stage D removes:
+        handler: Optional[Callable] = None,
+    ) -> str:
         """
-        Subscribe to a topic at runtime (code-driven).
+        Subscribe to a topic.
 
-        Args:
-            topic: Topic pattern (supports "*" wildcard per segment).
-            handler: Callable to invoke when the topic is published/requested.
+        Two calling conventions during Stage B:
+          * NEW (PR3): ``subscribe(topic, target_access_name=..., ...)``
+            — declarative, registers a subscription that routes to a
+            declared endpoint. Returns sub_uuid.
+          * LEGACY (still alive in Stage B; removed in Stage D):
+            ``subscribe(topic, handler)`` where ``handler`` is callable.
+            The framework dispatches the handler directly via the OLD
+            PluginCore.notify path.
 
-        Returns:
-            Subscription ID (use with unsubscribe() to remove).
-
-        .. deprecated::
-            handler= will be removed in the rework — subscriptions will
-            require declaring an endpoint and subscribing it by access_name.
-            See notes.txt.
+        The NEW path is selected when ``target_access_name`` is a str
+        (or ``handler`` kwarg is None). The LEGACY path is selected
+        when the second positional arg is a callable OR the ``handler``
+        kwarg is passed.
         """
-        warnings.warn(
-            "Plugin.subscribe() uses the legacy notifier subsystem which is "
-            "being redesigned (handler= will be removed). See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._plugin_core.subscribe(
+        # Determine which path we're on.
+        legacy_handler = handler
+        if legacy_handler is None and callable(target_access_name):
+            legacy_handler = target_access_name
+            target_access_name = None
+
+        if legacy_handler is not None:
+            # Legacy code-driven path. Issue DeprecationWarning to
+            # match the old behavior; preserved for Stage B test
+            # plugins that haven't been migrated yet.
+            warnings.warn(
+                "Plugin.subscribe(handler=...) uses the legacy notifier "
+                "subsystem (handler= path); migrate to subscribe(topic, "
+                "target_access_name=...) before Stage D. See notes.txt.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return await self._plugin_core.subscribe(
+                topic,
+                self.plugin_name,
+                self.plugin_uuid,
+                handler=legacy_handler,
+            )
+
+        # NEW PR3 path — runtime subscription via target_access_name.
+        if not isinstance(target_access_name, str) or not target_access_name:
+            raise TypeError(
+                "subscribe(): target_access_name must be a non-empty string "
+                "(NEW path) — or pass a callable as 2nd arg / handler= "
+                "kwarg for the LEGACY path."
+            )
+        return await self._plugin_core.subscribe_event(
             topic,
             self.plugin_name,
             self.plugin_uuid,
-            handler=handler,
+            target_access_name=target_access_name,
+            target_plugin=target_plugin,
+            target_plugin_uuid=target_plugin_uuid,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            authors=authors,
+            blocked_authors=blocked_authors,
         )
 
     async def unsubscribe(self, subscription_id: str) -> bool:
         """
-        Remove a runtime subscription by its ID.
+        Remove a subscription by its sub_uuid (or legacy id — same str).
 
-        Returns:
-            True if the subscription was found and removed.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
+        Stage B accepts both NEW (sub_uuid) and LEGACY (id) ids — the
+        underlying registry uses uuid hex strings for both.
         """
-        warnings.warn(
-            "Plugin.unsubscribe() uses the legacy notifier subsystem which "
-            "is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._plugin_core.unsubscribe(subscription_id)
+        # Try NEW path first (subscribe_event returns sub_uuid). Falls
+        # back to legacy unsubscribe; both ultimately call
+        # topic_registry.unsubscribe so this is a single registry op
+        # either way.
+        return await self._plugin_core.unsubscribe_event(subscription_id)
 
-    # ── PR3 Stage A: pre-start guards for new sync entry points (Q1) ──
-    # Stage A only ships the guard stubs; the actual publish_event /
-    # request_event / subscribe / unsubscribe implementations land in
-    # Stage B. The stubs raise RequestException loudly when called
-    # before the framework's main event loop is running, so callers in
-    # plugin __init__/on_load (which run before the loop is up) get a
-    # clear failure instead of silently hanging on
-    # run_coroutine_threadsafe(..., None).
+    # ── PR3 Stage B: publish_event / request_event API ────────────────
 
     def _check_framework_started(self) -> None:
         """Guard helper — raise if the main event loop hasn't been bound yet.
 
-        Used by every NEW sync entry point added in Stage A and (per Q1
-        retrofit guidance, closing B-038) by ``execute_sync`` when no
-        event loop is available yet.
+        Used by every NEW sync entry point and (per Q1 retrofit
+        guidance, closing B-038) by ``execute_sync`` when no event
+        loop is available yet.
         """
         if self._plugin_core.main_event_loop is None:
             raise RequestException(
                 "Framework not started — sync APIs require running event loop"
             )
 
-    @log_errors
-    def publish_event_sync(self, *args, **kwargs) -> int:
-        """Pre-start guard stub. Real implementation lands in Stage B.
-
-        Two failure modes: pre-start (loop not running) raises
-        RequestException per Q1; post-guard "not yet implemented"
-        raises NotImplementedError so callers wrapping in
-        ``except RequestException`` don't silently swallow the
-        Stage-B-not-landed signal.
-        """
-        self._check_framework_started()
-        raise NotImplementedError(
-            "Plugin.publish_event_sync() not implemented yet (PR3 Stage B)"
+    @async_log_errors
+    async def publish_event(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+    ) -> int:
+        """Publish an event (1:N fire-and-forget) per PR3 LOCKED L."""
+        return await self._plugin_core.publish_event(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
         )
 
     @log_errors
-    def request_event_sync(self, *args, **kwargs) -> Any:
-        """Pre-start guard stub. Real implementation lands in Stage B."""
+    def publish_event_sync(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+    ) -> int:
+        """Sync variant of publish_event (C16)."""
         self._check_framework_started()
-        raise NotImplementedError(
-            "Plugin.request_event_sync() not implemented yet (PR3 Stage B)"
+        return self._plugin_core.publish_event_sync(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+        )
+
+    @async_log_errors
+    async def request_event(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Request an event (1:1 ask) per PR3 LOCKED L."""
+        return await self._plugin_core.request_event(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            timeout=timeout,
         )
 
     @log_errors
-    def request_event_stream_sync(self, *args, **kwargs):
-        """Pre-start guard stub. Real implementation lands in Stage B.
-
-        Not a generator function in Stage A — the guard fires at call
-        time per Q1. Stage B's real implementation will be a generator
-        naturally (yields chunks).
-        """
+    def request_event_sync(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Sync variant of request_event (C16)."""
         self._check_framework_started()
-        raise NotImplementedError(
-            "Plugin.request_event_stream_sync() not implemented yet (PR3 Stage B)"
+        return self._plugin_core.request_event_sync(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            timeout=timeout,
         )
+
+    async def request_event_stream(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ):
+        """Streaming variant of request_event."""
+        async for chunk in self._plugin_core.request_event_stream(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            timeout=timeout,
+        ):
+            yield chunk
 
     @log_errors
-    def subscribe_sync(self, *args, **kwargs) -> str:
-        """Pre-start guard stub. Real implementation lands in Stage B."""
+    def request_event_stream_sync(
+        self,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[dict] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ):
+        """Sync streaming variant of request_event (C16)."""
         self._check_framework_started()
-        raise NotImplementedError(
-            "Plugin.subscribe_sync() not implemented yet (PR3 Stage B)"
+        return self._request_event_stream_sync_inner(
+            event_id, payload, topic_vars, hosts, blocked_hosts, timeout,
         )
 
+    def _request_event_stream_sync_inner(
+        self,
+        event_id: str,
+        payload: Any,
+        topic_vars: Optional[dict],
+        hosts: Union[str, list, None],
+        blocked_hosts: Union[str, list, None],
+        timeout: Optional[float],
+    ):
+        """Generator body — same split pattern as execute_stream_sync
+        so the pre-start guard fires at call time, not first iteration."""
+        for chunk in self._plugin_core.request_event_stream_sync(
+            self,
+            event_id,
+            payload=payload,
+            topic_vars=topic_vars,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            timeout=timeout,
+        ):
+            yield chunk
+
     @log_errors
-    def unsubscribe_sync(self, *args, **kwargs) -> bool:
-        """Pre-start guard stub. Real implementation lands in Stage B."""
+    def subscribe_sync(
+        self,
+        topic: str,
+        target_access_name: str,
+        *,
+        target_plugin: Optional[str] = None,
+        target_plugin_uuid: Optional[str] = None,
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
+        authors: Union[str, list, None] = None,
+        blocked_authors: Union[str, list, None] = None,
+    ) -> str:
+        """Sync variant of subscribe (C16). New-API-only; no legacy
+        handler= path here — sync callers running on a worker thread
+        should use the declarative target_access_name shape."""
         self._check_framework_started()
-        raise NotImplementedError(
-            "Plugin.unsubscribe_sync() not implemented yet (PR3 Stage B)"
+        future = asyncio.run_coroutine_threadsafe(
+            self._plugin_core.subscribe_event(
+                topic,
+                self.plugin_name,
+                self.plugin_uuid,
+                target_access_name=target_access_name,
+                target_plugin=target_plugin,
+                target_plugin_uuid=target_plugin_uuid,
+                hosts=hosts,
+                blocked_hosts=blocked_hosts,
+                authors=authors,
+                blocked_authors=blocked_authors,
+            ),
+            self._plugin_core.main_event_loop,
         )
+        return future.result()
+
+    @log_errors
+    def unsubscribe_sync(self, sub_uuid: str) -> bool:
+        """Sync variant of unsubscribe (C16)."""
+        self._check_framework_started()
+        future = asyncio.run_coroutine_threadsafe(
+            self._plugin_core.unsubscribe_event(sub_uuid),
+            self._plugin_core.main_event_loop,
+        )
+        return future.result()
 
     @log_errors
     @abstractmethod

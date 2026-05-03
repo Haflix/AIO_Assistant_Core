@@ -1,4 +1,6 @@
 import os
+import re
+import socket
 import sys
 
 os.environ.setdefault("PYTHONUTF8", "1")  # UTF-8 mode: all open() default to utf-8
@@ -82,18 +84,145 @@ def _validate_identifier_name(name, *, context: str) -> None:
 
 # Sections of plugin_config.yml that get DEEP-MERGED by apply_overrides.
 # Each section is a top-level mapping; per-key entries are merged via
-# _deep_merge_args. PR3 will add "events" and "subscriptions".
-_OVERRIDE_SECTIONS = ("arguments", "endpoints")
+# _deep_merge_args. PR3 Stage B adds "events" and "subscriptions".
+_OVERRIDE_SECTIONS = ("arguments", "endpoints", "events", "subscriptions")
 
 # Sections that enforce STRICT unknown-subkey handling: an override naming
 # a subkey not present in the base plugin_config is a fail-load ERROR.
 # Other sections fall back to lenient (additive) deep-merge per Q14.
+# Per Q14 events/subscriptions are LENIENT — overrides may add new keys.
 _STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})
 
 # Plugin-level scalar/list fields (top-level fields of plugin_config.yml)
-# that an `overrides:` block may VALUE-REPLACE. PR3 will add "prefix" and
-# "verbose_notifier".
-_PLUGIN_LEVEL_OVERRIDE_FIELDS = ("description", "remote", "version")
+# that an `overrides:` block may VALUE-REPLACE. PR3 Stage B adds "prefix"
+# and "verbose_notifier".
+_PLUGIN_LEVEL_OVERRIDE_FIELDS = (
+    "description",
+    "remote",
+    "version",
+    "prefix",
+    "verbose_notifier",
+)
+
+# Reserved topic_vars / load-time-templating names.
+_RESERVED_TEMPLATE_VARS = frozenset({"prefix", "plugin_name", "hostname", "plugin_uuid"})
+
+# {var}-style placeholder regex. Matches {name} where name is identifier-style.
+_TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve_load_time_template(
+    template: str,
+    *,
+    prefix: str,
+    plugin_name: str,
+    hostname: str,
+    plugin_uuid: str,
+) -> str:
+    """Resolve the four reserved placeholders in a topic template at config-load
+    time per PR3 LOCKED J. UNKNOWN ``{var}`` placeholders are LEFT INTACT for
+    runtime resolution via topic_vars (PR3 LOCKED L).
+
+    NOT a generic ``str.format()`` — that would error on unresolved
+    ``{var}`` placeholders that should stay templated.
+    """
+    if not isinstance(template, str) or "{" not in template:
+        return template
+
+    substitutions = {
+        "prefix": prefix,
+        "plugin_name": plugin_name,
+        "hostname": hostname,
+        "plugin_uuid": plugin_uuid,
+    }
+
+    def _repl(match: re.Match) -> str:
+        name = match.group(1)
+        if name in substitutions:
+            return substitutions[name]
+        return match.group(0)  # leave untouched for runtime templating
+
+    return _TEMPLATE_VAR_RE.sub(_repl, template)
+
+
+def _validate_topic_static(
+    topic: str,
+    *,
+    context: str,
+    allow_wildcards: bool,
+) -> str:
+    """Validate a topic string per PR3 LOCKED L + Q15/Q16/C20.
+
+    Returns the normalized topic (leading/trailing slashes stripped).
+
+    Validation rules applied here:
+      * Must be non-empty after stripping (Q15).
+      * No empty middle segments (e.g. "a//b") — C20 rejection.
+      * If allow_wildcards is False, ``*`` characters anywhere are
+        rejected (events.topic field — wildcards are subscriber-side
+        only, LOCKED L #1).
+      * If allow_wildcards is True, the only allowed ``*`` form is a
+        FULL-segment wildcard (e.g. "ai/*"). Embedded ``*`` mid-segment
+        like "sensor/abc*" is rejected (C20 / LOCKED L #2a).
+
+    Raises ValueError with ``context`` prefix on violation.
+    """
+    if not isinstance(topic, str):
+        raise ValueError(
+            f"{context}: topic must be a string; got {type(topic).__name__}"
+        )
+
+    stripped = topic.strip("/")
+    if not stripped or not stripped.strip():
+        raise ValueError(f"{context}: topic must not be empty (Q15)")
+
+    segments = stripped.split("/")
+    for seg in segments:
+        if not seg:
+            raise ValueError(
+                f"{context}: empty middle segment in topic {topic!r} (C20)"
+            )
+        if "*" in seg:
+            if not allow_wildcards:
+                raise ValueError(
+                    f"{context}: wildcards not allowed in topic {topic!r} "
+                    f"(LOCKED L #1 — wildcards are subscriber-side only)"
+                )
+            if seg != "*":
+                raise ValueError(
+                    f"{context}: embedded '*' mid-segment in topic {topic!r} "
+                    f"(C20 — '*' must be a complete segment)"
+                )
+
+    if not allow_wildcards and _TEMPLATE_VAR_RE.search(stripped) is None:
+        # subscriptions.topic also forbids {var} runtime templating; that
+        # check is done by the SUBSCRIPTION-side validator (different fn),
+        # not here. Events.topic *allows* {var} runtime placeholders, so
+        # we don't reject them in this branch either. The check is
+        # purely "embedded * mid-segment" + "empty middle segment" +
+        # "non-empty topic" + (events-only) "no wildcards".
+        pass
+
+    return stripped
+
+
+def _validate_subscription_topic(topic: str, *, context: str) -> str:
+    """Subscription topic validator. Same shape as
+    _validate_topic_static(allow_wildcards=True) PLUS subscription-only
+    rule LOCKED L #2: ``{var}`` runtime templating syntax is REJECTED in
+    subscriptions.topic (subscribers use ``*`` wildcards instead).
+    """
+    if not isinstance(topic, str):
+        raise ValueError(
+            f"{context}: topic must be a string; got {type(topic).__name__}"
+        )
+    if _TEMPLATE_VAR_RE.search(topic) is not None:
+        raise ValueError(
+            f"{context}: '{{var}}' templating syntax not allowed in "
+            f"subscription topic {topic!r} (LOCKED L #2 — subscribers use "
+            f"'*' wildcards, not {{var}} placeholders)"
+        )
+    return _validate_topic_static(topic, context=context, allow_wildcards=True)
 
 
 def _deep_merge_args(
@@ -883,6 +1012,26 @@ class PluginCore:
                 "use `overrides.arguments:` instead. Ignored."
             )
 
+        # Q22: warn on any other unrecognized plugin-entry-level field.
+        # Common mistake: writing `prefix:` or `verbose_notifier:` at the
+        # plugin-entry level instead of inside `overrides:`. Warn + ignore.
+        _KNOWN_PLUGIN_ENTRY_KEYS = frozenset({
+            "name", "enabled", "path", "overrides",
+            # legacy `arguments:` already handled above with a tailored
+            # message; include here so we don't double-warn.
+            "arguments",
+        })
+        for stray_key in plugin_entry.keys():
+            if stray_key in _KNOWN_PLUGIN_ENTRY_KEYS:
+                continue
+            await warn_config(
+                f"main config plugin entry for {name!r}: unknown field "
+                f"{stray_key!r}; expected one of "
+                f"{sorted(_KNOWN_PLUGIN_ENTRY_KEYS - {'arguments'})} "
+                f"or place plugin_config overrides inside `overrides:` "
+                f"(Q22). Ignored."
+            )
+
         # Apply broader `overrides:` block from main config plugin entry.
         # Type-check (dict-or-None or warn-and-ignore deployment misconfig).
         override = plugin_entry.get("overrides")
@@ -1027,6 +1176,31 @@ class PluginCore:
         plugin.remote = merged_config.get("remote") or False
         plugin.description = merged_config.get("description") or "UNKNOWN"
         plugin.arguments = merged_args
+
+        # PR3 Stage B: prefix + verbose_notifier plugin-level fields. prefix
+        # defaults to plugin_name (per LOCKED J — author-default fallback).
+        # verbose_notifier defaults to False (Q18). Both are overridable
+        # via the standard overrides mechanism.
+        prefix_val = merged_config.get("prefix")
+        if prefix_val is None or (isinstance(prefix_val, str) and not prefix_val.strip()):
+            prefix_val = name
+        if not isinstance(prefix_val, str):
+            await warn_config(
+                f"prefix must be a string; got {type(prefix_val).__name__}; "
+                f"falling back to plugin_name"
+            )
+            prefix_val = name
+        plugin.prefix = prefix_val
+
+        verbose_val = merged_config.get("verbose_notifier", False)
+        if not isinstance(verbose_val, bool):
+            await warn_config(
+                f"verbose_notifier must be a bool; got "
+                f"{type(verbose_val).__name__}; falling back to False"
+            )
+            verbose_val = False
+        plugin.verbose_notifier = verbose_val
+
         endpoints_cfg = merged_config.get("endpoints") or {}
         if not isinstance(endpoints_cfg, dict):
             # apply_overrides + the validator above already enforce dict shape.
@@ -1040,6 +1214,164 @@ class PluginCore:
         # Alias retained for backward-compatible callsite naming. Same dict.
         plugin._endpoint_by_access = plugin.endpoints
 
+        # ── PR3 Stage B: parse events: and subscriptions: sections ─────
+        # Both sections are optional, default to empty dict. Per LOCKED A.
+        # Validation rules (LOCKED L + Q15 + Q16 + C20) applied here at
+        # load. Topic templates resolved against load-time placeholders
+        # ({prefix}, {plugin_name}, {hostname}, {plugin_uuid}); unknown
+        # {var} placeholders are LEFT INTACT for runtime templating.
+        events_cfg = merged_config.get("events")
+        if events_cfg is None:
+            events_cfg = {}
+        if not isinstance(events_cfg, dict):
+            await error_config(
+                f"events: must be a mapping (dict keyed by event_id); got "
+                f"{type(events_cfg).__name__}"
+            )
+            return
+
+        subs_cfg = merged_config.get("subscriptions")
+        if subs_cfg is None:
+            subs_cfg = {}
+        if not isinstance(subs_cfg, dict):
+            await error_config(
+                f"subscriptions: must be a mapping (dict keyed by "
+                f"declared_id); got {type(subs_cfg).__name__}"
+            )
+            return
+
+        hostname_val = self.hostname
+        plugin_events: Dict[str, Dict[str, Any]] = {}
+        for event_id, entry in events_cfg.items():
+            try:
+                _validate_identifier_name(event_id, context="event_id")
+            except ValueError as e:
+                await error_config(str(e))
+                return
+            if entry is None:
+                entry = {}
+            if not isinstance(entry, dict):
+                await error_config(
+                    f"events.{event_id}: entry must be a mapping; got "
+                    f"{type(entry).__name__}"
+                )
+                return
+
+            raw_topic = entry.get("topic")
+            if raw_topic is None or not isinstance(raw_topic, str):
+                await error_config(
+                    f"events.{event_id}: 'topic' field is required and must "
+                    f"be a string"
+                )
+                return
+
+            # Resolve load-time placeholders (LOCKED J).
+            resolved_topic = _resolve_load_time_template(
+                raw_topic,
+                prefix=plugin.prefix,
+                plugin_name=name,
+                hostname=hostname_val,
+                plugin_uuid=plugin.plugin_uuid,
+            )
+
+            # Validate post-templating shape. Events forbid wildcards
+            # (LOCKED L #1) but ALLOW {var} runtime placeholders (so we
+            # only reject embedded * mid-segment + empty middle segments
+            # + empty topic. Wildcards == any '*' character — but
+            # _validate_topic_static checks segment-by-segment with
+            # allow_wildcards=False rejecting ANY '*'. {var} placeholders
+            # are FINE because they don't contain '*'.).
+            try:
+                stripped_topic = _validate_topic_static(
+                    resolved_topic,
+                    context=f"events.{event_id}.topic",
+                    allow_wildcards=False,
+                )
+            except ValueError as e:
+                await error_config(str(e))
+                return
+
+            entry_dict = {
+                "topic": stripped_topic,
+                "hosts": entry.get("hosts"),
+                "blocked_hosts": entry.get("blocked_hosts"),
+                "enabled": (
+                    bool(entry["enabled"]) if "enabled" in entry else True
+                ),
+            }
+            plugin_events[event_id] = entry_dict
+        plugin.events = plugin_events
+
+        plugin_subs: Dict[str, Dict[str, Any]] = {}
+        for declared_id, entry in subs_cfg.items():
+            try:
+                _validate_identifier_name(declared_id, context="declared_id")
+            except ValueError as e:
+                await error_config(str(e))
+                return
+            if entry is None:
+                entry = {}
+            if not isinstance(entry, dict):
+                await error_config(
+                    f"subscriptions.{declared_id}: entry must be a mapping; "
+                    f"got {type(entry).__name__}"
+                )
+                return
+
+            raw_topic = entry.get("topic")
+            if raw_topic is None or not isinstance(raw_topic, str):
+                await error_config(
+                    f"subscriptions.{declared_id}: 'topic' field is required "
+                    f"and must be a string"
+                )
+                return
+
+            target_access = entry.get("target_access_name")
+            if target_access is None or not isinstance(target_access, str) or not target_access.strip():
+                await error_config(
+                    f"subscriptions.{declared_id}: 'target_access_name' "
+                    f"field is required and must be a non-empty string"
+                )
+                return
+
+            # Resolve load-time placeholders FIRST (then reject {var} +
+            # other invalid shapes). LOCKED J says unknown {var} is left
+            # intact at load time; subscriptions then reject any
+            # remaining {var} syntax (LOCKED L #2). Reserved-template
+            # vars are resolved away here, so only USER {var} survives,
+            # which is then rejected.
+            resolved_topic = _resolve_load_time_template(
+                raw_topic,
+                prefix=plugin.prefix,
+                plugin_name=name,
+                hostname=hostname_val,
+                plugin_uuid=plugin.plugin_uuid,
+            )
+            try:
+                stripped_topic = _validate_subscription_topic(
+                    resolved_topic,
+                    context=f"subscriptions.{declared_id}.topic",
+                )
+            except ValueError as e:
+                await error_config(str(e))
+                return
+
+            entry_dict = {
+                "topic": stripped_topic,
+                "target_access_name": target_access,
+                "target_plugin": entry.get("target_plugin", name),
+                "target_plugin_uuid": entry.get("target_plugin_uuid"),
+                "hosts": entry.get("hosts", "any"),
+                "blocked_hosts": entry.get("blocked_hosts"),
+                "authors": entry.get("authors"),
+                "blocked_authors": entry.get("blocked_authors"),
+                "enabled": (
+                    bool(entry["enabled"]) if "enabled" in entry else True
+                ),
+            }
+            plugin_subs[declared_id] = entry_dict
+        plugin.subscriptions = plugin_subs
+
         async with self.plugin_lock:
             self.plugins[name] = plugin
             # Maintain uuid index if available
@@ -1047,17 +1379,11 @@ class PluginCore:
             if plugin_uuid:
                 self.plugins_by_uuid[plugin_uuid] = plugin
 
-        # Register config-driven topic subscriptions
-        for ep_key, endpoint in plugin.endpoints.items():
-            topic = endpoint.get("topic")
-            if topic and isinstance(topic, str) and topic.strip():
-                await self.topic_registry.subscribe(
-                    topic_pattern=topic.strip(),
-                    plugin_name=name,
-                    plugin_uuid=plugin.plugin_uuid,
-                    endpoint_access_name=ep_key,
-                    config_driven=True,
-                )
+        # PR3 Stage B: legacy `topic:` field auto-registration is now
+        # done in _register_yaml_subscriptions (called from
+        # _enable_plugin) so that disable -> re-enable re-registers
+        # the subs. Stage D removes the legacy `topic:` field path
+        # entirely.
 
         self._logger.info(
             f"Successfully loaded plugin: {name} (Version: {plugin.version}, Path: {path})"
@@ -1209,31 +1535,127 @@ class PluginCore:
 
     @async_handle_errors(None)
     async def _enable_plugin(self, plugin_name: str):
-        """Method to enable a plugin."""
+        """Method to enable a plugin.
+
+        PR3 Stage B (Q23 + C15): YAML-declared subscriptions register
+        BEFORE user.on_enable runs. So plugin code starts with subs
+        already live; events arriving during on_enable are dispatched
+        to handlers (which exist by definition — methods on the plugin
+        class).
+        """
         async with self.plugin_lock:
             plugin = self.plugins[plugin_name]
             if not plugin.enabled:
-                if asyncio.iscoroutinefunction(plugin.on_enable):
-                    await plugin.on_enable()
-                else:
-                    await self.main_event_loop.run_in_executor(
-                        self._plugin_executor, plugin.on_enable
-                    )
+                # Register YAML subscriptions FIRST. Disabled subs (Q13)
+                # skipped at registration; their declared_id stays in
+                # plugin.subscriptions so override-time toggling works.
+                await self._register_yaml_subscriptions(plugin)
+
+                # Flip plugin.enabled=True BEFORE user.on_enable per Q23
+                # + Q11: handlers must be callable (find_endpoint requires
+                # plugin.enabled) so self-publish-from-on_enable works.
+                # Roll back enabled + unregister subs on raise.
                 plugin.enabled = True
+                try:
+                    if asyncio.iscoroutinefunction(plugin.on_enable):
+                        await plugin.on_enable()
+                    else:
+                        await self.main_event_loop.run_in_executor(
+                            self._plugin_executor, plugin.on_enable
+                        )
+                except Exception:
+                    plugin.enabled = False
+                    await self._unregister_plugin_subscriptions(plugin)
+                    raise
 
     @async_log_errors
     async def _disable_plugin(self, plugin_name: str):
-        """Disable a plugin by calling its on_disable and setting enabled=False."""
+        """Disable a plugin by calling its on_disable and setting enabled=False.
+
+        PR3 Stage B (C15): YAML + runtime subs are unregistered AFTER
+        user.on_disable returns. User code can publish/receive events
+        during shutdown teardown.
+        """
         async with self.plugin_lock:
             plugin = self.plugins[plugin_name]
             if plugin.enabled:
-                if asyncio.iscoroutinefunction(plugin.on_disable):
-                    await plugin.on_disable()
-                else:
-                    await self.main_event_loop.run_in_executor(
-                        self._plugin_executor, plugin.on_disable
+                try:
+                    if asyncio.iscoroutinefunction(plugin.on_disable):
+                        await plugin.on_disable()
+                    else:
+                        await self.main_event_loop.run_in_executor(
+                            self._plugin_executor, plugin.on_disable
+                        )
+                finally:
+                    # Unregister all subs (YAML + runtime) regardless of
+                    # whether on_disable raised. Symmetric with the
+                    # rollback in _enable_plugin.
+                    await self._unregister_plugin_subscriptions(plugin)
+                    plugin.enabled = False
+
+    async def _register_yaml_subscriptions(self, plugin: Plugin) -> None:
+        """Register every YAML-declared subscription for ``plugin`` per
+        Q23 + C15 + LOCKED A subscriptions: shape.
+
+        Stage B also re-applies the legacy ``topic:`` field
+        auto-registration here (Stage D removes that path) — moving
+        from load-time to on_enable-time so disable -> re-enable
+        cycles re-register the subs naturally.
+
+        Disabled subs (``enabled: false``) get a Subscription with
+        ``enabled=False`` so they live in the registry (visible to
+        introspection / future advertisement) but are skipped by
+        find_all/find_first matching.
+        """
+        # PR3 subscriptions: section.
+        subs_dict = getattr(plugin, "subscriptions", {}) or {}
+        if isinstance(subs_dict, dict):
+            for declared_id, entry in subs_dict.items():
+                sub_uuid = await self.topic_registry.subscribe(
+                    topic_pattern=entry["topic"],
+                    plugin_name=plugin.plugin_name,
+                    plugin_uuid=plugin.plugin_uuid,
+                    target_plugin=entry.get("target_plugin", plugin.plugin_name),
+                    target_access_name=entry["target_access_name"],
+                    target_plugin_uuid=entry.get("target_plugin_uuid"),
+                    hosts=entry.get("hosts", "any"),
+                    blocked_hosts=entry.get("blocked_hosts"),
+                    authors=entry.get("authors"),
+                    blocked_authors=entry.get("blocked_authors"),
+                    declared_id=declared_id,
+                    enabled=bool(entry.get("enabled", True)),
+                )
+                plugin._sub_uuids.append(sub_uuid)
+
+        # Legacy `topic:` field on endpoints — Stage B keeps alive,
+        # Stage D removes.
+        endpoints_dict = getattr(plugin, "endpoints", {}) or {}
+        if isinstance(endpoints_dict, dict):
+            for ep_key, endpoint in endpoints_dict.items():
+                if not isinstance(endpoint, dict):
+                    continue
+                topic = endpoint.get("topic")
+                if topic and isinstance(topic, str) and topic.strip():
+                    sub_uuid = await self.topic_registry.subscribe(
+                        topic_pattern=topic.strip(),
+                        plugin_name=plugin.plugin_name,
+                        plugin_uuid=plugin.plugin_uuid,
+                        endpoint_access_name=ep_key,
+                        config_driven=True,
                     )
-                plugin.enabled = False
+                    plugin._sub_uuids.append(sub_uuid)
+
+    async def _unregister_plugin_subscriptions(self, plugin: Plugin) -> None:
+        """Unregister every sub (YAML + runtime) for ``plugin`` at
+        on_disable end (C15). Uses unsubscribe_plugin which removes by
+        plugin_uuid (covers BOTH YAML subs registered via the wrapper
+        AND runtime subs registered via Plugin.subscribe — both share
+        plugin_uuid). plugin._sub_uuids is cleared as a side-effect.
+        """
+        plugin_uuid = getattr(plugin, "plugin_uuid", None)
+        if plugin_uuid:
+            await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+        plugin._sub_uuids = []
 
     @async_handle_errors(None)
     async def _reload_plugin(self, plugin_name: str):
@@ -2870,3 +3292,696 @@ class PluginCore:
             stacklevel=2,
         )
         return await self.topic_registry.unsubscribe(subscription_id)
+
+    # ── PR3 Stage B: new publish_event / request_event / subscribe API ─
+
+    def _sub_accepts_local(self, sub: Subscription) -> bool:
+        """Stage B sub-level host filter for LOCAL fan-out.
+
+        Sub's ``hosts``/``blocked_hosts`` interpreted against the
+        framework's own hostname. Used by publish_event /
+        request_event / request_event_stream alike (LOCKED H).
+        """
+        sub_hosts = sub.hosts
+        sub_blocked = sub.blocked_hosts
+
+        def _hosts_accepts(val) -> bool:
+            if val is None or val == "any":
+                return True
+            if isinstance(val, str):
+                return val in ("local", self.hostname)
+            if isinstance(val, list):
+                return "local" in val or self.hostname in val or "any" in val
+            return False
+
+        def _blocked(val) -> bool:
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return val in ("local", self.hostname, "any")
+            if isinstance(val, list):
+                return "local" in val or self.hostname in val or "any" in val
+            return False
+
+        return _hosts_accepts(sub_hosts) and not _blocked(sub_blocked)
+
+    def _sub_accepts_author(self, sub: Subscription, author: str) -> bool:
+        """Stage B sub-level author filter (LOCKED H + Q4).
+
+        Q4: system-originated events are implicitly trusted — they pass
+        any explicit ``authors`` whitelist UNLESS ``blocked_authors``
+        explicitly names "system".
+        """
+        authors = sub.authors
+        blocked_authors = sub.blocked_authors
+
+        def _accepts(val) -> bool:
+            if val is None:
+                return True
+            if isinstance(val, str):
+                return val == author or val == "any"
+            if isinstance(val, list):
+                return author in val or "any" in val
+            return False
+
+        def _blocked(val) -> bool:
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return val == author or val == "any"
+            if isinstance(val, list):
+                return author in val or "any" in val
+            return False
+
+        # Q4: system bypasses authors whitelist (but blocked_authors
+        # can still name "system" explicitly to lock it out).
+        if author == "system":
+            return not _blocked(blocked_authors)
+
+        return _accepts(authors) and not _blocked(blocked_authors)
+
+    def _lookup_event(self, plugin: Plugin, event_id: str) -> dict:
+        """Look up event_entry by event_id (C1 step 1).
+
+        Separated from topic_vars validation + template resolution so
+        callers can do the ``enabled: false`` check (C2) BEFORE running
+        the more expensive validation pass. Per C1 ORDER OF OPERATIONS:
+        step 1 lookup → step 2 enabled check → ... → topic_vars validate.
+        """
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("event_id must be a non-empty string")
+
+        events_dict = getattr(plugin, "events", {}) or {}
+        event_entry = events_dict.get(event_id)
+        if event_entry is None:
+            raise ValueError(
+                f"Event {event_id!r} not declared in events: section "
+                f"of plugin {plugin.plugin_name!r} (LOCKED L #10)"
+            )
+        return event_entry
+
+    def _resolve_topic_for_event(
+        self,
+        plugin: Plugin,
+        event_id: str,
+        topic_vars: Optional[Dict[str, str]],
+        event_entry: Optional[dict] = None,
+    ) -> tuple:
+        """Look up event_id, validate topic_vars, resolve template.
+
+        Returns (resolved_topic, event_entry). Raises ValueError on
+        spec violations (LOCKED L #3-9 + Q15/Q16). The caller is
+        expected to handle ``enabled: false`` semantics — this helper
+        validates and resolves but does NOT decide whether to dispatch.
+
+        ``event_entry`` may be passed by callers that already did
+        ``_lookup_event`` (avoids double-lookup); when None, this helper
+        does the lookup itself.
+        """
+        if event_entry is None:
+            event_entry = self._lookup_event(plugin, event_id)
+
+        # Validate topic_vars shape (LOCKED L #3-9).
+        if topic_vars is None:
+            tv: Dict[str, str] = {}
+        elif isinstance(topic_vars, dict):
+            tv = topic_vars
+        else:
+            raise TypeError(
+                f"topic_vars must be a Dict[str, str] or None; "
+                f"got {type(topic_vars).__name__} (LOCKED L #3)"
+            )
+
+        for k, v in tv.items():
+            if not isinstance(k, str):
+                raise TypeError(
+                    f"topic_vars keys must be str; got {type(k).__name__} "
+                    f"(LOCKED L #3)"
+                )
+            if k in _RESERVED_TEMPLATE_VARS:
+                raise ValueError(
+                    f"topic_vars key {k!r} is reserved (LOCKED L #6); "
+                    f"reserved names: {sorted(_RESERVED_TEMPLATE_VARS)}"
+                )
+            if not isinstance(v, str):
+                raise TypeError(
+                    f"topic_vars[{k!r}] must be str; got {type(v).__name__} "
+                    f"(LOCKED L #3)"
+                )
+            if "/" in v:
+                raise ValueError(
+                    f"topic_vars[{k!r}]={v!r} contains '/'; would inject "
+                    f"extra topic segments (LOCKED L #4)"
+                )
+            if not v:
+                raise ValueError(
+                    f"topic_vars[{k!r}] is empty string (LOCKED L #5)"
+                )
+            stripped = v.strip()
+            if not stripped:
+                # Whitespace-only collapses to an empty segment per
+                # LOCKED L #5; report it under the same rule for clarity.
+                raise ValueError(
+                    f"topic_vars[{k!r}]={v!r} is whitespace-only — "
+                    f"collapses to empty segment (LOCKED L #5)"
+                )
+            if stripped != v:
+                raise ValueError(
+                    f"topic_vars[{k!r}]={v!r} has leading/trailing "
+                    f"whitespace (LOCKED L)"
+                )
+
+        # Resolve {var} placeholders in the topic template.
+        topic_template = event_entry["topic"]
+        placeholders = set(_TEMPLATE_VAR_RE.findall(topic_template))
+
+        if not placeholders and tv:
+            self._logger.warning(
+                "publish_event/request_event %s: topic %r is static but "
+                "topic_vars=%r passed (LOCKED L #9 — likely confused "
+                "payload vs topic_vars)",
+                event_id, topic_template, tv,
+            )
+
+        # Check missing keys for {var} placeholders (LOCKED L #7).
+        missing = placeholders - set(tv.keys())
+        if missing:
+            raise ValueError(
+                f"event {event_id!r} topic {topic_template!r} requires "
+                f"topic_vars keys {sorted(missing)} (LOCKED L #7)"
+            )
+
+        # Check extra topic_vars keys (LOCKED L #8 — WARN, not error).
+        extra = set(tv.keys()) - placeholders
+        if extra:
+            self._logger.warning(
+                "publish_event/request_event %s: topic_vars keys %r not "
+                "used in topic %r (LOCKED L #8 — probably caller mistake)",
+                event_id, sorted(extra), topic_template,
+            )
+
+        # Substitute. Use the same regex helper to keep behavior consistent.
+        def _sub(match: re.Match) -> str:
+            name = match.group(1)
+            if name in tv:
+                return tv[name]
+            # Should be unreachable given the missing-key check above —
+            # defensive guard.
+            raise ValueError(
+                f"event {event_id!r} unresolved placeholder {{{name}}}"
+            )
+
+        resolved = _TEMPLATE_VAR_RE.sub(_sub, topic_template)
+
+        # Post-resolution checks (Q15 reject empty + Q16 strip slashes).
+        stripped_topic = resolved.strip("/")
+        if not stripped_topic.strip():
+            raise ValueError(
+                f"event {event_id!r} resolved topic empty (Q15)"
+            )
+
+        # Re-validate post-resolution (no embedded * mid-segment, no
+        # empty middle segments). Wildcards forbidden in events. Per
+        # LOCKED L's "ORDER OF OPERATIONS" + "FILTER LOOKUP" step 6.
+        try:
+            stripped_topic = _validate_topic_static(
+                stripped_topic,
+                context=f"event {event_id!r} resolved topic",
+                allow_wildcards=False,
+            )
+        except ValueError:
+            raise
+
+        return stripped_topic, event_entry
+
+    @async_log_errors
+    async def publish_event(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+    ) -> int:
+        """Publish an event (1:N fire-and-forget).
+
+        Per PR3 PLAN F + LOCKED L FILTER LOOKUP. Returns the count of
+        local subs the publisher targeted (post-filter). Stage B is
+        LOCAL-only; remote dispatch lands in Stage C.
+
+        Pure declaration model: ``event_id`` MUST exist in
+        ``publisher.events``. Disabled events (``enabled: false``)
+        silently drop and return 0 (C2).
+        """
+        # C1 ORDER OF OPERATIONS:
+        # Step 1: event_id lookup.
+        event_entry = self._lookup_event(publisher, event_id)
+
+        # Step 2: enabled flag (C2 — silent drop on publish_event).
+        # MUST precede topic_vars validation so disabled events with
+        # malformed topic_vars don't raise ValueError.
+        if not event_entry.get("enabled", True):
+            self._logger.debug(
+                "publish_event %s: event disabled, silent drop", event_id
+            )
+            return 0
+
+        # Step 3: payload normalization (Q7).
+        if payload is None:
+            payload = {}
+
+        # Step 4-5: topic_vars validation + template resolution +
+        # post-resolution checks (Q15/Q16 + LOCKED L #3-9).
+        resolved_topic, _ = self._resolve_topic_for_event(
+            publisher, event_id, topic_vars, event_entry=event_entry
+        )
+
+        # Step 7: hosts/blocked_hosts default-and-override.
+        eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
+        eff_blocked = (
+            blocked_hosts
+            if blocked_hosts is not None
+            else event_entry.get("blocked_hosts")
+        )
+        # Stage B: we don't pass these into per-sub Request creation
+        # (sub fan-out uses hosts="local" per C19). They WILL be used
+        # by Stage C for remote-side advert filter. Stored for trace.
+
+        # Step 4: local fan-out — find all local subs matching resolved
+        # topic. find_all returns insertion order (LOCKED C).
+        all_subs = await self.topic_registry.find_all(resolved_topic)
+        local_subs = [
+            s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid
+        ]
+
+        survivors = [
+            s for s in local_subs
+            if self._sub_accepts_local(s)
+            and self._sub_accepts_author(s, publisher.plugin_name)
+        ]
+
+        if publisher.verbose_notifier:
+            self._logger.debug(
+                "publish_event %s topic=%r matched %d local sub(s) "
+                "(of %d total subs)",
+                event_id, resolved_topic, len(survivors), len(local_subs),
+            )
+
+        # Per-sub fan-out tasks. Each gets its own Request with
+        # kind="publish_event", hosts="local" (C19), and
+        # requester_id=sub.plugin_uuid (C18).
+        now_ts = time.time()
+        for sub in survivors:
+            await self._fanout_sub(
+                sub=sub,
+                publisher=publisher,
+                resolved_topic=resolved_topic,
+                payload=payload,
+                kind="publish_event",
+                timestamp=now_ts,
+                timeout=None,
+            )
+
+        return len(survivors)
+
+    async def _fanout_sub(
+        self,
+        *,
+        sub: Subscription,
+        publisher: Plugin,
+        resolved_topic: str,
+        payload: Any,
+        kind: str,
+        timestamp: float,
+        timeout: Optional[float],
+    ) -> Optional[Request]:
+        """Build a per-sub Request and spawn its dispatch task (publish
+        path) or build + return without spawning (request path; caller
+        awaits it).
+
+        Stage B always returns the Request. publish_event ignores the
+        return value (fire-and-forget). request_event awaits it.
+        """
+        author_host = self.hostname
+        request = Request(
+            author_host=author_host,
+            plugin=sub.target_plugin or sub.plugin_name,
+            method=sub.target_access_name,
+            args=payload,
+            plugin_uuid=sub.target_plugin_uuid,
+            target_hosts="local",  # C19
+            blocked_hosts=None,
+            author=publisher.plugin_name,
+            author_id=publisher.plugin_uuid,
+            timeout=timeout,
+            request_id=None,
+            event_loop=self.main_event_loop,
+            kind=kind,
+            topic=resolved_topic,
+            origin_subscription_id=sub.declared_id or sub.sub_uuid,
+            timestamp=timestamp,
+            requester_id=sub.plugin_uuid,  # C18
+        )
+
+        async with self.request_lock:
+            self.requests[request.id] = request
+
+        async def _run_and_collect():
+            try:
+                await self._process_request(request)
+            finally:
+                # Q12 fix: mark for cleanup so cleanup_requests doesn't
+                # leak fan-out Requests.
+                await request.set_collected()
+
+        task = asyncio.create_task(_run_and_collect())
+        self.task_list.append(task)
+
+        return request
+
+    @log_errors
+    def publish_event_sync(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+    ) -> int:
+        """Sync variant of publish_event (C16). Schedules the async
+        coroutine on main_event_loop via run_coroutine_threadsafe.
+        Pre-start guard fires inside the Plugin wrapper (Q1)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self.publish_event(
+                publisher, event_id, payload, topic_vars, hosts, blocked_hosts
+            ),
+            self.main_event_loop,
+        )
+        return future.result()
+
+    @async_log_errors
+    async def request_event(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Request an event (1:1 ask).
+
+        Per PR3 PLAN F. Tie-break: insertion order on local subs (LOCKED
+        C). No local match → RequestException (Stage B is LOCAL-only;
+        remote dispatch lands in Stage C).
+        """
+        # C1 ORDER OF OPERATIONS: lookup → enabled → payload → resolve.
+        event_entry = self._lookup_event(publisher, event_id)
+
+        # C2: disabled events raise on request_event (caller awaits a
+        # result, can't silently return None). MUST precede topic_vars
+        # validation.
+        if not event_entry.get("enabled", True):
+            raise RequestException(
+                f"event {event_id!r} disabled (C2)"
+            )
+
+        if payload is None:
+            payload = {}
+
+        resolved_topic, _ = self._resolve_topic_for_event(
+            publisher, event_id, topic_vars, event_entry=event_entry
+        )
+
+        # Find first matching LOCAL sub (insertion order). Apply the
+        # same sub-level host/author filter as publish_event so subs
+        # with hosts="remote" or blocked_authors filtering us out are
+        # skipped (LOCKED H).
+        all_subs = await self.topic_registry.find_all(resolved_topic)
+        local_match = next(
+            (
+                s for s in all_subs
+                if s.plugin_uuid in self.plugins_by_uuid
+                and self._sub_accepts_local(s)
+                and self._sub_accepts_author(s, publisher.plugin_name)
+            ),
+            None,
+        )
+
+        if local_match is None:
+            raise RequestException(
+                f"request_event {event_id!r}: no subscriber matches resolved "
+                f"topic {resolved_topic!r}"
+            )
+
+        request = await self._fanout_sub(
+            sub=local_match,
+            publisher=publisher,
+            resolved_topic=resolved_topic,
+            payload=payload,
+            kind="request_event",
+            timestamp=time.time(),
+            timeout=timeout,
+        )
+
+        result, error, _ = await request.wait_for_result_async()
+        if error:
+            raise RequestException(result)
+        return result
+
+    @log_errors
+    def request_event_sync(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Sync variant of request_event (C16)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self.request_event(
+                publisher, event_id, payload, topic_vars, hosts,
+                blocked_hosts, timeout,
+            ),
+            self.main_event_loop,
+        )
+        return future.result()
+
+    @async_gen_log_errors
+    async def request_event_stream(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Streaming variant of request_event. First yield is wrapped
+        in Event metadata (LOCKED I); subsequent yields raw."""
+        # C1 ORDER OF OPERATIONS: lookup → enabled → payload → resolve.
+        event_entry = self._lookup_event(publisher, event_id)
+        if not event_entry.get("enabled", True):
+            raise RequestException(
+                f"event {event_id!r} disabled (C2)"
+            )
+        if payload is None:
+            payload = {}
+        resolved_topic, _ = self._resolve_topic_for_event(
+            publisher, event_id, topic_vars, event_entry=event_entry
+        )
+
+        # Apply the same sub-level filter as publish_event /
+        # request_event so subs with hosts="remote" or blocked_authors
+        # filtering us out are skipped (LOCKED H).
+        all_subs = await self.topic_registry.find_all(resolved_topic)
+        local_match = next(
+            (
+                s for s in all_subs
+                if s.plugin_uuid in self.plugins_by_uuid
+                and self._sub_accepts_local(s)
+                and self._sub_accepts_author(s, publisher.plugin_name)
+            ),
+            None,
+        )
+        if local_match is None:
+            raise RequestException(
+                f"request_event_stream {event_id!r}: no subscriber matches "
+                f"resolved topic {resolved_topic!r}"
+            )
+
+        # Route through find_endpoint so the C18 accessible_by_other_plugins
+        # access check applies on the streaming path too. Pass
+        # requester_id=local_match.plugin_uuid (the SUB OWNER's identity)
+        # so cross-plugin subs to private endpoints are denied
+        # consistently with the non-streaming request_event path.
+        found = await self.find_endpoint(
+            access_name=local_match.target_access_name,
+            hosts="local",
+            plugin_uuid=local_match.target_plugin_uuid,
+            requester_id=local_match.plugin_uuid,
+            target_plugin=local_match.target_plugin,
+        )
+        if found is None:
+            raise RequestException(
+                f"request_event_stream {event_id!r}: target endpoint "
+                f"{local_match.target_access_name!r} not found on "
+                f"{local_match.target_plugin!r} (or access denied per C18)"
+            )
+        target_plugin, endpoint, _node = found
+        internal = endpoint.get("internal_name") or local_match.target_access_name
+        func = getattr(target_plugin, internal, None)
+        if func is None or not (
+            inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func)
+        ):
+            raise RequestException(
+                f"request_event_stream {event_id!r}: handler is not a "
+                f"generator function (use request_event instead)"
+            )
+
+        # Build the Event metadata for first-chunk wrapping.
+        event_meta = Event(
+            topic=resolved_topic,
+            payload=payload,
+            author=publisher.plugin_name,
+            author_id=publisher.plugin_uuid,
+            author_host=self.hostname,
+            subscription_id=local_match.declared_id or local_match.sub_uuid,
+            timestamp=time.time(),
+        )
+
+        first = True
+        # The handler is a plain endpoint generator — pass the Event as
+        # single positional argument, matching the non-streaming
+        # subscriber-handler convention (LOCKED I).
+        if inspect.isasyncgenfunction(func):
+            async for chunk in func(event_meta):
+                if first:
+                    first = False
+                    # Yield Event-shaped wrapper: event with payload =
+                    # first chunk.
+                    wrapped = Event(
+                        topic=resolved_topic,
+                        payload=chunk,
+                        author=publisher.plugin_name,
+                        author_id=publisher.plugin_uuid,
+                        author_host=self.hostname,
+                        subscription_id=event_meta.subscription_id,
+                        timestamp=event_meta.timestamp,
+                    )
+                    yield wrapped
+                else:
+                    yield chunk
+        else:
+            sentinel = object()
+            gen = func(event_meta)
+            while True:
+                chunk = await asyncio.to_thread(next, gen, sentinel)
+                if chunk is sentinel:
+                    break
+                if first:
+                    first = False
+                    wrapped = Event(
+                        topic=resolved_topic,
+                        payload=chunk,
+                        author=publisher.plugin_name,
+                        author_id=publisher.plugin_uuid,
+                        author_host=self.hostname,
+                        subscription_id=event_meta.subscription_id,
+                        timestamp=event_meta.timestamp,
+                    )
+                    yield wrapped
+                else:
+                    yield chunk
+
+    @gen_log_errors
+    def request_event_stream_sync(
+        self,
+        publisher: Plugin,
+        event_id: str,
+        payload: Any = None,
+        topic_vars: Optional[Dict[str, str]] = None,
+        hosts: Union[str, list, None] = None,
+        blocked_hosts: Union[str, list, None] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Sync variant of request_event_stream (C16). Iterates the
+        async generator on main_event_loop and yields chunks back to
+        the caller thread."""
+        async_gen = self.request_event_stream(
+            publisher, event_id, payload, topic_vars, hosts, blocked_hosts,
+            timeout,
+        )
+
+        while True:
+            try:
+                chunk = asyncio.run_coroutine_threadsafe(
+                    async_gen.__anext__(), self.main_event_loop
+                ).result()
+            except StopAsyncIteration:
+                break
+            yield chunk
+
+    async def subscribe_event(
+        self,
+        topic: str,
+        plugin_name: str,
+        plugin_uuid: str,
+        target_access_name: str,
+        target_plugin: Optional[str] = None,
+        target_plugin_uuid: Optional[str] = None,
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
+        authors: Union[str, list, None] = None,
+        blocked_authors: Union[str, list, None] = None,
+    ) -> str:
+        """Register a runtime subscription (NEW PR3 API). Returns sub_uuid.
+
+        Pure-runtime path; declared_id stays None per LOCKED D.
+        Adds the sub_uuid to the owning plugin's _sub_uuids list so the
+        on_disable wrapper can include it in the unregister sweep.
+        """
+        sub_uuid = await self.topic_registry.subscribe(
+            topic_pattern=topic,
+            plugin_name=plugin_name,
+            plugin_uuid=plugin_uuid,
+            target_plugin=target_plugin or plugin_name,
+            target_access_name=target_access_name,
+            target_plugin_uuid=target_plugin_uuid,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            authors=authors,
+            blocked_authors=blocked_authors,
+            declared_id=None,
+            enabled=True,
+        )
+
+        owner = self.plugins_by_uuid.get(plugin_uuid)
+        if owner is not None and hasattr(owner, "_sub_uuids"):
+            owner._sub_uuids.append(sub_uuid)
+
+        return sub_uuid
+
+    async def unsubscribe_event(self, sub_uuid: str) -> bool:
+        """Remove a runtime subscription (NEW PR3 API).
+
+        Returns True if found and removed. Cleans up the owning plugin's
+        _sub_uuids list as a side-effect (best-effort lookup).
+        """
+        sub = await self.topic_registry.get_subscription(sub_uuid)
+        ok = await self.topic_registry.unsubscribe(sub_uuid)
+        if ok and sub is not None:
+            owner = self.plugins_by_uuid.get(sub.plugin_uuid)
+            if owner is not None and hasattr(owner, "_sub_uuids"):
+                try:
+                    owner._sub_uuids.remove(sub_uuid)
+                except ValueError:
+                    pass
+        return ok
