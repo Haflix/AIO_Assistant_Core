@@ -194,14 +194,11 @@ def _validate_topic_static(
                     f"(C20 — '*' must be a complete segment)"
                 )
 
-    if not allow_wildcards and _TEMPLATE_VAR_RE.search(stripped) is None:
-        # subscriptions.topic also forbids {var} runtime templating; that
-        # check is done by the SUBSCRIPTION-side validator (different fn),
-        # not here. Events.topic *allows* {var} runtime placeholders, so
-        # we don't reject them in this branch either. The check is
-        # purely "embedded * mid-segment" + "empty middle segment" +
-        # "non-empty topic" + (events-only) "no wildcards".
-        pass
+    # NOTE: subscriptions.topic also forbids {var} runtime templating;
+    # that check lives in _validate_subscription_topic (different fn).
+    # events.topic *allows* {var} runtime placeholders. So this fn
+    # only validates: non-empty + (events-only) no wildcards + no
+    # embedded * mid-segment + no empty middle segments.
 
     return stripped
 
@@ -3295,6 +3292,47 @@ class PluginCore:
 
     # ── PR3 Stage B: new publish_event / request_event / subscribe API ─
 
+    def _publisher_targets_local(
+        self,
+        eff_hosts: Union[str, list, None],
+        eff_blocked: Union[str, list, None],
+    ) -> bool:
+        """Decide whether the publisher's hosts/blocked_hosts kwargs
+        permit LOCAL fan-out at all (LOCKED IN — PUBLISHER hosts).
+
+        Per spec: ``hosts`` defaults to "local". ``hosts="remote"``
+        means peer-only — local subs are skipped. ``hosts=[<list>]``
+        excluding "local"/own hostname also skips local. ``blocked_hosts``
+        with "local"/own hostname/"any" also skips.
+
+        Returns True if local fan-out should proceed; False to skip.
+        """
+        # Default per spec: hosts not provided → "local".
+        if eff_hosts is None:
+            eff_hosts = "local"
+
+        def _hosts_allows_local(val) -> bool:
+            if val == "any":
+                return True
+            if isinstance(val, str):
+                return val in ("local", self.hostname)
+            if isinstance(val, list):
+                return "local" in val or self.hostname in val
+            return False
+
+        def _blocked_excludes_local(val) -> bool:
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return val in ("local", self.hostname, "any")
+            if isinstance(val, list):
+                return "local" in val or self.hostname in val
+            return False
+
+        return _hosts_allows_local(eff_hosts) and not _blocked_excludes_local(
+            eff_blocked
+        )
+
     def _sub_accepts_local(self, sub: Subscription) -> bool:
         """Stage B sub-level host filter for LOCAL fan-out.
 
@@ -3564,9 +3602,21 @@ class PluginCore:
             if blocked_hosts is not None
             else event_entry.get("blocked_hosts")
         )
-        # Stage B: we don't pass these into per-sub Request creation
-        # (sub fan-out uses hosts="local" per C19). They WILL be used
-        # by Stage C for remote-side advert filter. Stored for trace.
+        # Stage C will read eff_hosts/eff_blocked for the peer-level
+        # filter (PR3 PLAN F step 5a). Stage B uses them ONLY to gate
+        # whether local fan-out happens at all (e.g. hosts="remote"
+        # means peer-only, no local delivery).
+
+        # Publisher-level gate: skip local fan-out if publisher's
+        # hosts/blocked_hosts exclude local delivery.
+        if not self._publisher_targets_local(eff_hosts, eff_blocked):
+            if publisher.verbose_notifier:
+                self._logger.debug(
+                    "publish_event %s topic=%r: publisher hosts=%r "
+                    "blocked_hosts=%r excludes local fan-out",
+                    event_id, resolved_topic, eff_hosts, eff_blocked,
+                )
+            return 0
 
         # Step 4: local fan-out — find all local subs matching resolved
         # topic. find_all returns insertion order (LOCKED C).
@@ -3644,6 +3694,15 @@ class PluginCore:
             requester_id=sub.plugin_uuid,  # C18
         )
 
+        # C10: propagate the publisher's sync call chain through fan-out
+        # so cross-pool cycle detection still works when a sync subscriber
+        # handler eventually re-enters execute_sync / publish_event_sync /
+        # etc. Stage A's _tracked_event wrapper reads request._call_chain.
+        existing_chain = getattr(_sync_call_chain, "chain", ())
+        request._call_chain = tuple(existing_chain) + (
+            (publisher.plugin_uuid, kind),
+        )
+
         async with self.request_lock:
             self.requests[request.id] = request
 
@@ -3716,6 +3775,27 @@ class PluginCore:
             publisher, event_id, topic_vars, event_entry=event_entry
         )
 
+        # Publisher-level hosts gate: if hosts="remote" or excludes
+        # local, request_event has no local route and Stage B is
+        # LOCAL-only — raise rather than silently fail (caller awaits
+        # a result).
+        eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
+        eff_blocked = (
+            blocked_hosts
+            if blocked_hosts is not None
+            else event_entry.get("blocked_hosts")
+        )
+        if not self._publisher_targets_local(eff_hosts, eff_blocked):
+            raise RequestException(
+                f"request_event {event_id!r}: publisher hosts={eff_hosts!r} "
+                f"excludes local; remote dispatch lands in Stage C"
+            )
+
+        # Capture timestamp once so all per-sub Requests built off this
+        # call see consistent epoch seconds (consistency with
+        # publish_event).
+        now_ts = time.time()
+
         # Find first matching LOCAL sub (insertion order). Apply the
         # same sub-level host/author filter as publish_event so subs
         # with hosts="remote" or blocked_authors filtering us out are
@@ -3743,7 +3823,7 @@ class PluginCore:
             resolved_topic=resolved_topic,
             payload=payload,
             kind="request_event",
-            timestamp=time.time(),
+            timestamp=now_ts,
             timeout=timeout,
         )
 
@@ -3797,6 +3877,24 @@ class PluginCore:
         resolved_topic, _ = self._resolve_topic_for_event(
             publisher, event_id, topic_vars, event_entry=event_entry
         )
+
+        # Publisher-level hosts gate (same as request_event).
+        eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
+        eff_blocked = (
+            blocked_hosts
+            if blocked_hosts is not None
+            else event_entry.get("blocked_hosts")
+        )
+        if not self._publisher_targets_local(eff_hosts, eff_blocked):
+            raise RequestException(
+                f"request_event_stream {event_id!r}: publisher hosts="
+                f"{eff_hosts!r} excludes local; remote dispatch lands in "
+                f"Stage C"
+            )
+
+        # Capture timestamp once (consistency with publish_event /
+        # request_event).
+        now_ts = time.time()
 
         # Apply the same sub-level filter as publish_event /
         # request_event so subs with hosts="remote" or blocked_authors
@@ -3854,7 +3952,7 @@ class PluginCore:
             author_id=publisher.plugin_uuid,
             author_host=self.hostname,
             subscription_id=local_match.declared_id or local_match.sub_uuid,
-            timestamp=time.time(),
+            timestamp=now_ts,
         )
 
         first = True
@@ -3882,8 +3980,15 @@ class PluginCore:
         else:
             sentinel = object()
             gen = func(event_meta)
+            loop = asyncio.get_running_loop()
             while True:
-                chunk = await asyncio.to_thread(next, gen, sentinel)
+                # Sync handler iteration runs on the SyncDispatcher pool
+                # per Q17 + C3 (NOT asyncio.to_thread, which uses the
+                # default executor and breaks the executor isolation
+                # invariant).
+                chunk = await loop.run_in_executor(
+                    self.sync_dispatcher.executor, next, gen, sentinel
+                )
                 if chunk is sentinel:
                     break
                 if first:
