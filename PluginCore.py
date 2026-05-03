@@ -3326,7 +3326,15 @@ class PluginCore:
             if isinstance(val, str):
                 return val in ("local", self.hostname, "any")
             if isinstance(val, list):
-                return "local" in val or self.hostname in val
+                # Match _sub_accepts_local: "any" inside a list is
+                # technically invalid per spec but defensively treated
+                # as a wildcard block when present (consistent with
+                # subscriber-side _sub_accepts_local)._
+                return (
+                    "local" in val
+                    or self.hostname in val
+                    or "any" in val
+                )
             return False
 
         return _hosts_allows_local(eff_hosts) and not _blocked_excludes_local(
@@ -3541,14 +3549,11 @@ class PluginCore:
         # Re-validate post-resolution (no embedded * mid-segment, no
         # empty middle segments). Wildcards forbidden in events. Per
         # LOCKED L's "ORDER OF OPERATIONS" + "FILTER LOOKUP" step 6.
-        try:
-            stripped_topic = _validate_topic_static(
-                stripped_topic,
-                context=f"event {event_id!r} resolved topic",
-                allow_wildcards=False,
-            )
-        except ValueError:
-            raise
+        stripped_topic = _validate_topic_static(
+            stripped_topic,
+            context=f"event {event_id!r} resolved topic",
+            allow_wildcards=False,
+        )
 
         return stripped_topic, event_entry
 
@@ -3698,10 +3703,16 @@ class PluginCore:
         # so cross-pool cycle detection still works when a sync subscriber
         # handler eventually re-enters execute_sync / publish_event_sync /
         # etc. Stage A's _tracked_event wrapper reads request._call_chain.
+        # Use the SAME flat-string format the execute path uses
+        # (`f"{plugin}.{method}"`) — see _execute_sync_tracked at the
+        # `chain + (target,)` site. Mismatched element shapes break the
+        # `target in chain` membership test downstream and let real
+        # cycles slip past detection.
         existing_chain = getattr(_sync_call_chain, "chain", ())
-        request._call_chain = tuple(existing_chain) + (
-            (publisher.plugin_uuid, kind),
+        target_for_chain = (
+            f"{sub.target_plugin or sub.plugin_name}.{sub.target_access_name}"
         )
+        request._call_chain = tuple(existing_chain) + (target_for_chain,)
 
         async with self.request_lock:
             self.requests[request.id] = request
