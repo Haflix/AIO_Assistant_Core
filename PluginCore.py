@@ -3931,20 +3931,21 @@ class PluginCore:
         # requester_id=local_match.plugin_uuid (the SUB OWNER's identity)
         # so cross-plugin subs to private endpoints are denied
         # consistently with the non-streaming request_event path.
-        found = await self.find_endpoint(
+        # NOTE: find_endpoint returns (None, None, None) on no-match
+        # (NOT bare None), so check the unpacked plugin slot.
+        target_plugin, endpoint, _node = await self.find_endpoint(
             access_name=local_match.target_access_name,
             hosts="local",
             plugin_uuid=local_match.target_plugin_uuid,
             requester_id=local_match.plugin_uuid,
             target_plugin=local_match.target_plugin,
         )
-        if found is None:
+        if target_plugin is None or endpoint is None:
             raise RequestException(
                 f"request_event_stream {event_id!r}: target endpoint "
                 f"{local_match.target_access_name!r} not found on "
                 f"{local_match.target_plugin!r} (or access denied per C18)"
             )
-        target_plugin, endpoint, _node = found
         internal = endpoint.get("internal_name") or local_match.target_access_name
         func = getattr(target_plugin, internal, None)
         if func is None or not (
