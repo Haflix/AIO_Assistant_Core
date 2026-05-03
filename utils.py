@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 import contextlib
+import dataclasses
 import datetime
 import logging
 from logging.handlers import QueueHandler, QueueListener
@@ -1189,6 +1190,11 @@ class Plugin(ABC):
         Returns:
             The result from the target method or None if an error occurs.
         """
+        # PR3 Stage A: retrofit pre-start guard (Q1 closes B-038).
+        # Calling execute_sync from on_load (before the framework's
+        # main_event_loop is bound) used to silently hang on
+        # run_coroutine_threadsafe(..., None); now it raises clearly.
+        self._check_framework_started()
         return self._plugin_core.execute_sync(
             plugin,
             method,
@@ -1278,6 +1284,39 @@ class Plugin(ABC):
         Yields:
             Each value yielded by the target streaming method.
         """
+        # PR3 Stage A: retrofit pre-start guard at CALL time (Q1 closes
+        # B-038, symmetry with execute_sync). The guard cannot live in
+        # the generator body itself — Python defers generator-body
+        # execution until first iteration. We split into a non-generator
+        # wrapper (this method) that runs the guard and returns the
+        # inner generator below.
+        self._check_framework_started()
+        return self._execute_stream_sync_inner(
+            plugin,
+            method,
+            args,
+            plugin_uuid,
+            hosts,
+            blocked_hosts,
+            author,
+            author_id,
+            timeout,
+        )
+
+    def _execute_stream_sync_inner(
+        self,
+        plugin: str,
+        method: str,
+        args: Union[tuple, dict, None],
+        plugin_uuid: Optional[str],
+        hosts: Union[str, list, None],
+        blocked_hosts: Union[str, list, None],
+        author: str,
+        author_id: str,
+        timeout: Optional[float],
+    ):
+        """Generator body for execute_stream_sync (split out so the
+        pre-start guard fires at call time, not at first iteration)."""
         for i in self._plugin_core.execute_stream_sync(
             plugin,
             method,
@@ -1549,6 +1588,72 @@ class Plugin(ABC):
         )
         return await self._plugin_core.unsubscribe(subscription_id)
 
+    # ── PR3 Stage A: pre-start guards for new sync entry points (Q1) ──
+    # Stage A only ships the guard stubs; the actual publish_event /
+    # request_event / subscribe / unsubscribe implementations land in
+    # Stage B. The stubs raise RequestException loudly when called
+    # before the framework's main event loop is running, so callers in
+    # plugin __init__/on_load (which run before the loop is up) get a
+    # clear failure instead of silently hanging on
+    # run_coroutine_threadsafe(..., None).
+
+    def _check_framework_started(self) -> None:
+        """Guard helper — raise if the main event loop hasn't been bound yet.
+
+        Used by every NEW sync entry point added in Stage A and (per Q1
+        retrofit guidance, closing B-038) by ``execute_sync`` when no
+        event loop is available yet.
+        """
+        if self._plugin_core.main_event_loop is None:
+            raise RequestException(
+                "Framework not started — sync APIs require running event loop"
+            )
+
+    @log_errors
+    def publish_event_sync(self, *args, **kwargs) -> int:
+        """Pre-start guard stub. Real implementation lands in Stage B."""
+        self._check_framework_started()
+        raise RequestException(
+            "Plugin.publish_event_sync() not implemented yet (PR3 Stage B)"
+        )
+
+    @log_errors
+    def request_event_sync(self, *args, **kwargs) -> Any:
+        """Pre-start guard stub. Real implementation lands in Stage B."""
+        self._check_framework_started()
+        raise RequestException(
+            "Plugin.request_event_sync() not implemented yet (PR3 Stage B)"
+        )
+
+    @log_errors
+    def request_event_stream_sync(self, *args, **kwargs):
+        """Pre-start guard stub. Real implementation lands in Stage B.
+
+        Not a generator function in Stage A — the guard fires at call
+        time per Q1. Stage B's real implementation will be a generator
+        naturally (yields chunks).
+        """
+        self._check_framework_started()
+        raise RequestException(
+            "Plugin.request_event_stream_sync() not implemented yet (PR3 Stage B)"
+        )
+
+    @log_errors
+    def subscribe_sync(self, *args, **kwargs) -> str:
+        """Pre-start guard stub. Real implementation lands in Stage B."""
+        self._check_framework_started()
+        raise RequestException(
+            "Plugin.subscribe_sync() not implemented yet (PR3 Stage B)"
+        )
+
+    @log_errors
+    def unsubscribe_sync(self, *args, **kwargs) -> bool:
+        """Pre-start guard stub. Real implementation lands in Stage B."""
+        self._check_framework_started()
+        raise RequestException(
+            "Plugin.unsubscribe_sync() not implemented yet (PR3 Stage B)"
+        )
+
     @log_errors
     @abstractmethod
     def on_load(self):
@@ -1566,6 +1671,53 @@ class Plugin(ABC):
     async def on_disable(self):
         """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class Event:
+    """Event delivered to subscriber handlers via publish_event/request_event.
+
+    Per PR3 LOCKED I — receiving handlers get one positional arg, an Event,
+    instead of the raw args/kwargs that execute() dispatches. Handler shape:
+
+        async def handle_greet(self, event):
+            name = event.payload["name"]
+            ...
+
+    Endpoints called via execute() are NOT wrapped — they keep the args
+    (tuple/dict/None) shape. Dispatch path determines the wrapping; the
+    sole place this class is constructed is the kind-aware branch in
+    PluginCore._call_endpoint (Stage A) and the local fan-out path
+    (Stage B).
+    """
+
+    topic: str  # literal topic that fired (post-resolution)
+    payload: Any  # whatever was passed as payload to publish_event/request_event
+    author: str  # publisher plugin_name
+    author_id: str  # publisher plugin_uuid (runtime)
+    author_host: str  # publisher hostname
+    subscription_id: str  # declared_id (YAML key) or sub_uuid (runtime sub) per C4 (a)
+    timestamp: float  # epoch seconds when publish_event/request_event was called
+
+    @classmethod
+    def from_request(cls, request: "Request") -> "Event":
+        """Build an Event from a kind-aware Request.
+
+        Used by PluginCore._call_endpoint when ``request.kind`` is one of
+        ``"publish_event"`` / ``"request_event"``. The Request's
+        ``origin_subscription_id`` carries either the declared_id (for
+        YAML subs) or the sub_uuid (for runtime subs) — Stage B sets the
+        appropriate value at fan-out time per PR3 LOCKED D + C4 (a).
+        """
+        return cls(
+            topic=request.topic if request.topic is not None else "",
+            payload=request.args,
+            author=request.author,
+            author_id=request.author_id,
+            author_host=request.author_host,
+            subscription_id=request.origin_subscription_id or "",
+            timestamp=request.timestamp,
+        )
 
 
 class Request:
@@ -1587,6 +1739,12 @@ class Request:
         timeout: Union[float, tuple] = None,
         request_id: str = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
+        # PR3 Stage A: notifier-rework fields. Defaults preserve execute path.
+        kind: str = "execute",
+        topic: Optional[str] = None,
+        origin_subscription_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+        requester_id: Optional[str] = None,
     ) -> None:
         self.author_host = author_host
         self.author = author
@@ -1604,6 +1762,19 @@ class Request:
         self.error = False
         self.result = None
         self.finished_at = None
+
+        # PR3 Stage A: kind-aware fields. `kind` selects execute vs event
+        # dispatch in PluginCore._call_endpoint; `topic` carries the
+        # resolved literal topic for event kinds; `origin_subscription_id`
+        # carries the sub_uuid this Request was fanned out for;
+        # `timestamp` is epoch seconds at Request creation;
+        # `requester_id` overrides author_id for find_endpoint's access
+        # check (defaults to None → falls back to author_id at lookup).
+        self.kind = kind
+        self.topic = topic
+        self.origin_subscription_id = origin_subscription_id
+        self.timestamp = timestamp if timestamp is not None else time.time()
+        self.requester_id = requester_id
 
         if type(timeout) == tuple:
             self.timeout_duration = timeout[0]
@@ -1697,6 +1868,12 @@ class GeneratorRequest:
         timeout: Union[float, tuple] = None,
         request_id: str = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
+        # PR3 Stage A: notifier-rework fields. Defaults preserve execute path.
+        kind: str = "execute",
+        topic: Optional[str] = None,
+        origin_subscription_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+        requester_id: Optional[str] = None,
     ) -> None:
         self.author_host = author_host
         self.author = author
@@ -1714,6 +1891,13 @@ class GeneratorRequest:
         self.error = False
         self.result = None
         self.finished_at = None
+
+        # PR3 Stage A: kind-aware fields. See Request.__init__ for semantics.
+        self.kind = kind
+        self.topic = topic
+        self.origin_subscription_id = origin_subscription_id
+        self.timestamp = timestamp if timestamp is not None else time.time()
+        self.requester_id = requester_id
 
         self.queue = asyncio.Queue()
 

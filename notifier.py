@@ -15,9 +15,52 @@ Single-level wildcard "*" is supported: "sensor/*/temperature" matches
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
+
+
+class SyncDispatcher:
+    """Dedicated executor for sync subscriber handlers (PR3 Q17 + C3 + C8).
+
+    Thin wrapper around a ``ThreadPoolExecutor(max_workers=N,
+    thread_name_prefix="sync-notifier")`` whose internal queue serves as
+    the FIFO dispatch queue for sync handlers. Workers pick up handlers
+    one at a time; with ``workers=1`` the user gets serialization (C9).
+    Default ``N=4`` per Q17, configurable via
+    ``general.sync_dispatcher_workers`` in main config.yml.
+
+    Stage A: instantiated by PluginCore.__init__ and shut down by
+    PluginCore.close() AFTER the existing 30s in-flight drain (C8).
+    Callers (Stage B fan-out) submit handlers via
+    ``loop.run_in_executor(dispatcher.executor, handler, event)`` —
+    NOT submit + done_callback (per C3).
+    """
+
+    def __init__(
+        self,
+        workers: int = 4,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._workers = max(1, int(workers))
+        self._logger = logger or logging.getLogger(__name__)
+        self.executor = ThreadPoolExecutor(
+            max_workers=self._workers,
+            thread_name_prefix="sync-notifier",
+        )
+        self._logger.debug(
+            "SyncDispatcher initialized with %d worker(s)", self._workers
+        )
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Shut the executor down. ``wait=False`` matches C8 — the
+        graceful 30s drain happens upstream in PluginCore.close() before
+        this method is called, so by the time we get here pending sync
+        handlers have either finished or been told to wrap up.
+        """
+        self._logger.debug("SyncDispatcher.shutdown(wait=%s)", wait)
+        self.executor.shutdown(wait=wait)
 
 
 @dataclass

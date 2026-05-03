@@ -33,7 +33,7 @@ _sync_call_chain = threading.local()
 
 from exceptions import NetworkRequestException, RequestException
 from networking_classes import Node, RemotePlugin
-from utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest
+from utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
 from decorators import (
     log_errors,
     handle_errors,
@@ -45,7 +45,7 @@ from decorators import (
     gen_handle_errors,
 )
 from networking import NetworkManager, REMOTE_NO_RESULT
-from notifier import TopicRegistry, Subscription
+from notifier import TopicRegistry, Subscription, SyncDispatcher
 
 
 # Reserved identifier names — disallowed as plugin names AND endpoint
@@ -408,6 +408,30 @@ class PluginCore:
         self.topic_registry = TopicRegistry(self._logger.getChild("notifier"))
         self._config_write_lock = threading.Lock()
 
+        # PR3 Stage A: dedicated executor for sync subscriber handlers
+        # (Q17 + C3 + C8). Default 4 workers, configurable via
+        # `general.sync_dispatcher_workers`. Reads from the live yaml_config
+        # which load_config_yaml has already populated above. Falls back to
+        # 4 for any malformed/absent value (no config-time hard failure —
+        # the framework never blocked startup on a bad sync-dispatcher
+        # value before, so we keep that posture).
+        general_cfg = self.yaml_config.get("general", {}) or {}
+        raw_workers = general_cfg.get("sync_dispatcher_workers", 4)
+        try:
+            sync_workers = int(raw_workers)
+            if sync_workers < 1:
+                raise ValueError("must be >= 1")
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "Invalid general.sync_dispatcher_workers=%r; defaulting to 4",
+                raw_workers,
+            )
+            sync_workers = 4
+        self.sync_dispatcher = SyncDispatcher(
+            workers=sync_workers,
+            logger=self._logger.getChild("sync_dispatcher"),
+        )
+
     async def wait_until_ready(self):
         """Ensure initialization tasks are started and await their completion."""
         # Ensure event loop and maintenance task
@@ -501,6 +525,30 @@ class PluginCore:
                     t.cancel()
                 await asyncio.gather(*still_pending, return_exceptions=True)
         self.task_list = []
+
+        # 2.5. Shutdown the SyncDispatcher (PR3 Stage A, Q17 + C8).
+        # MUST happen AFTER the 30s in-flight drain. Per C8 spec: wrap
+        # executor.shutdown(wait=True) in asyncio.wait_for with 30s
+        # timeout. On timeout, fall through to wait=False semantics
+        # (drop pending queued items, let still-running handlers
+        # finish in the background).
+        if hasattr(self, "sync_dispatcher") and self.sync_dispatcher is not None:
+            self._logger.info("Shutdown: stopping sync dispatcher...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.sync_dispatcher.executor.shutdown, wait=True
+                    ),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "SyncDispatcher graceful shutdown exceeded 30s; forcing wait=False"
+                )
+                with contextlib.suppress(Exception):
+                    self.sync_dispatcher.shutdown(wait=False)
+            except Exception:
+                self._logger.exception("SyncDispatcher shutdown failed")
 
         # 3. Disable plugins in REVERSE config order
         #    Reverse order ensures dependents shut down before their dependencies.
@@ -1643,12 +1691,18 @@ class PluginCore:
             plugin_name = request.target_plugin
             function_name = request.target_method
 
+            # PR3 Stage A: prefer request.requester_id (set by Stage B
+            # fan-out to sub OWNER's plugin_uuid per C18) over
+            # author_id. None on execute-path Requests → falls back to
+            # author_id, preserving find_endpoint's existing access
+            # check semantics.
+            requester = request.requester_id or request.author_id
             plugin, endpoint, node = await self.find_endpoint(
                 request.target_method,
                 request.target_hosts,
                 request.blocked_hosts,
                 request.target_plugin_uuid,
-                request.author_id,
+                requester,
                 request.target_plugin,
             )
 
@@ -1707,7 +1761,9 @@ class PluginCore:
 
                 try:
                     chain = getattr(request, "_call_chain", ())
-                    result = await self._call_endpoint(func, request.args, chain)
+                    result = await self._call_endpoint(
+                        func, request.args, chain, request=request
+                    )
                 except Exception as e:
                     await self._set_request_result(request, str(e), True)
                     return
@@ -1723,9 +1779,53 @@ class PluginCore:
                 )
 
     async def _call_endpoint(
-        self, func: Callable, args: Any, call_chain: tuple = ()
+        self,
+        func: Callable,
+        args: Any,
+        call_chain: tuple = (),
+        request: Optional[Request] = None,
     ) -> Any:
-        """Call endpoint function handling sync/async and arg shapes."""
+        """Call endpoint function handling sync/async and arg shapes.
+
+        PR3 Stage A: when ``request`` is provided AND ``request.kind`` is
+        an event kind (``"publish_event"`` / ``"request_event"``), the
+        handler receives a single positional ``Event`` argument instead of
+        the unpacked ``args`` shape used by the execute path. Sync event
+        handlers are dispatched on the dedicated SyncDispatcher executor
+        via ``run_in_executor`` (Q17 + C3), NOT the shared
+        ``_plugin_executor``. The execute path (``request is None`` OR
+        ``request.kind == "execute"``) takes ZERO new code paths.
+        """
+        # PR3 Stage A: kind-aware Event branch. Only fires for event
+        # kinds; the execute path (kind="execute" or no request) falls
+        # through to the original implementation untouched.
+        if request is not None and request.kind in (
+            "publish_event",
+            "request_event",
+        ):
+            event = Event.from_request(request)
+
+            if asyncio.iscoroutinefunction(func):
+                # Async handlers awaited directly on the main event loop.
+                return await func(event)
+
+            # Sync event handlers run on the dedicated SyncDispatcher
+            # executor (Q17 + C3 + C8). run_in_executor pattern — NOT
+            # submit + done_callback — so the awaiting fan-out task is
+            # naturally long-lived and integrates with task_list / the
+            # 30s shutdown drain.
+            def _tracked_event(ev):
+                _sync_call_chain.chain = call_chain
+                try:
+                    return func(ev)
+                finally:
+                    _sync_call_chain.chain = ()
+
+            return await self.main_event_loop.run_in_executor(
+                self.sync_dispatcher.executor, _tracked_event, event
+            )
+
+        # Execute path — unchanged from PR2 behavior.
         if asyncio.iscoroutinefunction(func):
             if isinstance(args, tuple):
                 return await func(*args)
@@ -1766,12 +1866,16 @@ class PluginCore:
             plugin_name = request.target_plugin
             function_name = request.target_method
 
+            # PR3 Stage A: same requester_id-aware lookup as
+            # _process_request (C18). None on execute-path Requests →
+            # falls back to author_id.
+            requester = request.requester_id or request.author_id
             plugin, endpoint, node = await self.find_endpoint(
                 request.target_method,
                 request.target_hosts,
                 request.blocked_hosts,
                 request.target_plugin_uuid,
-                request.author_id,
+                requester,
                 request.target_plugin,
             )
 
