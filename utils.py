@@ -1252,7 +1252,7 @@ class Plugin(ABC):
         ):
             yield i
 
-    # @log_errors
+    @log_errors
     def execute_stream_sync(
         self,
         plugin: str,
@@ -1611,9 +1611,16 @@ class Plugin(ABC):
 
     @log_errors
     def publish_event_sync(self, *args, **kwargs) -> int:
-        """Pre-start guard stub. Real implementation lands in Stage B."""
+        """Pre-start guard stub. Real implementation lands in Stage B.
+
+        Two failure modes: pre-start (loop not running) raises
+        RequestException per Q1; post-guard "not yet implemented"
+        raises NotImplementedError so callers wrapping in
+        ``except RequestException`` don't silently swallow the
+        Stage-B-not-landed signal.
+        """
         self._check_framework_started()
-        raise RequestException(
+        raise NotImplementedError(
             "Plugin.publish_event_sync() not implemented yet (PR3 Stage B)"
         )
 
@@ -1621,7 +1628,7 @@ class Plugin(ABC):
     def request_event_sync(self, *args, **kwargs) -> Any:
         """Pre-start guard stub. Real implementation lands in Stage B."""
         self._check_framework_started()
-        raise RequestException(
+        raise NotImplementedError(
             "Plugin.request_event_sync() not implemented yet (PR3 Stage B)"
         )
 
@@ -1634,7 +1641,7 @@ class Plugin(ABC):
         naturally (yields chunks).
         """
         self._check_framework_started()
-        raise RequestException(
+        raise NotImplementedError(
             "Plugin.request_event_stream_sync() not implemented yet (PR3 Stage B)"
         )
 
@@ -1642,7 +1649,7 @@ class Plugin(ABC):
     def subscribe_sync(self, *args, **kwargs) -> str:
         """Pre-start guard stub. Real implementation lands in Stage B."""
         self._check_framework_started()
-        raise RequestException(
+        raise NotImplementedError(
             "Plugin.subscribe_sync() not implemented yet (PR3 Stage B)"
         )
 
@@ -1650,7 +1657,7 @@ class Plugin(ABC):
     def unsubscribe_sync(self, *args, **kwargs) -> bool:
         """Pre-start guard stub. Real implementation lands in Stage B."""
         self._check_framework_started()
-        raise RequestException(
+        raise NotImplementedError(
             "Plugin.unsubscribe_sync() not implemented yet (PR3 Stage B)"
         )
 
@@ -1708,7 +1715,16 @@ class Event:
         ``origin_subscription_id`` carries either the declared_id (for
         YAML subs) or the sub_uuid (for runtime subs) — Stage B sets the
         appropriate value at fan-out time per PR3 LOCKED D + C4 (a).
+
+        Raises ValueError if called with an execute-kind Request — that
+        signals a Stage B fan-out bug (only event kinds should reach
+        from_request). Defensive guard catches Stage B mistakes early.
         """
+        if request.kind not in ("publish_event", "request_event"):
+            raise ValueError(
+                f"Event.from_request requires kind in "
+                f"('publish_event', 'request_event'); got kind={request.kind!r}"
+            )
         return cls(
             topic=request.topic if request.topic is not None else "",
             payload=request.args,
