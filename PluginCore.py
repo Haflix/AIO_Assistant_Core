@@ -3628,6 +3628,8 @@ class PluginCore:
         topic_vars: Optional[Dict[str, str]] = None,
         hosts: Union[str, list, None] = None,
         blocked_hosts: Union[str, list, None] = None,
+        *,
+        _caller_chain: Optional[tuple] = None,
     ) -> int:
         """Publish an event (1:N fire-and-forget).
 
@@ -3663,6 +3665,23 @@ class PluginCore:
         )
 
         # Step 7: hosts/blocked_hosts default-and-override.
+        # Validate caller-supplied values via _normalize_hosts (events:
+        # defaults already normalized at YAML load). default=None so a
+        # caller-None falls through to the event_entry's value cleanly;
+        # an actual "local" default is then applied by
+        # _publisher_targets_local. This catches malformed forms like
+        # `hosts=[]` (empty list) at call time instead of silently
+        # mishandling them downstream.
+        if hosts is not None:
+            hosts = _normalize_hosts(
+                hosts, param_name="publish_event hosts", default=None,
+            )
+        if blocked_hosts is not None:
+            blocked_hosts = _normalize_hosts(
+                blocked_hosts,
+                param_name="publish_event blocked_hosts",
+                default=None,
+            )
         eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
         eff_blocked = (
             blocked_hosts
@@ -3717,6 +3736,7 @@ class PluginCore:
                 payload=payload,
                 kind="publish_event",
                 timestamp=now_ts,
+                caller_chain=_caller_chain,
                 timeout=None,
             )
 
@@ -3732,6 +3752,7 @@ class PluginCore:
         kind: str,
         timestamp: float,
         timeout: Optional[float],
+        caller_chain: Optional[tuple] = None,
     ) -> Optional[Request]:
         """Build a per-sub Request and spawn its dispatch task (publish
         path) or build + return without spawning (request path; caller
@@ -3770,7 +3791,18 @@ class PluginCore:
         # `chain + (target,)` site. Mismatched element shapes break the
         # `target in chain` membership test downstream and let real
         # cycles slip past detection.
-        existing_chain = getattr(_sync_call_chain, "chain", ())
+        #
+        # ``caller_chain`` is passed by sync entry points (publish_event_sync
+        # etc.) which captured _sync_call_chain.chain on the WORKER thread
+        # before scheduling onto the event loop. Threadlocal lookup here
+        # would return () because the event loop thread never set it. If
+        # not provided, fall back to threadlocal — covers the async-caller
+        # path where _fanout_sub runs in the same task tree as the sync
+        # wrapper that set the chain.
+        if caller_chain is not None:
+            existing_chain = caller_chain
+        else:
+            existing_chain = getattr(_sync_call_chain, "chain", ())
         target_for_chain = (
             f"{sub.target_plugin or sub.plugin_name}.{sub.target_access_name}"
         )
@@ -3804,10 +3836,20 @@ class PluginCore:
     ) -> int:
         """Sync variant of publish_event (C16). Schedules the async
         coroutine on main_event_loop via run_coroutine_threadsafe.
-        Pre-start guard fires inside the Plugin wrapper (Q1)."""
+        Pre-start guard fires inside the Plugin wrapper (Q1).
+
+        C10: capture _sync_call_chain.chain on the WORKER thread before
+        scheduling onto the event loop. The coroutine running on the
+        loop thread sees `_sync_call_chain.chain == ()` (different
+        thread, different threadlocal), so the chain must be passed
+        explicitly via _caller_chain to thread cycle detection through
+        sync→fan-out→sync paths.
+        """
+        chain = getattr(_sync_call_chain, "chain", ())
         future = asyncio.run_coroutine_threadsafe(
             self.publish_event(
-                publisher, event_id, payload, topic_vars, hosts, blocked_hosts
+                publisher, event_id, payload, topic_vars, hosts, blocked_hosts,
+                _caller_chain=chain,
             ),
             self.main_event_loop,
         )
@@ -3823,6 +3865,8 @@ class PluginCore:
         hosts: Union[str, list, None] = None,
         blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
+        *,
+        _caller_chain: Optional[tuple] = None,
     ) -> Any:
         """Request an event (1:1 ask).
 
@@ -3847,6 +3891,20 @@ class PluginCore:
         resolved_topic, _ = self._resolve_topic_for_event(
             publisher, event_id, topic_vars, event_entry=event_entry
         )
+
+        # Validate caller-supplied hosts/blocked_hosts (events: defaults
+        # already normalized at YAML load). Catches malformed forms at
+        # call time. default=None so caller-None falls through.
+        if hosts is not None:
+            hosts = _normalize_hosts(
+                hosts, param_name="request_event hosts", default=None,
+            )
+        if blocked_hosts is not None:
+            blocked_hosts = _normalize_hosts(
+                blocked_hosts,
+                param_name="request_event blocked_hosts",
+                default=None,
+            )
 
         # Publisher-level hosts gate: if hosts="remote" or excludes
         # local, request_event has no local route and Stage B is
@@ -3898,6 +3956,7 @@ class PluginCore:
             kind="request_event",
             timestamp=now_ts,
             timeout=timeout,
+            caller_chain=_caller_chain,
         )
 
         try:
@@ -3925,11 +3984,13 @@ class PluginCore:
         blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
     ) -> Any:
-        """Sync variant of request_event (C16)."""
+        """Sync variant of request_event (C16). C10: capture caller's
+        _sync_call_chain on the WORKER thread before scheduling."""
+        chain = getattr(_sync_call_chain, "chain", ())
         future = asyncio.run_coroutine_threadsafe(
             self.request_event(
                 publisher, event_id, payload, topic_vars, hosts,
-                blocked_hosts, timeout,
+                blocked_hosts, timeout, _caller_chain=chain,
             ),
             self.main_event_loop,
         )
@@ -3945,6 +4006,8 @@ class PluginCore:
         hosts: Union[str, list, None] = None,
         blocked_hosts: Union[str, list, None] = None,
         timeout: Optional[float] = None,
+        *,
+        _caller_chain: Optional[tuple] = None,
     ) -> Any:
         """Streaming variant of request_event. First yield is wrapped
         in Event metadata (LOCKED I); subsequent yields raw."""
@@ -3959,6 +4022,22 @@ class PluginCore:
         resolved_topic, _ = self._resolve_topic_for_event(
             publisher, event_id, topic_vars, event_entry=event_entry
         )
+
+        # Validate caller-supplied hosts/blocked_hosts (parity with
+        # publish_event/request_event; events: defaults pre-normalized
+        # at YAML load).
+        if hosts is not None:
+            hosts = _normalize_hosts(
+                hosts,
+                param_name="request_event_stream hosts",
+                default=None,
+            )
+        if blocked_hosts is not None:
+            blocked_hosts = _normalize_hosts(
+                blocked_hosts,
+                param_name="request_event_stream blocked_hosts",
+                default=None,
+            )
 
         # Publisher-level hosts gate (same as request_event).
         eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
@@ -4105,6 +4184,28 @@ class PluginCore:
         else:
             sentinel = object()
             gen = func(event_meta)
+
+            # C10: thread the publisher's sync call chain into the
+            # SyncDispatcher worker thread before each `next()` call so
+            # cycle detection works for sync generators that call
+            # execute_sync internally. _caller_chain is set by the sync
+            # wrapper (request_event_stream_sync); falls back to the
+            # event loop's threadlocal otherwise (= () for async-loop
+            # callers; only sync callers passing through the wrapper
+            # populate it meaningfully).
+            stream_chain = (
+                _caller_chain
+                if _caller_chain is not None
+                else getattr(_sync_call_chain, "chain", ())
+            )
+
+            def _next_with_chain(g, sent, ch):
+                _sync_call_chain.chain = ch
+                try:
+                    return next(g, sent)
+                finally:
+                    _sync_call_chain.chain = ()
+
             try:
                 while True:
                     rem = _residual()
@@ -4113,7 +4214,8 @@ class PluginCore:
                     # default executor and breaks the executor isolation
                     # invariant).
                     fut = loop.run_in_executor(
-                        self.sync_dispatcher.executor, next, gen, sentinel
+                        self.sync_dispatcher.executor,
+                        _next_with_chain, gen, sentinel, stream_chain,
                     )
                     try:
                         if rem is None:
@@ -4169,10 +4271,18 @@ class PluginCore:
     ) -> Any:
         """Sync variant of request_event_stream (C16). Iterates the
         async generator on main_event_loop and yields chunks back to
-        the caller thread."""
+        the caller thread.
+
+        C10: capture _sync_call_chain.chain on the WORKER thread before
+        scheduling the async generator on the loop. The loop thread can't
+        see this threadlocal; sync-gen handler invocations inside the
+        stream re-set the chain on each next() call (see
+        request_event_stream sync branch).
+        """
+        chain = getattr(_sync_call_chain, "chain", ())
         async_gen = self.request_event_stream(
             publisher, event_id, payload, topic_vars, hosts, blocked_hosts,
-            timeout,
+            timeout, _caller_chain=chain,
         )
 
         try:
