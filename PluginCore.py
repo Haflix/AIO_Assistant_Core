@@ -1382,15 +1382,46 @@ class PluginCore:
                 await error_config(str(e))
                 return
 
+            # Normalize sub-level filter values via _normalize_hosts (parity
+            # with the events: section fix from cycle 6). Without this,
+            # YAML forms like `hosts: []` (empty list — spec says invalid)
+            # would silently produce a sub that rejects all delivery, with
+            # no warning at load time. Same logic applied to blocked_hosts,
+            # authors, blocked_authors.
+            try:
+                sh = _normalize_hosts(
+                    entry.get("hosts", "any"),
+                    param_name=f"subscriptions.{declared_id}.hosts",
+                    default="any",
+                )
+                sbh = _normalize_hosts(
+                    entry.get("blocked_hosts"),
+                    param_name=f"subscriptions.{declared_id}.blocked_hosts",
+                    default=None,
+                )
+                sa = _normalize_hosts(
+                    entry.get("authors"),
+                    param_name=f"subscriptions.{declared_id}.authors",
+                    default=None,
+                )
+                sba = _normalize_hosts(
+                    entry.get("blocked_authors"),
+                    param_name=f"subscriptions.{declared_id}.blocked_authors",
+                    default=None,
+                )
+            except ValueError as e:
+                await error_config(str(e))
+                return
+
             entry_dict = {
                 "topic": stripped_topic,
                 "target_access_name": target_access,
                 "target_plugin": entry.get("target_plugin", name),
                 "target_plugin_uuid": entry.get("target_plugin_uuid"),
-                "hosts": entry.get("hosts", "any"),
-                "blocked_hosts": entry.get("blocked_hosts"),
-                "authors": entry.get("authors"),
-                "blocked_authors": entry.get("blocked_authors"),
+                "hosts": sh,
+                "blocked_hosts": sbh,
+                "authors": sa,
+                "blocked_authors": sba,
                 "enabled": (
                     bool(entry["enabled"]) if "enabled" in entry else True
                 ),
@@ -4183,7 +4214,37 @@ class PluginCore:
         Pure-runtime path; declared_id stays None per LOCKED D.
         Adds the sub_uuid to the owning plugin's _sub_uuids list so the
         on_disable wrapper can include it in the unregister sweep.
+
+        Topic + filter values are validated with the same rules YAML
+        load applies (LOCKED L #2 + LOCKED IN — PUBLISHER hosts) so a
+        runtime ``subscribe(\"sensor/abc*\", ...)`` (embedded `*`) or
+        ``subscribe(\"\", ...)`` (empty) doesn't silently produce a
+        permanently dead subscription.
         """
+        topic = _validate_subscription_topic(
+            topic, context=f"runtime subscribe ({plugin_name})"
+        )
+        hosts = _normalize_hosts(
+            hosts,
+            param_name=f"runtime subscribe ({plugin_name}).hosts",
+            default="any",
+        )
+        blocked_hosts = _normalize_hosts(
+            blocked_hosts,
+            param_name=f"runtime subscribe ({plugin_name}).blocked_hosts",
+            default=None,
+        )
+        authors = _normalize_hosts(
+            authors,
+            param_name=f"runtime subscribe ({plugin_name}).authors",
+            default=None,
+        )
+        blocked_authors = _normalize_hosts(
+            blocked_authors,
+            param_name=f"runtime subscribe ({plugin_name}).blocked_authors",
+            default=None,
+        )
+
         sub_uuid = await self.topic_registry.subscribe(
             topic_pattern=topic,
             plugin_name=plugin_name,
