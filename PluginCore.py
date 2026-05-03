@@ -689,25 +689,33 @@ class PluginCore:
             self._logger.info("Shutdown: disabling %s...", name)
             try:
                 async with self.plugin_lock:
-                    if asyncio.iscoroutinefunction(plugin.on_disable):
-                        await asyncio.wait_for(plugin.on_disable(), timeout=30)
-                    else:
-                        await asyncio.wait_for(
-                            self.main_event_loop.run_in_executor(
-                                self._plugin_executor, plugin.on_disable
-                            ),
-                            timeout=30,
-                        )
-                    plugin.enabled = False
+                    try:
+                        if asyncio.iscoroutinefunction(plugin.on_disable):
+                            await asyncio.wait_for(plugin.on_disable(), timeout=30)
+                        else:
+                            await asyncio.wait_for(
+                                self.main_event_loop.run_in_executor(
+                                    self._plugin_executor, plugin.on_disable
+                                ),
+                                timeout=30,
+                            )
+                    finally:
+                        # PR3 Stage B C15: unregister YAML + runtime subs
+                        # for this plugin AFTER on_disable runs (or
+                        # raised/timed out). Mirrors _disable_plugin's
+                        # try/finally guarantee. Without this, later
+                        # plugins firing events during their on_disable
+                        # could match subs from already-stopped earlier
+                        # plugins.
+                        await self._unregister_plugin_subscriptions(plugin)
+                        plugin.enabled = False
                 self._logger.info("Shutdown: %s disabled", name)
             except asyncio.TimeoutError:
                 self._logger.warning(
                     "Shutdown: %s on_disable timed out after 30s", name
                 )
-                plugin.enabled = False
             except Exception as e:
                 self._logger.error("Shutdown: %s on_disable failed: %s", name, e)
-                plugin.enabled = False
 
         # Sweep any plugin-source per-logger thresholds. Covers never-enabled
         # plugins (the disable loop above skips them via the `enabled` guard)
@@ -1288,10 +1296,31 @@ class PluginCore:
                 await error_config(str(e))
                 return
 
+            # Validate event-entry hosts/blocked_hosts via the same
+            # normalizer execute_sync uses (rejects empty list, empty
+            # string in list, non-str items, etc.). Raw YAML values
+            # otherwise reach _publisher_targets_local unchecked,
+            # silently mishandling forms like `hosts: []` (would drop
+            # all local fan-out without warning).
+            try:
+                eh = _normalize_hosts(
+                    entry.get("hosts"),
+                    param_name=f"events.{event_id}.hosts",
+                    default=None,
+                )
+                ebh = _normalize_hosts(
+                    entry.get("blocked_hosts"),
+                    param_name=f"events.{event_id}.blocked_hosts",
+                    default=None,
+                )
+            except ValueError as e:
+                await error_config(str(e))
+                return
+
             entry_dict = {
                 "topic": stripped_topic,
-                "hosts": entry.get("hosts"),
-                "blocked_hosts": entry.get("blocked_hosts"),
+                "hosts": eh,
+                "blocked_hosts": ebh,
                 "enabled": (
                     bool(entry["enabled"]) if "enabled" in entry else True
                 ),
@@ -1543,9 +1572,11 @@ class PluginCore:
         async with self.plugin_lock:
             plugin = self.plugins[plugin_name]
             if not plugin.enabled:
-                # Register YAML subscriptions FIRST. Disabled subs (Q13)
-                # skipped at registration; their declared_id stays in
-                # plugin.subscriptions so override-time toggling works.
+                # Register YAML subscriptions FIRST. Disabled subs (Q13
+                # `enabled: false`) ARE registered, but with the
+                # Subscription.enabled=False flag so find_all/find_first
+                # skip them — keeps declared_id present in the registry
+                # for override-time toggling without dispatching.
                 await self._register_yaml_subscriptions(plugin)
 
                 # Flip plugin.enabled=True BEFORE user.on_enable per Q23
@@ -3967,12 +3998,44 @@ class PluginCore:
             timestamp=now_ts,
         )
 
+        # Q8: timeout = whole-stream budget. Tracked via per-chunk
+        # asyncio.wait_for with the residual deadline. Caller passing
+        # timeout=N gets N seconds total across all chunks; on expiry
+        # raises RequestException("...timed out").
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if timeout is not None else None
+
+        def _residual() -> Optional[float]:
+            if deadline is None:
+                return None
+            rem = deadline - loop.time()
+            if rem <= 0:
+                raise RequestException(
+                    f"request_event_stream {event_id!r} timed out after "
+                    f"{timeout}s (whole-stream budget per Q8)"
+                )
+            return rem
+
         first = True
         # The handler is a plain endpoint generator — pass the Event as
         # single positional argument, matching the non-streaming
         # subscriber-handler convention (LOCKED I).
         if inspect.isasyncgenfunction(func):
-            async for chunk in func(event_meta):
+            ait = func(event_meta).__aiter__()
+            while True:
+                rem = _residual()
+                try:
+                    if rem is None:
+                        chunk = await ait.__anext__()
+                    else:
+                        chunk = await asyncio.wait_for(ait.__anext__(), timeout=rem)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as e:
+                    raise RequestException(
+                        f"request_event_stream {event_id!r} timed out after "
+                        f"{timeout}s (whole-stream budget per Q8)"
+                    ) from e
                 if first:
                     first = False
                     # Yield Event-shaped wrapper: event with payload =
@@ -3992,15 +4055,25 @@ class PluginCore:
         else:
             sentinel = object()
             gen = func(event_meta)
-            loop = asyncio.get_running_loop()
             while True:
+                rem = _residual()
                 # Sync handler iteration runs on the SyncDispatcher pool
                 # per Q17 + C3 (NOT asyncio.to_thread, which uses the
                 # default executor and breaks the executor isolation
                 # invariant).
-                chunk = await loop.run_in_executor(
+                fut = loop.run_in_executor(
                     self.sync_dispatcher.executor, next, gen, sentinel
                 )
+                try:
+                    if rem is None:
+                        chunk = await fut
+                    else:
+                        chunk = await asyncio.wait_for(fut, timeout=rem)
+                except asyncio.TimeoutError as e:
+                    raise RequestException(
+                        f"request_event_stream {event_id!r} timed out after "
+                        f"{timeout}s (whole-stream budget per Q8)"
+                    ) from e
                 if chunk is sentinel:
                     break
                 if first:
