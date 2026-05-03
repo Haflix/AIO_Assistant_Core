@@ -4370,6 +4370,20 @@ class PluginCore:
         topic = _validate_subscription_topic(
             topic, context=f"runtime subscribe ({plugin_name})"
         )
+        # Defensive: target_access_name must be a non-empty identifier-style
+        # string. The Plugin.subscribe wrapper already checks this for the
+        # standard call path, but direct PluginCore.subscribe_event calls
+        # (test code, future internal callers) bypass the wrapper. Without
+        # this guard, an empty string silently produces a permanently dead
+        # subscription — find_endpoint(access_name="") returns
+        # (None,None,None) every time with a confusing "endpoint not found"
+        # error far from the bad subscribe call.
+        if not isinstance(target_access_name, str) or not target_access_name.strip():
+            raise ValueError(
+                f"runtime subscribe ({plugin_name}): target_access_name "
+                f"must be a non-empty string; got "
+                f"{type(target_access_name).__name__}={target_access_name!r}"
+            )
         hosts = _normalize_hosts(
             hosts,
             param_name=f"runtime subscribe ({plugin_name}).hosts",
