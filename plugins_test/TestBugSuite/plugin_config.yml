@@ -1,0 +1,41 @@
+description: PR3 Stage F bughunt repro suite — one case per open bugtracker entry
+version: "0.2.0"
+remote: false
+arguments:
+events:
+  # B-047 task_list-growth probe event. Topic matched by self-sub
+  # `b047_probe_sub` so each publish_event creates one fan-out task,
+  # exercising the task_list.append code path the bug describes.
+  b047_probe_event:
+    topic: "test_bugsuite/b047/probe"
+    hosts: "local"
+subscriptions:
+  b047_probe_sub:
+    topic: "test_bugsuite/b047/probe"
+    target_access_name: handle_b047_probe
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    tags:
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the bug-repro suite and return a structured suite result dict
+    arguments:
+      - name: category
+        description: 'legacy_removed | addressed_in_pr3 | active | deferred | already_covered | null (all)'
+      - name: host
+        description: 'local | remote | null'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+      - name: allow_destructive
+  handle_b047_probe:
+    internal_name: handle_b047_probe
+    remote: false
+    accessible_by_other_plugins: true
+    description: No-op subscriber used by B-047 task_list growth repro
+    arguments:
+      - name: event
