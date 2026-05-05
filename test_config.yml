@@ -29,6 +29,10 @@ plugins:
     enabled: true
     path: ./plugins_test/TestEventSuite
 
+  - name: TestBugSuite
+    enabled: true
+    path: ./plugins_test/TestBugSuite
+
   - name: TestEventTarget
     enabled: true
     path: ./plugins_test/TestEventTarget

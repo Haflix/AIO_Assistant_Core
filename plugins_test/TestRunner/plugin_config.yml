@@ -1,5 +1,5 @@
 description: Orchestrator that drives the AIO Assistant Core test framework's per-suite plugins
-version: 0.2.0
+version: 0.3.0
 remote: False
 arguments:
   suites:
@@ -8,6 +8,7 @@ arguments:
     - TestEventSuite
     - TestLifecycleSuite
     - TestRemoteSuite
+    - TestBugSuite
 endpoints:
   run_all:
     internal_name: run_all
