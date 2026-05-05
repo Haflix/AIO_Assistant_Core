@@ -33,7 +33,11 @@ import yaml
 # that would deadlock the ThreadPoolExecutor.
 _sync_call_chain = threading.local()
 
-from exceptions import NetworkRequestException, RequestException
+from exceptions import (
+    NetworkRequestException,
+    NoLocalSubException,
+    RequestException,
+)
 from networking_classes import Node, RemotePlugin
 from utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
 from decorators import (
@@ -1702,6 +1706,9 @@ class PluginCore:
                     enabled=bool(entry.get("enabled", True)),
                 )
                 plugin._sub_uuids.append(sub_uuid)
+                # PR3 Stage C add-delta hook (locked #18 item 3) — YAML
+                # path. No-op when networking is disabled / not ready.
+                await self._broadcast_yaml_sub_added(sub_uuid)
 
         # Legacy `topic:` field on endpoints — Stage B keeps alive,
         # Stage D removes.
@@ -1720,6 +1727,27 @@ class PluginCore:
                         config_driven=True,
                     )
                     plugin._sub_uuids.append(sub_uuid)
+                    await self._broadcast_yaml_sub_added(sub_uuid)
+
+    async def _broadcast_yaml_sub_added(self, sub_uuid: str) -> None:
+        """Helper used by YAML-registration sites to push add-delta to
+        peers. Wraps the get_subscription + ready-flag check in one place
+        so the YAML loop stays clean."""
+        if not (
+            getattr(self, "networking_enabled", False)
+            and self.network is not None
+            and getattr(self.network, "is_ready", False)
+        ):
+            return
+        sub = await self.topic_registry.get_subscription(sub_uuid)
+        if sub is None:
+            return
+        try:
+            await self.network.broadcast_local_sub_added(sub)
+        except Exception:
+            self._logger.debug(
+                "_broadcast_yaml_sub_added: broadcast failed", exc_info=True
+            )
 
     async def _unregister_plugin_subscriptions(self, plugin: Plugin) -> None:
         """Unregister every sub (YAML + runtime) for ``plugin`` at
@@ -1730,6 +1758,27 @@ class PluginCore:
         """
         plugin_uuid = getattr(plugin, "plugin_uuid", None)
         if plugin_uuid:
+            # PR3 Stage C remove-delta loop (locked #18 item 5). Snapshot
+            # subs BEFORE the bulk-unsubscribe, then per-sub broadcast.
+            if (
+                getattr(self, "networking_enabled", False)
+                and self.network is not None
+                and getattr(self.network, "is_ready", False)
+            ):
+                try:
+                    subs_to_remove = await self.topic_registry.get_plugin_subscriptions(
+                        plugin_uuid
+                    )
+                except Exception:
+                    subs_to_remove = []
+                for sub in subs_to_remove:
+                    try:
+                        await self.network.broadcast_local_sub_removed(sub)
+                    except Exception:
+                        self._logger.debug(
+                            "_unregister_plugin_subscriptions: broadcast failed",
+                            exc_info=True,
+                        )
             await self.topic_registry.unsubscribe_plugin(plugin_uuid)
         plugin._sub_uuids = []
 
@@ -3450,6 +3499,63 @@ class PluginCore:
 
         return _hosts_accepts(sub_hosts) and not _blocked(sub_blocked)
 
+    def _sub_accepts_remote_publisher(
+        self,
+        sub,
+        author_host: Optional[str],
+        author: Optional[str],
+    ) -> bool:
+        """PR3 Stage C receiver-gate (locked #18 item 1). True iff this
+        local sub should receive a publish_event/request_event coming
+        from a peer at ``author_host`` published by ``author``.
+
+        Distinct from `_sub_accepts_local` which gates LOCAL fan-out
+        against our own hostname. Receiver-gate logic:
+          - hosts="local"          → REJECT (sub opted out of remote)
+          - hosts="any"/"remote"   → ACCEPT (then check blocked_hosts)
+          - hosts=<str>            → ACCEPT iff str==author_host or "any"
+          - hosts=[list]           → ACCEPT iff author_host in list, or
+                                     "any"/"remote" in list
+        blocked_hosts: REJECT iff blocked names author_host, "any", or
+        "remote". Authors filter is applied separately via
+        `_sub_accepts_author`.
+        """
+        sub_hosts = getattr(sub, "hosts", None)
+        if sub_hosts == "local":
+            return False
+
+        if sub_hosts is None or sub_hosts in ("any", "remote"):
+            accepts = True
+        elif isinstance(sub_hosts, str):
+            accepts = (sub_hosts == author_host) or sub_hosts == "any"
+        elif isinstance(sub_hosts, list):
+            accepts = (
+                (author_host is not None and author_host in sub_hosts)
+                or "any" in sub_hosts
+                or "remote" in sub_hosts
+            )
+        else:
+            return False
+
+        if not accepts:
+            return False
+
+        sub_blocked = getattr(sub, "blocked_hosts", None)
+        if sub_blocked is None:
+            return True
+        if isinstance(sub_blocked, str):
+            if sub_blocked in ("any", "remote") or sub_blocked == author_host:
+                return False
+        elif isinstance(sub_blocked, list):
+            if (
+                "any" in sub_blocked
+                or "remote" in sub_blocked
+                or (author_host is not None and author_host in sub_blocked)
+            ):
+                return False
+
+        return True
+
     def _sub_accepts_author(self, sub: Subscription, author: str) -> bool:
         """Stage B sub-level author filter (LOCKED H + Q4).
 
@@ -3715,65 +3821,160 @@ class PluginCore:
         # means peer-only, no local delivery).
 
         # Publisher-level gate: skip local fan-out if publisher's
-        # hosts/blocked_hosts exclude local delivery.
-        if not self._publisher_targets_local(eff_hosts, eff_blocked):
+        # hosts/blocked_hosts exclude local delivery. PR3 Stage C still
+        # runs remote dispatch even when local is skipped.
+        local_targets = self._publisher_targets_local(eff_hosts, eff_blocked)
+        now_ts = time.time()
+        survivors: list = []
+
+        if local_targets:
+            # Step 4: local fan-out — find all local subs matching resolved
+            # topic. find_all returns insertion order (LOCKED C).
+            all_subs = await self.topic_registry.find_all(resolved_topic)
+            local_subs = [
+                s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid
+            ]
+
+            survivors = [
+                s for s in local_subs
+                if self._sub_accepts_local(s)
+                and self._sub_accepts_author(s, publisher.plugin_name)
+            ]
+
+            if publisher.verbose_notifier:
+                self._logger.debug(
+                    "publish_event %s topic=%r matched %d local sub(s) "
+                    "(of %d total subs)",
+                    event_id, resolved_topic, len(survivors), len(local_subs),
+                )
+
+            # Per-sub fan-out tasks. Each gets its own Request with
+            # kind="publish_event", hosts="local" (C19), and
+            # requester_id=sub.plugin_uuid (C18).
+            for sub in survivors:
+                await self._fanout_sub(
+                    sub=sub,
+                    publisher=publisher,
+                    resolved_topic=resolved_topic,
+                    payload=payload,
+                    kind="publish_event",
+                    timestamp=now_ts,
+                    caller_chain=_caller_chain,
+                    timeout=None,
+                )
+        else:
             if publisher.verbose_notifier:
                 self._logger.debug(
                     "publish_event %s topic=%r: publisher hosts=%r "
                     "blocked_hosts=%r excludes local fan-out",
                     event_id, resolved_topic, eff_hosts, eff_blocked,
                 )
-            return 0
 
-        # Step 4: local fan-out — find all local subs matching resolved
-        # topic. find_all returns insertion order (LOCKED C).
-        all_subs = await self.topic_registry.find_all(resolved_topic)
-        local_subs = [
-            s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid
-        ]
+        # PR3 Stage C step 18 — remote dispatch (locked #16). Fire-and-
+        # forget per-peer publish tasks for every advertised sub on
+        # every reachable peer that survived per-peer + sub-level
+        # filters. Best-effort; return count is local + remote.
+        local_count = len(survivors)
+        remote_count = 0
+        if (
+            getattr(self, "networking_enabled", False)
+            and self.network is not None
+            and getattr(self.network, "is_ready", False)
+        ):
+            try:
+                from uuid import uuid4 as _uuid4
+                request_uuid = _uuid4().hex
+                per_peer = await self.network._build_remote_dispatch(
+                    topic=resolved_topic,
+                    payload=payload,
+                    author=publisher.plugin_name,
+                    author_id=publisher.plugin_uuid,
+                    author_host=self.hostname,
+                    timestamp=now_ts,
+                    request_uuid=request_uuid,
+                    eff_hosts=eff_hosts,
+                    eff_blocked_hosts=eff_blocked,
+                )
+                remote_count = sum(len(advs) for advs in per_peer.values())
 
-        survivors = [
-            s for s in local_subs
-            if self._sub_accepts_local(s)
-            and self._sub_accepts_author(s, publisher.plugin_name)
-        ]
+                tasks = []
+                for peer_hostname, advs in per_peer.items():
+                    node = next(
+                        (
+                            n for n in list(self.network.nodes)
+                            if n.hostname == peer_hostname
+                        ),
+                        None,
+                    )
+                    if node is None:
+                        continue
+                    # locked #16: caller-acquires-_struct_lock-once;
+                    # enabled recheck atomic with task creation.
+                    async with self.network._adverts_struct_lock:
+                        if not node.enabled:
+                            continue
+                        t = asyncio.create_task(
+                            self.network.publish_event_remote(
+                                node.IP,
+                                resolved_topic,
+                                payload,
+                                publisher.plugin_name,
+                                publisher.plugin_uuid,
+                                self.hostname,
+                                now_ts,
+                                request_uuid,
+                            )
+                        )
+                        self.network._inflight_publishes.setdefault(
+                            peer_hostname, set()
+                        ).add(t)
+                    tasks.append(t)
 
-        if publisher.verbose_notifier:
-            self._logger.debug(
-                "publish_event %s topic=%r matched %d local sub(s) "
-                "(of %d total subs)",
-                event_id, resolved_topic, len(survivors), len(local_subs),
-            )
+                    def _deregister(_t, ph=peer_hostname):
+                        async def _drop():
+                            async with self.network._adverts_struct_lock:
+                                s = self.network._inflight_publishes.get(ph)
+                                if s is not None:
+                                    s.discard(_t)
+                                    if not s:
+                                        self.network._inflight_publishes.pop(
+                                            ph, None
+                                        )
+                        try:
+                            asyncio.create_task(_drop())
+                        except RuntimeError:
+                            pass
+                    t.add_done_callback(_deregister)
 
-        # Per-sub fan-out tasks. Each gets its own Request with
-        # kind="publish_event", hosts="local" (C19), and
-        # requester_id=sub.plugin_uuid (C18).
-        now_ts = time.time()
-        for sub in survivors:
-            await self._fanout_sub(
-                sub=sub,
-                publisher=publisher,
-                resolved_topic=resolved_topic,
-                payload=payload,
-                kind="publish_event",
-                timestamp=now_ts,
-                caller_chain=_caller_chain,
-                timeout=None,
-            )
+                if tasks:
+                    asyncio.create_task(
+                        asyncio.gather(*tasks, return_exceptions=True)
+                    )
+            except Exception:
+                self._logger.debug(
+                    "publish_event remote dispatch failed", exc_info=True
+                )
 
-        return len(survivors)
+        return local_count + remote_count
 
     async def _fanout_sub(
         self,
         *,
         sub: Subscription,
-        publisher: Plugin,
+        publisher: Optional[Plugin],
         resolved_topic: str,
         payload: Any,
         kind: str,
         timestamp: float,
         timeout: Optional[float],
         caller_chain: Optional[tuple] = None,
+        # PR3 Stage C — locked #3 + #15. When invoked from the
+        # networking-side handler path, `publisher` is None and the
+        # remote publisher metadata arrives via these kwargs.
+        remote_publisher_name: Optional[str] = None,
+        remote_publisher_uuid: Optional[str] = None,
+        remote_publisher_host: Optional[str] = None,
+        remote_verbose: bool = False,
     ) -> Optional[Request]:
         """Build a per-sub Request and spawn its dispatch task (publish
         path) or build + return without spawning (request path; caller
@@ -3782,17 +3983,41 @@ class PluginCore:
         Stage B always returns the Request. publish_event ignores the
         return value (fire-and-forget). request_event awaits it.
         """
-        author_host = self.hostname
+        # PR3 Stage C defense-in-depth (locked #15): reject any caller
+        # path that hands us a remote_publisher_host claiming our own
+        # hostname. The wire handler already gates this; defense-in-
+        # depth covers tests + future direct callers that bypass
+        # _handle_client.
+        if (
+            remote_publisher_host is not None
+            and remote_publisher_host == self.hostname
+        ):
+            self._logger.warning(
+                "fan-out gate: remote_publisher_host equals our hostname; rejecting"
+            )
+            return None
+
+        # Resolve effective publisher metadata. Local path reads from
+        # `publisher: Plugin`; remote path reads from kwargs.
+        if publisher is not None:
+            eff_author = publisher.plugin_name
+            eff_author_id = publisher.plugin_uuid
+            eff_author_host = self.hostname
+        else:
+            eff_author = remote_publisher_name or "remote"
+            eff_author_id = remote_publisher_uuid or "remote"
+            eff_author_host = remote_publisher_host or ""
+
         request = Request(
-            author_host=author_host,
+            author_host=eff_author_host,
             plugin=sub.target_plugin or sub.plugin_name,
             method=sub.target_access_name,
             args=payload,
             plugin_uuid=sub.target_plugin_uuid,
             target_hosts="local",  # C19
             blocked_hosts=None,
-            author=publisher.plugin_name,
-            author_id=publisher.plugin_uuid,
+            author=eff_author,
+            author_id=eff_author_id,
             timeout=timeout,
             request_id=None,
             event_loop=self.main_event_loop,
@@ -3974,6 +4199,78 @@ class PluginCore:
         )
 
         if local_match is None:
+            # PR3 Stage C step 19 — remote dispatch fall-through (locked
+            # #6 + #13). Iterate _inbound_global_order in C11 insertion
+            # order, apply ALL filters, try each surviving candidate.
+            if (
+                getattr(self, "networking_enabled", False)
+                and self.network is not None
+                and getattr(self.network, "is_ready", False)
+            ):
+                from uuid import uuid4 as _uuid4
+                from notifier import TopicRegistry as _TR
+                request_uuid = _uuid4().hex
+
+                async with self.network._adverts_struct_lock:
+                    cands_raw = list(self.network._inbound_global_order.items())
+
+                candidates = []
+                for (peer_hostname, _sub_uuid), advert in cands_raw:
+                    node = next(
+                        (
+                            n for n in list(self.network.nodes)
+                            if n.hostname == peer_hostname
+                        ),
+                        None,
+                    )
+                    if node is None:
+                        continue
+                    try:
+                        if not (node.enabled and await node.is_alive()):
+                            continue
+                    except Exception:
+                        continue
+                    if not self.network._hosts_match(
+                        eff_hosts, eff_blocked, peer_hostname
+                    ):
+                        continue
+                    if not self._sub_accepts_remote_publisher(
+                        advert, self.hostname, publisher.plugin_name
+                    ):
+                        continue
+                    if not self._sub_accepts_author(advert, publisher.plugin_name):
+                        continue
+                    if not _TR._topic_matches(advert.topic_pattern, resolved_topic):
+                        continue
+                    candidates.append((peer_hostname, advert, node))
+
+                last_exc: Optional[BaseException] = None
+                for peer_hostname, advert, node in candidates:
+                    try:
+                        return await self.network.request_event_remote(
+                            node.IP,
+                            resolved_topic,
+                            payload,
+                            publisher.plugin_name,
+                            publisher.plugin_uuid,
+                            self.hostname,
+                            now_ts,
+                            request_uuid,
+                            timeout=timeout,
+                        )
+                    except (NetworkRequestException, NoLocalSubException) as exc:
+                        last_exc = exc
+                        continue  # locked #6 fall-through
+                    except RequestException:
+                        raise
+
+                # All candidates exhausted (or none) — propagate.
+                if last_exc is not None:
+                    raise RequestException(
+                        f"request_event {event_id!r}: no handler found / all "
+                        f"unreachable (last: {last_exc})"
+                    )
+
             raise RequestException(
                 f"request_event {event_id!r}: no subscriber matches resolved "
                 f"topic {resolved_topic!r}"
@@ -4103,6 +4400,93 @@ class PluginCore:
             None,
         )
         if local_match is None:
+            # PR3 Stage C step 20 — remote dispatch fall-through (locked
+            # #6 + #13). Pre-first-chunk fall-through ONLY; mid-stream
+            # NetworkRequestException terminates without fall-through to
+            # preserve the Event-first invariant.
+            if (
+                getattr(self, "networking_enabled", False)
+                and self.network is not None
+                and getattr(self.network, "is_ready", False)
+            ):
+                from uuid import uuid4 as _uuid4
+                from notifier import TopicRegistry as _TR
+                request_uuid = _uuid4().hex
+
+                async with self.network._adverts_struct_lock:
+                    cands_raw = list(self.network._inbound_global_order.items())
+
+                candidates = []
+                for (peer_hostname, _sub_uuid), advert in cands_raw:
+                    node = next(
+                        (
+                            n for n in list(self.network.nodes)
+                            if n.hostname == peer_hostname
+                        ),
+                        None,
+                    )
+                    if node is None:
+                        continue
+                    try:
+                        if not (node.enabled and await node.is_alive()):
+                            continue
+                    except Exception:
+                        continue
+                    if not self.network._hosts_match(
+                        eff_hosts, eff_blocked, peer_hostname
+                    ):
+                        continue
+                    if not self._sub_accepts_remote_publisher(
+                        advert, self.hostname, publisher.plugin_name
+                    ):
+                        continue
+                    if not self._sub_accepts_author(advert, publisher.plugin_name):
+                        continue
+                    if not _TR._topic_matches(advert.topic_pattern, resolved_topic):
+                        continue
+                    candidates.append((peer_hostname, advert, node))
+
+                last_exc: Optional[BaseException] = None
+                for peer_hostname, advert, node in candidates:
+                    agen = self.network.request_event_stream_remote(
+                        node.IP,
+                        resolved_topic,
+                        payload,
+                        publisher.plugin_name,
+                        publisher.plugin_uuid,
+                        self.hostname,
+                        now_ts,
+                        request_uuid,
+                        timeout=timeout,
+                    )
+                    # Tee first chunk in an isolated try/except so that
+                    # ONLY pre-first-chunk failures fall through (locked
+                    # #6 strict). Mid-stream errors propagate verbatim.
+                    try:
+                        first = await agen.__anext__()
+                    except StopAsyncIteration:
+                        # Empty stream — degenerate but legal. Treat as
+                        # successful with zero items.
+                        return
+                    except (NetworkRequestException, NoLocalSubException) as exc:
+                        last_exc = exc
+                        continue
+                    except RequestException:
+                        raise
+
+                    # First chunk yielded — committed to this peer; no
+                    # fall-through past this point.
+                    yield first
+                    async for chunk in agen:
+                        yield chunk
+                    return
+
+                if last_exc is not None:
+                    raise RequestException(
+                        f"request_event_stream {event_id!r}: no handler "
+                        f"found / all unreachable (last: {last_exc})"
+                    )
+
             raise RequestException(
                 f"request_event_stream {event_id!r}: no subscriber matches "
                 f"resolved topic {resolved_topic!r}"
@@ -4424,6 +4808,23 @@ class PluginCore:
         if owner is not None and hasattr(owner, "_sub_uuids"):
             owner._sub_uuids.append(sub_uuid)
 
+        # PR3 Stage C add-delta hook (locked #18 item 3). No-op when
+        # networking is disabled or not yet ready.
+        if (
+            getattr(self, "networking_enabled", False)
+            and self.network is not None
+            and getattr(self.network, "is_ready", False)
+        ):
+            sub = await self.topic_registry.get_subscription(sub_uuid)
+            if sub is not None:
+                try:
+                    await self.network.broadcast_local_sub_added(sub)
+                except Exception:
+                    self._logger.debug(
+                        "subscribe_event: broadcast add-delta failed",
+                        exc_info=True,
+                    )
+
         return sub_uuid
 
     async def unsubscribe_event(self, sub_uuid: str) -> bool:
@@ -4433,6 +4834,24 @@ class PluginCore:
         _sub_uuids list as a side-effect (best-effort lookup).
         """
         sub = await self.topic_registry.get_subscription(sub_uuid)
+
+        # PR3 Stage C remove-delta hook (locked #18 item 4). Send BEFORE
+        # the registry drop so the broadcast still has access to the
+        # sub object and our peers see the remove cleanly.
+        if (
+            sub is not None
+            and getattr(self, "networking_enabled", False)
+            and self.network is not None
+            and getattr(self.network, "is_ready", False)
+        ):
+            try:
+                await self.network.broadcast_local_sub_removed(sub)
+            except Exception:
+                self._logger.debug(
+                    "unsubscribe_event: broadcast remove-delta failed",
+                    exc_info=True,
+                )
+
         ok = await self.topic_registry.unsubscribe(sub_uuid)
         if ok and sub is not None:
             owner = self.plugins_by_uuid.get(sub.plugin_uuid)

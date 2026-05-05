@@ -3,14 +3,37 @@ import ssl
 import socket
 import ipaddress
 import asyncio
+import contextlib
+import inspect
 import pickle
 import struct
 import os
-from typing import List, Union, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union, Optional, Tuple
 from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors
-from exceptions import NetworkRequestException, NodeException
+from exceptions import (
+    NetworkRequestException,
+    NodeException,
+    NoLocalSubException,
+    RequestException,
+)
 from networking_classes import Node
 from networking_classes import RemotePlugin
+
+
+# PR3 Stage C — in-memory advertised-subscription record (per-peer wire
+# projection). Plain dataclass so it pickles cleanly and only carries the
+# four wire-eligible filter fields plus identity. Receiver-only fields
+# (target_plugin, target_access_name, target_plugin_uuid, declared_id,
+# enabled, plugin_name, plugin_uuid) stay private to the owning node.
+@dataclass
+class AdvertSub:
+    sub_uuid: str
+    topic_pattern: str
+    hosts: Union[str, list, None]
+    blocked_hosts: Union[str, list, None]
+    authors: Union[str, list, None]
+    blocked_authors: Union[str, list, None]
 
 
 # Message type constants
@@ -31,6 +54,13 @@ MSG_TOPIC_REQUEST = 8  # Request-by-topic (one-to-one with response)
 MSG_TOPIC_REQUEST_STREAM = 9  # Streaming request-by-topic
 
 MSG_STREAM_ITEM_END = 14  # Marks end of one item in a streaming response
+
+# PR3 Stage C — event protocol message types (locked #1, locked #13)
+MSG_PUBLISH_EVENT = 15
+MSG_REQUEST_EVENT = 16
+MSG_REQUEST_EVENT_STREAM = 17
+MSG_SUB_ADVERTISE = 18
+MSG_SUB_DELTA = 19
 
 MSG_AUTH = 20  # Authentication message (shared secret)
 
@@ -110,6 +140,51 @@ class NetworkManager:
         self.heartbeat_interval: float = 10.0
         self.lookup_interval: float = 60.0
         self.liveness_timeout: float = 30.0
+
+        # ── PR3 Stage C advert-protocol state ─────────────────────────
+        # Per-peer table of subs the peer told us about. Keyed by peer
+        # hostname (locked #8) — stable across reconnects/IP changes.
+        self._inbound_adverts: Dict[str, Dict[str, AdvertSub]] = {}
+
+        # Global insertion-order structure for C11 tie-break — first peer
+        # to advertise a matching sub wins on no-local-match. Key is
+        # (peer_hostname, sub_uuid); value is AdvertSub.
+        self._inbound_global_order: Dict[Tuple[str, str], AdvertSub] = {}
+
+        # Per-peer record of subs we've already told that peer about. Used
+        # to compute deltas at register/unregister time and to avoid
+        # double-sending a sub we filtered out. Inner key is OUR local
+        # sub_uuid.
+        self._outbound_adverts: Dict[str, Dict[str, AdvertSub]] = {}
+
+        # Per-peer advert lock (locked #9). Acquired around the FULL
+        # outbound advert lifecycle (build content + send) so snapshot vs
+        # delta can never race into the wire pool.
+        self._advert_locks: Dict[str, asyncio.Lock] = {}
+
+        # Single global mutation lock for atomic mutation of the three
+        # tables together. ALWAYS acquired AFTER a per-peer lock when both
+        # are needed; never held across wire send / _get_connection await.
+        self._adverts_struct_lock: asyncio.Lock = asyncio.Lock()
+
+        # Per-peer in-flight publish tasks (locked #4). Mutated under
+        # _adverts_struct_lock per locked #16. Tasks self-deregister on
+        # completion; disconnect hook iterates and cancels.
+        self._inflight_publishes: Dict[str, set] = {}
+
+        # One-shot trigger guard for initial-snapshot send. Set after
+        # first successful _initial_advert_exchange for a peer; cleared
+        # in _drop_peer_advert_state so reconnects re-arm.
+        self._snapshot_sent: set = set()
+
+        # Per-peer in-flight initial-exchange task (cancellable on
+        # disconnect via _drop_peer_advert_state).
+        self._initial_exchange_tasks: Dict[str, asyncio.Task] = {}
+
+        # Networking-ready flag. True after start() finishes wiring
+        # background tasks; False at top of stop(). Used by add/remove
+        # broadcast hooks to no-op until peers can be reached.
+        self.is_ready: bool = False
 
     # ── Per-node port helpers ──────────────────────────────────────────
 
@@ -223,6 +298,11 @@ class NetworkManager:
                 MSG_NOTIFY: "NOTIFY",
                 MSG_TOPIC_REQUEST: "TOPIC_REQUEST",
                 MSG_TOPIC_REQUEST_STREAM: "TOPIC_REQUEST_STREAM",
+                MSG_PUBLISH_EVENT: "PUBLISH_EVENT",
+                MSG_REQUEST_EVENT: "REQUEST_EVENT",
+                MSG_REQUEST_EVENT_STREAM: "REQUEST_EVENT_STREAM",
+                MSG_SUB_ADVERTISE: "SUB_ADVERTISE",
+                MSG_SUB_DELTA: "SUB_DELTA",
                 MSG_RESULT: "RESULT",
                 MSG_ERROR: "ERROR",
             }.get(msg_type, f"UNKNOWN({msg_type})")
@@ -321,6 +401,20 @@ class NetworkManager:
             await self._send_message(writer, MSG_ERROR, error_msg)
         except Exception as e:
             self._logger.exception("Error sending error message")
+            raise
+
+    async def _send_error_pickled(
+        self, writer: asyncio.StreamWriter, exc: BaseException
+    ) -> None:
+        """Ship pickled exception INSTANCE on MSG_ERROR (locked #13).
+
+        Stage A/B's existing _send_error(writer, str) path coexists; Stage
+        D removes the bare-string variant when old MSG types die.
+        """
+        try:
+            await self._send_message(writer, MSG_ERROR, exc)
+        except Exception:
+            self._logger.exception("Error sending pickled error message")
             raise
 
     def _create_ssl_context(self) -> ssl.SSLContext:
@@ -500,11 +594,13 @@ class NetworkManager:
                                 node, timeout=self.liveness_timeout
                             )
                             if not ok:
-                                node.enabled = False
+                                # PR3 Stage C step 17 path #1: route through
+                                # _mark_node_dead so advert state drops.
+                                await self._mark_node_dead(node)
                         except Exception:
                             # Mark node disabled on heartbeat failure
                             try:
-                                node.enabled = False
+                                await self._mark_node_dead(node)
                             except Exception:
                                 pass
                 except Exception:
@@ -514,9 +610,20 @@ class NetworkManager:
         self._logger.debug("[SERVER] Starting heartbeat loop task")
         self.heartbeat_task = asyncio.create_task(heartbeat_loop())
 
+        # PR3 Stage C: networking is now ready for advert broadcasts
+        # (locked #18 step 15 guard). Subscriptions registered before
+        # start() get picked up by the symmetric initial-exchange when
+        # peers are discovered.
+        self.is_ready = True
+
     async def stop(self):
         """Stop the socket server and close all connections."""
         self._logger.info("[SERVER] Stopping server and background tasks")
+
+        # PR3 Stage C: flip ready flag FIRST so concurrent broadcast
+        # hooks become no-ops (locked #18 step 15 guard).
+        self.is_ready = False
+
         # Cancel background tasks first
         for task in [self.heartbeat_task, self.discovery_task]:
             if task:
@@ -525,6 +632,25 @@ class NetworkManager:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # PR3 Stage C step 17 path #3: drop advert state for every peer
+        # we've ever known about, BEFORE closing pooled connections.
+        try:
+            async with self._adverts_struct_lock:
+                hosts = list(
+                    set(self._inbound_adverts.keys())
+                    | set(self._outbound_adverts.keys())
+                    | set(self._snapshot_sent)
+                )
+            for h in hosts:
+                try:
+                    await self._drop_peer_advert_state(h)
+                except Exception:
+                    self._logger.debug(
+                        "advert drop on stop() for %s failed", h, exc_info=True
+                    )
+        except Exception:
+            self._logger.debug("advert cleanup loop in stop() failed", exc_info=True)
 
         if self.server:
             self.server.close()
@@ -573,6 +699,12 @@ class NetworkManager:
         """Main server-side connection handler with authentication."""
         client_addr = writer.get_extra_info("peername")
         self._logger.debug(f"New client connection from {client_addr}")
+
+        # PR3 Stage C (locked #17): per-connection state dict. PR3 receiver
+        # handlers populate ``conn_context["peer_hostname"]`` on first
+        # sight of a non-None ``payload["author_host"]`` (after the
+        # self-impersonation gate). Finally block reads it for cleanup.
+        conn_context: Dict[str, Any] = {}
 
         try:
             # Authenticate client
@@ -630,6 +762,19 @@ class NetworkManager:
                     await self._handle_topic_request(reader, writer, data)
                 elif msg_type == MSG_TOPIC_REQUEST_STREAM:
                     await self._handle_topic_request_stream(reader, writer, data)
+                # PR3 Stage C dispatch — locked #17 conn_context threaded
+                elif msg_type == MSG_PUBLISH_EVENT:
+                    await self._handle_publish_event(reader, writer, data, conn_context)
+                elif msg_type == MSG_REQUEST_EVENT:
+                    await self._handle_request_event(reader, writer, data, conn_context)
+                elif msg_type == MSG_REQUEST_EVENT_STREAM:
+                    await self._handle_request_event_stream(
+                        reader, writer, data, conn_context
+                    )
+                elif msg_type == MSG_SUB_ADVERTISE:
+                    await self._handle_sub_advertise(reader, writer, data, conn_context)
+                elif msg_type == MSG_SUB_DELTA:
+                    await self._handle_sub_delta(reader, writer, data, conn_context)
                 else:
                     self._logger.warning(
                         f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
@@ -645,6 +790,33 @@ class NetworkManager:
                 await self._send_error(writer, str(e))
             except Exception:
                 pass
+        finally:
+            # PR3 Stage C (locked #17): drop advert state on connection
+            # close ONLY IF heartbeat has also marked the peer dead.
+            # Heartbeat is the source-of-truth — pooled-connection-recycle
+            # would over-eagerly drop on every transient pool churn.
+            try:
+                peer_hostname = conn_context.get("peer_hostname")
+                if peer_hostname:
+                    node = next(
+                        (
+                            n for n in list(self.nodes)
+                            if n.hostname == peer_hostname
+                        ),
+                        None,
+                    )
+                    if node is not None and not node.enabled:
+                        await self._drop_peer_advert_state(peer_hostname)
+                    else:
+                        self._logger.debug(
+                            "_handle_client finally: peer %s still enabled — heartbeat owns drop",
+                            peer_hostname,
+                        )
+            except Exception:
+                self._logger.debug(
+                    "_handle_client finally: advert cleanup hook failed",
+                    exc_info=True,
+                )
 
     async def _handle_execute(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
@@ -1045,6 +1217,1431 @@ class NetworkManager:
         except Exception as e:
             self._logger.exception(f"[TOPIC_STREAM] Exception: {e}")
             await self._send_error(writer, str(e))
+
+    # ── PR3 Stage C handlers + helpers (locked #1, #13, #15, #17) ──
+
+    def _safe_peer_ip(self, writer: asyncio.StreamWriter) -> Optional[str]:
+        """Best-effort extract of TCP peer IP from a StreamWriter."""
+        try:
+            peer = writer.get_extra_info("peername")
+            if peer and isinstance(peer, tuple) and len(peer) >= 1:
+                return peer[0]
+        except Exception:
+            pass
+        return None
+
+    def _hosts_match(
+        self,
+        hosts: Union[str, list, None],
+        blocked_hosts: Union[str, list, None],
+        peer_hostname: str,
+    ) -> bool:
+        """Networking-layer peer-host filter (PR3 PLAN F step 5a).
+
+        Mirrors PluginCore's nested ``_matches_remote_node`` /
+        ``_is_remote_node_blocked`` predicates without re-importing them
+        (they're closures inside find_endpoint).
+        """
+        def _matches(val):
+            if isinstance(val, str):
+                return val in ("remote", "any") or val == peer_hostname
+            if isinstance(val, list):
+                return peer_hostname in val
+            return False
+
+        def _blocked(val):
+            if val is None:
+                return False
+            if isinstance(val, str):
+                return val in ("remote", "any") or val == peer_hostname
+            if isinstance(val, list):
+                return peer_hostname in val
+            return False
+
+        return _matches(hosts) and not _blocked(blocked_hosts)
+
+    def _should_advertise_sub_to_peer(self, sub, peer_hostname: str) -> bool:
+        """PR3 PLAN H. True iff this LOCAL sub should be advertised to a
+        peer with the given hostname. Lookup ORDER:
+          1. enabled=False → False
+          2. hosts="local" → False (sub explicitly opts out of remote)
+          3. hosts predicate (positive accept)
+          4. blocked_hosts subtract
+        """
+        if peer_hostname is None:
+            return False
+        if not getattr(sub, "enabled", True):
+            return False
+
+        sub_hosts = getattr(sub, "hosts", None)
+        if sub_hosts == "local":
+            return False
+
+        if sub_hosts in ("any", "remote"):
+            accepts = True
+        elif isinstance(sub_hosts, str):
+            accepts = (sub_hosts == peer_hostname)
+        elif isinstance(sub_hosts, list):
+            accepts = peer_hostname in sub_hosts
+        elif sub_hosts is None:
+            accepts = True
+        else:
+            return False
+
+        if not accepts:
+            return False
+
+        sub_blocked = getattr(sub, "blocked_hosts", None)
+        if sub_blocked is None:
+            return True
+        if isinstance(sub_blocked, str):
+            if sub_blocked in ("any", "remote") or sub_blocked == peer_hostname:
+                return False
+        elif isinstance(sub_blocked, list):
+            if (
+                peer_hostname in sub_blocked
+                or "any" in sub_blocked
+                or "remote" in sub_blocked
+            ):
+                return False
+
+        return True
+
+    def _filter_inbound_advert(self, advert: dict) -> bool:
+        """Typed-validation gate for a single inbound advert dict. Drops
+        entries missing required keys / wrong types. Trust filtering
+        happens OUTBOUND-side (per PLAN H)."""
+        if not isinstance(advert, dict):
+            return False
+        sub_uuid = advert.get("sub_uuid")
+        topic = advert.get("topic")
+        if not isinstance(sub_uuid, str) or not sub_uuid:
+            return False
+        if not isinstance(topic, str) or not topic:
+            return False
+        return True
+
+    def _serialize_local_sub_for_peer(self, sub) -> dict:
+        """Project a Stage-B Subscription to wire-payload dict. Drops
+        legacy ``handler`` slot (B-053) and receiver-only fields.
+        """
+        return {
+            "sub_uuid": sub.sub_uuid,
+            "topic": sub.topic_pattern,
+            "hosts": sub.hosts,
+            "blocked_hosts": sub.blocked_hosts,
+            "authors": sub.authors,
+            "blocked_authors": sub.blocked_authors,
+        }
+
+    def _self_impersonation_check(
+        self,
+        author_host: Optional[str],
+        writer: asyncio.StreamWriter,
+        msg_label: str,
+    ) -> bool:
+        """Locked #15: reject payloads claiming our own hostname. Returns
+        True if the gate FIRED (caller should bail). Passive log + no
+        state cleanup — would clear our own state if we acted on it.
+        """
+        if author_host is None:
+            return False
+        if author_host == self.plugin_core.hostname:
+            try:
+                peer = writer.get_extra_info("peername")
+            except Exception:
+                peer = None
+            self._logger.warning(
+                "self-impersonation rejected: peer %s claimed our hostname %s on %s",
+                peer, author_host, msg_label,
+            )
+            return True
+        return False
+
+    async def _maybe_reciprocal_exchange(
+        self,
+        author_host: Optional[str],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Reciprocal advert trigger (locked #7 + #10). Idempotent via
+        ``_snapshot_sent`` fast-path; authoritative gate inside
+        ``_initial_advert_exchange``."""
+        if not author_host or author_host == self.plugin_core.hostname:
+            return
+        if author_host in self._snapshot_sent:
+            return
+        node = next(
+            (n for n in list(self.nodes) if n.hostname == author_host),
+            None,
+        )
+        if node is not None:
+            asyncio.create_task(self._spawn_initial_exchange(node))
+            return
+        # Fallback: client-only peer not yet in node table.
+        peer_ip = self._safe_peer_ip(writer)
+        if peer_ip:
+            asyncio.create_task(
+                self._spawn_initial_exchange_for_ip(peer_ip, author_host)
+            )
+
+    async def _handle_publish_event(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_PUBLISH_EVENT: receive, gate, fan-out (PR3 PLAN F)."""
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+
+            # Self-impersonation gate (locked #15).
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_PUBLISH_EVENT"
+            ):
+                return
+
+            # locked #17: record peer hostname on first sight.
+            if author_host:
+                conn_context.setdefault("peer_hostname", author_host)
+
+            # Reciprocal advert trigger (locked #7 + #10).
+            await self._maybe_reciprocal_exchange(author_host, writer)
+
+            topic = payload_dict.get("topic")
+            payload = payload_dict.get("payload")
+            author = payload_dict.get("author", "remote")
+            author_id = payload_dict.get("author_id", "remote")
+            timestamp = payload_dict.get("timestamp")
+            if not isinstance(topic, str) or not topic:
+                self._logger.warning(
+                    "[PUBLISH_EVENT] missing/invalid topic from author_host=%s",
+                    author_host,
+                )
+                return
+
+            self._logger.debug(
+                "[PUBLISH_EVENT] topic=%r author=%s author_host=%s",
+                topic, author, author_host,
+            )
+
+            # Resolve local subs.
+            try:
+                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+            except Exception:
+                self._logger.exception(
+                    "[PUBLISH_EVENT] find_all failed for topic %r", topic
+                )
+                return
+
+            for sub in all_subs:
+                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                    continue
+                if not self.plugin_core._sub_accepts_remote_publisher(
+                    sub, author_host, author
+                ):
+                    continue
+                if not self.plugin_core._sub_accepts_author(sub, author):
+                    continue
+                try:
+                    await self.plugin_core._fanout_sub(
+                        sub=sub,
+                        publisher=None,
+                        resolved_topic=topic,
+                        payload=payload,
+                        kind="publish_event",
+                        timestamp=timestamp if isinstance(timestamp, (int, float)) else 0.0,
+                        timeout=None,
+                        caller_chain=None,
+                        remote_publisher_name=author,
+                        remote_publisher_uuid=author_id,
+                        remote_publisher_host=author_host,
+                        remote_verbose=False,
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "[PUBLISH_EVENT] fanout failed for sub %s", sub.sub_uuid
+                    )
+
+        except Exception:
+            self._logger.exception("[PUBLISH_EVENT] handler crashed")
+
+    async def _handle_request_event(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_REQUEST_EVENT: receive, gate, fan-out, return result (PR3
+        PLAN G)."""
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_REQUEST_EVENT"
+            ):
+                # No response — caller will see TimeoutError / closed.
+                return
+
+            if author_host:
+                conn_context.setdefault("peer_hostname", author_host)
+
+            await self._maybe_reciprocal_exchange(author_host, writer)
+
+            topic = payload_dict.get("topic")
+            payload = payload_dict.get("payload")
+            author = payload_dict.get("author", "remote")
+            author_id = payload_dict.get("author_id", "remote")
+            timestamp = payload_dict.get("timestamp")
+            timeout = payload_dict.get("timeout")
+            if not isinstance(topic, str) or not topic:
+                await self._send_error_pickled(
+                    writer,
+                    NetworkRequestException("missing/invalid topic"),
+                )
+                return
+
+            try:
+                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+            except Exception as exc:
+                self._logger.exception(
+                    "[REQUEST_EVENT] find_all failed for topic %r", topic
+                )
+                await self._send_error_pickled(writer, NetworkRequestException(str(exc)))
+                return
+
+            local_match = None
+            for sub in all_subs:
+                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                    continue
+                if not self.plugin_core._sub_accepts_remote_publisher(
+                    sub, author_host, author
+                ):
+                    continue
+                if not self.plugin_core._sub_accepts_author(sub, author):
+                    continue
+                local_match = sub
+                break
+
+            if local_match is None:
+                # locked #13: no-local-sub path emits NoLocalSubException.
+                await self._send_error_pickled(
+                    writer,
+                    NoLocalSubException(
+                        f"no local subscriber for topic {topic!r}"
+                    ),
+                )
+                return
+
+            try:
+                request = await self.plugin_core._fanout_sub(
+                    sub=local_match,
+                    publisher=None,
+                    resolved_topic=topic,
+                    payload=payload,
+                    kind="request_event",
+                    timestamp=timestamp if isinstance(timestamp, (int, float)) else 0.0,
+                    timeout=timeout,
+                    caller_chain=None,
+                    remote_publisher_name=author,
+                    remote_publisher_uuid=author_id,
+                    remote_publisher_host=author_host,
+                    remote_verbose=False,
+                )
+                if request is None:
+                    # Defense-in-depth gate inside _fanout_sub fired —
+                    # treat as no-handler.
+                    await self._send_error_pickled(
+                        writer,
+                        NoLocalSubException("fan-out gate rejected fan-out"),
+                    )
+                    return
+                result, error, _ = await request.wait_for_result_async()
+                try:
+                    await request.set_collected()
+                except Exception:
+                    pass
+                if error:
+                    if isinstance(result, BaseException):
+                        await self._send_error_pickled(writer, result)
+                    else:
+                        await self._send_error_pickled(
+                            writer, RequestException(str(result))
+                        )
+                    return
+            except RequestException as exc:
+                await self._send_error_pickled(writer, exc)
+                return
+            except Exception as exc:
+                self._logger.exception("[REQUEST_EVENT] handler crashed")
+                await self._send_error_pickled(
+                    writer, RequestException(str(exc))
+                )
+                return
+
+            # Send chunked result.
+            try:
+                payload_bytes = pickle.dumps(result)
+                if len(payload_bytes) > CHUNK_SIZE:
+                    offset = 0
+                    while offset < len(payload_bytes):
+                        chunk_data = payload_bytes[offset : offset + CHUNK_SIZE]
+                        chunk_length = len(chunk_data) + 1
+                        header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                        writer.write(header + chunk_data)
+                        await writer.drain()
+                        offset += CHUNK_SIZE
+                else:
+                    chunk_length = len(payload_bytes) + 1
+                    header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
+                    writer.write(header + payload_bytes)
+                    await writer.drain()
+                await self._send_end_stream(writer)
+            except Exception:
+                self._logger.exception("[REQUEST_EVENT] result send failed")
+
+        except Exception as exc:
+            self._logger.exception("[REQUEST_EVENT] handler crashed")
+            try:
+                await self._send_error_pickled(
+                    writer, NetworkRequestException(str(exc))
+                )
+            except Exception:
+                pass
+
+    async def _handle_request_event_stream(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_REQUEST_EVENT_STREAM: streaming variant. First chunk wraps
+        in Event metadata (locked #2 SERVER-SIDE wrap). Cannot reuse
+        ``_fanout_sub`` (kind="request_event_stream" rejected by Stage B
+        path). Dedicated streaming receiver path."""
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_REQUEST_EVENT_STREAM"
+            ):
+                return
+
+            if author_host:
+                conn_context.setdefault("peer_hostname", author_host)
+
+            await self._maybe_reciprocal_exchange(author_host, writer)
+
+            topic = payload_dict.get("topic")
+            req_payload = payload_dict.get("payload")
+            author = payload_dict.get("author", "remote")
+            author_id = payload_dict.get("author_id", "remote")
+            timestamp = payload_dict.get("timestamp")
+            timeout = payload_dict.get("timeout")
+            if not isinstance(topic, str) or not topic:
+                await self._send_error_pickled(
+                    writer, NetworkRequestException("missing/invalid topic")
+                )
+                return
+
+            try:
+                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+            except Exception as exc:
+                self._logger.exception(
+                    "[REQUEST_EVENT_STREAM] find_all failed for topic %r", topic
+                )
+                await self._send_error_pickled(
+                    writer, NetworkRequestException(str(exc))
+                )
+                return
+
+            local_match = None
+            for sub in all_subs:
+                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                    continue
+                if not self.plugin_core._sub_accepts_remote_publisher(
+                    sub, author_host, author
+                ):
+                    continue
+                if not self.plugin_core._sub_accepts_author(sub, author):
+                    continue
+                local_match = sub
+                break
+
+            if local_match is None:
+                await self._send_error_pickled(
+                    writer,
+                    NoLocalSubException(
+                        f"no local subscriber for topic {topic!r}"
+                    ),
+                )
+                return
+
+            # Resolve bound async/sync gen method via find_endpoint
+            # (C18 access check). `endpoint["func"]` is unbound — we need
+            # the BOUND method via getattr on the target plugin.
+            try:
+                target_plugin, endpoint, _ = await self.plugin_core.find_endpoint(
+                    access_name=local_match.target_access_name,
+                    hosts="local",
+                    plugin_uuid=local_match.target_plugin_uuid,
+                    requester_id=local_match.plugin_uuid,
+                    target_plugin=local_match.target_plugin,
+                )
+            except Exception as exc:
+                self._logger.exception(
+                    "[REQUEST_EVENT_STREAM] find_endpoint failed"
+                )
+                await self._send_error_pickled(
+                    writer, RequestException(str(exc))
+                )
+                return
+
+            if target_plugin is None or endpoint is None:
+                await self._send_error_pickled(
+                    writer,
+                    RequestException(
+                        f"target endpoint {local_match.target_access_name!r} "
+                        f"not found on {local_match.target_plugin!r}"
+                    ),
+                )
+                return
+
+            internal = endpoint.get("internal_name") or local_match.target_access_name
+            func = getattr(target_plugin, internal, None)
+            if func is None or not (
+                inspect.isasyncgenfunction(func)
+                or inspect.isgeneratorfunction(func)
+            ):
+                await self._send_error_pickled(
+                    writer,
+                    RequestException("handler is not a generator function"),
+                )
+                return
+
+            from utils import Event as _Event  # local import to avoid cycle
+
+            ts = timestamp if isinstance(timestamp, (int, float)) else 0.0
+            sub_id_for_event = (
+                local_match.declared_id
+                if local_match.declared_id is not None
+                else local_match.sub_uuid
+            )
+
+            # Build Event from wire metadata (NOT via Event.from_request).
+            # First chunk wraps; subsequent chunks raw.
+            async def _iterate_and_send():
+                first = True
+                if inspect.isasyncgenfunction(func):
+                    # async-gen path — we still need to feed an Event to
+                    # the handler on its first call so it sees publisher
+                    # metadata. Build a sentinel Event with payload=None
+                    # for the first arg; the handler's first yield is
+                    # what we wrap.
+                    placeholder = _Event(
+                        topic=topic,
+                        payload=req_payload,
+                        author=author,
+                        author_id=author_id,
+                        author_host=author_host,
+                        subscription_id=sub_id_for_event,
+                        timestamp=ts,
+                    )
+                    ait = func(placeholder).__aiter__()
+                    try:
+                        while True:
+                            try:
+                                chunk = await ait.__anext__()
+                            except StopAsyncIteration:
+                                break
+                            if first:
+                                first = False
+                                wrapped = _Event(
+                                    topic=topic,
+                                    payload=chunk,
+                                    author=author,
+                                    author_id=author_id,
+                                    author_host=author_host,
+                                    subscription_id=sub_id_for_event,
+                                    timestamp=ts,
+                                )
+                                await self._send_message(
+                                    writer, MSG_STREAM_CHUNK, wrapped
+                                )
+                            else:
+                                await self._send_message(
+                                    writer, MSG_STREAM_CHUNK, chunk
+                                )
+                            await self._send_message(
+                                writer, MSG_STREAM_ITEM_END, None
+                            )
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await ait.aclose()
+                else:
+                    # Sync generator — run on the SyncDispatcher executor
+                    # (Q17 + C3 isolation).
+                    placeholder = _Event(
+                        topic=topic,
+                        payload=req_payload,
+                        author=author,
+                        author_id=author_id,
+                        author_host=author_host,
+                        subscription_id=sub_id_for_event,
+                        timestamp=ts,
+                    )
+                    sentinel = object()
+                    gen = func(placeholder)
+                    loop = asyncio.get_running_loop()
+                    try:
+                        while True:
+                            fut = loop.run_in_executor(
+                                self.plugin_core.sync_dispatcher.executor,
+                                lambda g=gen, s=sentinel: next(g, s),
+                            )
+                            chunk = await fut
+                            if chunk is sentinel:
+                                break
+                            if first:
+                                first = False
+                                wrapped = _Event(
+                                    topic=topic,
+                                    payload=chunk,
+                                    author=author,
+                                    author_id=author_id,
+                                    author_host=author_host,
+                                    subscription_id=sub_id_for_event,
+                                    timestamp=ts,
+                                )
+                                await self._send_message(
+                                    writer, MSG_STREAM_CHUNK, wrapped
+                                )
+                            else:
+                                await self._send_message(
+                                    writer, MSG_STREAM_CHUNK, chunk
+                                )
+                            await self._send_message(
+                                writer, MSG_STREAM_ITEM_END, None
+                            )
+                    finally:
+                        with contextlib.suppress(Exception):
+                            gen.close()
+
+            try:
+                if timeout is not None:
+                    await asyncio.wait_for(_iterate_and_send(), timeout=timeout)
+                else:
+                    await _iterate_and_send()
+                await self._send_end_stream(writer)
+            except asyncio.TimeoutError:
+                await self._send_error_pickled(
+                    writer,
+                    RequestException(
+                        f"request_event_stream timed out after {timeout}s"
+                    ),
+                )
+            except RequestException as exc:
+                await self._send_error_pickled(writer, exc)
+            except Exception as exc:
+                self._logger.exception("[REQUEST_EVENT_STREAM] iteration crashed")
+                await self._send_error_pickled(
+                    writer, RequestException(str(exc))
+                )
+
+        except Exception as exc:
+            self._logger.exception("[REQUEST_EVENT_STREAM] handler crashed")
+            try:
+                await self._send_error_pickled(
+                    writer, NetworkRequestException(str(exc))
+                )
+            except Exception:
+                pass
+
+    async def _handle_sub_advertise(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_SUB_ADVERTISE: full snapshot replace (locked #1, #5)."""
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_SUB_ADVERTISE"
+            ):
+                return
+
+            if not isinstance(author_host, str) or not author_host:
+                self._logger.warning(
+                    "[SUB_ADVERTISE] invalid author_host=%r", author_host
+                )
+                return
+
+            conn_context.setdefault("peer_hostname", author_host)
+
+            # Soft anti-spoof check.
+            peer_ip = self._safe_peer_ip(writer)
+            if peer_ip:
+                node_for_ip = next(
+                    (n for n in list(self.nodes) if n.IP == peer_ip),
+                    None,
+                )
+                if (
+                    node_for_ip is not None
+                    and node_for_ip.hostname
+                    and node_for_ip.hostname != author_host
+                ):
+                    self._logger.warning(
+                        "[SUB_ADVERTISE] anti-spoof: TCP peer IP %s known as %s "
+                        "but wire claimed author_host=%s — accepting wire claim "
+                        "(locked #1)",
+                        peer_ip, node_for_ip.hostname, author_host,
+                    )
+
+            subs_payload = payload_dict.get("subscriptions")
+            if not isinstance(subs_payload, list):
+                self._logger.warning(
+                    "[SUB_ADVERTISE] subscriptions not a list from %s", author_host
+                )
+                return
+
+            # Atomic purge + reinsert (per locked #5: empty list → {}).
+            async with self._adverts_struct_lock:
+                self._inbound_adverts[author_host] = {}
+                self._inbound_global_order = {
+                    k: v
+                    for k, v in self._inbound_global_order.items()
+                    if k[0] != author_host
+                }
+                for entry in subs_payload:
+                    if not self._filter_inbound_advert(entry):
+                        continue
+                    sub = AdvertSub(
+                        sub_uuid=entry["sub_uuid"],
+                        topic_pattern=entry["topic"],
+                        hosts=entry.get("hosts"),
+                        blocked_hosts=entry.get("blocked_hosts"),
+                        authors=entry.get("authors"),
+                        blocked_authors=entry.get("blocked_authors"),
+                    )
+                    self._inbound_adverts[author_host][sub.sub_uuid] = sub
+                    self._inbound_global_order[(author_host, sub.sub_uuid)] = sub
+
+            self._logger.debug(
+                "[SUB_ADVERTISE] recorded %d subs from %s",
+                len(subs_payload), author_host,
+            )
+
+            # Reciprocal: if we haven't yet advertised to this peer,
+            # send our snapshot back (locked #7).
+            await self._maybe_reciprocal_exchange(author_host, writer)
+
+        except Exception:
+            self._logger.exception("[SUB_ADVERTISE] handler crashed")
+
+    async def _handle_sub_delta(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_SUB_DELTA: single add or remove (locked #1)."""
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_SUB_DELTA"
+            ):
+                return
+
+            if not isinstance(author_host, str) or not author_host:
+                self._logger.warning(
+                    "[SUB_DELTA] invalid author_host=%r", author_host
+                )
+                return
+
+            conn_context.setdefault("peer_hostname", author_host)
+
+            kind = payload_dict.get("kind")
+            if kind not in ("add", "remove"):
+                self._logger.warning(
+                    "[SUB_DELTA] invalid kind=%r from %s", kind, author_host
+                )
+                return
+
+            subs_payload = payload_dict.get("subscriptions")
+            if not isinstance(subs_payload, list) or not subs_payload:
+                self._logger.debug(
+                    "[SUB_DELTA] empty subscriptions from %s", author_host
+                )
+                return
+
+            # Soft anti-spoof check (same as advertise).
+            peer_ip = self._safe_peer_ip(writer)
+            if peer_ip:
+                node_for_ip = next(
+                    (n for n in list(self.nodes) if n.IP == peer_ip),
+                    None,
+                )
+                if (
+                    node_for_ip is not None
+                    and node_for_ip.hostname
+                    and node_for_ip.hostname != author_host
+                ):
+                    self._logger.warning(
+                        "[SUB_DELTA] anti-spoof: TCP peer IP %s known as %s but "
+                        "wire claimed author_host=%s — accepting (locked #1)",
+                        peer_ip, node_for_ip.hostname, author_host,
+                    )
+
+            entry = subs_payload[0]
+            async with self._adverts_struct_lock:
+                if kind == "add":
+                    if not self._filter_inbound_advert(entry):
+                        self._logger.warning(
+                            "[SUB_DELTA] add: malformed entry from %s", author_host
+                        )
+                        return
+                    sub = AdvertSub(
+                        sub_uuid=entry["sub_uuid"],
+                        topic_pattern=entry["topic"],
+                        hosts=entry.get("hosts"),
+                        blocked_hosts=entry.get("blocked_hosts"),
+                        authors=entry.get("authors"),
+                        blocked_authors=entry.get("blocked_authors"),
+                    )
+                    self._inbound_adverts.setdefault(author_host, {})[sub.sub_uuid] = sub
+                    self._inbound_global_order[(author_host, sub.sub_uuid)] = sub
+                else:
+                    sub_uuid = entry.get("sub_uuid") if isinstance(entry, dict) else None
+                    if not isinstance(sub_uuid, str) or not sub_uuid:
+                        self._logger.warning(
+                            "[SUB_DELTA] remove: missing sub_uuid from %s",
+                            author_host,
+                        )
+                        return
+                    per_peer = self._inbound_adverts.get(author_host)
+                    if per_peer is None or sub_uuid not in per_peer:
+                        # Idempotent skip
+                        return
+                    per_peer.pop(sub_uuid, None)
+                    self._inbound_global_order.pop((author_host, sub_uuid), None)
+
+            await self._maybe_reciprocal_exchange(author_host, writer)
+
+        except Exception:
+            self._logger.exception("[SUB_DELTA] handler crashed")
+
+    # ── PR3 Stage C client methods (publish/request/advertise/delta) ──
+
+    async def publish_event_remote(
+        self,
+        IP: str,
+        topic: str,
+        payload: Any,
+        author: str,
+        author_id: str,
+        author_host: str,
+        timestamp: float,
+        request_uuid: str,
+    ) -> None:
+        """Fire-and-forget MSG_PUBLISH_EVENT to a remote peer. NO response
+        read — server doesn't send one."""
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "payload": payload,
+                "author": author,
+                "author_id": author_id,
+                "author_host": author_host,
+                "timestamp": timestamp,
+                "request_uuid": request_uuid,
+            }
+            await self._send_message(writer, MSG_PUBLISH_EVENT, request_data)
+        except Exception:
+            self._logger.debug(
+                "[PUBLISH_EVENT_REMOTE] failed to send to %s", IP, exc_info=True
+            )
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    await self._return_connection(IP, reader, writer)
+                    connection_returned = True
+                except Exception:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+    async def request_event_remote(
+        self,
+        IP: str,
+        topic: str,
+        payload: Any,
+        author: str,
+        author_id: str,
+        author_host: str,
+        timestamp: float,
+        request_uuid: str,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Request-by-event on a remote peer; returns chunked result.
+
+        Decoder uses ``_receive_message`` (locked #13: pickled exception
+        INSTANCE on MSG_ERROR; defensive bare-string fallback retained).
+        """
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "payload": payload,
+                "author": author,
+                "author_id": author_id,
+                "author_host": author_host,
+                "timestamp": timestamp,
+                "request_uuid": request_uuid,
+                "timeout": timeout,
+            }
+            await self._send_message(writer, MSG_REQUEST_EVENT, request_data)
+
+            result_chunks_bytes: List[bytes] = []
+            while True:
+                try:
+                    msg_type, chunk = await self._receive_message(reader)
+                except (TimeoutError, ConnectionError) as e:
+                    raise NetworkRequestException(str(e))
+                if msg_type == MSG_STREAM_CHUNK:
+                    # _receive_message already unpickled. We RE-PICKLE so
+                    # the existing chunk-reassembly path works (server
+                    # may have split the result across multiple
+                    # MSG_STREAM_CHUNKs).
+                    result_chunks_bytes.append(pickle.dumps(chunk))
+                    continue
+                if msg_type == MSG_END_STREAM:
+                    break
+                if msg_type == MSG_ERROR:
+                    decoded = chunk
+                    if not isinstance(decoded, BaseException):
+                        decoded = NetworkRequestException(
+                            str(decoded) if decoded is not None else ""
+                        )
+                    raise decoded
+                raise NetworkRequestException(
+                    f"Unexpected message type: {msg_type}"
+                )
+
+            await self._return_connection(IP, reader, writer)
+            connection_returned = True
+
+            if not result_chunks_bytes:
+                return None
+            # Reassembly: single chunk path is the common case;
+            # multi-chunk concat-then-loads matches Stage A behavior.
+            if len(result_chunks_bytes) == 1:
+                return pickle.loads(result_chunks_bytes[0])
+            full = b"".join(result_chunks_bytes)
+            return pickle.loads(full)
+        except RequestException:
+            raise
+        except Exception as e:
+            self._logger.debug(
+                "[REQUEST_EVENT_REMOTE] error from %s: %s", IP, e
+            )
+            raise NetworkRequestException(str(e))
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def request_event_stream_remote(
+        self,
+        IP: str,
+        topic: str,
+        payload: Any,
+        author: str,
+        author_id: str,
+        author_host: str,
+        timestamp: float,
+        request_uuid: str,
+        timeout: Optional[float] = None,
+    ):
+        """Streaming request-by-event on a remote peer; yields chunks.
+
+        Framing invariant: server emits MSG_STREAM_CHUNK + MSG_STREAM_ITEM_END
+        per yield, terminated by MSG_END_STREAM.
+        """
+        reader = None
+        writer = None
+        connection_returned = False
+        try:
+            reader, writer = await self._get_connection(IP)
+            request_data = {
+                "topic": topic,
+                "payload": payload,
+                "author": author,
+                "author_id": author_id,
+                "author_host": author_host,
+                "timestamp": timestamp,
+                "request_uuid": request_uuid,
+                "timeout": timeout,
+            }
+            await self._send_message(writer, MSG_REQUEST_EVENT_STREAM, request_data)
+
+            pending = None
+            have_pending = False
+            while True:
+                try:
+                    msg_type, chunk = await self._receive_message(reader)
+                except (TimeoutError, ConnectionError) as e:
+                    raise NetworkRequestException(str(e))
+                if msg_type == MSG_STREAM_CHUNK:
+                    pending = chunk
+                    have_pending = True
+                    continue
+                if msg_type == MSG_STREAM_ITEM_END:
+                    if have_pending:
+                        yield pending
+                        pending = None
+                        have_pending = False
+                    continue
+                if msg_type == MSG_END_STREAM:
+                    break
+                if msg_type == MSG_ERROR:
+                    decoded = chunk
+                    if not isinstance(decoded, BaseException):
+                        decoded = NetworkRequestException(
+                            str(decoded) if decoded is not None else ""
+                        )
+                    raise decoded
+                raise NetworkRequestException(
+                    f"Unexpected message type: {msg_type}"
+                )
+
+            await self._return_connection(IP, reader, writer)
+            connection_returned = True
+        except RequestException:
+            raise
+        except Exception as e:
+            self._logger.debug(
+                "[REQUEST_EVENT_STREAM_REMOTE] error from %s: %s", IP, e
+            )
+            raise NetworkRequestException(str(e))
+        finally:
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    async def advertise_subs_remote(self, peer_ip: str, peer_hostname: str) -> None:
+        """Send full snapshot to a peer (Tree 2 step 13 — content built
+        INSIDE per-peer lock so snapshot vs delta serialise per locked #9).
+        """
+        lock = self._advert_locks.setdefault(peer_hostname, asyncio.Lock())
+        async with lock:
+            try:
+                subs = await self.plugin_core.topic_registry.list_local_subs()
+            except Exception:
+                self._logger.exception(
+                    "[ADVERTISE] list_local_subs failed for peer %s", peer_hostname
+                )
+                return
+
+            async with self._adverts_struct_lock:
+                filtered = [
+                    s for s in subs
+                    if self._should_advertise_sub_to_peer(s, peer_hostname)
+                ]
+                projected = {
+                    s.sub_uuid: AdvertSub(
+                        sub_uuid=s.sub_uuid,
+                        topic_pattern=s.topic_pattern,
+                        hosts=s.hosts,
+                        blocked_hosts=s.blocked_hosts,
+                        authors=s.authors,
+                        blocked_authors=s.blocked_authors,
+                    )
+                    for s in filtered
+                }
+                self._outbound_adverts[peer_hostname] = projected
+
+            wire_payload = {
+                "author_host": self.plugin_core.hostname,
+                "kind": "snapshot",
+                "subscriptions": [
+                    self._serialize_local_sub_for_peer(s) for s in filtered
+                ],
+            }
+
+            reader = None
+            writer = None
+            connection_returned = False
+            try:
+                reader, writer = await self._get_connection(peer_ip)
+                await self._send_message(writer, MSG_SUB_ADVERTISE, wire_payload)
+            except Exception:
+                self._logger.debug(
+                    "[ADVERTISE] failed to send snapshot to %s", peer_hostname,
+                    exc_info=True,
+                )
+                # Wipe outbound on send-failure so a retry actually
+                # rebuilds + resends.
+                async with self._adverts_struct_lock:
+                    self._outbound_adverts.pop(peer_hostname, None)
+                raise
+            finally:
+                if reader and writer and not connection_returned:
+                    try:
+                        await self._return_connection(peer_ip, reader, writer)
+                        connection_returned = True
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+
+    async def send_sub_delta_remote(
+        self,
+        peer_ip: str,
+        peer_hostname: str,
+        kind: str,
+        sub,
+    ) -> None:
+        """Send single delta (add/remove) to a peer. Same lock-order
+        pattern as advertise_subs_remote."""
+        if kind not in ("add", "remove"):
+            self._logger.warning(
+                "[DELTA] invalid kind=%r for peer %s", kind, peer_hostname
+            )
+            return
+        lock = self._advert_locks.setdefault(peer_hostname, asyncio.Lock())
+        async with lock:
+            async with self._adverts_struct_lock:
+                outbound_for_peer = self._outbound_adverts.get(peer_hostname, {})
+                if kind == "add":
+                    if sub.sub_uuid in outbound_for_peer:
+                        return  # already advertised
+                    outbound_for_peer = self._outbound_adverts.setdefault(
+                        peer_hostname, {}
+                    )
+                    outbound_for_peer[sub.sub_uuid] = AdvertSub(
+                        sub_uuid=sub.sub_uuid,
+                        topic_pattern=sub.topic_pattern,
+                        hosts=sub.hosts,
+                        blocked_hosts=sub.blocked_hosts,
+                        authors=sub.authors,
+                        blocked_authors=sub.blocked_authors,
+                    )
+                else:
+                    if sub.sub_uuid not in outbound_for_peer:
+                        return  # never advertised
+                    del self._outbound_adverts[peer_hostname][sub.sub_uuid]
+
+            if kind == "add":
+                wire_subs = [self._serialize_local_sub_for_peer(sub)]
+            else:
+                wire_subs = [{"sub_uuid": sub.sub_uuid}]
+
+            wire_payload = {
+                "author_host": self.plugin_core.hostname,
+                "kind": kind,
+                "subscriptions": wire_subs,
+            }
+
+            reader = None
+            writer = None
+            connection_returned = False
+            try:
+                reader, writer = await self._get_connection(peer_ip)
+                await self._send_message(writer, MSG_SUB_DELTA, wire_payload)
+            except Exception:
+                self._logger.debug(
+                    "[DELTA] failed to send %s to %s", kind, peer_hostname,
+                    exc_info=True,
+                )
+            finally:
+                if reader and writer and not connection_returned:
+                    try:
+                        await self._return_connection(peer_ip, reader, writer)
+                        connection_returned = True
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+
+    # ── Sub-broadcast helpers (called from PluginCore subscribe/unsubscribe) ──
+
+    async def broadcast_local_sub_added(self, sub) -> None:
+        """Filter peers + send add-delta. No-op when not ready."""
+        if not getattr(self, "is_ready", False):
+            return
+        for node in list(self.nodes):
+            if node.hostname is None:
+                continue
+            if node.hostname == self.plugin_core.hostname:
+                continue
+            try:
+                if not (node.enabled and await node.is_alive()):
+                    continue
+            except Exception:
+                continue
+            if not self._should_advertise_sub_to_peer(sub, node.hostname):
+                continue
+            try:
+                await self.send_sub_delta_remote(
+                    node.IP, node.hostname, "add", sub
+                )
+            except Exception:
+                self._logger.debug(
+                    "broadcast_local_sub_added: send to %s failed",
+                    node.hostname, exc_info=True,
+                )
+
+    async def broadcast_local_sub_removed(self, sub) -> None:
+        """Filter peers + send remove-delta. Only sends to peers we have
+        actually advertised this sub to (outbound table is authority)."""
+        if not getattr(self, "is_ready", False):
+            return
+        for node in list(self.nodes):
+            if node.hostname is None:
+                continue
+            if node.hostname == self.plugin_core.hostname:
+                continue
+            try:
+                if not (node.enabled and await node.is_alive()):
+                    continue
+            except Exception:
+                continue
+            # Authority: only re-advertise removes for subs we sent.
+            outbound = self._outbound_adverts.get(node.hostname, {})
+            if sub.sub_uuid not in outbound:
+                continue
+            try:
+                await self.send_sub_delta_remote(
+                    node.IP, node.hostname, "remove", sub
+                )
+            except Exception:
+                self._logger.debug(
+                    "broadcast_local_sub_removed: send to %s failed",
+                    node.hostname, exc_info=True,
+                )
+
+    # ── Initial-exchange + disconnect cleanup helpers ──
+
+    async def _spawn_initial_exchange(self, node) -> None:
+        """Schedule (or skip) initial advert exchange to a Node. Idempotent
+        via in-flight task table + ``_snapshot_sent`` guard inside the
+        inner task body (locked #7)."""
+        host = getattr(node, "hostname", None)
+        if not host:
+            return
+        async with self._adverts_struct_lock:
+            prev = self._initial_exchange_tasks.get(host)
+            if prev is not None and not prev.done():
+                return
+            inner = asyncio.create_task(self._initial_advert_exchange(node))
+            self._initial_exchange_tasks[host] = inner
+
+        def _deregister(_t, h=host):
+            async def _drop():
+                async with self._adverts_struct_lock:
+                    cur = self._initial_exchange_tasks.get(h)
+                    if cur is _t:
+                        self._initial_exchange_tasks.pop(h, None)
+            try:
+                asyncio.create_task(_drop())
+            except RuntimeError:
+                # Loop closed during shutdown — drop silently.
+                pass
+
+        inner.add_done_callback(_deregister)
+
+    async def _initial_advert_exchange(self, node) -> None:
+        """Authoritative check-then-set under struct_lock. If a second
+        concurrent trigger arrived, bail."""
+        host = getattr(node, "hostname", None)
+        if not host:
+            return
+        async with self._adverts_struct_lock:
+            if host in self._snapshot_sent:
+                return
+            self._snapshot_sent.add(host)
+        try:
+            await self.advertise_subs_remote(node.IP, host)
+        except Exception:
+            async with self._adverts_struct_lock:
+                self._snapshot_sent.discard(host)
+            self._logger.warning(
+                "initial advert exchange to %s failed", host
+            )
+            raise
+
+    async def _spawn_initial_exchange_for_ip(
+        self, peer_ip: str, host: str
+    ) -> None:
+        """Variant for client-only peers without a Node entry yet."""
+        if not host:
+            return
+        async with self._adverts_struct_lock:
+            prev = self._initial_exchange_tasks.get(host)
+            if prev is not None and not prev.done():
+                return
+
+            async def _exchange():
+                async with self._adverts_struct_lock:
+                    if host in self._snapshot_sent:
+                        return
+                    self._snapshot_sent.add(host)
+                try:
+                    await self.advertise_subs_remote(peer_ip, host)
+                except Exception:
+                    async with self._adverts_struct_lock:
+                        self._snapshot_sent.discard(host)
+                    raise
+
+            t = asyncio.create_task(_exchange())
+            self._initial_exchange_tasks[host] = t
+
+        def _dereg(_t, h=host):
+            async def _drop():
+                async with self._adverts_struct_lock:
+                    cur = self._initial_exchange_tasks.get(h)
+                    if cur is _t:
+                        self._initial_exchange_tasks.pop(h, None)
+            try:
+                asyncio.create_task(_drop())
+            except RuntimeError:
+                pass
+
+        t.add_done_callback(_dereg)
+
+    async def _drop_peer_advert_state(self, peer_hostname: str) -> None:
+        """Clear all advert state for a peer + cancel in-flight tasks
+        targeting it (locked #4 + #17)."""
+        if not peer_hostname:
+            return
+        async with self._adverts_struct_lock:
+            self._inbound_adverts.pop(peer_hostname, None)
+            self._inbound_global_order = {
+                k: v
+                for k, v in self._inbound_global_order.items()
+                if k[0] != peer_hostname
+            }
+            self._outbound_adverts.pop(peer_hostname, None)
+            self._snapshot_sent.discard(peer_hostname)
+            tasks = self._inflight_publishes.pop(peer_hostname, set())
+            ex_task = self._initial_exchange_tasks.pop(peer_hostname, None)
+
+        for t in tasks:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
+        if ex_task is not None and not ex_task.done():
+            try:
+                ex_task.cancel()
+                try:
+                    await asyncio.wait_for(ex_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+            except Exception:
+                pass
+
+        # Pop the per-peer Lock entry. Orphaning a held lock is harmless
+        # — GC'd when its task completes.
+        self._advert_locks.pop(peer_hostname, None)
+
+    async def _mark_node_dead(self, node) -> None:
+        """Centralised node-dead helper. Idempotent."""
+        if not node.enabled:
+            return
+        node.enabled = False
+        host = getattr(node, "hostname", None)
+        if host:
+            await self._drop_peer_advert_state(host)
+
+    # ── Remote-dispatch helper for publish_event step 18 ──
+
+    async def _build_remote_dispatch(
+        self,
+        topic: str,
+        payload: Any,
+        author: str,
+        author_id: str,
+        author_host: str,
+        timestamp: float,
+        request_uuid: str,
+        eff_hosts: Union[str, list, None],
+        eff_blocked_hosts: Union[str, list, None],
+    ) -> Dict[str, List[AdvertSub]]:
+        """Build per-peer list of advertised subs that match the publish
+        event after applying peer-level + sub-level filters. Returns dict
+        keyed by peer_hostname → list of surviving AdvertSub instances.
+        """
+        from notifier import TopicRegistry as _TR  # local import: cycle
+
+        out: Dict[str, List[AdvertSub]] = {}
+        async with self._adverts_struct_lock:
+            per_peer_snap = {
+                host: list(adverts.values())
+                for host, adverts in self._inbound_adverts.items()
+            }
+
+        for node in list(self.nodes):
+            if node.hostname == self.plugin_core.hostname:
+                continue
+            try:
+                if not (node.enabled and await node.is_alive()):
+                    continue
+            except Exception:
+                continue
+            if not self._hosts_match(eff_hosts, eff_blocked_hosts, node.hostname):
+                continue
+            peer_subs = per_peer_snap.get(node.hostname, [])
+            surviving: List[AdvertSub] = []
+            for advert in peer_subs:
+                if not _TR._topic_matches(advert.topic_pattern, topic):
+                    continue
+                if not self.plugin_core._sub_accepts_remote_publisher(
+                    advert, self.plugin_core.hostname, author
+                ):
+                    continue
+                if not self.plugin_core._sub_accepts_author(advert, author):
+                    continue
+                surviving.append(advert)
+            if surviving:
+                out[node.hostname] = surviving
+        return out
 
     async def _handle_ping(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
@@ -2018,21 +3615,22 @@ class NetworkManager:
             if not response:
                 node = await self._get_node(IP)
                 if node:
-                    node.enabled = False
+                    # PR3 Stage C step 17 path #6.
+                    await self._mark_node_dead(node)
                 raise NetworkRequestException("Couldnt reach host")
 
             # Check if it's a MockResponse (418 error)
             if hasattr(response, "status_code") and response.status_code == 418:
                 node = await self._get_node(IP)
                 if node:
-                    node.enabled = False
+                    await self._mark_node_dead(node)
                 raise NodeException("Host is not discoverable")
 
             # Response is now a dict, not an httpx.Response
             if not isinstance(response, dict):
                 node = await self._get_node(IP)
                 if node:
-                    node.enabled = False
+                    await self._mark_node_dead(node)
                 raise NetworkRequestException(f"Invalid response format from {IP}")
 
             # Update node info and mark enabled
@@ -2040,6 +3638,16 @@ class NetworkManager:
             if node:
                 node.enabled = True
                 await node.update(response, self.plugin_core.hostname)
+                # PR3 Stage C: peer-connect lifecycle hook (Site A —
+                # locked #7). Symmetric initial-exchange — fire-and-
+                # forget; idempotent via `_snapshot_sent`.
+                if (
+                    getattr(self.plugin_core, "networking_enabled", False)
+                    and node.hostname
+                    and node.hostname != self.plugin_core.hostname
+                    and node.hostname not in self._snapshot_sent
+                ):
+                    asyncio.create_task(self._spawn_initial_exchange(node))
 
             # Cascade discovery for returned auto_discoverable nodes.
             # Wire format: 3-tuple (IP, port, hostname).
@@ -2248,7 +3856,10 @@ class NetworkManager:
     @async_log_errors
     async def _disable_node(self, IP: str):
         self._logger.info(f"[NODE] Disabling node {IP}")
-        (await self._get_node(IP)).enabled = False
+        node = await self._get_node(IP)
+        if node is not None:
+            # PR3 Stage C step 17 path #7.
+            await self._mark_node_dead(node)
 
     @async_log_errors
     async def node_exists(self, IP: str):  # FIXME: Add search for hostname

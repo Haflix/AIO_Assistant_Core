@@ -430,3 +430,9 @@ class TopicRegistry:
         """Look up a subscription by sub_uuid."""
         async with self._lock:
             return self._subs.get(sub_uuid)
+
+    async def list_local_subs(self) -> List[Subscription]:
+        """Snapshot all local subs in insertion order. Used by Stage C
+        advert protocol for outbound snapshot build (locked #14)."""
+        async with self._lock:
+            return list(self._subs.values())
