@@ -49,9 +49,9 @@ MSG_STREAM_CHUNK = 11
 MSG_ERROR = 12
 MSG_END_STREAM = 13
 
-MSG_NOTIFY = 7  # Fire-and-forget topic notification
-MSG_TOPIC_REQUEST = 8  # Request-by-topic (one-to-one with response)
-MSG_TOPIC_REQUEST_STREAM = 9  # Streaming request-by-topic
+# MSG types 7-9 reserved (removed in PR3 Stage D —
+# ex-MSG_NOTIFY / MSG_TOPIC_REQUEST / MSG_TOPIC_REQUEST_STREAM).
+# Do not reuse these numbers for new MSG types.
 
 MSG_STREAM_ITEM_END = 14  # Marks end of one item in a streaming response
 
@@ -67,7 +67,7 @@ MSG_AUTH = 20  # Authentication message (shared secret)
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
 
-# Sentinel returned by request_topic_remote when server sends no result data.
+# Sentinel returned by request_event_remote when server sends no result data.
 # Distinguishes "handler returned None" (valid) from "no response received."
 REMOTE_NO_RESULT = object()
 
@@ -295,9 +295,6 @@ class NetworkManager:
                 MSG_PING: "PING",
                 MSG_INFO: "INFO",
                 MSG_FIND_TAGGED_ENDPOINTS: "FIND_TAGGED_ENDPOINTS",
-                MSG_NOTIFY: "NOTIFY",
-                MSG_TOPIC_REQUEST: "TOPIC_REQUEST",
-                MSG_TOPIC_REQUEST_STREAM: "TOPIC_REQUEST_STREAM",
                 MSG_PUBLISH_EVENT: "PUBLISH_EVENT",
                 MSG_REQUEST_EVENT: "REQUEST_EVENT",
                 MSG_REQUEST_EVENT_STREAM: "REQUEST_EVENT_STREAM",
@@ -756,12 +753,6 @@ class NetworkManager:
                     await self._handle_info(reader, writer, data)
                 elif msg_type == MSG_FIND_TAGGED_ENDPOINTS:
                     await self._handle_find_tagged_endpoints(reader, writer, data)
-                elif msg_type == MSG_NOTIFY:
-                    await self._handle_notify(reader, writer, data)
-                elif msg_type == MSG_TOPIC_REQUEST:
-                    await self._handle_topic_request(reader, writer, data)
-                elif msg_type == MSG_TOPIC_REQUEST_STREAM:
-                    await self._handle_topic_request_stream(reader, writer, data)
                 # PR3 Stage C dispatch — locked #17 conn_context threaded
                 elif msg_type == MSG_PUBLISH_EVENT:
                     await self._handle_publish_event(reader, writer, data, conn_context)
@@ -1114,110 +1105,6 @@ class NetworkManager:
             )
             await self._send_error(writer, str(e))
 
-    # ── Notifier handlers (server-side, called when a remote node sends us a topic message) ──
-
-    async def _handle_notify(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
-    ):
-        """Handle MSG_NOTIFY: fan out to local subscribers."""
-        try:
-            topic = data.get("topic")
-            args = data.get("args")
-            author = data.get("author", "remote")
-            author_id = data.get("author_id", "remote")
-
-            self._logger.info(f"[NOTIFY] Remote notify for topic '{topic}'")
-
-            count = await self.plugin_core.notify(
-                topic,
-                args,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-            )
-            await self._send_message(writer, MSG_RESULT, {"count": count})
-        except Exception as e:
-            self._logger.exception(f"[NOTIFY] Exception: {e}")
-            await self._send_error(writer, str(e))
-
-    async def _handle_topic_request(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
-    ):
-        """Handle MSG_TOPIC_REQUEST: find local handler and return result."""
-        try:
-            topic = data.get("topic")
-            args = data.get("args")
-            author = data.get("author", "remote")
-            author_id = data.get("author_id", "remote")
-            timeout = data.get("timeout")
-
-            self._logger.info(f"[TOPIC_REQUEST] Remote request for topic '{topic}'")
-
-            result = await self.plugin_core.request_topic(
-                topic,
-                args,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-                timeout=timeout,
-            )
-
-            # Send result using same chunked protocol as _handle_execute
-            payload = pickle.dumps(result)
-            if len(payload) > CHUNK_SIZE:
-                offset = 0
-                while offset < len(payload):
-                    chunk_data = payload[offset : offset + CHUNK_SIZE]
-                    chunk_length = len(chunk_data) + 1
-                    header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                    writer.write(header + chunk_data)
-                    await writer.drain()
-                    offset += CHUNK_SIZE
-            else:
-                chunk_length = len(payload) + 1
-                header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                writer.write(header + payload)
-                await writer.drain()
-
-            await self._send_end_stream(writer)
-        except Exception as e:
-            self._logger.exception(f"[TOPIC_REQUEST] Exception: {e}")
-            await self._send_error(writer, str(e))
-
-    async def _handle_topic_request_stream(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
-    ):
-        """Handle MSG_TOPIC_REQUEST_STREAM: find local handler and stream results."""
-        try:
-            topic = data.get("topic")
-            args = data.get("args")
-            author = data.get("author", "remote")
-            author_id = data.get("author_id", "remote")
-            timeout = data.get("timeout")
-
-            self._logger.info(
-                f"[TOPIC_STREAM] Remote stream request for topic '{topic}'"
-            )
-
-            async for chunk in self.plugin_core.request_topic_stream(
-                topic,
-                args,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-                timeout=timeout,
-            ):
-                payload = pickle.dumps(chunk)
-                chunk_length = len(payload) + 1
-                header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                writer.write(header + payload)
-                await writer.drain()
-
-            await self._send_end_stream(writer)
-        except Exception as e:
-            self._logger.exception(f"[TOPIC_STREAM] Exception: {e}")
-            await self._send_error(writer, str(e))
-
     # ── PR3 Stage C handlers + helpers (locked #1, #13, #15, #17) ──
 
     def _safe_peer_ip(self, writer: asyncio.StreamWriter) -> Optional[str]:
@@ -1322,8 +1209,8 @@ class NetworkManager:
         return True
 
     def _serialize_local_sub_for_peer(self, sub) -> dict:
-        """Project a Stage-B Subscription to wire-payload dict. Drops
-        legacy ``handler`` slot (B-053) and receiver-only fields.
+        """Project a Subscription to wire-payload dict. Drops receiver-only
+        fields (target_plugin, target_access_name) that the peer does not need.
         """
         return {
             "sub_uuid": sub.sub_uuid,
@@ -3277,186 +3164,6 @@ class NetworkManager:
                         await writer.wait_closed()
                     except Exception:
                         pass
-
-    # ── Notifier client methods (called by PluginCore to reach remote nodes) ──
-
-    async def notify_remote(
-        self,
-        IP: str,
-        topic: str,
-        args=None,
-        author: str = "remote",
-        author_id: str = "remote",
-    ) -> int:
-        """Send a fire-and-forget notification to a remote node."""
-        reader = None
-        writer = None
-        connection_returned = False
-        try:
-            reader, writer = await self._get_connection(IP)
-            request_data = {
-                "topic": topic,
-                "args": args,
-                "author": author,
-                "author_id": author_id,
-            }
-            await self._send_message(writer, MSG_NOTIFY, request_data)
-
-            msg_type, data = await self._receive_message(reader)
-            if msg_type == MSG_ERROR:
-                self._logger.warning(
-                    f"[NOTIFY_REMOTE] Node {IP} returned error: {data}"
-                )
-                return 0
-
-            await self._return_connection(IP, reader, writer)
-            connection_returned = True
-            return data.get("count", 0) if isinstance(data, dict) else 0
-        except Exception as e:
-            self._logger.exception(f"[NOTIFY_REMOTE] Error notifying {IP}: {e}")
-            return 0
-        finally:
-            if reader and writer and not connection_returned:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-    async def request_topic_remote(
-        self,
-        IP: str,
-        topic: str,
-        args=None,
-        author: str = "remote",
-        author_id: str = "remote",
-        timeout=None,
-    ):
-        """Request-by-topic on a remote node, returning the result."""
-        reader = None
-        writer = None
-        connection_returned = False
-        try:
-            reader, writer = await self._get_connection(IP)
-            request_data = {
-                "topic": topic,
-                "args": args,
-                "author": author,
-                "author_id": author_id,
-                "timeout": timeout,
-            }
-            await self._send_message(writer, MSG_TOPIC_REQUEST, request_data)
-
-            # Receive chunked response (same protocol as execute_remote)
-            result_chunks_bytes = []
-            while True:
-                length_bytes = await reader.readexactly(4)
-                msg_length = struct.unpack(">I", length_bytes)[0]
-                if msg_length > MAX_MESSAGE_SIZE:
-                    raise NetworkRequestException(
-                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
-                    )
-                msg_type_byte = await reader.readexactly(1)
-                msg_type = msg_type_byte[0]
-                payload_length = msg_length - 1
-
-                if payload_length > 0:
-                    payload = await reader.readexactly(payload_length)
-                    if msg_type == MSG_STREAM_CHUNK:
-                        result_chunks_bytes.append(payload)
-                    elif msg_type == MSG_END_STREAM:
-                        break
-                    elif msg_type == MSG_ERROR:
-                        error_data = pickle.loads(payload)
-                        raise NetworkRequestException(str(error_data))
-                    else:
-                        raise NetworkRequestException(
-                            f"Unexpected msg type: {msg_type}"
-                        )
-                elif msg_type == MSG_END_STREAM:
-                    break
-
-            await self._return_connection(IP, reader, writer)
-            connection_returned = True
-
-            if result_chunks_bytes:
-                full_pickled = b"".join(result_chunks_bytes)
-                return pickle.loads(full_pickled)
-            return REMOTE_NO_RESULT
-        except Exception as e:
-            self._logger.exception(f"[TOPIC_REQUEST_REMOTE] Error from {IP}: {e}")
-            raise
-        finally:
-            if reader and writer and not connection_returned:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-    async def request_topic_stream_remote(
-        self,
-        IP: str,
-        topic: str,
-        args=None,
-        author: str = "remote",
-        author_id: str = "remote",
-        timeout=None,
-    ):
-        """Request-by-topic streaming on a remote node, yielding results."""
-        reader = None
-        writer = None
-        connection_returned = False
-        try:
-            reader, writer = await self._get_connection(IP)
-            request_data = {
-                "topic": topic,
-                "args": args,
-                "author": author,
-                "author_id": author_id,
-                "timeout": timeout,
-            }
-            await self._send_message(writer, MSG_TOPIC_REQUEST_STREAM, request_data)
-
-            while True:
-                length_bytes = await reader.readexactly(4)
-                msg_length = struct.unpack(">I", length_bytes)[0]
-                if msg_length > MAX_MESSAGE_SIZE:
-                    raise NetworkRequestException(
-                        f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
-                    )
-                msg_type_byte = await reader.readexactly(1)
-                msg_type = msg_type_byte[0]
-                payload_length = msg_length - 1
-
-                if payload_length > 0:
-                    payload = await reader.readexactly(payload_length)
-                    if msg_type == MSG_STREAM_CHUNK:
-                        yield pickle.loads(payload)
-                    elif msg_type == MSG_END_STREAM:
-                        break
-                    elif msg_type == MSG_ERROR:
-                        error_data = pickle.loads(payload)
-                        raise NetworkRequestException(str(error_data))
-                    else:
-                        raise NetworkRequestException(
-                            f"Unexpected msg type: {msg_type}"
-                        )
-                elif msg_type == MSG_END_STREAM:
-                    break
-
-            await self._return_connection(IP, reader, writer)
-            connection_returned = True
-        except Exception as e:
-            self._logger.exception(f"[TOPIC_STREAM_REMOTE] Error from {IP}: {e}")
-            raise
-        finally:
-            if reader and writer and not connection_returned:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
 
     # async def execute_remote(
     #    self,

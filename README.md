@@ -253,7 +253,7 @@ Manages network communication between multiple nodes for distributed plugin exec
 - Endpoint availability checking across nodes via `node_has_endpoint()`
 - Tag-based endpoint discovery on remote nodes via `node_get_tagged_endpoints()`
 - Remote plugin execution and streaming
-- Cross-node topic notify/request via `notify_remote()`, `request_topic_remote()`, and `request_topic_stream_remote()`
+- Cross-node topic publish/request via `publish_event_remote()`, `request_event_remote()`, and `request_event_stream_remote()`
 - Heartbeat-based liveness monitoring
 - Background loops for discovery and heartbeat
 
@@ -269,17 +269,23 @@ Each message uses a binary format: `[4-byte length][1-byte message_type][pickle 
 | Ping | `MSG_PING` (4) | Health check / heartbeat |
 | Info | `MSG_INFO` (5) | Exchange node information and discovery data |
 | Find Tagged Endpoints | `MSG_FIND_TAGGED_ENDPOINTS` (6) | Query endpoints by tag on a remote node |
-| Notify | `MSG_NOTIFY` (7) | Fire-and-forget topic publish to remote nodes |
-| Topic Request | `MSG_TOPIC_REQUEST` (8) | Request-by-topic call to a remote node |
-| Topic Request Stream | `MSG_TOPIC_REQUEST_STREAM` (9) | Streaming request-by-topic to a remote node |
 | Result | `MSG_RESULT` (10) | Response with result data |
 | Stream Chunk | `MSG_STREAM_CHUNK` (11) | A chunk of streaming data |
 | Error | `MSG_ERROR` (12) | Error response |
 | End Stream | `MSG_END_STREAM` (13) | Marks end of a stream |
 | Stream Item End | `MSG_STREAM_ITEM_END` (14) | Marks end of an individual streamed item |
+| Publish Event | `MSG_PUBLISH_EVENT` (15) | Fire-and-forget event publish to remote nodes |
+| Request Event | `MSG_REQUEST_EVENT` (16) | Request-by-event call to a remote node |
+| Request Event Stream | `MSG_REQUEST_EVENT_STREAM` (17) | Streaming request-by-event to a remote node |
+| Sub Advertise | `MSG_SUB_ADVERTISE` (18) | Initial subscription-snapshot exchange between peers |
+| Sub Delta | `MSG_SUB_DELTA` (19) | Incremental subscribe/unsubscribe delta to peers |
 | Auth | `MSG_AUTH` (20) | Authentication message (shared secret) |
 
-A `REMOTE_NO_RESULT` sentinel distinguishes "handler returned `None`" from "no remote handler responded" for `request_topic` calls across nodes.
+(MSG types 7-9 are reserved — they previously held the legacy notify /
+request_topic / request_topic_stream wire IDs which were retired in PR3
+Stage D.)
+
+A `REMOTE_NO_RESULT` sentinel distinguishes "handler returned `None`" from "no remote handler responded" for `request_event` calls across nodes.
 
 ### Plugin Base Class
 
@@ -495,17 +501,17 @@ for item in self.execute_stream_sync("PluginA", "streaming_method", args, hosts=
     print(item)
 ```
 
-### Topic-Based Communication (Notifier System)
+### Topic-Based Communication (Event System)
 
-The notifier system provides topic-based pub/sub and request-by-topic routing, decoupling plugins from having to know each other's names.
+The event system provides topic-based pub/sub and request-by-topic routing, decoupling plugins from having to know each other's names. Publishers declare named events in `plugin_config.yml` and call them by `event_id`; subscribers declare topic patterns plus a target endpoint that receives an `Event` object.
 
 **Two communication patterns:**
 
 | Pattern | Method | Description |
 |---|---|---|
-| Fire-and-forget | `notify()` / `notify_sync()` | One-to-many. All subscribers called concurrently, errors logged. Returns the number of subscribers that were notified (int). |
-| Request-by-topic | `request_topic()` / `request_topic_sync()` | One-to-one. First matching handler called, result returned. |
-| Streaming request | `request_topic_stream()` / `request_topic_stream_sync()` | One-to-one streaming. |
+| Fire-and-forget | `publish_event()` / `publish_event_sync()` | One-to-many. All matching subscribers called concurrently, errors logged. Returns the number of subscribers that received the event (int). |
+| Request-by-event | `request_event()` / `request_event_sync()` | One-to-one. First matching handler called, result returned. |
+| Streaming request | `request_event_stream()` / `request_event_stream_sync()` | One-to-one streaming. |
 
 **Topics** use `/` as separator. Single-level wildcard `*` matches exactly one segment:
 
@@ -515,42 +521,61 @@ The notifier system provides topic-based pub/sub and request-by-topic routing, d
 "sensor/*"                  — does NOT match "sensor/bathroom/temperature"
 ```
 
-**Subscribe via config** (in `plugin_config.yml`):
+**Declare events you publish** (publisher side, in `plugin_config.yml`):
 
 ```yaml
+events:
+  ai_chat:
+    topic: "ai/chat"
+    hosts: "any"
+```
+
+**Declare subscriptions** (subscriber side, in `plugin_config.yml`):
+
+```yaml
+subscriptions:
+  handle_chat_sub:
+    topic: "ai/chat"
+    target_access_name: handle_chat       # endpoint that receives the Event
+    hosts: "any"
 endpoints:
-  handle_chat:                    # access_name = key
-    internal_name: _handle_chat   # only needed when method name differs from key
-    topic: "ai/chat"              # auto-subscribed on plugin load
+  handle_chat:
+    internal_name: handle_chat
     remote: True
     accessible_by_other_plugins: True
+    arguments:
+      - name: event
 ```
 
 **Subscribe via code** (runtime, in `on_enable`):
 
 ```python
 async def on_enable(self):
-    self._sub_id = await self.subscribe("events/*", self._on_event)
+    self._sub_id = await self.subscribe(
+        "events/*", target_access_name="my_event_handler"
+    )
 
 async def on_disable(self):
     await self.unsubscribe(self._sub_id)
 ```
 
+The handler endpoint receives an `Event` object with `event.topic`, `event.payload`, `event.author`, and `event.author_host`.
+
 **Usage from a plugin:**
 
 ```python
 # Fire-and-forget — all subscribers receive it
-count = await self.notify("sensor/temperature", {"value": 22.5})
+count = await self.publish_event("ai_chat", payload={"message": "hello"})
 
 # Request with response — first matching handler
-result = await self.request_topic("ai/chat", {"message": "hello"})
+result = await self.request_event("ai_chat", payload={"message": "hello"})
 
 # Streaming
-async for chunk in self.request_topic_stream("ai/stream", args):
+async for chunk in self.request_event_stream("ai_stream", payload=args):
     process(chunk)
 ```
 
-**Cross-node:** Topic operations support the same `host` parameter as `execute()` (`"any"`, `"local"`, `"remote"`, or a specific hostname). Remote nodes are queried when no local handler is found.
+**Cross-node:** Event operations support the same `hosts` parameter as `execute()` (`"any"`, `"local"`, `"remote"`, or a specific hostname). Remote nodes are reached via the advertised-subscription protocol; remote subscribers receive the same `Event` object.
 
 ### Tags and Endpoint Discovery
 
@@ -743,7 +768,7 @@ plugins:
 
 - `endpoints` is **strict**: an unknown endpoint key in the override (one that doesn't exist in `plugin_config.yml`'s endpoints dict) is an ERROR and the plugin fails to load. Catches typos in deployment configs that would otherwise silently miss the override target.
 - `arguments` is **lenient**: unknown subkeys are added to the merged dict. Plugin authors are free to read or ignore them.
-- Unknown TOP-LEVEL keys in the `overrides:` block (anything not in `{arguments, endpoints, description, remote, version}`) log a WARN and are ignored. PR3 will add `events`, `subscriptions`, `prefix`, and `verbose_notifier` to this set.
+- Unknown TOP-LEVEL keys in the `overrides:` block (anything not in `{arguments, endpoints, events, subscriptions, description, remote, version, prefix, verbose_notifier}`) log a WARN and are ignored.
 
 **Merge rules (apply to `arguments` and `endpoints` deep-merges):**
 
@@ -931,56 +956,56 @@ Synchronous version of `execute_stream()`. Returns a sync generator. Must not be
 
 **Yields**: Results from the plugin's generator method
 
-#### `notify(topic, args=None, hosts="any", author="system", author_id="system")`
+#### `publish_event(event_id, payload=None, hosts=None, ...)`
 
-Fire-and-forget publish to a topic. All matching subscribers are called concurrently; errors are logged but do not propagate.
-
-**Parameters**:
-
-- `topic` (str): Topic string using `/` separator (e.g. `"sensor/bathroom/temperature"`)
-- `args` (tuple/dict/None): Arguments forwarded to every subscriber
-- `host` (str): `"local"`, `"remote"`, `"any"`, or a specific hostname
-
-**Returns**: Number of subscribers that were called (int)
-
-#### `notify_sync(topic, args=None, hosts="any", ...)`
-
-Synchronous variant of `notify()`.
-
-#### `request_topic(topic, args=None, hosts="any", author="system", author_id="system", timeout=None)`
-
-Request-by-topic: find the first matching handler and return its result. Same discovery logic as `execute()` with `hosts="any"` (local first, then remote).
+Fire-and-forget publish for a declared event. All matching subscribers are dispatched concurrently; errors are logged but do not propagate.
 
 **Parameters**:
 
-- `topic` (str): Topic string to request
-- `args` (tuple/dict/None): Arguments forwarded to the handler
-- `host` (str): `"local"`, `"remote"`, `"any"`, or a specific hostname
+- `event_id` (str): Event id declared in `events:` of `plugin_config.yml`
+- `payload` (any): Payload forwarded to every subscriber as `event.payload`
+- `hosts` (str/list): `"local"`, `"remote"`, `"any"`, or a specific hostname / list of hostnames (defaults to the event's declared `hosts`)
+
+**Returns**: Number of subscribers that received the event (int — local + remote)
+
+#### `publish_event_sync(event_id, payload=None, hosts=None, ...)`
+
+Synchronous variant of `publish_event()`.
+
+#### `request_event(event_id, payload=None, hosts=None, timeout=None, ...)`
+
+Request-by-event: find the first matching subscription and return the target endpoint's result. Same discovery logic as `execute()` with `hosts="any"` (local first, then remote).
+
+**Parameters**:
+
+- `event_id` (str): Event id declared in `events:` of `plugin_config.yml`
+- `payload` (any): Payload forwarded to the handler as `event.payload`
+- `hosts` (str/list): `"local"`, `"remote"`, `"any"`, or a specific hostname
 - `timeout` (float): Optional timeout in seconds
 
-**Returns**: Result from the handler
+**Returns**: Result from the target endpoint
 
-**Raises**: `RequestException` if no handler found
+**Raises**: `RequestException` if no subscription matches the event
 
-#### `request_topic_sync(topic, args=None, ...)`
+#### `request_event_sync(event_id, payload=None, ...)`
 
-Synchronous variant of `request_topic()`.
+Synchronous variant of `request_event()`.
 
-#### `request_topic_stream(topic, args=None, hosts="any", ...)`
+#### `request_event_stream(event_id, payload=None, hosts=None, ...)`
 
-Request-by-topic with streaming. Finds the first matching handler and yields its results.
+Request-by-event with streaming. Finds the first matching subscription and yields the target endpoint's results.
 
-**Yields**: Results from the handler's generator method
+**Yields**: Items yielded by the handler's generator method (the first item is wrapped as an `Event`)
 
-**Raises**: `RequestException` if no handler found
+**Raises**: `RequestException` if no subscription matches the event
 
-#### `request_topic_stream_sync(topic, args=None, ...)`
+#### `request_event_stream_sync(event_id, payload=None, ...)`
 
-Synchronous streaming variant of `request_topic()`.
+Synchronous streaming variant of `request_event()`.
 
-#### `subscribe(topic, plugin_name, plugin_uuid, endpoint_access_name=None, handler=None, config_driven=False)`
+#### `subscribe(topic, plugin_name, plugin_uuid, target_access_name=None, ...)`
 
-Register a topic subscription. Used internally by `Plugin.subscribe()`.
+Register a topic subscription targeted at a declared endpoint. Used internally by `Plugin.subscribe()`.
 
 **Returns**: Subscription ID (str)
 
@@ -1433,9 +1458,7 @@ AIO_Assistant_Core/
 │   ├── CLI/                   # Textual TUI dashboard (stats, plugin mgmt, config editor, logs)
 │   ├── InteropTarget/         # Interop test target (sync/async/generators)
 │   ├── InteropCaller/         # Interop test runner
-│   ├── NetTest/               # Network testing plugin (echo, big objects, streaming)
-│   ├── NotifierPublisher/     # Topic-based notifier test publisher
-│   └── NotifierSubscriber/    # Topic-based notifier test subscriber
+│   └── NetTest/               # Network testing plugin (echo, big objects, streaming)
 └── logs/                      # Auto-generated log files (AIO_AI_<timestamp>.log)
 ```
 

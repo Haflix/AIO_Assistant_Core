@@ -1,7 +1,9 @@
 """TestRemoteVictim — Phase 5 fixture (remote=False).
 
-Provides a code-driven sub on test/r/code (B-001 bypass target) and a
-streaming code-driven sub on test/r/code_stream (B-042 streaming variant).
+Provides a sub on test/r/code (B-001 bypass target) and a streaming sub
+on test/r/code_stream (B-042 streaming variant). Both subs are
+runtime-registered in on_enable via subscribe(target_access_name=...) so
+they cleanly tear down on on_disable.
 """
 
 from typing import Any
@@ -23,7 +25,7 @@ class TestRemoteVictim(Plugin):
             "test/r/code",
             self.plugin_name,
             self.plugin_uuid,
-            handler=self._code_handler,
+            target_access_name="code_handler",
         )
         self._sub_ids.append(sid)
 
@@ -31,7 +33,7 @@ class TestRemoteVictim(Plugin):
             "test/r/code_stream",
             self.plugin_name,
             self.plugin_uuid,
-            handler=self._code_stream_handler,
+            target_access_name="code_stream_handler",
         )
         self._sub_ids.append(sid_stream)
         self._logger.debug(
@@ -47,11 +49,11 @@ class TestRemoteVictim(Plugin):
                 pass
         self._sub_ids = []
 
-    async def _code_handler(self, *args, **kwargs):
+    async def code_handler(self, event=None):
         self.bypass_count += 1
 
     @async_gen_log_errors
-    async def _code_stream_handler(self, *args, **kwargs):
+    async def code_stream_handler(self, event=None):
         for i in range(3):
             self.stream_bypass_count += 1
             yield f"bypass_{i}"
@@ -61,7 +63,9 @@ class TestRemoteVictim(Plugin):
         return value
 
     @async_log_errors
-    async def r_topic_local_only(self, payload: Any = None) -> Any:
+    async def r_topic_local_only(self, event=None) -> Any:
+        # Subscriber endpoints receive an Event under the new API.
+        payload = event.payload if event is not None else None
         return {"local_only_received": payload}
 
     @async_log_errors

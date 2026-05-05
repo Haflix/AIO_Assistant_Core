@@ -49,17 +49,9 @@ plugins:
     enabled: false
     path: ./plugins_test/TestStreamTarget
 
-  - name: TestNotifierSuite
+  - name: TestEventSuite
     enabled: false
-    path: ./plugins_test/TestNotifierSuite
-
-  - name: TestNotifierTarget
-    enabled: false
-    path: ./plugins_test/TestNotifierTarget
-
-  - name: TestNotifierBadActor       # loaded on-demand by TestNotifierSuite
-    enabled: false
-    path: ./plugins_test/TestNotifierBadActor
+    path: ./plugins_test/TestEventSuite
 
   - name: TestLifecycleSuite
     enabled: false
@@ -92,10 +84,6 @@ plugins:
   - name: TestRemoteVictim              # loaded by the Phase 5 subprocess only
     enabled: false
     path: ./plugins_test/TestRemoteVictim
-
-  - name: TestRemoteSpoofer             # loaded by the Phase 5 subprocess only
-    enabled: false
-    path: ./plugins_test/TestRemoteSpoofer
 
   - name: CLI
     enabled: true

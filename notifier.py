@@ -1,21 +1,12 @@
 """
 Topic-based pub/sub notification and request-by-topic routing system.
 
-PR3 Stage B: TopicRegistry + Subscription dataclass refactored for the
-publish_event/request_event API. Subscriptions reference a TARGET endpoint
-(target_plugin + target_access_name) instead of carrying a raw handler
-callable. Matching iterates a single insertion-ordered structure so YAML
-declaration order alone determines tie-breaks (LOCKED C — no more
-exact-then-wildcard split).
-
-The OLD `notify`/`request_topic` API (PluginCore.notify, request_topic,
-their sync + stream variants) still calls into this registry. Stage B
-keeps that path alive — Stage D removes it. To bridge both APIs, the
-Subscription dataclass keeps a small back-compat shim: legacy
-``handler``/``endpoint_access_name``/``config_driven`` fields are
-re-exposed as Python ``@property`` overlays on top of the new
-``target_plugin``/``target_access_name``/``declared_id`` fields, so the
-old PluginCore.notify path keeps reading them by attribute name.
+TopicRegistry + Subscription dataclass back the publish_event /
+request_event API. Subscriptions reference a TARGET endpoint
+(``target_plugin`` + ``target_access_name``) instead of carrying a raw
+handler callable. Matching iterates a single insertion-ordered structure
+so YAML declaration order alone determines tie-breaks — there is no
+exact-then-wildcard split.
 
 Topics use "/" as separator (e.g. "ai/chat", "sensor/bathroom/temperature").
 Single-level wildcard "*" is supported: "sensor/*/temperature" matches
@@ -26,7 +17,7 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union
 from uuid import uuid4
 
 
@@ -74,13 +65,13 @@ class SyncDispatcher:
 
 @dataclass
 class Subscription:
-    """A single topic subscription (PR3 Stage B — new shape).
+    """A single topic subscription.
 
     Per LOCKED IN PR3 NOTIFIER YAML + EVENT MODEL section D + the
     "TopicRegistry / Subscription dataclass field updates" notes:
 
       * ``sub_uuid`` — always uuid4 hex (Q6 β + uuid naming convention).
-        Replaces the legacy ``id`` field as the canonical identity.
+        Canonical identity.
       * ``declared_id`` — YAML key for declared subs; ``None`` for
         runtime subs. Used as Event.subscription_id for declared subs
         per C4 (a).
@@ -95,18 +86,6 @@ class Subscription:
       * ``hosts`` / ``blocked_hosts`` / ``authors`` / ``blocked_authors``
         — receiver-side filter chain.
       * ``enabled`` — Q13 opt-out flag, default True.
-
-    Legacy fields (Stage B compat — Stage D removes them):
-      * ``id`` — alias for sub_uuid; old code reads it directly.
-      * ``handler`` — bare callable for code-driven subs registered via
-        the legacy ``Plugin.subscribe(topic, handler=...)`` path.
-      * ``endpoint_access_name`` — alias for target_access_name.
-      * ``config_driven`` — derived from ``declared_id is not None``,
-        but kept as a real field for the legacy path that reads it.
-
-    The legacy fields are populated by the legacy ``subscribe(handler=...)``
-    code path; new code uses ``target_plugin`` + ``target_access_name``
-    and never reads the legacy fields.
     """
 
     # Identity
@@ -134,17 +113,8 @@ class Subscription:
     # Opt-out flag (Q13). Disabled subs are skipped at registration.
     enabled: bool = True
 
-    # ── LEGACY fields (Stage B only; Stage D removes) ──────────────
-    # The old PluginCore.notify / request_topic path reads these
-    # directly. New code SHOULD NOT use them.
-    handler: Optional[Callable] = None
-    endpoint_access_name: Optional[str] = None
-    config_driven: bool = False
-
     def __repr__(self) -> str:
-        target = f"{self.target_plugin}.{self.target_access_name}" if (
-            self.target_plugin or self.target_access_name
-        ) else (self.endpoint_access_name or "?")
+        target = f"{self.target_plugin}.{self.target_access_name}"
         head = self.declared_id or self.sub_uuid[:8]
         return f"Sub({head}, {self.topic_pattern} -> {target})"
 
@@ -192,14 +162,6 @@ class TopicRegistry:
         # YAML-key lookups (override-time, debugging). NOT used for
         # matching.
         self._by_declared: Dict[tuple, str] = {}
-
-    @property
-    def _by_id(self) -> Dict[str, Subscription]:
-        """Legacy alias for ``_subs``. Stage B keeps this around because
-        TestNotifierSuite (still alive until Stage D) pokes into the
-        registry directly. Stage D removes both the test and the alias.
-        """
-        return self._subs
 
     @staticmethod
     def _is_wildcard(topic: str) -> bool:
@@ -262,7 +224,6 @@ class TopicRegistry:
         topic_pattern: str,
         plugin_name: str,
         plugin_uuid: str,
-        # Stage B: prefer target_plugin / target_access_name
         target_plugin: Optional[str] = None,
         target_access_name: Optional[str] = None,
         target_plugin_uuid: Optional[str] = None,
@@ -272,32 +233,14 @@ class TopicRegistry:
         blocked_authors: Union[str, list, None] = None,
         declared_id: Optional[str] = None,
         enabled: bool = True,
-        # Legacy kwargs — Stage B back-compat. Stage D removes them.
-        endpoint_access_name: Optional[str] = None,
-        handler: Optional[Callable] = None,
-        config_driven: bool = False,
     ) -> str:
         """Build and register a Subscription. Returns sub_uuid.
 
-        Two calling conventions are supported during Stage B:
-          1. NEW (Stage B+): pass ``target_plugin`` + ``target_access_name``.
-          2. LEGACY (still alive in Stage B; removed in Stage D): pass
-             ``endpoint_access_name`` (treated as target_access_name on
-             the calling plugin) — also accepts ``handler=`` kwarg for
-             code-driven subs that route through the OLD PluginCore.notify
-             path. The OLD path inspects ``sub.handler`` via a
-             ``@property`` shim and calls it directly.
-
-        Code-driven legacy subs (``handler=`` only) are stored as a
-        Subscription with ``target_plugin/target_access_name`` blank and
-        a ``_legacy_handler`` slot patched on the dataclass instance —
-        the legacy notify path uses ``sub.handler`` (the property)
-        which dispatches to the slot. New code MUST NOT depend on this.
+        ``target_plugin`` defaults to ``plugin_name`` (self-routing).
+        ``target_access_name`` is required (resolves to the endpoint that
+        receives the dispatched event).
         """
-        # Stage B compat: if caller used the old endpoint_access_name kwarg
-        # without target_plugin, treat the sub as routed back to the owner.
         effective_target_plugin = target_plugin or plugin_name
-        effective_target_access = target_access_name or endpoint_access_name or ""
 
         sub = Subscription(
             sub_uuid=uuid4().hex,
@@ -306,21 +249,13 @@ class TopicRegistry:
             plugin_name=plugin_name,
             plugin_uuid=plugin_uuid,
             target_plugin=effective_target_plugin,
-            target_access_name=effective_target_access,
+            target_access_name=target_access_name or "",
             target_plugin_uuid=target_plugin_uuid,
             hosts=hosts,
             blocked_hosts=blocked_hosts,
             authors=authors,
             blocked_authors=blocked_authors,
             enabled=enabled,
-            # Legacy field population — Stage D removes:
-            handler=handler,
-            endpoint_access_name=(
-                endpoint_access_name
-                if endpoint_access_name is not None
-                else (target_access_name or None)
-            ),
-            config_driven=config_driven or (declared_id is not None),
         )
 
         return await self.register(sub)

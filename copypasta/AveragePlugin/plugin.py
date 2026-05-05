@@ -79,19 +79,20 @@ class AveragePlugin(Plugin):
         return result
 
     @async_log_errors
-    async def handle_event(self, data):
+    async def handle_event(self, event):
         """
         Example topic-subscribed endpoint.
 
         This method is called when someone publishes to "example/event"
-        via self.notify("example/event", data) or
-        self.request_topic("example/event", data).
+        via self.publish_event("example_event_id", payload=...) or
+        self.request_event("example_event_id", payload=...).
 
-        No need to know which plugin handles this — topic-based routing
-        decouples the caller from the handler.
+        Subscriber endpoints receive an Event object with .topic, .payload,
+        .author, .author_host. Topic-based routing decouples the caller
+        from the handler.
         """
-        self._logger.info(f"Received event: {data}")
-        return {"received": data, "handled_by": self.plugin_name}
+        self._logger.info(f"Received event payload: {event.payload}")
+        return {"received": event.payload, "handled_by": self.plugin_name}
 
     @async_gen_log_errors
     async def example_stream(self, count):

@@ -23,7 +23,6 @@ import inspect
 import asyncio
 import time
 import threading
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
@@ -50,7 +49,7 @@ from decorators import (
     gen_log_errors,
     gen_handle_errors,
 )
-from networking import NetworkManager, REMOTE_NO_RESULT
+from networking import NetworkManager
 from notifier import TopicRegistry, Subscription, SyncDispatcher
 
 
@@ -1457,11 +1456,10 @@ class PluginCore:
             if plugin_uuid:
                 self.plugins_by_uuid[plugin_uuid] = plugin
 
-        # PR3 Stage B: legacy `topic:` field auto-registration is now
-        # done in _register_yaml_subscriptions (called from
-        # _enable_plugin) so that disable -> re-enable re-registers
-        # the subs. Stage D removes the legacy `topic:` field path
-        # entirely.
+        # PR3 Stage B moved YAML subscription registration to
+        # _register_yaml_subscriptions (called from _enable_plugin) so
+        # that disable -> re-enable re-registers subs. Stage D removed
+        # the legacy `topic:` field auto-registration path entirely.
 
         self._logger.info(
             f"Successfully loaded plugin: {name} (Version: {plugin.version}, Path: {path})"
@@ -1677,10 +1675,8 @@ class PluginCore:
         """Register every YAML-declared subscription for ``plugin`` per
         Q23 + C15 + LOCKED A subscriptions: shape.
 
-        Stage B also re-applies the legacy ``topic:`` field
-        auto-registration here (Stage D removes that path) — moving
-        from load-time to on_enable-time so disable -> re-enable
-        cycles re-register the subs naturally.
+        Subscription registration runs at on_enable-time (not load-time)
+        so that disable -> re-enable cycles re-register subs naturally.
 
         Disabled subs (``enabled: false``) get a Subscription with
         ``enabled=False`` so they live in the registry (visible to
@@ -1709,25 +1705,6 @@ class PluginCore:
                 # PR3 Stage C add-delta hook (locked #18 item 3) — YAML
                 # path. No-op when networking is disabled / not ready.
                 await self._broadcast_yaml_sub_added(sub_uuid)
-
-        # Legacy `topic:` field on endpoints — Stage B keeps alive,
-        # Stage D removes.
-        endpoints_dict = getattr(plugin, "endpoints", {}) or {}
-        if isinstance(endpoints_dict, dict):
-            for ep_key, endpoint in endpoints_dict.items():
-                if not isinstance(endpoint, dict):
-                    continue
-                topic = endpoint.get("topic")
-                if topic and isinstance(topic, str) and topic.strip():
-                    sub_uuid = await self.topic_registry.subscribe(
-                        topic_pattern=topic.strip(),
-                        plugin_name=plugin.plugin_name,
-                        plugin_uuid=plugin.plugin_uuid,
-                        endpoint_access_name=ep_key,
-                        config_driven=True,
-                    )
-                    plugin._sub_uuids.append(sub_uuid)
-                    await self._broadcast_yaml_sub_added(sub_uuid)
 
     async def _broadcast_yaml_sub_added(self, sub_uuid: str) -> None:
         """Helper used by YAML-registration sites to push add-delta to
@@ -2898,524 +2875,39 @@ class PluginCore:
 
     # ── Notifier system ───────────────────────────────────────────────
 
-    async def _resolve_subscription(self, sub: Subscription) -> tuple:
-        """
-        Resolve a Subscription to (plugin_name, access_name) for use with execute().
-
-        For config-driven subs, the endpoint access_name is already known.
-        For code-driven subs, a temporary endpoint is not needed — we call the
-        handler directly via _call_endpoint.
-        """
-        return sub.plugin_name, sub.endpoint_access_name, sub.handler
-
-    @async_log_errors
-    async def notify(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-    ) -> int:
-        """
-        Fire-and-forget publish to a topic. All matching subscribers are called
-        concurrently; errors are logged but do not propagate.
-
-        Returns the number of subscribers that were called.
-
-        .. deprecated::
-            The notifier subsystem is being redesigned. List-form
-            hosts/blocked_hosts is rejected on this legacy path; full list
-            support arrives with the rework. See notes.txt.
-        """
-        warnings.warn(
-            "PluginCore.notify() uses the legacy notifier subsystem which is "
-            "being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
-        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
-            raise ValueError(
-                "Legacy notifier methods do not yet support list-form hosts/"
-                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
-                "or a single hostname. Full list support arrives with the "
-                "notifier rework."
-            )
-
-        subs = await self.topic_registry.find_all(topic)
-        if not subs:
-            self._logger.debug(f"Notify '{topic}': no subscribers")
-            return 0
-
-        called = 0
-
-        async def _call_sub(sub: Subscription):
-            nonlocal called
-            try:
-                plugin_name, access_name, handler = await self._resolve_subscription(
-                    sub
-                )
-
-                if handler is not None:
-                    # Code-driven: call handler directly
-                    await self._call_endpoint(handler, args)
-                elif access_name:
-                    # Config-driven: route through execute()
-                    await self.execute(
-                        plugin_name,
-                        access_name,
-                        args,
-                        plugin_uuid=sub.plugin_uuid,
-                        hosts="local",
-                        author=author,
-                        author_id=author_id,
-                    )
-                called += 1
-            except Exception as e:
-                self._logger.warning(
-                    f"Notify '{topic}': subscriber {sub} raised {type(e).__name__}: {e}"
-                )
-
-        # Local subscribers
-        local_subs = [s for s in subs if s.plugin_uuid in self.plugins_by_uuid]
-        local_targeted = hosts in ("any", "local", self.hostname)
-        local_blocked = (
-            blocked_hosts in ("any", "local", self.hostname)
-            if blocked_hosts
-            else False
-        )
-        if local_targeted and not local_blocked and local_subs:
-            await asyncio.gather(*[_call_sub(s) for s in local_subs])
-
-        # Remote notify (broadcast to all nodes)
-        remote_needed = hosts in ("any", "remote") or (
-            hosts not in ("local", self.hostname)
-        )
-        if remote_needed and getattr(self, "networking_enabled", False):
-            for node in self.network.nodes:
-                if not (node.enabled and await node.is_alive()):
-                    continue
-                if hosts not in ("any", "remote") and node.hostname != hosts:
-                    continue
-                if blocked_hosts is not None and (
-                    blocked_hosts in ("any", "remote")
-                    or blocked_hosts == node.hostname
-                ):
-                    continue
-                try:
-                    await self.network.notify_remote(
-                        node.IP,
-                        topic,
-                        args,
-                        author,
-                        author_id,
-                    )
-                    called += 1  # Count remote dispatch as one call
-                except Exception as e:
-                    self._logger.warning(
-                        f"Notify '{topic}': remote node {node.hostname} failed: {e}"
-                    )
-
-        return called
-
-    @log_errors
-    def notify_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-    ) -> int:
-        """Synchronous variant of notify().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.notify_sync() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        future = asyncio.run_coroutine_threadsafe(
-            self.notify(topic, args, hosts, blocked_hosts, author, author_id),
-            self.main_event_loop,
-        )
-        return future.result()
-
-    @async_log_errors
-    async def request_topic(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Request-by-topic: find the first matching handler and return its result.
-        Same discovery logic as execute() with hosts="any" (local first).
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.request_topic() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
-        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
-            raise ValueError(
-                "Legacy notifier methods do not yet support list-form hosts/"
-                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
-                "or a single hostname. Full list support arrives with the "
-                "notifier rework."
-            )
-
-        # Try local subscription first (only if hosts includes local and not blocked)
-        sub = None
-        local_targeted = hosts in ("any", "local", self.hostname)
-        local_blocked = (
-            blocked_hosts in ("any", "local", self.hostname)
-            if blocked_hosts
-            else False
-        )
-        if local_targeted and not local_blocked:
-            sub = await self.topic_registry.find_first(topic)
-
-        if sub is not None:
-            plugin_name, access_name, handler = await self._resolve_subscription(sub)
-
-            if handler is not None:
-                return await self._call_endpoint(handler, args)
-
-            return await self.execute(
-                plugin_name,
-                access_name,
-                args,
-                plugin_uuid=sub.plugin_uuid,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-                timeout=timeout,
-            )
-
-        # No local match (or hosts excludes local) — check remote
-        if getattr(self, "networking_enabled", False) and hosts not in (
-            "local",
-            self.hostname,
-        ):
-            for node in self.network.nodes:
-                if not (node.enabled and await node.is_alive()):
-                    continue
-                if hosts not in ("any", "remote") and node.hostname != hosts:
-                    continue
-                if blocked_hosts is not None and (
-                    blocked_hosts in ("any", "remote")
-                    or blocked_hosts == node.hostname
-                ):
-                    continue
-                try:
-                    result = await self.network.request_topic_remote(
-                        node.IP,
-                        topic,
-                        args,
-                        author,
-                        author_id,
-                        timeout,
-                    )
-                    if result is not REMOTE_NO_RESULT:
-                        return result
-                except Exception as e:
-                    self._logger.warning(
-                        f"request_topic '{topic}': remote {node.hostname} failed: {e}"
-                    )
-
-        raise RequestException(f"No handler found for topic '{topic}'")
-
-    @log_errors
-    def request_topic_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Synchronous variant of request_topic().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.request_topic_sync() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        chain = getattr(_sync_call_chain, "chain", ())
-        target = f"topic:{topic}"
-        if target in chain:
-            raise RequestException(
-                f"Circular sync call: {' -> '.join(chain)} -> {target}"
-            )
-
-        future = asyncio.run_coroutine_threadsafe(
-            self.request_topic(
-                topic, args, hosts, blocked_hosts, author, author_id, timeout
-            ),
-            self.main_event_loop,
-        )
-        return future.result()
-
-    @async_gen_log_errors
-    async def request_topic_stream(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Request-by-topic with streaming: find the first matching handler
-        and yield its results.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.request_topic_stream() uses the legacy notifier "
-            "subsystem which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
-        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
-            raise ValueError(
-                "Legacy notifier methods do not yet support list-form hosts/"
-                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
-                "or a single hostname. Full list support arrives with the "
-                "notifier rework."
-            )
-
-        sub = None
-        local_targeted = hosts in ("any", "local", self.hostname)
-        local_blocked = (
-            blocked_hosts in ("any", "local", self.hostname)
-            if blocked_hosts
-            else False
-        )
-        if local_targeted and not local_blocked:
-            sub = await self.topic_registry.find_first(topic)
-
-        if sub is None:
-            if getattr(self, "networking_enabled", False) and hosts not in (
-                "local",
-                self.hostname,
-            ):
-                for node in self.network.nodes:
-                    if not (node.enabled and await node.is_alive()):
-                        continue
-                    if hosts not in ("any", "remote") and node.hostname != hosts:
-                        continue
-                    if blocked_hosts is not None and (
-                        blocked_hosts in ("any", "remote")
-                        or blocked_hosts == node.hostname
-                    ):
-                        continue
-                    try:
-                        async for chunk in self.network.request_topic_stream_remote(
-                            node.IP,
-                            topic,
-                            args,
-                            author,
-                            author_id,
-                            timeout,
-                        ):
-                            yield chunk
-                        return
-                    except Exception as e:
-                        self._logger.warning(
-                            f"request_topic_stream '{topic}': remote {node.hostname} failed: {e}"
-                        )
-            raise RequestException(f"No handler found for topic '{topic}'")
-
-        plugin_name, access_name, handler = await self._resolve_subscription(sub)
-
-        if handler is not None:
-            # Code-driven handler — must be an async generator
-            if inspect.isasyncgenfunction(handler):
-                if isinstance(args, tuple):
-                    async for chunk in handler(*args):
-                        yield chunk
-                elif isinstance(args, dict):
-                    async for chunk in handler(**args):
-                        yield chunk
-                elif args is None:
-                    async for chunk in handler():
-                        yield chunk
-                else:
-                    async for chunk in handler(args):
-                        yield chunk
-            elif inspect.isgeneratorfunction(handler):
-                if isinstance(args, tuple):
-                    gen = handler(*args)
-                elif isinstance(args, dict):
-                    gen = handler(**args)
-                elif args is None:
-                    gen = handler()
-                else:
-                    gen = handler(args)
-                sentinel = object()
-                while True:
-                    chunk = await asyncio.to_thread(next, gen, sentinel)
-                    if chunk is sentinel:
-                        break
-                    yield chunk
-            else:
-                raise RequestException(
-                    f"Handler for topic '{topic}' is not a generator function"
-                )
-        else:
-            async for chunk in self.execute_stream(
-                plugin_name,
-                access_name,
-                args,
-                plugin_uuid=sub.plugin_uuid,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-                timeout=timeout,
-            ):
-                yield chunk
-
-    @gen_log_errors
-    def request_topic_stream_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        author: str = "system",
-        author_id: str = "system",
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Synchronous streaming variant of request_topic().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.request_topic_stream_sync() uses the legacy notifier "
-            "subsystem which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        hosts, blocked_hosts = self._validate_host_args(hosts, blocked_hosts)
-        if isinstance(hosts, list) or isinstance(blocked_hosts, list):
-            raise ValueError(
-                "Legacy notifier methods do not yet support list-form hosts/"
-                "blocked_hosts. Use a string keyword ('any'/'local'/'remote') "
-                "or a single hostname. Full list support arrives with the "
-                "notifier rework."
-            )
-
-        sub = asyncio.run_coroutine_threadsafe(
-            self.topic_registry.find_first(topic),
-            self.main_event_loop,
-        ).result()
-
-        if sub is None:
-            raise RequestException(f"No handler found for topic '{topic}'")
-
-        plugin_name, access_name, handler = asyncio.run_coroutine_threadsafe(
-            self._resolve_subscription(sub),
-            self.main_event_loop,
-        ).result()
-
-        if handler is not None:
-            if inspect.isgeneratorfunction(handler):
-                if isinstance(args, tuple):
-                    yield from handler(*args)
-                elif isinstance(args, dict):
-                    yield from handler(**args)
-                elif args is None:
-                    yield from handler()
-                else:
-                    yield from handler(args)
-            else:
-                raise RequestException(
-                    f"Handler for topic '{topic}' is not a sync generator"
-                )
-        else:
-            for chunk in self.execute_stream_sync(
-                plugin_name,
-                access_name,
-                args,
-                plugin_uuid=sub.plugin_uuid,
-                hosts="local",
-                author=author,
-                author_id=author_id,
-                timeout=timeout,
-            ):
-                yield chunk
-
     async def subscribe(
         self,
         topic: str,
         plugin_name: str,
         plugin_uuid: str,
-        endpoint_access_name: Optional[str] = None,
-        handler: Optional[Callable] = None,
-        config_driven: bool = False,
+        target_plugin: Optional[str] = None,
+        target_access_name: Optional[str] = None,
+        target_plugin_uuid: Optional[str] = None,
+        hosts: Union[str, list, None] = "any",
+        blocked_hosts: Union[str, list, None] = None,
+        authors: Union[str, list, None] = None,
+        blocked_authors: Union[str, list, None] = None,
+        declared_id: Optional[str] = None,
+        enabled: bool = True,
     ) -> str:
-        """Register a topic subscription. Returns subscription ID.
-
-        .. deprecated::
-            The notifier subsystem is being redesigned. ``handler=`` will be
-            removed and subscriptions will require an endpoint access_name
-            target. See notes.txt.
-        """
-        warnings.warn(
-            "PluginCore.subscribe() uses the legacy notifier subsystem which "
-            "is being redesigned (handler= will be removed). See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        """Register a topic subscription. Returns subscription ID."""
         return await self.topic_registry.subscribe(
             topic_pattern=topic,
             plugin_name=plugin_name,
             plugin_uuid=plugin_uuid,
-            endpoint_access_name=endpoint_access_name,
-            handler=handler,
-            config_driven=config_driven,
+            target_plugin=target_plugin,
+            target_access_name=target_access_name,
+            target_plugin_uuid=target_plugin_uuid,
+            hosts=hosts,
+            blocked_hosts=blocked_hosts,
+            authors=authors,
+            blocked_authors=blocked_authors,
+            declared_id=declared_id,
+            enabled=enabled,
         )
 
     async def unsubscribe(self, subscription_id: str) -> bool:
-        """Remove a topic subscription by ID.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "PluginCore.unsubscribe() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+        """Remove a topic subscription by ID."""
         return await self.topic_registry.unsubscribe(subscription_id)
 
     # ── PR3 Stage B: new publish_event / request_event / subscribe API ─

@@ -15,14 +15,14 @@ class TestRemoteTarget(Plugin):
     @async_log_errors
     async def on_enable(self):
         self._logger.debug("TestRemoteTarget.on_enable")
-        # Code-driven hang sub on test/r/hang — B-020 driver. Registered as
-        # code-driven so notify dispatch goes through _call_sub's direct-
-        # handler path (no execute round-trip).
+        # Code-driven hang sub on test/r/hang — B-020 driver. Registered
+        # at runtime via subscribe(target_access_name=...) so publish_event
+        # dispatch goes through execute() to the r_hang_topic_handler endpoint.
         self._hang_sub_id = await self._plugin_core.subscribe(
             "test/r/hang",
             self.plugin_name,
             self.plugin_uuid,
-            handler=self.r_hang_topic_handler,
+            target_access_name="r_hang_topic_handler",
         )
 
     @async_log_errors
@@ -65,23 +65,25 @@ class TestRemoteTarget(Plugin):
         return "did_not_hang"
 
     @async_log_errors
-    async def r_topic_open(self, payload: Any = None) -> Any:
+    async def r_topic_open(self, event=None) -> Any:
+        # Subscriber endpoints receive an Event object under the new API.
+        payload = event.payload if event is not None else None
         return {"received": payload}
 
     @async_gen_log_errors
-    async def r_topic_huge_stream(self):
-        # B-024 driver. _handle_topic_request_stream emits ONE
+    async def r_topic_huge_stream(self, event=None):
+        # B-024 driver. _handle_request_event_stream emits ONE
         # MSG_STREAM_CHUNK per yielded item with chunk_length = pickled-size + 1.
         # If chunk_length exceeds MAX_MESSAGE_SIZE (100 MB on the receiver),
-        # the receiver raises NetworkRequestException at networking.py:1639
-        # and the entire stream is killed. _handle_execute_stream splits;
-        # _handle_topic_request_stream does NOT — that's the bug.
+        # the receiver raises NetworkRequestException and the entire stream
+        # is killed. _handle_execute_stream splits;
+        # _handle_request_event_stream does NOT — that's the bug.
         # 101 MB triggers the rejection.
         yield {"data": b"\xab" * (101 * 1024 * 1024)}
 
     @async_log_errors
-    async def r_hang_topic_handler(self, *args, **kwargs):
-        # B-020 driver: subscribed via on_enable to test/r/hang. notify_sync
-        # against this from a SYNC context should block until this returns
-        # (which is never, until cancelled).
+    async def r_hang_topic_handler(self, event=None):
+        # B-020 driver: subscribed via on_enable to test/r/hang.
+        # publish_event_sync against this from a SYNC context should block
+        # until this returns (which is never, until cancelled).
         await asyncio.Event().wait()

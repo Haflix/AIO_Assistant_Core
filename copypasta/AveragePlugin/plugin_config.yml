@@ -1,7 +1,19 @@
 description: Example plugin demonstrating the AIO Assistant Core plugin structure
-version: 1.0.0
+version: 1.1.0
 remote: True  # Set to True if this plugin should be accessible remotely
 arguments:  # Optional: Arguments passed during plugin loading
+
+# Subscriptions: declarative event-router entries. Each subscription binds
+# a topic pattern to a target endpoint (target_access_name). When the topic
+# fires (via publish_event / request_event), the framework dispatches the
+# event to the named endpoint. Topics use "/" as separator. Single-segment
+# wildcard "*" is supported, e.g. "sensor/*/temperature".
+subscriptions:
+  handle_event_sub:
+    topic: "example/event"
+    target_access_name: handle_event
+    hosts: "local"
+
 endpoints:
   # Endpoints are a dict keyed by access_name (the name other plugins call).
   # `internal_name` is optional; if absent it defaults to the key.
@@ -45,18 +57,18 @@ endpoints:
         type: int
         description: Number of items to yield
 
-  # Topic-subscribed endpoint example (notifier system):
-  # Adding a "topic" field makes this endpoint callable via notify() or request_topic()
-  # instead of hardcoding the plugin name. Topics use "/" as separator.
-  # Wildcards: subscribe to "sensor/*/temperature" to match "sensor/bath/temperature" etc.
+  # Topic-subscribed endpoint example (event system).
+  # The matching `subscriptions.handle_event_sub` block above wires this
+  # endpoint to the topic "example/event". When publish_event /
+  # request_event fires for that topic, the framework dispatches the
+  # Event object to handle_event(self, event).
   handle_event:
     internal_name: handle_event
-    topic: "example/event"  # <-- subscribes this endpoint to the topic
     tags: []
     remote: True
     accessible_by_other_plugins: True
-    description: Example endpoint subscribed to a topic via config
+    description: Example endpoint subscribed to a topic via subscriptions block
     arguments:
-      - name: data
+      - name: event
         type: any
-        description: Event data received from the topic
+        description: Event object received from the topic (event.payload, event.topic, event.author, event.author_host)

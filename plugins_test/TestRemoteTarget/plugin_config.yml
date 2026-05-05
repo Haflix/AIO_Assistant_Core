@@ -1,7 +1,16 @@
 description: Phase 5 fixture — remote=True endpoints + streaming generators for wire-bug repros
-version: 0.1.0
+version: 0.2.0
 remote: True
 arguments:
+subscriptions:
+  huge_stream_sub:
+    topic: "test/r/huge_stream"
+    target_access_name: r_topic_huge_stream
+    hosts: "local"
+  open_sub:
+    topic: "test/r/open"
+    target_access_name: r_topic_open
+    hosts: "local"
 endpoints:
   r_open:
     internal_name: r_open
@@ -44,8 +53,7 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    topic: test/r/huge_stream
-    description: Async gen subscribed to test/r/huge_stream — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_topic_stream
+    description: Async gen subscribed to test/r/huge_stream (via subscriptions block) — yields one bytes item bigger than CHUNK_SIZE for B-024 via request_event_stream
     arguments:
 
   r_async_gen_raises_after:
@@ -70,7 +78,15 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    topic: test/r/open
-    description: Config-driven topic handler subscribed to test/r/open
+    description: Config-driven topic handler subscribed to test/r/open (via subscriptions block)
     arguments:
-      - name: payload
+      - name: event
+
+  r_hang_topic_handler:
+    internal_name: r_hang_topic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: B-020 hang handler subscribed at runtime to test/r/hang
+    arguments:
+      - name: event

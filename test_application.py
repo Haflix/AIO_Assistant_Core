@@ -108,7 +108,7 @@ async def run_tests() -> int:
                 "suites": [
                     "TestExecuteSuite",
                     "TestStreamSuite",
-                    "TestNotifierSuite",
+                    "TestEventSuite",
                     "TestLifecycleSuite",
                     "TestRemoteSuite",
                     "TestPR2Suite",

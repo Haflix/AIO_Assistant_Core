@@ -88,46 +88,56 @@ async for item in self.execute_stream("PluginName", "stream_method", args, hosts
     print(item)
 ```
 
-### Topic-Based Communication (Notifier System)
+### Topic-Based Communication (Event System)
 
-Use topics to decouple plugins — the caller doesn't need to know which plugin handles the request.
+Use topics to decouple plugins — the caller doesn't need to know which plugin handles the request. Publishers declare named events in `plugin_config.yml`; subscribers declare topic patterns plus a target endpoint that receives an `Event` object.
 
 ```python
-# Fire-and-forget (one-to-many) — all subscribers are called
-count = await self.notify("sensor/temperature", {"value": 22.5})
+# Fire-and-forget (one-to-many) — all subscribers receive the Event
+count = await self.publish_event("sensor_temp", payload={"value": 22.5})
 
-# Request-by-topic (one-to-one with response) — first matching handler
-result = await self.request_topic("ai/chat", {"message": "hello"})
+# Request-by-event (one-to-one with response) — first matching handler
+result = await self.request_event("ai_chat", payload={"message": "hello"})
 
-# Streaming request-by-topic
-async for chunk in self.request_topic_stream("ai/stream", args):
+# Streaming request-by-event
+async for chunk in self.request_event_stream("ai_stream", payload=args):
     print(chunk)
 
 # Sync variants available too:
-self.notify_sync("sensor/temperature", {"value": 22.5})
-result = self.request_topic_sync("ai/chat", {"message": "hello"})
+self.publish_event_sync("sensor_temp", payload={"value": 22.5})
+result = self.request_event_sync("ai_chat", payload={"message": "hello"})
 ```
 
 **Subscribing to topics — two ways:**
 
-1. **Config-driven** (in plugin_config.yml):
+1. **Config-driven** (in `plugin_config.yml`):
 ```yaml
+subscriptions:
+  handle_chat_sub:
+    topic: "ai/chat"
+    target_access_name: handle_chat
+    hosts: "any"
 endpoints:
-  - internal_name: _handle_chat
-    access_name: handle_chat
-    topic: "ai/chat"            # auto-subscribed on plugin load
+  handle_chat:
+    internal_name: handle_chat
     remote: True
     accessible_by_other_plugins: True
+    arguments:
+      - name: event
 ```
 
 2. **Code-driven** (at runtime, typically in `on_enable`):
 ```python
 async def on_enable(self):
-    self._sub_id = await self.subscribe("events/*", self._on_event)
+    self._sub_id = await self.subscribe(
+        "events/*", target_access_name="my_event_handler"
+    )
 
 async def on_disable(self):
     await self.unsubscribe(self._sub_id)
 ```
+
+The handler endpoint receives an `Event` object: `event.topic`, `event.payload`, `event.author`, `event.author_host`.
 
 **Topics** use `/` as separator. Single-level wildcard `*` matches one segment:
 - `sensor/*/temperature` matches `sensor/bathroom/temperature`

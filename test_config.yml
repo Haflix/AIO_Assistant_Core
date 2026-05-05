@@ -25,20 +25,9 @@ plugins:
     enabled: true
     path: ./plugins_test/TestStreamTarget
 
-  - name: TestNotifierSuite
+  - name: TestEventSuite
     enabled: true
-    path: ./plugins_test/TestNotifierSuite
-
-  - name: TestNotifierTarget
-    enabled: true
-    path: ./plugins_test/TestNotifierTarget
-
-  # TestNotifierBadActor is loaded on demand by the suite (§5.4 idiom);
-  # config entry must exist so load_plugin_with_conf can find the path,
-  # but enabled=false so it doesn't auto-load at startup.
-  - name: TestNotifierBadActor
-    enabled: false
-    path: ./plugins_test/TestNotifierBadActor
+    path: ./plugins_test/TestEventSuite
 
   - name: TestLifecycleSuite
     enabled: true
@@ -71,7 +60,7 @@ plugins:
     enabled: true
     path: ./plugins_test/TestRemoteSuite
 
-  # TestRemoteTarget / Victim / Spoofer are loaded by the SUBPROCESS only
+  # TestRemoteTarget / Victim are loaded by the SUBPROCESS only
   # (plugins_test/_remote_node/config.subnode.yml). They are listed here so
   # config.example.yml stays discoverable, but enabled:false on the parent
   # so they don't load locally.
@@ -82,10 +71,6 @@ plugins:
   - name: TestRemoteVictim
     enabled: false
     path: ./plugins_test/TestRemoteVictim
-
-  - name: TestRemoteSpoofer
-    enabled: false
-    path: ./plugins_test/TestRemoteSpoofer
 
   # PR2 config-restructure regression suite (Phase PR2.1)
   - name: TestPR2Suite

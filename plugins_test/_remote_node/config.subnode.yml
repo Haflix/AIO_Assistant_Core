@@ -9,10 +9,6 @@ plugins:
     enabled: true
     path: ./plugins_test/TestRemoteVictim
 
-  - name: TestRemoteSpoofer
-    enabled: true
-    path: ./plugins_test/TestRemoteSpoofer
-
 general:
     hostname: "test-subnode"           # MUST differ from parent hostname
     plugin_package: plugins_test

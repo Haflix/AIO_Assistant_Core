@@ -17,17 +17,17 @@ KNOWN FIXTURE GAPS (2026-04-28, after first end-to-end run with networking on):
   currently fail with "Endpoint reset_bypass not found" until that split
   lands.
 - B-028.no_client_timeout case calls execute(timeout=2.0) — but execute_remote
-  DOES have request-level timeout. B-028 is specifically about notify_remote /
-  request_topic_remote NOT having client-side timeout. The case body needs
-  to call those APIs directly to repro.
+  DOES have request-level timeout. B-028 is specifically about
+  publish_event_remote / request_event_remote NOT having client-side
+  timeout. The case body needs to call those APIs directly to repro.
 - access_false_blocked case expects RequestException for a remote=True +
   accessible_by_other_plugins=False endpoint. find_endpoint only checks
   accessible_by_other_plugins for LOCAL cross-plugin calls; remote callers
   pass through plugin.remote + endpoint.remote. The test expectation is
   wrong; either redesign or remove the case.
-- B-020.notify_sync_blocks_on_remote subnode has no sub on test/r/hang
-  topic, so notify_sync doesn't block waiting for any remote handler.
-  Need a hanging sub on the subnode to repro the bug.
+- B-020.publish_event_sync_blocks_on_remote subnode has no sub on
+  test/r/hang topic, so publish_event_sync doesn't block waiting for any
+  remote handler. Need a hanging sub on the subnode to repro the bug.
 
 Phase 5.1 cleanup: redesign these fixtures to repro the bugs they claim.
 
@@ -37,11 +37,11 @@ subprocess startup success.
 
 Cases (~22):
 - remote.execute.remote_false_blocked / .access_false_blocked
-- remote.notify.remote_false_blocked_for_config
+- remote.publish_event.remote_false_blocked_for_config
 - remote.B-001.code_driven_bypass
 - remote.B-042.code_driven_stream_bypass
-- remote.B-018.spoof_system_string / .spoof_known_uuid
-- remote.B-019.notify_count_per_node_not_per_sub
+- remote.B-018.spoof_system_string / .spoof_known_uuid (skipped — Stage E)
+- remote.B-019.publish_event_count_per_node_not_per_sub
 - remote.B-021.first_sub_not_remote_eligible
 - remote.B-024.huge_item / .B-025.partial_then_failover
 - remote.B-011.stream_error_sentinel_via_item_end
@@ -49,10 +49,10 @@ Cases (~22):
 - remote.B-028.no_client_timeout
 - remote.B-029.code_driven_timeout_ignored
 - remote.B-030.unpicklable_args
-- remote.B-027.notify_return_count_misleading
+- remote.B-027.publish_event_return_count_misleading
 - remote.B-032.head_of_line_blocking
-- remote.B-033.request_topic_stream_sync_host_remote
-- remote.B-020.notify_sync_blocks_on_remote
+- remote.B-033.request_event_stream_sync_host_remote
+- remote.B-020.publish_event_sync_blocks_on_remote
 - remote.find_endpoints_by_tag
 - edge: tag.no_matches / tag.mixed_local_remote / pool.exhaustion / discovery.race
 """
@@ -75,7 +75,7 @@ from decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
@@ -266,9 +266,11 @@ class TestRemoteSuite(Plugin):
                 hosts=c.hosts,
             )
 
-        async def body_notify_remote_false_blocked_for_config(c):
+        async def body_publish_event_remote_false_blocked_for_config(c):
             await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
-            await self.notify("test/r/local", {"data": "x"}, hosts=c.hosts)
+            await self.publish_event(
+                "r_local", payload={"data": "x"}, hosts=c.hosts,
+            )
             cnt = await self.execute(
                 "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
             )
@@ -276,7 +278,9 @@ class TestRemoteSuite(Plugin):
 
         async def body_b001_code_driven_bypass(c):
             await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
-            await self.notify("test/r/code", {"data": "bypass"}, hosts=c.hosts)
+            await self.publish_event(
+                "r_code", payload={"data": "bypass"}, hosts=c.hosts,
+            )
             cnt = await self.execute(
                 "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
             )
@@ -284,14 +288,14 @@ class TestRemoteSuite(Plugin):
                 c.set_marker("bypass_succeeded")
                 raise AssertionError(
                     f"B-001: code-driven sub on remote=False plugin fired "
-                    f"({cnt} times) via remote notify"
+                    f"({cnt} times) via remote publish_event"
                 )
 
         async def body_b042_code_driven_stream_bypass(c):
             await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
             try:
-                async for _ in self.request_topic_stream(
-                    "test/r/code_stream", hosts=c.hosts,
+                async for _ in self.request_event_stream(
+                    "r_code_stream", hosts=c.hosts,
                 ):
                     pass
             except Exception:
@@ -307,68 +311,25 @@ class TestRemoteSuite(Plugin):
                 )
 
         async def body_b018_spoof_system_string(c):
-            # Suite calls into Spoofer (running on peer subnode), which then
-            # calls notify_remote(IP=parent, topic, author='system'). The
-            # parent's _handle_notify forwards author='system' which gets
-            # rewritten to hostname → bypass remote-eligibility check.
-            await self.execute("TestRemoteVictim", "reset_bypass", hosts="local")
-            await self.execute(
-                "TestRemoteSpoofer", "spoof_notify",
-                {
-                    "target_ip": peer_ip,
-                    "topic": "test/r/code",
-                    "args": None,
-                    "author": "system",
-                    "author_id": "system",
-                },
-                hosts=c.hosts,
+            c.skip(
+                "B-018 spoofing — Stage E re-evaluates author-stamping under "
+                "PR3 Stage C wire protocol; spoofer retired in PR3 Stage D."
             )
-            cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", hosts="local",
-            )
-            if cnt > 0:
-                c.set_marker("bypass_succeeded")
-                raise AssertionError(
-                    f"B-018: 'system' string spoof bypassed remote check "
-                    f"({cnt} unauthorized fires)"
-                )
 
         async def body_b018_spoof_known_uuid(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", hosts="local")
-            local_victim = self._plugin_core.plugins.get("TestRemoteVictim")
-            if local_victim is None:
-                c.skip("TestRemoteVictim not loaded locally")
-                return
-            local_uuid = local_victim.plugin_uuid
-            await self.execute(
-                "TestRemoteSpoofer", "spoof_notify",
-                {
-                    "target_ip": peer_ip,
-                    "topic": "test/r/code",
-                    "args": None,
-                    "author": "remote",
-                    "author_id": local_uuid,
-                },
-                hosts=c.hosts,
+            c.skip(
+                "B-018 spoofing — Stage E re-evaluates author-stamping under "
+                "PR3 Stage C wire protocol; spoofer retired in PR3 Stage D."
             )
-            cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", hosts="local",
-            )
-            if cnt > 0:
-                c.set_marker("bypass_succeeded")
-                raise AssertionError(
-                    f"B-018: known-uuid spoof bypassed remote check "
-                    f"({cnt} unauthorized fires)"
-                )
 
         async def body_b019_count_per_node(c):
             # On the parent's side we have one local sub for test/r/multi (set up
-            # by code below); on the peer we'd register 3 more. Then notify
+            # by code below); on the peer we'd register 3 more. Then publish_event
             # hosts=any returns count == 1 + 1 (one per remote node) instead of
             # 1 + 3 (one per actual sub).
             c.skip(
                 "B-019 case requires registering N peer-side subs at runtime; "
-                "fixture wiring TBD — use the existing remote.notify.basic "
+                "fixture wiring TBD — use the existing remote.publish_event.basic "
                 "matrix-expansion to validate basic count==1 path"
             )
 
@@ -379,7 +340,7 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_b024_huge_item(c):
-            # B-024: request_topic_stream emits ONE MSG_STREAM_CHUNK per
+            # B-024: request_event_stream emits ONE MSG_STREAM_CHUNK per
             # yielded item, no chunking, no item-end boundaries (unlike
             # execute_stream which DOES chunk via _handle_execute_stream).
             # If the pickled item exceeds CHUNK_SIZE (64KB) the receiver
@@ -389,8 +350,8 @@ class TestRemoteSuite(Plugin):
             # MAX, so this exercises the per-item-no-chunking path.
             try:
                 items = []
-                async for chunk in self.request_topic_stream(
-                    "test/r/huge_stream", hosts=c.hosts,
+                async for chunk in self.request_event_stream(
+                    "r_huge_stream", hosts=c.hosts,
                 ):
                     items.append(chunk)
                 # If items received cleanly with the original 200KB payload
@@ -449,14 +410,15 @@ class TestRemoteSuite(Plugin):
 
         async def body_b030_unpicklable_args(c):
             c.skip(
-                "B-030 requires passing an unpicklable arg through Plugin.notify; "
-                "the arg never crosses the Plugin wrapper unmodified — fixture TBD"
+                "B-030 requires passing an unpicklable arg through "
+                "Plugin.publish_event; the arg never crosses the Plugin "
+                "wrapper unmodified — fixture TBD"
             )
 
-        async def body_b027_notify_return_count(c):
+        async def body_b027_publish_event_return_count(c):
             c.skip(
-                "B-027 needs to inject a transport failure on notify_remote — "
-                "fixture TBD"
+                "B-027 needs to inject a transport failure on "
+                "publish_event_remote — fixture TBD"
             )
 
         async def body_b032_head_of_line_blocking(c):
@@ -467,13 +429,13 @@ class TestRemoteSuite(Plugin):
 
         async def body_b033_sync_stream_host_remote(c):
             c.skip(
-                "B-033 (sync request_topic_stream silently routing local) is "
+                "B-033 (sync request_event_stream silently routing local) is "
                 "covered as Phase 3 skip; remote variant duplicate"
             )
 
-        async def body_b020_notify_sync_blocks_on_remote(c):
+        async def body_b020_publish_event_sync_blocks_on_remote(c):
             await c.assert_hang(
-                asyncio.to_thread(self.notify_sync, "test/r/hang"),
+                asyncio.to_thread(self.publish_event_sync, "r_hang"),
                 timeout_s=2.0,
                 marker="outer_wait_for_fired",
             )
@@ -490,8 +452,9 @@ class TestRemoteSuite(Plugin):
              body_remote_false_blocked, ("access",), ()),
             ("remote.execute.access_false_blocked",
              body_access_false_blocked, ("access",), ()),
-            ("remote.notify.remote_false_blocked_for_config",
-             body_notify_remote_false_blocked_for_config, ("access",), ()),
+            ("remote.publish_event.remote_false_blocked_for_config",
+             body_publish_event_remote_false_blocked_for_config,
+             ("access",), ()),
             ("remote.B-001.code_driven_bypass",
              body_b001_code_driven_bypass,
              ("bug_repro", "security"), ("B-001",)),
@@ -504,7 +467,7 @@ class TestRemoteSuite(Plugin):
             ("remote.B-018.spoof_known_uuid",
              body_b018_spoof_known_uuid,
              ("bug_repro", "security"), ("B-018",)),
-            ("remote.B-019.notify_count_per_node_not_per_sub",
+            ("remote.B-019.publish_event_count_per_node_not_per_sub",
              body_b019_count_per_node,
              ("bug_repro",), ("B-019",)),
             ("remote.B-021.first_sub_not_remote_eligible",
@@ -527,17 +490,17 @@ class TestRemoteSuite(Plugin):
             ("remote.B-030.unpicklable_args",
              body_b030_unpicklable_args,
              ("bug_repro",), ("B-030",)),
-            ("remote.B-027.notify_return_count_misleading",
-             body_b027_notify_return_count,
+            ("remote.B-027.publish_event_return_count_misleading",
+             body_b027_publish_event_return_count,
              ("bug_repro",), ("B-027",)),
             ("remote.B-032.head_of_line_blocking",
              body_b032_head_of_line_blocking,
              ("bug_repro", "slow"), ("B-032",)),
-            ("remote.B-033.request_topic_stream_sync_host_remote",
+            ("remote.B-033.request_event_stream_sync_host_remote",
              body_b033_sync_stream_host_remote,
              ("bug_repro",), ("B-033",)),
-            ("remote.B-020.notify_sync_blocks_on_remote",
-             body_b020_notify_sync_blocks_on_remote,
+            ("remote.B-020.publish_event_sync_blocks_on_remote",
+             body_b020_publish_event_sync_blocks_on_remote,
              ("bug_repro",), ("B-020",)),
             ("remote.find_endpoints_by_tag", body_find_endpoints_by_tag,
              ("discovery", "basic"), ()),

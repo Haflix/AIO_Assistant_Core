@@ -29,7 +29,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.2.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -42,7 +42,7 @@ class TestLifecycleSuite(Plugin):
 
     @log_errors
     def on_load(self, *args, **kwargs):
-        pass
+        self._lifecycle_b037_fired: bool = False
 
     @async_log_errors
     async def on_enable(self):
@@ -84,7 +84,7 @@ class TestLifecycleSuite(Plugin):
         await self._basic_pop_pending(rec, kw)
         await self._basic_b005_purge(rec, kw)
         await self._basic_b008_concurrent_enable(rec, kw)
-        await self._basic_b037_notify_during_pop(rec, kw)
+        await self._basic_b037_event_during_pop(rec, kw)
         await self._basic_b043_pop_failed_reaped(rec, kw)
         await self._basic_b007_missing_version(rec, kw)
         await self._basic_disable_disabled_endpoint(rec, kw)
@@ -610,41 +610,39 @@ class TestLifecycleSuite(Plugin):
         )
 
     # ====================================================================
-    # BASIC B-037 — notify during pop
+    # BASIC B-037 — publish_event during pop
     # ====================================================================
 
-    async def _basic_b037_notify_during_pop(
+    async def _basic_b037_event_during_pop(
         self, rec: CaseRecorder, kw: Dict,
     ) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            # Subscribe a code-driven sub on victim that we can detect firing
-            # mid-pop. Use the Victim's own on_enable to register a sub via
-            # core.subscribe — but Victim doesn't have one. Instead, register
-            # one externally and bind it to victim's plugin_uuid.
+            # Subscribe a sub OWNED BY victim_uuid that targets an endpoint on
+            # the suite (lifecycle_observer). Victim-owned means the sub is
+            # cleaned when victim is popped. The endpoint flips a flag we
+            # check after the race.
             victim_obj = self._plugin_core.plugins[VICTIM]
-            fired_after = {"flag": False}
-
-            async def h(*args, **kw_):
-                fired_after["flag"] = True
+            self._lifecycle_b037_fired = False
 
             sub_id = await self._plugin_core.subscribe(
-                "lifecycle/notify_during_pop",
+                "lifecycle/event_during_pop",
                 victim_obj.plugin_name,
                 victim_obj.plugin_uuid,
-                handler=h,
+                target_plugin=self.plugin_name,
+                target_access_name="lifecycle_observer",
             )
 
             try:
-                # Concurrently pop + notify
+                # Concurrently pop + publish
                 pop_task = asyncio.create_task(
                     self._plugin_core.pop_plugin(VICTIM)
                 )
                 await asyncio.sleep(0.001)
-                await self.notify("lifecycle/notify_during_pop")
+                await self.publish_event("lifecycle_event_during_pop")
                 await pop_task
 
-                if fired_after["flag"]:
+                if self._lifecycle_b037_fired:
                     c.set_marker("handler_ran_after_disable")
                     raise AssertionError(
                         "B-037: handler ran during pop_plugin (race)"
@@ -664,13 +662,17 @@ class TestLifecycleSuite(Plugin):
                         pass
 
         await rec.run_case(
-            "lifecycle.B-037.notify_during_pop", body,
+            "lifecycle.B-037.event_during_pop", body,
             tags=("bug_repro",), bug_ids=("B-037",),
             expected_status="fail",
             expected_signature={"marker": "handler_ran_after_disable"},
             hard_timeout_s=15.0,
             **kw,
         )
+
+    async def lifecycle_observer(self, event) -> None:
+        """B-037 observer endpoint — sets a flag when fired."""
+        self._lifecycle_b037_fired = True
 
     # ====================================================================
     # BASIC B-043 — pop_plugin failed-pending request reaped

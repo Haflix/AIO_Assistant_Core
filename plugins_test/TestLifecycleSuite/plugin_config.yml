@@ -1,7 +1,11 @@
 description: Phase 4 suite — load/enable/disable/reload + B-007/B-004/B-005/B-006/B-008/B-009/B-010/B-016/B-037/B-043
-version: 0.1.0
+version: 0.2.1
 remote: False
 arguments:
+events:
+  lifecycle_event_during_pop:
+    topic: "lifecycle/event_during_pop"
+    hosts: "local"
 endpoints:
   run:
     internal_name: run
@@ -22,3 +26,8 @@ endpoints:
         description: Skip cases tagged 'slow'
       - name: allow_destructive
         description: If False, destructive cases are skipped
+  lifecycle_observer:
+    internal_name: lifecycle_observer
+    remote: False
+    accessible_by_other_plugins: True
+    description: B-037 observer endpoint — flips a flag when fired

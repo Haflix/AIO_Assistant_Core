@@ -39,9 +39,7 @@ plugins_test/
   TestExecuteTarget/             # Phase 1 fixture (also instantiated as TestExecuteTarget2)
   TestStreamSuite/               # Phase 2
   TestStreamTarget/              # Phase 2 fixture
-  TestNotifierSuite/             # Phase 3
-  TestNotifierTarget/            # Phase 3 fixture
-  TestNotifierBadActor/          # Phase 3 fixture (raises, hangs, cancels)
+  TestEventSuite/                # Phase 3 (PR3 Stage D — smoke shell; Stage E expands)
   TestLifecycleSuite/            # Phase 4
   TestLifecycleVictim/           # Phase 4 fixture (also instantiated as TestLifecycleVictim2)
   TestLifecycleBrokenVersion/    # Phase 4 static fixture for B-007 (plugin_config.yml without version)
@@ -49,7 +47,6 @@ plugins_test/
   TestRemoteSuite/               # Phase 5
   TestRemoteTarget/              # Phase 5 fixture; remote: true
   TestRemoteVictim/              # Phase 5 fixture; remote: false (B-001 target)
-  TestRemoteSpoofer/             # Phase 5 peer-side raw notify_remote helper for B-018
 ```
 
 ### 3.2 Tier discipline
@@ -65,7 +62,7 @@ arguments:
   suites:
     - TestExecuteSuite
     - TestStreamSuite
-    - TestNotifierSuite
+    - TestEventSuite
     - TestLifecycleSuite
     - TestRemoteSuite
 ```
@@ -199,8 +196,8 @@ Each case declares a `hosts: List[str]` (default `["local"]`). The recorder expa
 
 **Case body API:** the recorder passes the chosen `host` value into the case context (`c.host`). Test code uses `c.host` when constructing calls:
 ```python
-with rec.case("notif.notify.exact_one_sub", hosts=["local", "remote"]) as c:
-    count = await self.notify("test/greet", "World", hosts=c.host)
+with rec.case("event.publish.basic", hosts=["local", "remote"]) as c:
+    count = await self.publish_event("smoke_publish", payload={"x": 1}, hosts=c.host)
     c.expect(count, 1)
 ```
 
@@ -217,22 +214,22 @@ with rec.case("notif.notify.exact_one_sub", hosts=["local", "remote"]) as c:
 `hosts=["local", "remote"]` — matrix-expanded:
 - Phase 1: `exec.value.*`, `exec.error.no_endpoint`, `exec.error.no_plugin`, `exec.error.endpoint_raises`, `exec.error.endpoint_raises_request_exc`, `exec.error.returns_none`, `exec.error.returns_future`, `exec.timeout.hang_with_timeout`, `exec.B-017.private_from_other`, `exec.large_payload.return_value`, `exec.contract.deep_chain_request_exception_preserves_message`, `discovery.tag.*`
 - Phase 2: `stream.async.basic`, `stream.async.empty`, `stream.async.one`, `stream.async.raises_after_2`, `stream.timeout.hanging_gen`, `stream.error.endpoint_not_generator`
-- Phase 3: `notif.notify.no_subs`, `notif.notify.exact_one_sub`, `notif.notify.wildcard_match`, `notif.notify.multiple_subs`, `notif.notify.exact_and_wildcard`, `notif.request_topic.basic`, `notif.request_topic.no_sub`, `notif.request_topic_stream.basic`, `notif.request_topic_stream.sync_gen`, `notif.B-023.notify_returns_int_not_raises`, `notif.B-017.priv_via_topic_from_other`
+- Phase 3: `event.publish.basic`, `event.request.basic`, `event.metadata.basic` (PR3 Stage D smoke shell — Stage E expands)
 
 `hosts=["remote"]` only — wire-bug specific:
-- Phase 5 dedicated cases (B-001, B-018, B-021, B-024, B-025, B-027, B-028, B-029, B-030, B-032, B-033, B-042) and access-boundary cases (`remote.execute.remote_false_blocked`, `remote.execute.access_false_blocked`, `remote.notify.remote_false_blocked_for_config`)
+- Phase 5 dedicated cases (B-001, B-021, B-024, B-025, B-027, B-028, B-029, B-030, B-032, B-033, B-042) and access-boundary cases (`remote.execute.remote_false_blocked`, `remote.execute.access_false_blocked`, `remote.publish_event.remote_false_blocked_for_config`)
 
 `hosts=["local"]` (default, no annotation needed) — everything else.
 
 **Why these contract cases stay local-only** (clarification of the bullet-list contract):
 - UUID-handling cases (`exec.contract.find_endpoint_uuid_target_plugin_conflict`, `exec.contract.uuid_after_pop_returns_none`, `exec.contract.uuid_invalidated_after_reload`) — UUIDs are local-process identifiers; they don't roundtrip the wire.
-- Code-driven sub mechanics (`notif.notify.code_driven`, `notif.unsubscribe.code_driven`) — `Plugin.subscribe` is a local API; remote variants would test B-001's bypass instead, which is its own case.
+- Runtime-sub mechanics — `Plugin.subscribe` is a local API; remote variants would test B-001's bypass instead, which is its own case.
 - Lifecycle / reload / disable / pop / multi-instance / runner meta — intrinsically local per process state.
 - Sync API cases — sync calls run in the local threadpool by design; remote sync is undefined.
-- `notif.contract.notify_disabled_networking_no_remote_attempt` — assertion is "no remote attempt", so a remote variant is meaningless.
+- `event.contract.disabled_networking_no_remote_attempt` (Stage E) — assertion is "no remote attempt", so a remote variant is meaningless.
 - B-XXX bug-repro cases that test local mechanisms (B-002, B-006, B-008, B-039, B-040, B-041) — bug surface is local.
 
-**Phase 5 dedup:** the basic remote-execution / remote-notify / remote-request_topic cases that v3 had (`remote.execute.basic`, `remote.notify.basic`, `remote.request_topic.basic`, `remote.request_topic_stream.basic`) are removed from Phase 5 — they're now Phase 1/3 cases with `hosts=["local","remote"]`. Phase 5's table only contains wire-only mechanisms.
+**Phase 5 dedup:** the basic remote-execution / remote-publish_event / remote-request_event cases that v3 had (`remote.execute.basic`, `remote.publish_event.basic`, `remote.request_event.basic`, `remote.request_event_stream.basic`) are removed from Phase 5 — they're now Phase 1/3 cases with `hosts=["local","remote"]`. Phase 5's table only contains wire-only mechanisms.
 
 ### 4.7 Destructive-case handling
 
@@ -295,34 +292,34 @@ Suite recorder snapshots `core.plugins.keys()` at start of suite. After each cas
 
 Every case is wrapped in `asyncio.wait_for(case_body, timeout=hard_timeout_s)`. Default 30s. Per-case override via `recorder.case(..., hard_timeout_s=...)`.
 
-### 5.4 BadActor on-demand load idiom
+### 5.4 On-demand fixture load idiom
 
-`load_plugin_with_conf` short-circuits if entry's `enabled` flag is `False` (PluginCore.py:499-504). The suite must build a fresh entry dict to bypass this:
+`load_plugin_with_conf` short-circuits if entry's `enabled` flag is `False` (PluginCore.py). Suites that load a fixture on demand must build a fresh entry dict to bypass this:
 
 ```python
-async def _load_badactor(self):
+async def _load_fixture(self):
     entry = {
-        "name": "TestNotifierBadActor",
+        "name": "TestSomeFixture",
         "enabled": True,
-        "path": "./plugins_test/TestNotifierBadActor",
+        "path": "./plugins_test/TestSomeFixture",
     }
     await self._plugin_core.load_plugin_with_conf(entry)
-    await self._plugin_core._enable_plugin("TestNotifierBadActor")
+    await self._plugin_core._enable_plugin("TestSomeFixture")
 
-async def _unload_badactor(self):
-    await self._plugin_core.pop_plugin("TestNotifierBadActor")
+async def _unload_fixture(self):
+    await self._plugin_core.pop_plugin("TestSomeFixture")
 
-async def _unload_badactor_safe(self):
+async def _unload_fixture_safe(self):
     """Defensive variant for suite-level finally — never propagates."""
     try:
-        await self._plugin_core.pop_plugin("TestNotifierBadActor")
+        await self._plugin_core.pop_plugin("TestSomeFixture")
     except Exception as e:
         self._logger.warning(
-            f"BadActor defensive unload failed (already gone or half-state): {e}"
+            f"fixture defensive unload failed (already gone or half-state): {e}"
         )
 ```
 
-The case using BadActor calls `_load_badactor()` in `setup`, `_unload_badactor()` in `finally`, and declares `set_expected_drift(added=[], removed=[])`. If the case fails between load and unload, the suite-level `finally` calls `_unload_badactor_safe()` defensively — wrapped in try/except so a defensive-cleanup error doesn't mask the original case failure.
+The case using the fixture calls `_load_fixture()` in `setup`, `_unload_fixture()` in `finally`, and declares `set_expected_drift(added=[], removed=[])`. If the case fails between load and unload, the suite-level `finally` calls `_unload_fixture_safe()` defensively — wrapped in try/except so a defensive-cleanup error doesn't mask the original case failure.
 
 ---
 
@@ -482,100 +479,26 @@ These are boundary-condition / unusual-input variants. All `category="edge"`. Fa
 |---|---|---|---|
 | `stream.edge.cancellation.between_yields` | cancel consumer while producer is between yields (sleep); request entry reaped, no producer leak | — | cancellation, edge |
 
-### Phase 3 — TestNotifierSuite
+### Phase 3 — TestEventSuite (PR3 Stage D)
 
-**Plugins added:** `TestNotifierSuite`, `TestNotifierTarget`, `TestNotifierBadActor`.
+Phase 3 was previously TestNotifierSuite (with TestNotifierTarget /
+TestNotifierBadActor fixtures, ~36 cases covering the legacy notify /
+request_topic API). PR3 Stage D retired the legacy API end-to-end and
+replaced this phase with `TestEventSuite` — a smoke shell that verifies
+the new `publish_event` / `request_event` API works at the basic level:
 
-**TestNotifierTarget config-driven topics:**
-- `n_handle_greet` ← `test/greet`
-- `n_handle_math` ← `test/math/add`
-- `n_handle_wild_a` ← `test/wild/*`
-- `n_handle_wild_b` ← `test/*/end`
-- `n_handle_priv` ← `test/priv` with `accessible_by_other_plugins: false` (B-017)
-- `n_handle_count` — code-driven sub registered in `on_enable` on `test/count`
-- `n_handle_async_gen` ← `test/stream` (async generator)
-- `n_handle_sync_gen` ← `test/sync_stream` (sync generator)
+- `event.publish.basic` — `publish_event` returns the count of dispatched
+  subs and the matching subscriber endpoint receives the payload.
+- `event.request.basic` — `request_event` returns the target endpoint's
+  return value within the timeout.
+- `event.metadata.basic` — the subscriber endpoint receives an `Event`
+  object with `topic`, `payload`, `author`, and `author_host` populated.
 
-**TestNotifierTarget non-config endpoints (suite-driven):**
-- `trigger_topic_hop()` (sync) — calls `self.request_topic_sync("topic/hop", ...)` for B-039 chain observation
-- `topic_hop_observer()` (sync, subscribed to `topic/hop`) — reads `_sync_call_chain.chain` on entry, stores observed value on `self.observed_chain`
-- `self_publish_handler()` ← `test/self` — increments `self.self_publish_count`
-- `trigger_self_publish()` (async) — calls `self.notify("test/self")` from inside the same plugin; suite reads counter
-
-**TestNotifierBadActor** is `enabled: false` by default. Suites load it on demand using the §5.4 idiom. Behaviors:
-- `bad_handler_raises()`
-- `bad_handler_cancels()` — raises `asyncio.CancelledError()` (B-036)
-- `bad_handler_hangs(secs=3600)` (B-035)
-- `bad_handler_returns(value)`
-- Helper to register/unregister code-driven subs on demand
-
-**Test cases (~36):**
-
-| ID | Case | bug_ids | tags |
-|---|---|---|---|
-| `notif.notify.no_subs` | returns 0 | — | basic |
-| `notif.notify.exact_one_sub` | 1 exact match → fires, returns 1 | — | basic |
-| `notif.notify.wildcard_match` | `test/wild/foo` → fires `test/wild/*` | — | wildcards |
-| `notif.notify.multiple_subs` | 2 subs same topic → both fire, returns 2 | — | fan_out |
-| `notif.notify.exact_and_wildcard` | both match → both fire | — | wildcards |
-| `notif.notify.wildcard.empty_segment` | empty topic — pin current behavior | — | wildcards, contract |
-| `notif.notify.wildcard.leading_slash` | `/test/x` vs `/test/*` — pin current | — | wildcards, contract |
-| `notif.notify.wildcard.double_slash` | `a//b` — pin current | — | wildcards, contract |
-| `notif.notify.wildcard.mid_segment` | `a*b` literal star — pin current | — | wildcards, contract |
-| `notif.request_topic.basic` | returns first sub's value | — | basic |
-| `notif.request_topic.no_sub` | RequestException | — | error |
-| `notif.request_topic.priority_config_first` | config-driven before code-driven | — | priority |
-| `notif.B-040.wildcard_tie_after_reload` | two wildcards both match topic; record initial winner; reload; expected_status=fail, marker="winner_flipped" | B-040 | bug_repro |
-| `notif.request_topic_stream.basic` | streams 3 items | — | stream |
-| `notif.request_topic_stream.sync_gen` | sync gen handler | — | stream, sync_target |
-| `notif.notify.code_driven` | code-driven sub fires | — | code_driven |
-| `notif.unsubscribe.code_driven` | unsub → no longer fires | — | unsubscribe |
-| `notif.unsubscribe.idempotent` | unsubscribe twice → second returns False | — | unsubscribe |
-| `notif.subscribe.duplicate_topic_same_plugin` | two subs same topic same plugin — both fire | — | edge |
-| `notif.B-003.disable_clears_code_subs` | `_disable_plugin` then notify; expected_status=fail, marker="disabled_handler_fired" | B-003 | bug_repro |
-| `notif.B-003.disable_clears_config_subs` | same for config-driven | B-003 | bug_repro |
-| `notif.B-034.reload_window_drops_notify_code_driven` | start reload + notify in window; code-driven sub gone until new on_enable runs; Window B (large gap); expected_status=fail, marker="notify_dropped" | B-034 | bug_repro |
-| `notif.B-034.reload_window_drops_notify_config_driven` | same but config-driven topic sub; Window A (small gap between unsubscribe_plugin and re-subscribe inside load_plugin_with_conf); expected_status=fail, marker="notify_dropped" | B-034 | bug_repro |
-| `notif.B-022.subscribe_neither_handler_nor_access` | silent no-op | B-022 | bug_repro |
-| `notif.contract.both_handler_and_access_handler_wins` | regression-lock: handler wins (current documented behavior); expected_status=pass | — | contract |
-| `notif.error.sub_raises` | one sub raises → others still fire | — | error |
-| `notif.B-036.cancellederror_propagates` | sub raises CancelledError; expected_status=fail, exception_type="CancelledError" | B-036 | bug_repro |
-| `notif.B-035.notify_blocks_on_slow_sub` | sub hangs; wrap notify in wait_for(2s); expected_status=fail, marker="outer_wait_for_fired" | B-035 | bug_repro |
-| `notif.B-023.notify_returns_int_not_raises` | notify returns int; expected_status=fail with marker if it raises | B-023 | bug_repro |
-| `notif.B-017.priv_via_topic_from_other` | other plugin notifies private topic; expected_status=fail, marker="silently_dropped" | B-017 | bug_repro |
-| `notif.access.priv_via_topic_from_self_pinned` | same plugin via Plugin.notify with own author_id → reaches handler | — | access, contract |
-| `notif.B-017.priv_via_raw_core_notify` | raw `core.notify(topic, args)` (no author override; author='system' rewritten to hostname → `requester_id != plugin_uuid` AND `accessible_by_other_plugins=False` → handler not invoked); expected_status=fail, marker="silently_dropped" | B-017 | bug_repro |
-| `notif.basic.local_count_correct` | count returned == actual local subs that fired (sanity for non-remote path; NOT B-019) | — | basic |
-| `notif.sync.notify_sync` | from sync context | — | sync |
-| `notif.sync.request_topic_sync` | from sync context | — | sync |
-| `notif.sync.request_topic_stream_sync_no_remote` | hosts="any" no local sub → currently raises | B-014 | bug_repro |
-| `notif.sync.request_topic_stream_sync_host_remote_routes_local` | hosts="remote" silently routes local; SKIP if no peer (Phase 5) | B-033 | bug_repro, requires_remote |
-| `notif.B-039.sync_chain_via_topic_hop` | suite calls `core.execute_sync("TestNotifierTarget", "trigger_topic_hop")`; trigger calls `self.request_topic_sync("topic/hop", ...)` → topic_hop_observer fires → reads `_sync_call_chain.chain` on entry → stores in `target.observed_chain`; suite reads back via `execute("TestNotifierTarget", "get_observed_chain")` and asserts the chain is empty → `c.set_marker("chain_was_empty")`; expected_status=fail, signature marker="chain_was_empty" | B-039 | bug_repro |
-
-(All cases above are `category="basic"`.)
-
-**Additional basic cases:**
-
-| ID | Case | bug_ids | tags |
-|---|---|---|---|
-| `notif.contract.wildcard_does_not_cross_segments` | `"sensor/*"` MUST NOT match `"sensor/bath/temp"` (different segment count) | — | wildcards, contract |
-| `notif.contract.find_all_exact_before_wildcard` | exact subs returned before wildcard subs in `find_all` order (lock current behavior) | — | priority, contract |
-| `notif.contract.find_first_code_driven_registration_order` | two code-driven subs same topic; first registered wins | — | priority, contract |
-| `notif.contract.self_publish_self_delivers` | plugin notifies a topic it has subscribed to; handler fires (no `plugin_uuid != publisher` filter today; lock that) | — | self_publish, contract |
-| `notif.contract.notify_disabled_networking_no_remote_attempt` | `networking_enabled=False` → notify hosts="any" doesn't iterate `network.nodes` | — | networking, contract |
-| `notif.plugin_api.subscribe_unsubscribe_via_plugin_helpers` | `Plugin.subscribe(...)` returns sub_id; `Plugin.unsubscribe(sub_id)` removes it; verify via notify | — | api, contract |
-| `notif.plugin_api.notify_returns_int_through_plugin_wrapper` | `Plugin.notify(...)` returns the int from PluginCore.notify (decorator doesn't swallow) | — | api, contract |
-
-**Edge cases:**
-
-| ID | Case | bug_ids | tags |
-|---|---|---|---|
-| `notif.edge.wildcard.unicode` | topic `"测试/x"` and `"café/*"` — match correctly under segment-level rules | — | wildcards, edge |
-| `notif.edge.wildcard.literal_star_topic` | subscribe `"*"`; notify `"*"` → handler fires (single-segment wildcard matches `"*"`) | — | wildcards, edge |
-| `notif.edge.topic.just_slash` | topic `"/"` — pin behavior | — | wildcards, edge |
-| `notif.edge.subscribe.topic_with_control_chars` | subscribe topic with `\n` / `\t` — accepts (lock current) | — | edge |
-| `notif.edge.subscribe.long_topic_pattern` | 1 KB pattern works | — | edge |
-| `notif.edge.cancellation.notify_caller_cancel` | cancel `notify()` caller while `gather` runs; verify subs that already started complete; cancelled caller raises CancelledError | — | cancellation, edge |
+Stage E expands `TestEventSuite` to cover the full PR3 PLAN J case list
+(cross-plugin access C18, host filters, declared_id propagation, sync
+handlers, streaming, wildcard tie-breaks, etc.). Until then this suite is
+intentionally minimal — the existing PR3 SmokePub / SmokeSub fixtures
+cover cross-node verification at the integration level.
 
 ### Phase 4 — TestLifecycleSuite
 
@@ -613,7 +536,7 @@ These are boundary-condition / unusual-input variants. All `category="edge"`. Fa
 | `lifecycle.pop_plugin.fails_pending` | task waiting on `victim_hang_endpoint`; pop_plugin; assert task raises RequestException with "unloaded while pending" within 5s | — | basic |
 | `lifecycle.B-005.purge_skips_pending` | task waiting on `victim_hang_endpoint`; purge_plugins; expected_status=fail, marker="task_did_not_get_unloaded_error" | B-005 | bug_repro |
 | `lifecycle.B-008.concurrent_enable_race` | TWO Victim plugins; runtime config-order assertion (Victim before Victim2 — `c.skip(...)` if mis-ordered); Victim2 has `on_enable_delay_secs=1`; Victim's on_enable calls `execute("TestLifecycleVictim2", "is_db_open")`. Today: bug present → "Endpoint not found" → expected; suite catches RequestException("Endpoint not found"). expected_status=fail, signature `exception_type="RequestException", message_regex="Endpoint .* not found"`. (When bug fixed: call succeeds, no exception → `unexpected_pass`.) | B-008 | bug_repro |
-| `lifecycle.B-037.notify_during_pop` | notify on victim's topic; concurrently pop_plugin; expected_status=fail, marker="handler_ran_after_disable" | B-037 | bug_repro |
+| `lifecycle.B-037.event_during_pop` | publish_event on victim-owned sub topic; concurrently pop_plugin; expected_status=fail, marker="handler_ran_after_disable" | B-037 | bug_repro |
 | `lifecycle.B-006.running_loop_guard` | **destructive=True**. Body: snapshot `_running_loop_task`; inject `core.requests["bad-test-id"] = object()`; sleep 13s (>1 cleanup tick + slack); assert `_running_loop_task.done()` and `_running_loop_task.exception() is not None` → `c.set_marker("running_loop_died")`. `finally`: pop the bad request; restart `core._running_loop_task = asyncio.create_task(core.running_loop())`. `hard_timeout_s=30`. expected_signature `marker="running_loop_died"`. | B-006 | bug_repro, terminal |
 
 (All cases above are `category="basic"`.)
@@ -786,38 +709,44 @@ If networking uses a shared secret or TLS material, the subnode must read the sa
 
 **TestRemoteVictim endpoints (`remote: false` plugin):**
 - `r_local_only(value)` — accessible=True, plugin-level remote=False
-- Code-driven sub on `test/r/code` registered in `on_enable` (B-001 target). Handler increments `self.bypass_count`; suite reads via `get_bypass_count` endpoint.
-- `r_topic_local_only` ← `test/r/local` (config-driven, remote=False)
+- Runtime sub on `test/r/code` registered in `on_enable` (B-001 target). Target endpoint `code_handler` increments `self.bypass_count`; suite reads via `get_bypass_count` endpoint.
+- `r_topic_local_only` ← `test/r/local` (declared in subscriptions block, remote=False)
 
-**TestRemoteSpoofer endpoints (peer-side only):**
-- `spoof_notify(topic, args, author, author_id)` — uses `self._plugin_core.network.notify_remote(IP, topic, args, author, author_id)` directly to inject arbitrary author/author_id values. Suite calls into it via legitimate `execute(..., hosts="test-subnode")` to TRIGGER the spoof, which then originates from the peer back to the local node. Hard-guard: if `not self._plugin_core.networking_enabled or self._plugin_core.network is None`, skip cleanly.
+**TestRemoteSpoofer (RETIRED — PR3 Stage D):**
+- The spoofer relied on `network.notify_remote` to inject arbitrary
+  `author` / `author_id` at the wire layer. PR3 Stage C's locked decision
+  #15 (self-impersonation gate at fan-out + wire) makes the legacy
+  spoofing approach incoherent under the new protocol. B-018 cases that
+  depended on it are skipped under PR3 Stage D — Stage E PLAN J's
+  ACCESS CONTROL C18 + DELIVERY MODEL receiver-gate sections cover the
+  new-protocol equivalent test surface.
 
 #### 6.5.6 Test cases (~22)
 
-All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Generic remote-execute / remote-notify / remote-request_topic cases that mirror local behavior are NOT listed here — they live in Phase 1/3 with `hosts=["local","remote"]` and matrix-expand at runtime (§4.6).
+All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Generic remote-execute / remote-publish_event / remote-request_event cases that mirror local behavior are NOT listed here — they live in Phase 1/3 with `hosts=["local","remote"]` and matrix-expand at runtime (§4.6).
 
 | ID | Case | bug_ids | tags |
 |---|---|---|---|
 | `remote.execute.remote_false_blocked` | plugin-level `remote=False` endpoint NOT reachable from peer | — | access |
 | `remote.execute.access_false_blocked` | plugin-level remote=True but `accessible_by_other_plugins=False` from peer NOT reachable | — | access |
-| `remote.notify.remote_false_blocked_for_config` | config-driven sub on `remote=False` plugin NOT fired by remote notify (B-001 boundary check) | — | access |
-| `remote.B-001.code_driven_bypass` | code-driven sub on `remote=False` plugin IS fired by remote notify; readback via `get_bypass_count`; expected_status=fail, marker="bypass_succeeded" | B-001 | bug_repro, security |
-| `remote.B-042.code_driven_stream_bypass` | code-driven async-gen sub on `remote=False` plugin IS iterated by remote `request_topic_stream`; readback via counter; expected_status=fail, marker="bypass_succeeded". Companion to B-001 for the streaming path. | B-042 | bug_repro, security |
-| `remote.B-018.spoof_system_string` | TestRemoteSpoofer issues notify_remote with author="system"; expected_status=fail, marker="bypass_succeeded" | B-018 | bug_repro, security |
-| `remote.B-018.spoof_known_uuid` | same with `author_id=<known local uuid>`; suite passes uuid via args | B-018 | bug_repro, security |
-| `remote.B-019.notify_count_per_node_not_per_sub` | peer subscribes 3 handlers to `test/r/multi`; from local, `count = await core.notify("test/r/multi", hosts="remote")`; assert `count == 3`; today gives 1 per remote node; expected_status=fail, marker="count_was_node_not_subs" | B-019 | bug_repro |
+| `remote.publish_event.remote_false_blocked_for_config` | config-driven sub on `remote=False` plugin NOT fired by remote publish_event (B-001 boundary check) | — | access |
+| `remote.B-001.code_driven_bypass` | runtime sub on `remote=False` plugin IS fired by remote publish_event; readback via `get_bypass_count`; expected_status=fail, marker="bypass_succeeded" | B-001 | bug_repro, security |
+| `remote.B-042.code_driven_stream_bypass` | runtime async-gen sub on `remote=False` plugin IS iterated by remote `request_event_stream`; readback via counter; expected_status=fail, marker="bypass_succeeded". Companion to B-001 for the streaming path. | B-042 | bug_repro, security |
+| `remote.B-018.spoof_system_string` | RETIRED PR3 Stage D — Stage E re-evaluates author-stamping under PR3 Stage C wire protocol; spoofer fixture removed. | B-018 | skip |
+| `remote.B-018.spoof_known_uuid` | RETIRED PR3 Stage D — see above. | B-018 | skip |
+| `remote.B-019.publish_event_count_per_node_not_per_sub` | peer subscribes 3 handlers to `test/r/multi`; from local, `count = await core.publish_event("test_r_multi", hosts="remote")`; assert `count == 3`; today gives 1 per remote node; expected_status=fail, marker="count_was_node_not_subs" | B-019 | bug_repro |
 | `remote.B-021.first_sub_not_remote_eligible` | local has two subs: first remote=False, second remote=True; remote request → assert RequestException; expected_status=fail, exception_type=RequestException, message_regex="No handler" | B-021 | bug_repro |
 | `remote.B-024.huge_item` | server yields 101 MB item; expected_status=fail, marker="stream_aborted" | B-024 | bug_repro, slow |
 | `remote.B-025.partial_then_failover` | A yields 5 then raises, B yields 3; assert N>5 items received; expected_status=fail, marker="duplicate_items_silently_appended" | B-025 | bug_repro |
-| `remote.B-011.stream_error_sentinel_via_item_end` | server emits `("__STREAM_ERROR__", msg)` then `MSG_STREAM_ITEM_END`; client treats sentinel as data (path 1421-1433) | B-011, B-012 | bug_repro |
-| `remote.B-012.stream_error_sentinel_via_end_stream` | server emits `("__STREAM_ERROR__", msg)` then `MSG_END_STREAM` directly (path 1465-1477 — different unpickle branch); client treats sentinel as data | B-012 | bug_repro |
+| `remote.B-011.stream_error_sentinel_via_item_end` | server emits `("__STREAM_ERROR__", msg)` then `MSG_STREAM_ITEM_END`; client treats sentinel as data | B-011, B-012 | bug_repro |
+| `remote.B-012.stream_error_sentinel_via_end_stream` | server emits `("__STREAM_ERROR__", msg)` then `MSG_END_STREAM` directly (different unpickle branch); client treats sentinel as data | B-012 | bug_repro |
 | `remote.B-028.no_client_timeout` | remote hangs; outer wait_for(2s); expected_status=fail, marker="outer_wait_for_fired" | B-028 | bug_repro |
 | `remote.B-029.code_driven_timeout_ignored` | code-driven topic handler ignores caller's timeout; expected_status=fail, marker="elapsed_exceeded_timeout" | B-029 | bug_repro |
 | `remote.B-030.unpicklable_args` | local fires, remote silently misses; expected_status=fail, marker="state_diverged" | B-030 | bug_repro |
-| `remote.B-027.notify_return_count_misleading` | remote returns 0 from transport fail; assert PluginCore counted as +1; expected_status=fail, marker="counted_as_success" | B-027 | bug_repro |
+| `remote.B-027.publish_event_return_count_misleading` | remote returns 0 from transport fail; assert PluginCore counted as +1; expected_status=fail, marker="counted_as_success" | B-027 | bug_repro |
 | `remote.B-032.head_of_line_blocking` | slow sub blocks fast call on same connection; expected_status=fail, marker="fast_call_blocked" | B-032 | bug_repro, slow |
-| `remote.B-033.request_topic_stream_sync_host_remote` | hosts="remote" silently routes local | B-033 | bug_repro |
-| `remote.B-020.notify_sync_blocks_on_remote` | notify_sync from sync context with slow remote sub; assert calling thread blocked; expected_status=fail, marker="thread_blocked" | B-020 | bug_repro |
+| `remote.B-033.request_event_stream_sync_host_remote` | hosts="remote" silently routes local | B-033 | bug_repro |
+| `remote.B-020.publish_event_sync_blocks_on_remote` | publish_event_sync from sync context with slow remote sub; assert calling thread blocked; expected_status=fail, marker="thread_blocked" | B-020 | bug_repro |
 | `remote.find_endpoints_by_tag` | tag discovery cross-node returns peer endpoints | — | discovery, basic |
 
 (All cases above are `category="basic"`.)
@@ -828,7 +757,7 @@ All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Gen
 |---|---|---|---|
 | `remote.edge.tag.no_matches_returns_empty_list` | tag absent everywhere → empty list, not None | — | discovery, edge |
 | `remote.edge.tag.mixed_local_remote` | same tag on both nodes → both endpoints returned in single response | — | discovery, edge |
-| `remote.edge.pool.exhaustion_under_concurrent_hangs` | spawn N concurrent `request_topic("hang")`; assert pool slot recycled after caller cancellation | — | networking, edge, slow |
+| `remote.edge.pool.exhaustion_under_concurrent_hangs` | spawn N concurrent `request_event("hang")`; assert pool slot recycled after caller cancellation | — | networking, edge, slow |
 | `remote.edge.discovery.simultaneous_startup_race` | both nodes start within 100ms of each other; both eventually discover each other | — | networking, edge |
 
 ---
@@ -858,12 +787,8 @@ plugins:
   - name: TestStreamTarget
     enabled: false
 
-  - name: TestNotifierSuite
-    enabled: false
-  - name: TestNotifierTarget
-    enabled: false
-  - name: TestNotifierBadActor
-    enabled: false                        # suite enables programmatically when needed
+  - name: TestEventSuite
+    enabled: false                        # PR3 Stage D smoke shell; Stage E expands
 
   - name: TestLifecycleSuite
     enabled: false

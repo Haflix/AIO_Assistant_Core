@@ -1,11 +1,11 @@
 description: Orchestrator that drives the AIO Assistant Core test framework's per-suite plugins
-version: 0.1.0
+version: 0.2.0
 remote: False
 arguments:
   suites:
     - TestExecuteSuite
     - TestStreamSuite
-    - TestNotifierSuite
+    - TestEventSuite
     - TestLifecycleSuite
     - TestRemoteSuite
 endpoints:

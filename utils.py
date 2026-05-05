@@ -13,12 +13,11 @@ import queue
 import socket
 import sys
 import threading
-import warnings
 from logging import Logger, StreamHandler, DEBUG
 from uuid import uuid4
 import time
 import yaml
-from typing import Any, Callable, Optional, Tuple, Union, final
+from typing import Any, Optional, Tuple, Union, final
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from exceptions import RequestException, ConfigException
 from colorama import Fore, Style
@@ -1344,226 +1343,12 @@ class Plugin(ABC):
         ):
             yield i
 
-    # ── Notifier: fire-and-forget (one-to-many) ──────────────────────────
-    # NOTE: All notifier methods on Plugin are deprecated pending the
-    # notifier rework. See notes.txt for the redesign plan.
-
-    @async_log_errors
-    async def notify(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-    ) -> int:
-        """
-        Publish to a topic (fire-and-forget). All subscribers are called
-        concurrently; errors are logged but do not propagate.
-
-        Args:
-            topic: Topic string (e.g. "ai/chat", "sensor/bathroom/temperature").
-            args: Arguments forwarded to every subscriber.
-            hosts: Where to dispatch — "any", "local", "remote", a hostname, or a list of hostnames.
-            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
-
-        Returns:
-            Number of subscribers that were called.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.notify() uses the legacy notifier subsystem which is "
-            "being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._plugin_core.notify(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-        )
-
-    @log_errors
-    def notify_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-    ) -> int:
-        """Synchronous variant of notify().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.notify_sync() uses the legacy notifier subsystem which "
-            "is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._plugin_core.notify_sync(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-        )
-
-    # ── Notifier: request-by-topic (one-to-one with response) ─────────
-
-    @async_log_errors
-    async def request_topic(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Request a topic — the first matching handler is called and its
-        result returned. Same discovery logic as execute() with hosts="any".
-
-        Args:
-            topic: Topic string to request.
-            args: Arguments forwarded to the handler.
-            hosts: Where to search — "any", "local", "remote", a hostname, or a list of hostnames.
-            blocked_hosts: Hosts to exclude — same shape as `hosts`, or None for no blocking.
-            timeout: Optional timeout in seconds.
-
-        Returns:
-            The result from the handler.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.request_topic() uses the legacy notifier subsystem which "
-            "is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._plugin_core.request_topic(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
-        )
-
-    @log_errors
-    def request_topic_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Synchronous variant of request_topic().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.request_topic_sync() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._plugin_core.request_topic_sync(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
-        )
-
-    async def request_topic_stream(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Request a topic and stream results from the matching handler.
-
-        Yields:
-            Each value yielded by the handler.
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.request_topic_stream() uses the legacy notifier subsystem "
-            "which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        async for i in self._plugin_core.request_topic_stream(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
-        ):
-            yield i
-
-    def request_topic_stream_sync(
-        self,
-        topic: str,
-        args: Union[tuple, dict, None] = None,
-        hosts: Union[str, list, None] = "any",
-        blocked_hosts: Union[str, list, None] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Synchronous streaming variant of request_topic().
-
-        .. deprecated::
-            See notes.txt — the notifier subsystem is being redesigned.
-        """
-        warnings.warn(
-            "Plugin.request_topic_stream_sync() uses the legacy notifier "
-            "subsystem which is being redesigned. See notes.txt.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        for i in self._plugin_core.request_topic_stream_sync(
-            topic,
-            args,
-            hosts,
-            blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
-        ):
-            yield i
-
     # ── Notifier: subscription management ─────────────────────────────
-    # Plugin.subscribe / Plugin.unsubscribe are POLYMORPHIC during
-    # Stage B: they detect whether the caller is using the LEGACY
-    # ``subscribe(topic, handler)`` shape or the NEW PR3
-    # ``subscribe(topic, target_access_name, ...)`` shape and
-    # dispatch accordingly. Stage D removes the legacy path.
 
     async def subscribe(
         self,
         topic: str,
-        target_access_name=None,
+        target_access_name: Optional[str] = None,
         *,
         target_plugin: Optional[str] = None,
         target_plugin_uuid: Optional[str] = None,
@@ -1571,56 +1356,18 @@ class Plugin(ABC):
         blocked_hosts: Union[str, list, None] = None,
         authors: Union[str, list, None] = None,
         blocked_authors: Union[str, list, None] = None,
-        # LEGACY kwarg — Stage D removes:
-        handler: Optional[Callable] = None,
     ) -> str:
+        """Subscribe to a topic.
+
+        ``target_access_name`` must be a non-empty string naming a declared
+        endpoint on this plugin (or on ``target_plugin`` for cross-plugin
+        orchestrator subs). The framework dispatches matching events through
+        ``execute()`` to that endpoint. Returns ``sub_uuid``.
         """
-        Subscribe to a topic.
-
-        Two calling conventions during Stage B:
-          * NEW (PR3): ``subscribe(topic, target_access_name=..., ...)``
-            — declarative, registers a subscription that routes to a
-            declared endpoint. Returns sub_uuid.
-          * LEGACY (still alive in Stage B; removed in Stage D):
-            ``subscribe(topic, handler)`` where ``handler`` is callable.
-            The framework dispatches the handler directly via the OLD
-            PluginCore.notify path.
-
-        The NEW path is selected when ``target_access_name`` is a str
-        (or ``handler`` kwarg is None). The LEGACY path is selected
-        when the second positional arg is a callable OR the ``handler``
-        kwarg is passed.
-        """
-        # Determine which path we're on.
-        legacy_handler = handler
-        if legacy_handler is None and callable(target_access_name):
-            legacy_handler = target_access_name
-            target_access_name = None
-
-        if legacy_handler is not None:
-            # Legacy code-driven path. Issue DeprecationWarning to
-            # match the old behavior; preserved for Stage B test
-            # plugins that haven't been migrated yet.
-            warnings.warn(
-                "Plugin.subscribe(handler=...) uses the legacy notifier "
-                "subsystem (handler= path); migrate to subscribe(topic, "
-                "target_access_name=...) before Stage D. See notes.txt.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            return await self._plugin_core.subscribe(
-                topic,
-                self.plugin_name,
-                self.plugin_uuid,
-                handler=legacy_handler,
-            )
-
-        # NEW PR3 path — runtime subscription via target_access_name.
         if not isinstance(target_access_name, str) or not target_access_name:
             raise TypeError(
                 "subscribe(): target_access_name must be a non-empty string "
-                "(NEW path) — or pass a callable as 2nd arg / handler= "
-                "kwarg for the LEGACY path."
+                "naming a declared endpoint."
             )
         return await self._plugin_core.subscribe_event(
             topic,
@@ -1636,16 +1383,7 @@ class Plugin(ABC):
         )
 
     async def unsubscribe(self, subscription_id: str) -> bool:
-        """
-        Remove a subscription by its sub_uuid (or legacy id — same str).
-
-        Stage B accepts both NEW (sub_uuid) and LEGACY (id) ids — the
-        underlying registry uses uuid hex strings for both.
-        """
-        # Try NEW path first (subscribe_event returns sub_uuid). Falls
-        # back to legacy unsubscribe; both ultimately call
-        # topic_registry.unsubscribe so this is a single registry op
-        # either way.
+        """Remove a subscription by its sub_uuid."""
         return await self._plugin_core.unsubscribe_event(subscription_id)
 
     # ── PR3 Stage B: publish_event / request_event API ────────────────
