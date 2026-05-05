@@ -1582,24 +1582,16 @@ class NetworkManager:
                 )
                 return
 
-            # Send chunked result.
+            # Send result as a single MSG_STREAM_CHUNK + MSG_END_STREAM
+            # (PLAN b15 / locked #6). The previous hand-rolled chunk-split
+            # was framing-asymmetric vs. the client's _receive_message
+            # decoder, which pickle.loads each frame; a 64KB slice of a
+            # pickled blob is not itself valid pickle, so the second chunk
+            # always failed. _send_message handles the MAX_MESSAGE_SIZE
+            # (100MB) cap natively.
             try:
-                payload_bytes = pickle.dumps(result)
-                if len(payload_bytes) > CHUNK_SIZE:
-                    offset = 0
-                    while offset < len(payload_bytes):
-                        chunk_data = payload_bytes[offset : offset + CHUNK_SIZE]
-                        chunk_length = len(chunk_data) + 1
-                        header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                        writer.write(header + chunk_data)
-                        await writer.drain()
-                        offset += CHUNK_SIZE
-                else:
-                    chunk_length = len(payload_bytes) + 1
-                    header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
-                    writer.write(header + payload_bytes)
-                    await writer.drain()
-                await self._send_end_stream(writer)
+                await self._send_message(writer, MSG_STREAM_CHUNK, result)
+                await self._send_message(writer, MSG_END_STREAM, None)
             except Exception:
                 self._logger.exception("[REQUEST_EVENT] result send failed")
 
@@ -2059,7 +2051,7 @@ class NetworkManager:
         read — server doesn't send one."""
         reader = None
         writer = None
-        connection_returned = False
+        send_ok = False
         try:
             reader, writer = await self._get_connection(IP)
             request_data = {
@@ -2072,16 +2064,27 @@ class NetworkManager:
                 "request_uuid": request_uuid,
             }
             await self._send_message(writer, MSG_PUBLISH_EVENT, request_data)
+            send_ok = True
         except Exception:
+            # Send failure (broken pipe, peer reset, etc.) — do NOT return
+            # a possibly-broken writer to the pool. Mirror the exception
+            # cleanup convention used by request_event_remote /
+            # request_event_stream_remote and Stage A's execute_remote.
             self._logger.debug(
                 "[PUBLISH_EVENT_REMOTE] failed to send to %s", IP, exc_info=True
             )
         finally:
-            if reader and writer and not connection_returned:
-                try:
-                    await self._return_connection(IP, reader, writer)
-                    connection_returned = True
-                except Exception:
+            if reader and writer:
+                if send_ok:
+                    try:
+                        await self._return_connection(IP, reader, writer)
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                else:
                     try:
                         writer.close()
                         await writer.wait_closed()
@@ -2122,18 +2125,26 @@ class NetworkManager:
             }
             await self._send_message(writer, MSG_REQUEST_EVENT, request_data)
 
-            result_chunks_bytes: List[bytes] = []
+            # Server now ships result as a single MSG_STREAM_CHUNK (already
+            # unpickled by _receive_message) terminated by MSG_END_STREAM.
+            # MSG_STREAM_ITEM_END is defensive no-op: should not appear on
+            # this path, but a pooled connection may carry a stray frame
+            # from a prior streaming request — ignore rather than crash.
+            result: Any = None
+            have_result = False
             while True:
                 try:
                     msg_type, chunk = await self._receive_message(reader)
                 except (TimeoutError, ConnectionError) as e:
                     raise NetworkRequestException(str(e))
                 if msg_type == MSG_STREAM_CHUNK:
-                    # _receive_message already unpickled. We RE-PICKLE so
-                    # the existing chunk-reassembly path works (server
-                    # may have split the result across multiple
-                    # MSG_STREAM_CHUNKs).
-                    result_chunks_bytes.append(pickle.dumps(chunk))
+                    result = chunk
+                    have_result = True
+                    continue
+                if msg_type == MSG_STREAM_ITEM_END:
+                    # Defensive: not emitted by _handle_request_event after
+                    # the framing fix, but tolerate it for pooled-connection
+                    # robustness (PLAN b15).
                     continue
                 if msg_type == MSG_END_STREAM:
                     break
@@ -2151,14 +2162,9 @@ class NetworkManager:
             await self._return_connection(IP, reader, writer)
             connection_returned = True
 
-            if not result_chunks_bytes:
+            if not have_result:
                 return None
-            # Reassembly: single chunk path is the common case;
-            # multi-chunk concat-then-loads matches Stage A behavior.
-            if len(result_chunks_bytes) == 1:
-                return pickle.loads(result_chunks_bytes[0])
-            full = b"".join(result_chunks_bytes)
-            return pickle.loads(full)
+            return result
         except RequestException:
             raise
         except Exception as e:
@@ -2258,17 +2264,23 @@ class NetworkManager:
     async def advertise_subs_remote(self, peer_ip: str, peer_hostname: str) -> None:
         """Send full snapshot to a peer (Tree 2 step 13 — content built
         INSIDE per-peer lock so snapshot vs delta serialise per locked #9).
+
+        Lock order (locked #9): list_local_subs() acquires
+        topic_registry._lock; the subscribe/unsubscribe broadcast hooks
+        in PluginCore acquire topic_registry._lock first then reach
+        _advert_locks[peer] via send_sub_delta_remote. To avoid a cycle,
+        snapshot the local subs list BEFORE acquiring _advert_locks[peer].
         """
+        try:
+            subs = await self.plugin_core.topic_registry.list_local_subs()
+        except Exception:
+            self._logger.exception(
+                "[ADVERTISE] list_local_subs failed for peer %s", peer_hostname
+            )
+            return
+
         lock = self._advert_locks.setdefault(peer_hostname, asyncio.Lock())
         async with lock:
-            try:
-                subs = await self.plugin_core.topic_registry.list_local_subs()
-            except Exception:
-                self._logger.exception(
-                    "[ADVERTISE] list_local_subs failed for peer %s", peer_hostname
-                )
-                return
-
             async with self._adverts_struct_lock:
                 filtered = [
                     s for s in subs

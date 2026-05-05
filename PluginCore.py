@@ -4161,10 +4161,11 @@ class PluginCore:
                 default=None,
             )
 
-        # Publisher-level hosts gate: if hosts="remote" or excludes
-        # local, request_event has no local route and Stage B is
-        # LOCAL-only — raise rather than silently fail (caller awaits
-        # a result).
+        # Publisher-level hosts gate: when hosts="remote" or excludes
+        # local, skip the local-match phase entirely and go straight to
+        # Stage C remote dispatch (locked #18 item 7). Previously raised
+        # here, which prevented hosts="remote" callers from ever reaching
+        # the remote candidate iteration block.
         eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
         eff_blocked = (
             blocked_hosts
@@ -4172,31 +4173,31 @@ class PluginCore:
             else event_entry.get("blocked_hosts")
         )
         _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
-        if not self._publisher_targets_local(eff_hosts, eff_blocked):
-            raise RequestException(
-                f"request_event {event_id!r}: publisher hosts={eff_hosts!r} "
-                f"excludes local; remote dispatch lands in Stage C"
-            )
+        local_targets = self._publisher_targets_local(eff_hosts, eff_blocked)
 
         # Capture timestamp once so all per-sub Requests built off this
         # call see consistent epoch seconds (consistency with
         # publish_event).
         now_ts = time.time()
 
-        # Find first matching LOCAL sub (insertion order). Apply the
+        # Find first matching LOCAL sub (insertion order) only when the
+        # publisher's hosts filter actually targets local. Apply the
         # same sub-level host/author filter as publish_event so subs
         # with hosts="remote" or blocked_authors filtering us out are
         # skipped (LOCKED H).
-        all_subs = await self.topic_registry.find_all(resolved_topic)
-        local_match = next(
-            (
-                s for s in all_subs
-                if s.plugin_uuid in self.plugins_by_uuid
-                and self._sub_accepts_local(s)
-                and self._sub_accepts_author(s, publisher.plugin_name)
-            ),
-            None,
-        )
+        if local_targets:
+            all_subs = await self.topic_registry.find_all(resolved_topic)
+            local_match = next(
+                (
+                    s for s in all_subs
+                    if s.plugin_uuid in self.plugins_by_uuid
+                    and self._sub_accepts_local(s)
+                    and self._sub_accepts_author(s, publisher.plugin_name)
+                ),
+                None,
+            )
+        else:
+            local_match = None
 
         if local_match is None:
             # PR3 Stage C step 19 — remote dispatch fall-through (locked
@@ -4367,7 +4368,10 @@ class PluginCore:
                 default=None,
             )
 
-        # Publisher-level hosts gate (same as request_event).
+        # Publisher-level hosts gate (same as request_event): skip local
+        # match entirely when publisher's hosts filter excludes local;
+        # fall through directly to Stage C remote dispatch (locked #18
+        # item 8).
         eff_hosts = hosts if hosts is not None else event_entry.get("hosts")
         eff_blocked = (
             blocked_hosts
@@ -4375,12 +4379,7 @@ class PluginCore:
             else event_entry.get("blocked_hosts")
         )
         _warn_redundant_host_combos(eff_hosts, eff_blocked, self._logger)
-        if not self._publisher_targets_local(eff_hosts, eff_blocked):
-            raise RequestException(
-                f"request_event_stream {event_id!r}: publisher hosts="
-                f"{eff_hosts!r} excludes local; remote dispatch lands in "
-                f"Stage C"
-            )
+        local_targets = self._publisher_targets_local(eff_hosts, eff_blocked)
 
         # Capture timestamp once (consistency with publish_event /
         # request_event).
@@ -4388,17 +4387,21 @@ class PluginCore:
 
         # Apply the same sub-level filter as publish_event /
         # request_event so subs with hosts="remote" or blocked_authors
-        # filtering us out are skipped (LOCKED H).
-        all_subs = await self.topic_registry.find_all(resolved_topic)
-        local_match = next(
-            (
-                s for s in all_subs
-                if s.plugin_uuid in self.plugins_by_uuid
-                and self._sub_accepts_local(s)
-                and self._sub_accepts_author(s, publisher.plugin_name)
-            ),
-            None,
-        )
+        # filtering us out are skipped (LOCKED H). Only run local-match
+        # when publisher actually targets local.
+        if local_targets:
+            all_subs = await self.topic_registry.find_all(resolved_topic)
+            local_match = next(
+                (
+                    s for s in all_subs
+                    if s.plugin_uuid in self.plugins_by_uuid
+                    and self._sub_accepts_local(s)
+                    and self._sub_accepts_author(s, publisher.plugin_name)
+                ),
+                None,
+            )
+        else:
+            local_match = None
         if local_match is None:
             # PR3 Stage C step 20 — remote dispatch fall-through (locked
             # #6 + #13). Pre-first-chunk fall-through ONLY; mid-stream
