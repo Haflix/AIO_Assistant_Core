@@ -1,0 +1,150 @@
+description: PR3 Stage E target — passive subscriber for cross-plugin event tests
+version: "0.1.0"
+remote: false
+arguments:
+events:
+  target_outbound:
+    topic: "test_event/target/outbound"
+    hosts: "local"
+subscriptions:
+  # NOTE: no subscription on test_event/cross_plugin/dispatch here —
+  # the cross-plugin routing test explicitly verifies that the SUITE's
+  # cross-plugin sub (owner=TestEventSuite, target=TestEventTarget) is
+  # the only path; adding a self-owned sub here would double-fire.
+  enabled_false_sub:
+    topic: "test_event/disabled_sub/topic"
+    target_access_name: handle_disabled
+    hosts: "local"
+    enabled: false
+  private_endpoint_sub:
+    topic: "test_event/private/topic"
+    target_access_name: priv_endpoint
+    hosts: "local"
+  # The matching cases use TestEventSuite's cross-plugin subs (owner =
+  # suite, target = TestEventTarget). Adding self-owned subs here would
+  # double-fire and obscure the count.
+  wildcard_no_match_sub:
+    topic: "test_event/no_match/*/foo"
+    target_access_name: handle_no_match
+    hosts: "local"
+  hostname_topic_sub:
+    topic: "test_event/host/{hostname}/leaf"
+    target_access_name: handle_hostname_topic
+    hosts: "local"
+  prefix_topic_sub:
+    topic: "{prefix}/load_time/leaf"
+    target_access_name: handle_prefix_topic
+    hosts: "local"
+  plugin_name_topic_sub:
+    topic: "{plugin_name}/load_time/leaf"
+    target_access_name: handle_plugin_name_topic
+    hosts: "local"
+  user_topic_sub:
+    topic: "test_event/runtime/*/leaf"
+    target_access_name: handle_user_topic
+    hosts: "local"
+  mixed_topic_sub:
+    topic: "{prefix}/mixed/*/x"
+    target_access_name: handle_mixed_topic
+    hosts: "local"
+endpoints:
+  handle_cross:
+    internal_name: handle_cross
+    remote: false
+    accessible_by_other_plugins: true
+    description: Cross-plugin dispatch sink
+    arguments:
+      - name: event
+  handle_disabled:
+    internal_name: handle_disabled
+    remote: false
+    accessible_by_other_plugins: true
+    description: Subscription is enabled false; should never fire
+    arguments:
+      - name: event
+  priv_endpoint:
+    internal_name: priv_endpoint
+    remote: false
+    accessible_by_other_plugins: false
+    description: Private endpoint — accessible_by_other_plugins false
+    arguments:
+      - name: event
+  handle_requester_probe:
+    internal_name: handle_requester_probe
+    remote: false
+    accessible_by_other_plugins: true
+    description: Records the dispatch's requester identity for verification
+    arguments:
+      - name: event
+  handle_exact_match:
+    internal_name: handle_exact_match
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_wildcard_match:
+    internal_name: handle_wildcard_match
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_no_match:
+    internal_name: handle_no_match
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_sync:
+    internal_name: handle_sync
+    remote: false
+    accessible_by_other_plugins: true
+    description: Sync (def, not async def) handler — runs on SyncDispatcher
+    arguments:
+      - name: event
+  handle_stream:
+    internal_name: handle_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async generator handler for request_event_stream
+    arguments:
+      - name: event
+  handle_hostname_topic:
+    internal_name: handle_hostname_topic
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_prefix_topic:
+    internal_name: handle_prefix_topic
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_plugin_name_topic:
+    internal_name: handle_plugin_name_topic
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_user_topic:
+    internal_name: handle_user_topic
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_mixed_topic:
+    internal_name: handle_mixed_topic
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  reset_state:
+    internal_name: reset_state
+    remote: false
+    accessible_by_other_plugins: true
+    description: Reset all internal mailboxes for clean test state
+  get_state:
+    internal_name: get_state
+    remote: false
+    accessible_by_other_plugins: true
+    description: Snapshot all internal mailboxes

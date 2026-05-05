@@ -29,6 +29,17 @@ plugins:
     enabled: true
     path: ./plugins_test/TestEventSuite
 
+  - name: TestEventTarget
+    enabled: true
+    path: ./plugins_test/TestEventTarget
+
+  # Bad-actor fixture loaded on-demand by TestEventSuite (§5.4 idiom).
+  # Handlers raise / hang / cancel — kept disabled at framework boot so
+  # nothing fires accidentally.
+  - name: TestEventBadActor
+    enabled: false
+    path: ./plugins_test/TestEventBadActor
+
   - name: TestLifecycleSuite
     enabled: true
     path: ./plugins_test/TestLifecycleSuite

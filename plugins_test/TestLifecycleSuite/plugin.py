@@ -286,6 +286,11 @@ class TestLifecycleSuite(Plugin):
                             pass
                 await self._ensure_victim_clean()
 
+        # STAGE_E_FIXME: verify B-010 status — currently passes when run
+        # (showing as unexpected_pass). The PR3 notifier rework doesn't
+        # directly touch the on_disable-raises path so the fix likely
+        # came from the unrelated lifecycle changes in earlier stages;
+        # confirm with a manual repro before flipping expected_status.
         await rec.run_case(
             "lifecycle.B-010.on_disable_raises", body,
             tags=("bug_repro",), bug_ids=("B-010",),
@@ -661,6 +666,12 @@ class TestLifecycleSuite(Plugin):
                     except Exception:
                         pass
 
+        # STAGE_E_FIXME: verify B-037 status — passes under current
+        # PR3 architecture (handler did NOT fire during pop). Stage B
+        # moved YAML subscription cleanup into on_disable's tail
+        # (C15 + locked #18 item 5) which closes most of the race
+        # window. Tentatively fixed-by-construction; confirm with a
+        # manual repro and flip expected_status to "pass" when verified.
         await rec.run_case(
             "lifecycle.B-037.event_during_pop", body,
             tags=("bug_repro",), bug_ids=("B-037",),

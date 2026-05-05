@@ -518,6 +518,12 @@ class TestRemoteSuite(Plugin):
                         "expected_signature": {"marker": "stream_aborted"},
                     }
                 elif "B-028" in bug_ids or "B-020" in bug_ids:
+                    # STAGE_E_FIXME: verify B-020 status — currently
+                    # passes (unexpected_pass) when remote node is up.
+                    # Sync block on remote may be fixed-by-construction
+                    # by Stage B's sync entry-point retrofits + Q1 guard;
+                    # confirm with a remote-node manual repro before
+                    # flipping expected_status to "pass".
                     extra = {
                         "expected_status": "fail",
                         "expected_signature": {"marker": "outer_wait_for_fired"},

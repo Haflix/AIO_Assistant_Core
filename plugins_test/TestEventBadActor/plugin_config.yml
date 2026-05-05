@@ -1,0 +1,59 @@
+description: PR3 Stage E bad actor — handlers raise / hang / cancel on demand
+version: "0.1.0"
+remote: false
+arguments:
+events:
+subscriptions:
+  raising_async_sub:
+    topic: "test_event/badactor/raising_async"
+    target_access_name: handle_raising_async
+    hosts: "local"
+  raising_sync_sub:
+    topic: "test_event/badactor/raising_sync"
+    target_access_name: handle_raising_sync
+    hosts: "local"
+  hanging_sync_sub:
+    topic: "test_event/badactor/hanging_sync"
+    target_access_name: handle_hanging_sync
+    hosts: "local"
+  long_running_sync_sub:
+    topic: "test_event/badactor/long_sync"
+    target_access_name: handle_long_sync
+    hosts: "local"
+endpoints:
+  handle_raising_async:
+    internal_name: handle_raising_async
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_raising_sync:
+    internal_name: handle_raising_sync
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_hanging_sync:
+    internal_name: handle_hanging_sync
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_long_sync:
+    internal_name: handle_long_sync
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  configure:
+    internal_name: configure
+    remote: false
+    accessible_by_other_plugins: true
+    description: Adjust runtime knobs (hang_secs, raise_msg etc.)
+    arguments:
+      - name: settings
+  get_call_log:
+    internal_name: get_call_log
+    remote: false
+    accessible_by_other_plugins: true
+    description: Return list of (handler, started_at, finished_at) tuples

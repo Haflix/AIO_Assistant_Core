@@ -1,15 +1,127 @@
-description: PR3 event API suite — smoke-level publish_event / request_event verification (Stage E expands to full PLAN J)
-version: "0.1.0"
+description: PR3 event API suite — comprehensive PLAN J coverage (Stage E)
+version: "0.2.1"
 remote: false
+verbose_notifier: true
+prefix: "PSuite"
 arguments:
 events:
+  # ── smoke (carried forward from Stage D) ─────────────────────────────
   smoke_publish:
     topic: "test_event/smoke/publish"
     hosts: "local"
   smoke_request:
     topic: "test_event/smoke/request"
     hosts: "local"
+
+  # ── eventid declaration / lookup tests ───────────────────────────────
+  declared_event:
+    topic: "test_event/eventid/declared"
+    hosts: "local"
+  no_match_event:
+    topic: "test_event/eventid/no_match_anywhere"
+    hosts: "local"
+  disabled_event:
+    topic: "test_event/eventid/disabled"
+    hosts: "local"
+    enabled: false
+  kwargs_override_event:
+    topic: "test_event/eventid/{user}/leaf"
+    hosts: "local"
+
+  # ── topic templating ─────────────────────────────────────────────────
+  load_time_prefix_event:
+    topic: "{prefix}/load_time/leaf"
+    hosts: "local"
+  load_time_plugin_name_event:
+    topic: "{plugin_name}/load_time/leaf"
+    hosts: "local"
+  load_time_hostname_event:
+    topic: "test_event/host/{hostname}/leaf"
+    hosts: "local"
+  runtime_user_event:
+    topic: "test_event/runtime/{user}/leaf"
+    hosts: "local"
+  mixed_topic_event:
+    topic: "{prefix}/mixed/{user}/x"
+    hosts: "local"
+
+  # ── dispatch / metadata ──────────────────────────────────────────────
+  dispatch_metadata_event:
+    topic: "test_event/dispatch/metadata"
+    hosts: "local"
+  dispatch_payload_dict_event:
+    topic: "test_event/dispatch/payload_dict"
+    hosts: "local"
+  dispatch_payload_none_event:
+    topic: "test_event/dispatch/payload_none"
+    hosts: "local"
+  cross_plugin_dispatch_event:
+    topic: "test_event/cross_plugin/dispatch"
+    hosts: "local"
+  target_missing_event:
+    topic: "test_event/target_missing/topic"
+    hosts: "local"
+  enabled_false_sub_event:
+    topic: "test_event/disabled_sub/topic"
+    hosts: "local"
+  self_publish_loopback_event:
+    topic: "test_event/loopback/topic"
+    hosts: "local"
+  stream_event:
+    topic: "test_event/stream/topic"
+    hosts: "local"
+  stream_timeout_event:
+    topic: "test_event/stream_timeout/topic"
+    hosts: "local"
+
+  # ── matching + tie-break ─────────────────────────────────────────────
+  match_exact_event:
+    topic: "test_event/match/exact/leaf"
+    hosts: "local"
+  match_no_match_event:
+    topic: "test_event/no_match/segment/extra/foo"
+    hosts: "local"
+  match_yaml_order_event:
+    topic: "test_event/order/exactmatch/leaf"
+    hosts: "local"
+  match_strict_order_event:
+    topic: "test_event/strictorder/middle/leaf"
+    hosts: "local"
+
+  # ── access control (C18) ─────────────────────────────────────────────
+  access_priv_remote_event:
+    topic: "test_event/private/topic"
+    hosts: "local"
+  access_priv_self_event:
+    topic: "test_event/access/self_priv/topic"
+    hosts: "local"
+  access_requester_probe_event:
+    topic: "test_event/requester_probe/topic"
+    hosts: "local"
+
+  # ── sync dispatcher (Q17 + C3) ───────────────────────────────────────
+  sync_basic_event:
+    topic: "test_event/sync/topic"
+    hosts: "local"
+
+  # ── lifecycle ────────────────────────────────────────────────────────
+  lifecycle_runtime_chrono_event:
+    topic: "test_event/lifecycle/runtime_chrono"
+    hosts: "local"
+
+  # ── edge cases ───────────────────────────────────────────────────────
+  edge_static_warn_event:
+    topic: "test_event/edge/static_warn"
+    hosts: "local"
+  edge_extra_keys_event:
+    topic: "test_event/edge/extra_keys"
+    hosts: "local"
+  edge_static_topic_event:
+    topic: "test_event/edge/static_topic"
+    hosts: "local"
+
 subscriptions:
+  # ── smoke ────────────────────────────────────────────────────────────
   smoke_publish_sub:
     topic: "test_event/smoke/publish"
     target_access_name: handle_smoke_publish
@@ -18,13 +130,143 @@ subscriptions:
     topic: "test_event/smoke/request"
     target_access_name: handle_smoke_request
     hosts: "local"
+
+  # ── eventid lookup ───────────────────────────────────────────────────
+  declared_event_sub:
+    topic: "test_event/eventid/declared"
+    target_access_name: handle_declared
+    hosts: "local"
+  kwargs_override_sub:
+    topic: "test_event/eventid/alice/leaf"
+    target_access_name: handle_kwargs_override
+    hosts: "local"
+
+  # ── templating self-subs (publisher + subscriber on SAME plugin so
+  #     {prefix} / {plugin_name} resolve to the same value at load) ──
+  prefix_self_sub:
+    topic: "{prefix}/load_time/leaf"
+    target_access_name: handle_prefix_self
+    hosts: "local"
+  plugin_name_self_sub:
+    topic: "{plugin_name}/load_time/leaf"
+    target_access_name: handle_plugin_name_self
+    hosts: "local"
+
+  # ── dispatch ─────────────────────────────────────────────────────────
+  dispatch_metadata_sub:
+    topic: "test_event/dispatch/metadata"
+    target_access_name: handle_dispatch_metadata
+    hosts: "local"
+  dispatch_payload_dict_sub:
+    topic: "test_event/dispatch/payload_dict"
+    target_access_name: handle_dispatch_payload
+    hosts: "local"
+  dispatch_payload_none_sub:
+    topic: "test_event/dispatch/payload_none"
+    target_access_name: handle_dispatch_payload
+    hosts: "local"
+  # Cross-plugin sub: owner = TestEventSuite, target = TestEventTarget.
+  cross_plugin_dispatch_sub:
+    topic: "test_event/cross_plugin/dispatch"
+    target_plugin: TestEventTarget
+    target_access_name: handle_cross
+    hosts: "local"
+  target_missing_sub:
+    topic: "test_event/target_missing/topic"
+    target_plugin: NonexistentPlugin
+    target_access_name: handle_void
+    hosts: "local"
+  loopback_sub:
+    topic: "test_event/loopback/topic"
+    target_access_name: handle_loopback
+    hosts: "local"
+  stream_sub:
+    topic: "test_event/stream/topic"
+    target_plugin: TestEventTarget
+    target_access_name: handle_stream
+    hosts: "local"
+  stream_timeout_sub:
+    topic: "test_event/stream_timeout/topic"
+    target_access_name: handle_stream_timeout
+    hosts: "local"
+
+  # ── matching ────────────────────────────────────────────────────────
+  match_exact_sub:
+    topic: "test_event/match/exact/leaf"
+    target_plugin: TestEventTarget
+    target_access_name: handle_exact_match
+    hosts: "local"
+  match_wildcard_sub:
+    topic: "test_event/match/*/leaf"
+    target_plugin: TestEventTarget
+    target_access_name: handle_wildcard_match
+    hosts: "local"
+  # YAML order: WILDCARD first.
+  order_wildcard_first:
+    topic: "test_event/order/*/leaf"
+    target_access_name: handle_order_wildcard
+    hosts: "local"
+  order_exact_second:
+    topic: "test_event/order/exactmatch/leaf"
+    target_access_name: handle_order_exact
+    hosts: "local"
+  # Strict-order test (mixed exact + wildcard, multiple).
+  strict_order_a_wildcard:
+    topic: "test_event/strictorder/*/leaf"
+    target_access_name: handle_strict_a
+    hosts: "local"
+  strict_order_b_exact:
+    topic: "test_event/strictorder/middle/leaf"
+    target_access_name: handle_strict_b
+    hosts: "local"
+  strict_order_c_wildcard:
+    topic: "test_event/strictorder/*/*"
+    target_access_name: handle_strict_c
+    hosts: "local"
+
+  # ── access control ──────────────────────────────────────────────────
+  access_priv_remote_sub:
+    topic: "test_event/private/topic"
+    target_plugin: TestEventTarget
+    target_access_name: priv_endpoint
+    hosts: "local"
+  access_priv_self_sub:
+    topic: "test_event/access/self_priv/topic"
+    target_access_name: handle_self_priv
+    hosts: "local"
+  access_requester_probe_sub:
+    topic: "test_event/requester_probe/topic"
+    target_plugin: TestEventTarget
+    target_access_name: handle_requester_probe
+    hosts: "local"
+
+  # ── sync dispatcher ─────────────────────────────────────────────────
+  sync_basic_sub:
+    topic: "test_event/sync/topic"
+    target_plugin: TestEventTarget
+    target_access_name: handle_sync
+    hosts: "local"
+
+  # ── edge ────────────────────────────────────────────────────────────
+  edge_static_warn_sub:
+    topic: "test_event/edge/static_warn"
+    target_access_name: handle_edge_static_warn
+    hosts: "local"
+  edge_extra_keys_sub:
+    topic: "test_event/edge/extra_keys"
+    target_access_name: handle_edge_extra_keys
+    hosts: "local"
+  edge_static_topic_sub:
+    topic: "test_event/edge/static_topic"
+    target_access_name: handle_edge_static_topic
+    hosts: "local"
 endpoints:
   run:
     internal_name: run
     tags:
     remote: false
     accessible_by_other_plugins: true
-    description: Run the event-suite smoke cases and return a structured suite result dict
+    description: Run the event-suite cases and return a structured suite result dict
     arguments:
       - name: category
         description: 'basic | edge | null (both)'
@@ -36,17 +278,141 @@ endpoints:
         description: Filter cases by bug tag
       - name: skip_slow
       - name: allow_destructive
+
   handle_smoke_publish:
     internal_name: handle_smoke_publish
     remote: false
     accessible_by_other_plugins: true
-    description: Subscriber endpoint for smoke_publish event — records payload and metadata
     arguments:
       - name: event
   handle_smoke_request:
     internal_name: handle_smoke_request
     remote: false
     accessible_by_other_plugins: true
-    description: Subscriber endpoint for smoke_request event — echoes payload back
+    arguments:
+      - name: event
+
+  handle_declared:
+    internal_name: handle_declared
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_kwargs_override:
+    internal_name: handle_kwargs_override
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_prefix_self:
+    internal_name: handle_prefix_self
+    remote: false
+    accessible_by_other_plugins: true
+    description: Self-subscriber endpoint used by load-time {prefix} test
+    arguments:
+      - name: event
+  handle_plugin_name_self:
+    internal_name: handle_plugin_name_self
+    remote: false
+    accessible_by_other_plugins: true
+    description: Self-subscriber endpoint used by load-time {plugin_name} test
+    arguments:
+      - name: event
+  handle_void:
+    internal_name: handle_void
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+
+  handle_dispatch_metadata:
+    internal_name: handle_dispatch_metadata
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_dispatch_payload:
+    internal_name: handle_dispatch_payload
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_loopback:
+    internal_name: handle_loopback
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+
+  handle_stream_timeout:
+    internal_name: handle_stream_timeout
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+
+  handle_order_wildcard:
+    internal_name: handle_order_wildcard
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_order_exact:
+    internal_name: handle_order_exact
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_strict_a:
+    internal_name: handle_strict_a
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_strict_b:
+    internal_name: handle_strict_b
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_strict_c:
+    internal_name: handle_strict_c
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+
+  handle_self_priv:
+    internal_name: handle_self_priv
+    remote: false
+    accessible_by_other_plugins: false
+    description: Private endpoint — used for self-target access tests
+    arguments:
+      - name: event
+
+  handle_runtime_chrono:
+    internal_name: handle_runtime_chrono
+    remote: false
+    accessible_by_other_plugins: true
+    description: Runtime-subscribed handler used by chronological-order tests
+    arguments:
+      - name: event
+
+  handle_edge_static_warn:
+    internal_name: handle_edge_static_warn
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_edge_extra_keys:
+    internal_name: handle_edge_extra_keys
+    remote: false
+    accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  handle_edge_static_topic:
+    internal_name: handle_edge_static_topic
+    remote: false
+    accessible_by_other_plugins: true
     arguments:
       - name: event
