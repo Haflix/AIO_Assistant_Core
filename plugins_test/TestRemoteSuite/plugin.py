@@ -343,18 +343,16 @@ class TestRemoteSuite(Plugin):
             # B-024: request_event_stream emits ONE MSG_STREAM_CHUNK per
             # yielded item, no chunking, no item-end boundaries (unlike
             # execute_stream which DOES chunk via _handle_execute_stream).
-            # If the pickled item exceeds CHUNK_SIZE (64KB) the receiver
-            # may either (a) misparse — items unpicklable mid-stream, or
-            # (b) reject with NetworkRequestException if > MAX_MESSAGE_SIZE
-            # (100MB). 200KB sits well past CHUNK_SIZE and well under
-            # MAX, so this exercises the per-item-no-chunking path.
+            # The fixture yields one 101MB item — over MAX_MESSAGE_SIZE
+            # (100MB) — so the receiver should reject with
+            # NetworkRequestException. That is the B-024 repro path.
             try:
                 items = []
                 async for chunk in self.request_event_stream(
                     "r_huge_stream", hosts=c.hosts,
                 ):
                     items.append(chunk)
-                # If items received cleanly with the original 200KB payload
+                # If items received cleanly with the 101MB payload
                 # intact, B-024 isn't reproducing here (server may have
                 # added per-item chunking). Mark and fail.
                 if not items:

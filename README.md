@@ -33,7 +33,7 @@
 - **Connection Pooling**: Efficient reuse of network connections with configurable pool sizes
 - **Endpoint-Based Routing**: Fine-grained access control per endpoint with `accessible_by_other_plugins` and `remote` flags
 - **Simple API**: One-liner syntax for executing plugin methods
-- **Topic-Based Notifier**: Pub/sub and request-by-topic system for decoupled plugin communication with wildcard support
+- **Topic-Based Event System**: Pub/sub and request-by-event routing for decoupled plugin communication with wildcard support
 - **Streaming Support**: Full support for both sync and async generator-based data streams
 - **Built-in CLI Dashboard**: Textual-based TUI with system stats, plugin management, config editing, and live logs
 - **Error Handling**: Comprehensive decorator-based error handling for sync functions, async functions, sync generators, and async generators

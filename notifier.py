@@ -16,7 +16,7 @@ Single-level wildcard "*" is supported: "sensor/*/temperature" matches
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Union
 from uuid import uuid4
 
@@ -117,12 +117,6 @@ class Subscription:
         target = f"{self.target_plugin}.{self.target_access_name}"
         head = self.declared_id or self.sub_uuid[:8]
         return f"Sub({head}, {self.topic_pattern} -> {target})"
-
-    @property
-    def id(self) -> str:
-        """Legacy alias for sub_uuid. Read-only so the property and
-        a hypothetical dataclass field don't conflict."""
-        return self.sub_uuid
 
 
 class TopicRegistry:
