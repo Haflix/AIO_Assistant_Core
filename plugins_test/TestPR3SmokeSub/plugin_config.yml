@@ -1,0 +1,26 @@
+description: "PR3 Stage C smoke subscriber — receives cross-node events."
+version: "1.0.0"
+remote: true
+arguments: null
+subscriptions:
+  smoke_handler:
+    topic: "smoke/ping"
+    target_access_name: handle_ping
+    hosts: "any"
+  smoke_request_handler:
+    topic: "smoke/ask"
+    target_access_name: handle_ask
+    hosts: "any"
+endpoints:
+  handle_ping:
+    internal_name: handle_ping
+    remote: false
+    accessible_by_other_plugins: true
+  handle_ask:
+    internal_name: handle_ask
+    remote: false
+    accessible_by_other_plugins: true
+  get_received:
+    internal_name: get_received
+    remote: true
+    accessible_by_other_plugins: true

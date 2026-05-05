@@ -1,0 +1,16 @@
+description: "PR3 Stage C smoke publisher — fires events at remote subscribers."
+version: "1.0.0"
+remote: false
+arguments: null
+events:
+  smoke_event:
+    topic: "smoke/ping"
+    hosts: "any"
+  smoke_request:
+    topic: "smoke/ask"
+    hosts: "any"
+endpoints:
+  get_status:
+    internal_name: get_status
+    remote: false
+    accessible_by_other_plugins: true

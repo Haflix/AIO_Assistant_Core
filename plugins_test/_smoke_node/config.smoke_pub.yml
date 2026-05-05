@@ -1,0 +1,24 @@
+# Smoke parent config: loads ONLY TestPR3SmokePub. Listens on port 2510.
+plugins:
+  - name: TestPR3SmokePub
+    enabled: true
+    path: ./plugins_test/TestPR3SmokePub
+
+general:
+    hostname: "smoke-parent"
+    plugin_package: plugins_test
+    console_log_level: "INFO"
+    file_log_level: "DEBUG"
+    asyncio_debug: false
+    logger_levels:
+        asyncio: "MUTE"
+        urllib3: "MUTE"
+
+networking:
+    enabled: true
+    node_ips: []
+    port: 2510
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true
+    secret: "aio_smoke_secret"
