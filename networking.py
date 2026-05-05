@@ -2024,10 +2024,13 @@ class NetworkManager:
                         return
                     per_peer = self._inbound_adverts.get(author_host)
                     if per_peer is None or sub_uuid not in per_peer:
-                        # Idempotent skip
-                        return
-                    per_peer.pop(sub_uuid, None)
-                    self._inbound_global_order.pop((author_host, sub_uuid), None)
+                        # Idempotent skip — fall through to reciprocal-exchange
+                        # check (locked #7); the early-return in Cycle 6 review
+                        # was inconsistent with sister handlers.
+                        pass
+                    else:
+                        per_peer.pop(sub_uuid, None)
+                        self._inbound_global_order.pop((author_host, sub_uuid), None)
 
             await self._maybe_reciprocal_exchange(author_host, writer)
 
@@ -2385,21 +2388,42 @@ class NetworkManager:
 
             reader = None
             writer = None
-            connection_returned = False
+            send_ok = False
             try:
                 reader, writer = await self._get_connection(peer_ip)
                 await self._send_message(writer, MSG_SUB_DELTA, wire_payload)
+                send_ok = True
             except Exception:
                 self._logger.debug(
                     "[DELTA] failed to send %s to %s", kind, peer_hostname,
                     exc_info=True,
                 )
+                # Roll back outbound bookkeeping so retry / future-snapshot
+                # path can re-emit. Without this, peer state is recorded as
+                # "already advertised" / "already removed" even though no
+                # bytes hit the wire — silent staleness until reconnect.
+                async with self._adverts_struct_lock:
+                    outbound_now = self._outbound_adverts.get(peer_hostname)
+                    if outbound_now is not None:
+                        if kind == "add":
+                            outbound_now.pop(sub.sub_uuid, None)
+                        # For "remove" rollback we'd need the prior AdvertSub —
+                        # not preserved before delete. Acceptable: peer either
+                        # already had remove applied (idempotent) or our state
+                        # diverged briefly until next snapshot/reconnect.
             finally:
-                if reader and writer and not connection_returned:
-                    try:
-                        await self._return_connection(peer_ip, reader, writer)
-                        connection_returned = True
-                    except Exception:
+                if reader and writer:
+                    if send_ok:
+                        try:
+                            await self._return_connection(peer_ip, reader, writer)
+                        except Exception:
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                            except Exception:
+                                pass
+                    else:
+                        # Send failed — never return broken writer to pool.
                         try:
                             writer.close()
                             await writer.wait_closed()
