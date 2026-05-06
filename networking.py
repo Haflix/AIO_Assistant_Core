@@ -688,7 +688,7 @@ class NetworkManager:
             payload_length = msg_length - 1
             if payload_length > 0:
                 payload = await reader.readexactly(payload_length)
-                data = pickle.loads(payload)
+                data = safe_loads(payload)
             else:
                 data = None
 
@@ -3518,8 +3518,18 @@ class NetworkManager:
                         )
                         break
                     elif msg_type == MSG_ERROR:
-                        # Error message is pickled, so unpickle it
-                        error_data = pickle.loads(payload)
+                        # K-6 (B-066): wrap UnpicklingError so plugin
+                        # exceptions that didn't inherit Serializable
+                        # surface as a clean NetworkRequestException
+                        # rather than a confusing "Disallowed class".
+                        try:
+                            error_data = safe_loads(payload)
+                        except pickle.UnpicklingError as _e:
+                            raise NetworkRequestException(
+                                f"Remote node {IP} sent an exception class this node "
+                                f"does not recognize: {_e}. Plugin authors: make custom "
+                                f"exceptions inherit from serialization.SerializableException."
+                            )
                         if (
                             isinstance(error_data, tuple)
                             and len(error_data) == 2
@@ -3551,7 +3561,7 @@ class NetworkManager:
             if result_chunks_bytes:
                 # Concatenate all pickled chunks and unpickle
                 full_pickled = b"".join(result_chunks_bytes)
-                result = pickle.loads(full_pickled)
+                result = safe_loads(full_pickled)
                 try:
                     result_type = type(result).__name__
                 except Exception:
@@ -3687,7 +3697,7 @@ class NetworkManager:
                         if current_item_chunks:
                             full_pickled = b"".join(current_item_chunks)
                             try:
-                                item = pickle.loads(full_pickled)
+                                item = safe_loads(full_pickled)
                                 if isinstance(item, tuple) and len(item) == 2:
                                     if item[0] == "__STREAM_ERROR__":
                                         self._logger.exception(
@@ -3727,7 +3737,7 @@ class NetworkManager:
                         if current_item_chunks:
                             full_pickled = b"".join(current_item_chunks)
                             try:
-                                item = pickle.loads(full_pickled)
+                                item = safe_loads(full_pickled)
                                 items_yielded += 1
                                 yield item
                             except Exception as e:
@@ -3736,7 +3746,17 @@ class NetworkManager:
                                 )
                         break
                     elif msg_type == MSG_ERROR:
-                        error_data = pickle.loads(payload)
+                        # K-6 (B-066): wrap UnpicklingError on the MSG_ERROR
+                        # decode path so plugin exceptions that didn't inherit
+                        # Serializable still surface as NetworkRequestException.
+                        try:
+                            error_data = safe_loads(payload)
+                        except pickle.UnpicklingError as _e:
+                            raise NetworkRequestException(
+                                f"Remote node {IP} sent an exception class this node "
+                                f"does not recognize: {_e}. Plugin authors: make custom "
+                                f"exceptions inherit from serialization.SerializableException."
+                            )
                         error_msg = str(error_data)
                         if isinstance(error_data, tuple) and len(error_data) == 2:
                             error_msg = error_data[1]
@@ -3761,7 +3781,7 @@ class NetworkManager:
                     if current_item_chunks:
                         full_pickled = b"".join(current_item_chunks)
                         try:
-                            item = pickle.loads(full_pickled)
+                            item = safe_loads(full_pickled)
                             if isinstance(item, tuple) and len(item) == 2:
                                 if item[0] == "__STREAM_ERROR__":
                                     # Cycle-2 V3 fix: align with __STREAM_EXCEPTION__
@@ -3796,7 +3816,7 @@ class NetworkManager:
                     if current_item_chunks:
                         full_pickled = b"".join(current_item_chunks)
                         try:
-                            item = pickle.loads(full_pickled)
+                            item = safe_loads(full_pickled)
                             items_yielded += 1
                             yield item
                         except Exception as e:
