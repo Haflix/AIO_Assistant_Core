@@ -1049,20 +1049,20 @@ class NetworkManager:
                     break
 
                 if msg_type == MSG_EXECUTE:
-                    await self._handle_execute(reader, writer, data)
+                    await self._handle_execute(reader, writer, data, conn_context)
                 elif msg_type == MSG_EXECUTE_STREAM:
-                    await self._handle_execute_stream(reader, writer, data)
+                    await self._handle_execute_stream(reader, writer, data, conn_context)
                 elif msg_type == MSG_HAS_ENDPOINT:
                     self._logger.debug(
                         f"[ENDPOINT] Routing HAS_ENDPOINT message from {client_addr} to handler"
                     )
-                    await self._handle_has_endpoint(reader, writer, data)
+                    await self._handle_has_endpoint(reader, writer, data, conn_context)
                 elif msg_type == MSG_PING:
-                    await self._handle_ping(reader, writer, data)
+                    await self._handle_ping(reader, writer, data, conn_context)
                 elif msg_type == MSG_INFO:
-                    await self._handle_info(reader, writer, data)
+                    await self._handle_info(reader, writer, data, conn_context)
                 elif msg_type == MSG_FIND_TAGGED_ENDPOINTS:
-                    await self._handle_find_tagged_endpoints(reader, writer, data)
+                    await self._handle_find_tagged_endpoints(reader, writer, data, conn_context)
                 # PR3 Stage C dispatch — locked #17 conn_context threaded
                 elif msg_type == MSG_PUBLISH_EVENT:
                     await self._handle_publish_event(reader, writer, data, conn_context)
@@ -1129,9 +1129,14 @@ class NetworkManager:
                 )
 
     async def _handle_execute(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle EXECUTE message."""
+        conn_context = conn_context or {}
         try:
             plugin = data.get("plugin")
             method = data.get("method")
@@ -1240,9 +1245,14 @@ class NetworkManager:
             await self._send_error(writer, str(e))
 
     async def _handle_execute_stream(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle EXECUTE_STREAM message."""
+        conn_context = conn_context or {}
         try:
             plugin = data.get("plugin")
             method = data.get("method")
@@ -1368,9 +1378,14 @@ class NetworkManager:
                 pass
 
     async def _handle_has_endpoint(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle HAS_ENDPOINT message (checks plugin existence AND endpoint in one call)."""
+        conn_context = conn_context or {}
         client_addr = writer.get_extra_info("peername")
         try:
             access_name = data.get("access_name")
@@ -1468,9 +1483,14 @@ class NetworkManager:
             await self._send_error(writer, str(e))
 
     async def _handle_find_tagged_endpoints(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle FIND_TAGGED_ENDPOINTS message -- returns all local endpoints matching a tag."""
+        conn_context = conn_context or {}
         client_addr = writer.get_extra_info("peername")
         try:
             tag = data.get("tag")
@@ -3112,9 +3132,14 @@ class NetworkManager:
         return out
 
     async def _handle_ping(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle PING message."""
+        conn_context = conn_context or {}
         try:
             await self._send_message(writer, MSG_RESULT, {"status": "ok"})
         except Exception as e:
@@ -3122,9 +3147,14 @@ class NetworkManager:
             await self._send_error(writer, str(e))
 
     async def _handle_info(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, data: dict
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Optional[Dict[str, Any]] = None,
     ):
         """Handle INFO message."""
+        conn_context = conn_context or {}
         try:
             hostname = data.get("hostname")
             discover_nodes_info = data.get("discover_nodes_info")
