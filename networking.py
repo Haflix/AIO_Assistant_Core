@@ -824,6 +824,28 @@ class NetworkManager:
             request_id = data.get("request_id")
             args = data.get("args", [])
 
+            # B-018b GUARD — wire-supplied author/author_id cannot be trusted
+            # for access-control decisions. A peer can claim author="system"
+            # (rewritten to receiver hostname by execute() at PluginCore.py
+            # making is_local_system=True) or author_id=<a known local plugin
+            # uuid> (making is_local_plugin=True via find_endpoint), bypassing
+            # `remote: false` access checks. Wire requests are by definition
+            # remote; force a remote-classified sentinel so find_endpoint
+            # classifies them correctly. Original wire-supplied values
+            # preserved in the WARNING log for trace forensics.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if author == "system" or author_id in self.plugin_core.plugins_by_uuid:
+                self._logger.warning(
+                    "[EXECUTE] B-018b guard: rejected wire-supplied author=%r "
+                    "author_id=%r from peer=%s; rewriting to remote sentinel",
+                    author, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
+
             self._logger.info(
                 f"[EXECUTE] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
                 f"author={author}, author_id={author_id}, author_host={author_host}, request_id={request_id}, "
@@ -902,6 +924,20 @@ class NetworkManager:
             author_host = data.get("author_host")
             request_id = data.get("request_id")
             args = data.get("args", [])
+
+            # B-018b GUARD (mirror of _handle_execute) — see comment there.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if author == "system" or author_id in self.plugin_core.plugins_by_uuid:
+                self._logger.warning(
+                    "[EXECUTE_STREAM] B-018b guard: rejected wire-supplied "
+                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
+                    author, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
 
             self._logger.info(
                 f"[EXECUTE_STREAM] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
