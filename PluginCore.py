@@ -578,13 +578,14 @@ class PluginCore:
 
             if getattr(self, "networking_enabled", False):
                 if self.network is None:
+                    from pathlib import Path as _Path
+                    _nw_cfg = self.yaml_config.get("networking") or {}
+                    _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
                     self.network = NetworkManager(
                         self,
                         self._logger.getChild("networking"),
-                        node_ips=self.yaml_config.get("networking").get("node_ips", []),
-                        discover_nodes=self.yaml_config.get("networking").get(
-                            "discover_nodes", False
-                        ),
+                        node_ips=_nw_cfg.get("node_ips", []),
+                        discover_nodes=_nw_cfg.get("discover_nodes", False),
                         direct_discoverable=self.networking_direct_discoverable,
                         auto_discoverable=self.networking_auto_discoverable,
                         port=self.networking_port,
@@ -592,6 +593,8 @@ class PluginCore:
                         cert_file=getattr(self, "networking_cert_file", None),
                         key_file=getattr(self, "networking_key_file", None),
                         pool_size=getattr(self, "networking_pool_size", 5),
+                        networking_config=_nw_cfg,
+                        config_dir=_cfg_dir,
                     )
                 self._init_tasks.append(asyncio.create_task(self.network.start()))
 
@@ -609,13 +612,14 @@ class PluginCore:
         self._init_tasks = [asyncio.create_task(self.load_plugins())]
 
         if getattr(self, "networking_enabled", False):
+            from pathlib import Path as _Path
+            _nw_cfg = self.yaml_config.get("networking") or {}
+            _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
             self.network = NetworkManager(
                 self,
                 self._logger.getChild("networking"),
-                node_ips=self.yaml_config.get("networking").get("node_ips", []),
-                discover_nodes=self.yaml_config.get("networking").get(
-                    "discover_nodes", False
-                ),
+                node_ips=_nw_cfg.get("node_ips", []),
+                discover_nodes=_nw_cfg.get("discover_nodes", False),
                 direct_discoverable=self.networking_direct_discoverable,
                 auto_discoverable=self.networking_auto_discoverable,
                 port=self.networking_port,
@@ -623,6 +627,8 @@ class PluginCore:
                 cert_file=getattr(self, "networking_cert_file", None),
                 key_file=getattr(self, "networking_key_file", None),
                 pool_size=getattr(self, "networking_pool_size", 5),
+                networking_config=_nw_cfg,
+                config_dir=_cfg_dir,
             )
             self._init_tasks.append(asyncio.create_task(self.network.start()))
 

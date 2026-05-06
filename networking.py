@@ -4,12 +4,15 @@ import socket
 import ipaddress
 import asyncio
 import contextlib
+import datetime
+import hashlib
 import inspect
 import pickle
 import struct
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union, Optional, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Set, Union, Optional, Tuple
 from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors, async_gen_log_errors
 from exceptions import (
     NetworkRequestException,
@@ -19,6 +22,7 @@ from exceptions import (
 )
 from networking_classes import Node
 from networking_classes import RemotePlugin
+from serialization import safe_loads, FINGERPRINT_CLI_CMD, generate_keypair
 
 
 # PR3 Stage C — in-memory advertised-subscription record (per-peer wire
@@ -34,6 +38,19 @@ class AdvertSub:
     blocked_hosts: Union[str, list, None]
     authors: Union[str, list, None]
     blocked_authors: Union[str, list, None]
+
+
+# PR4 Stage K (B-066) — peer config entry. cert_pem is required (resolved
+# from cert_file at config-load time if needed). fingerprint is derived from
+# cert_pem at parse time and used as the post-handshake identity gate.
+@dataclass(frozen=True)
+class PeerSpec:
+    hostname: str
+    ip: str
+    port: int
+    cert_pem: str
+    fingerprint: str
+    system_caller: bool = False
 
 
 # Message type constants
@@ -62,7 +79,7 @@ MSG_REQUEST_EVENT_STREAM = 17
 MSG_SUB_ADVERTISE = 18
 MSG_SUB_DELTA = 19
 
-MSG_AUTH = 20  # Authentication message (shared secret)
+MSG_AUTH = 20  # Authentication message — removed in K-3, kept here for K-2 atomicity
 
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
@@ -87,15 +104,36 @@ class NetworkManager:
         cert_file: Optional[str] = None,
         key_file: Optional[str] = None,
         pool_size: int = 5,
+        networking_config: Optional[dict] = None,
+        config_dir: Optional[Path] = None,
     ):
         self.plugin_core = plugin_core
         self._logger = logger
 
+        # PR4 Stage K (B-066) — legacy node_ips deprecation. K-2 deviation
+        # from plan_final.md: hard error deferred to K-3 (after K-2b reworks
+        # the smoke harness configs that still use node_ips). K-2 only emits
+        # a warning so test_application.py's per-commit invariant is preserved.
+        nw_cfg = networking_config or {}
+        if "node_ips" in nw_cfg:
+            logger.warning(
+                "[NETWORKING] DEPRECATION: networking.node_ips schema is being "
+                "removed in PR4 Stage K (B-066 fix). Migrate to:\n"
+                "  networking:\n"
+                "    peers:\n"
+                "      - hostname: <peer-name>\n"
+                "        address: <ip[:port]>\n"
+                "        cert_file: _keys/peers/<peer-name>.pem  # OR cert_pem: |\n"
+                "        system_caller: false\n"
+                f"After migrating, run '{FINGERPRINT_CLI_CMD} --config <path>' on each "
+                "node to print its fingerprint. K-3 of Stage K will turn this "
+                "warning into a hard error."
+            )
+
         # Internal node_ips is normalized to list[tuple[str, Optional[int]]].
         # Each entry is (ip, port_or_None); port=None means "use the cluster
-        # default port self.port". External callers can pass either the legacy
-        # form (list of "IP" or "IP:PORT" strings, mixed) or the new form
-        # (list of {"ip": ..., "port": ...} dicts) — see _parse_endpoint.
+        # default port self.port". K-3 removes this field — kept here for K-2
+        # to preserve test invariant during the transition.
         self.node_ips: list[tuple[str, Optional[int]]] = [
             self._parse_endpoint(e) for e in (node_ips or [])
         ]
@@ -109,7 +147,26 @@ class NetworkManager:
         self.port = port
         self.nodes: list[Node] = []
 
-        # Security configuration
+        # PR4 Stage K identity + peer config (replaces self.secret / cert_file /
+        # key_file in K-3 — kept side-by-side here for atomic test invariant).
+        self.hostname: str = nw_cfg.get("hostname", socket.gethostname())
+        self.keys_dir: Path = Path(nw_cfg.get("keys_dir", "_keys"))
+        if not self.keys_dir.is_absolute():
+            base = config_dir if config_dir is not None else Path.cwd()
+            self.keys_dir = (Path(base) / self.keys_dir).resolve()
+        self.cert_path: Path = self.keys_dir / "cert.pem"
+        self.key_path: Path = self.keys_dir / "key.pem"
+        self.peers: List[PeerSpec] = self._parse_peers(nw_cfg.get("peers", []))
+        self.peers_by_fingerprint: Dict[str, PeerSpec] = {
+            p.fingerprint: p for p in self.peers
+        }
+        self.peers_by_endpoint: Dict[Tuple[str, int], PeerSpec] = {
+            (p.ip, p.port): p for p in self.peers
+        }
+        self.own_fingerprint: str = ""  # populated by _load_or_generate_identity
+
+        # Legacy security configuration (K-3 removes these together with the
+        # MSG_AUTH handshake in _handle_client and _create_connection).
         self.secret = secret or os.getenv("NETWORKING_SECRET", "")
         if isinstance(self.secret, str):
             self.secret = self.secret.encode()
@@ -241,20 +298,244 @@ class NetworkManager:
     def _resolve_port(self, IP: str) -> int:
         """Return the port to use when connecting to a peer at this IP.
 
-        Walks self.nodes for the first matching IP and returns its `port`
-        (falling back to self.port if the Node was created without one).
-        Falls back to self.port if no Node matches yet — the discovery flow
-        creates Nodes lazily, so the first connection-attempt to an IP we
-        haven't yet promoted to Node uses the cluster default port.
+        PR4 Stage K: walks self.peers_by_endpoint first (authoritative for
+        the new mTLS-pinned regime). Falls back to the legacy self.nodes /
+        self.node_ips lookup so existing tests that still use node_ips
+        continue to work during the K-2 → K-3 transition window.
         """
+        for peer_ip, peer_port in self.peers_by_endpoint.keys():
+            if peer_ip == IP:
+                return peer_port
         for node in self.nodes:
             if node.IP == IP:
                 return node.port if node.port is not None else self.port
-        # No matching node yet — also check raw node_ips entries
         for ip, port in self.node_ips:
             if ip == IP and port is not None:
                 return port
         return self.port
+
+    # ── PR4 Stage K (B-066) — peer parsing + identity helpers ─────────
+
+    def _parse_peers(self, raw_peers) -> List[PeerSpec]:
+        """Parse the peers config list, resolve cert_file → cert_pem,
+        derive SPKI fingerprint, validate uniqueness.
+
+        Accepts None (bare YAML key with no value) and treats as empty.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        if raw_peers is None:
+            raw_peers = []
+
+        peers: List[PeerSpec] = []
+        seen_fps: Set[str] = set()
+        seen_endpoints: Set[Tuple[str, int]] = set()
+
+        for entry in raw_peers:
+            hostname = entry.get("hostname")
+            address = entry.get("address")
+            if not hostname or not address:
+                raise RuntimeError(
+                    f"Peer entry missing hostname or address: {entry}"
+                )
+
+            cert_file = entry.get("cert_file")
+            cert_pem_inline = entry.get("cert_pem")
+            if cert_file and cert_pem_inline:
+                raise RuntimeError(
+                    f"Peer {hostname} has both cert_file and cert_pem set. "
+                    "Pick one (cert_file is preferred for cleaner config)."
+                )
+            if not cert_file and not cert_pem_inline:
+                raise RuntimeError(
+                    f"Peer {hostname} missing cert_file or cert_pem. "
+                    "Either provide a path-relative cert_file or paste the "
+                    "PEM body inline as cert_pem (multi-line YAML block)."
+                )
+
+            if cert_file:
+                cf_path = Path(cert_file)
+                if not cf_path.is_absolute():
+                    cf_path = (self.keys_dir.parent / cf_path).resolve()
+                try:
+                    cert_pem = cf_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as e:
+                    raise RuntimeError(
+                        f"Peer {hostname} cert_file {cf_path} could not be read: {e}. "
+                        "Check the path exists, is a file (not a directory), is "
+                        "readable, and contains UTF-8 PEM text (not DER binary)."
+                    )
+            else:
+                cert_pem = cert_pem_inline
+
+            cert_pem = cert_pem.strip()
+            if not cert_pem.startswith("-----BEGIN CERTIFICATE-----"):
+                raise RuntimeError(
+                    f"Peer {hostname} cert_pem missing PEM header after strip. "
+                    "Check YAML indentation or file content."
+                )
+
+            try:
+                cert = x509.load_pem_x509_certificate(cert_pem.encode())
+            except (ValueError, TypeError) as e:
+                raise RuntimeError(
+                    f"Peer {hostname} cert_pem is not valid PEM-encoded X.509: {e}"
+                )
+            spki = cert.public_key().public_bytes(
+                encoding=_ser.Encoding.DER,
+                format=_ser.PublicFormat.SubjectPublicKeyInfo,
+            )
+            derived_fp = f"sha256:{hashlib.sha256(spki).hexdigest()}"
+
+            declared_fp = entry.get("fingerprint")
+            if declared_fp and declared_fp != derived_fp:
+                raise RuntimeError(
+                    f"Peer {hostname} fingerprint mismatch: config says "
+                    f"{declared_fp} but cert hashes to {derived_fp}"
+                )
+
+            if derived_fp in seen_fps:
+                raise RuntimeError(
+                    f"Duplicate peer fingerprint across config: {derived_fp}"
+                )
+            seen_fps.add(derived_fp)
+
+            ip, _, port_str = address.partition(":")
+            port = int(port_str) if port_str else self.port
+            endpoint = (ip, port)
+            if endpoint in seen_endpoints:
+                raise RuntimeError(
+                    f"Duplicate peer endpoint across config: {ip}:{port}"
+                )
+            seen_endpoints.add(endpoint)
+
+            peers.append(PeerSpec(
+                hostname=hostname, ip=ip, port=port,
+                cert_pem=cert_pem, fingerprint=derived_fp,
+                system_caller=entry.get("system_caller", False),
+            ))
+
+        if not peers:
+            self._logger.debug("[NETWORKING] _parse_peers returned empty list")
+
+        return peers
+
+    def _load_or_generate_identity(self):
+        """Load existing cert.pem / key.pem from keys_dir, or generate a
+        fresh self-signed pair if both are missing. Sync function — disk
+        I/O only, no async operations.
+
+        Hard-errors on inconsistent state (one file present, the other
+        missing) and on stale .tmp orphans from a crashed mid-write.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        cert_exists = self.cert_path.exists()
+        key_exists = self.key_path.exists()
+
+        cert_tmp = self.cert_path.with_suffix(".pem.tmp")
+        key_tmp = self.key_path.with_suffix(".pem.tmp")
+        tmp_orphans = [str(p) for p in (cert_tmp, key_tmp) if p.exists()]
+        if tmp_orphans:
+            raise RuntimeError(
+                f"Found stale .tmp file(s) at {self.keys_dir}: {tmp_orphans}. "
+                "A previous run crashed mid-write. Delete the .tmp files to "
+                "allow a clean regeneration on next start (the .pem files "
+                "are intact if both are present)."
+            )
+
+        if cert_exists != key_exists:
+            raise RuntimeError(
+                f"Inconsistent identity state at {self.keys_dir}: "
+                f"cert.pem={cert_exists}, key.pem={key_exists}. "
+                "Either both or neither must exist. Delete the orphan .pem "
+                "file to allow regeneration on next start."
+            )
+
+        if cert_exists and key_exists:
+            try:
+                cert_pem = self.cert_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                raise RuntimeError(
+                    f"Existing cert at {self.cert_path} could not be read: {e}. "
+                    "If the file is corrupted, delete BOTH cert.pem and key.pem "
+                    "to regenerate (this changes the node's fingerprint — all "
+                    "peers must update their peers[].cert_pem entries)."
+                )
+            try:
+                cert = x509.load_pem_x509_certificate(cert_pem.encode())
+            except (ValueError, TypeError) as e:
+                raise RuntimeError(
+                    f"Existing cert at {self.cert_path} is not valid PEM-encoded X.509: {e}"
+                )
+            spki = cert.public_key().public_bytes(
+                encoding=_ser.Encoding.DER,
+                format=_ser.PublicFormat.SubjectPublicKeyInfo,
+            )
+            self.own_fingerprint = f"sha256:{hashlib.sha256(spki).hexdigest()}"
+        else:
+            _, _, fp, cert_pem = generate_keypair(str(self.keys_dir), self.hostname)
+            self.own_fingerprint = fp
+
+        if os.name == "nt":
+            self._logger.warning(
+                "[NETWORKING] Running on Windows — key file 0o600 permission "
+                "could not be enforced. Ensure key.pem is not world-readable "
+                "via NTFS ACLs or move it to a per-user directory."
+            )
+
+        self._logger.info(
+            "[NETWORKING] Identity ready. Fingerprint: %s", self.own_fingerprint,
+        )
+
+    def _extract_peer_fingerprint(self, writer: asyncio.StreamWriter) -> str:
+        """Compute SPKI SHA-256 fingerprint of the TLS peer's cert. Used
+        as the post-handshake identity gate in K-3.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        ssl_object = writer.get_extra_info("ssl_object")
+        if ssl_object is None:
+            raise ConnectionError("non-TLS connection")
+        cert_der = ssl_object.getpeercert(binary_form=True)
+        if not cert_der:
+            raise ConnectionError("peer presented no cert")
+        cert = x509.load_der_x509_certificate(cert_der)
+        spki = cert.public_key().public_bytes(
+            encoding=_ser.Encoding.DER,
+            format=_ser.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return f"sha256:{hashlib.sha256(spki).hexdigest()}"
+
+    def _create_server_ssl_context(self) -> ssl.SSLContext:
+        """K-2 add: mTLS-pinned server context. Switched on in K-3."""
+        return self._create_pinned_ssl_context(ssl.PROTOCOL_TLS_SERVER)
+
+    def _create_client_ssl_context(self) -> ssl.SSLContext:
+        """K-2 add: mTLS-pinned client context. Switched on in K-3."""
+        return self._create_pinned_ssl_context(ssl.PROTOCOL_TLS_CLIENT)
+
+    def _create_pinned_ssl_context(self, protocol) -> ssl.SSLContext:
+        """Shared body for the K-2 pinned-mTLS contexts. Each peer's PEM
+        cert is loaded as a trust anchor (each self-signed cert is its
+        own CA after the BasicConstraints(ca=True) extension added in
+        generate_keypair). Post-handshake SPKI pin check is the actual
+        identity gate (in _handle_client / _create_connection, K-3).
+        """
+        context = ssl.SSLContext(protocol)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        # Order matters in Python 3.10+: verify_mode must be set BEFORE
+        # check_hostname=False, otherwise check_hostname=False raises ValueError.
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = False
+        context.load_cert_chain(str(self.cert_path), str(self.key_path))
+        if self.peers:
+            cadata = "\n".join(p.cert_pem for p in self.peers)
+            context.load_verify_locations(cadata=cadata)
+        return context
 
     def _pool_key(self, IP: str) -> tuple[str, int]:
         """Connection-pool key for an IP. Always (IP, port) — two peers on
