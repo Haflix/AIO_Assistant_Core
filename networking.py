@@ -498,6 +498,15 @@ class NetworkManager:
                         "without closing bracket. Use [ipv6]:port form."
                     )
                 ip = address[1:end_bracket]
+                if not ip:
+                    # Cycle 2 verifier MED fix: reject empty bracket "[]:port"
+                    # at config-load time instead of letting it propagate to
+                    # PeerSpec(ip="") and surface later as a cryptic
+                    # socket.gaierror at connect time.
+                    raise RuntimeError(
+                        f"Peer {hostname} address {address!r}: empty bracket. "
+                        "Provide an IPv6 address inside the brackets, e.g. [::1]:2511."
+                    )
                 rest = address[end_bracket + 1:]
                 if rest.startswith(":"):
                     try:

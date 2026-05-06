@@ -76,6 +76,10 @@ _PROJECT_EXCEPTIONS: FrozenSet[Tuple[str, str]] = frozenset({
 # --- Static exception registry (pre-populated at module import) ---
 
 _TRUSTED_EXCEPTION_MODULES: FrozenSet[str] = frozenset({
+    # Python 3.11+ aliased asyncio.TimeoutError -> builtins.TimeoutError
+    # at the pickle stream layer (see PEP 678 / bpo-45390). Older
+    # versions still pickle it under "asyncio". Keep both module names
+    # so cross-node propagation works regardless of Python version.
     "builtins", "exceptions", "asyncio", "asyncio.exceptions",
     "concurrent.futures", "concurrent.futures._base",
     "pickle", "ssl", "socket", "json",

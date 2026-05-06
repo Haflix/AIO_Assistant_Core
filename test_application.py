@@ -195,15 +195,33 @@ def _cleanup_test_mtls_identities(mtls: Dict[str, str]) -> None:
             os.unlink(pem_file)
         except OSError:
             pass
+    # Cycle 2 fresh-eyes MED fix: clear env vars so a second in-process
+    # invocation of run_tests() (test rerun, REPL session, etc.) cannot
+    # pick up stale paths pointing at the now-deleted temp dirs.
+    for key in (
+        "AIO_TEST_SUB_KEYS_DIR",
+        "AIO_TEST_PARENT_CERT_PEM_FILE",
+        "AIO_TEST_PARENT_HOSTNAME",
+        "AIO_TEST_PARENT_PORT",
+    ):
+        os.environ.pop(key, None)
 
 
 async def run_tests() -> int:
     mtls = _provision_test_mtls_identities()
-    _set_subnode_env_for_test_remote_suite(mtls)
+    try:
+        _set_subnode_env_for_test_remote_suite(mtls)
 
-    pc = PluginCore(CONFIG_PATH)
-    _patch_networking_for_mtls(pc, mtls)
-    await pc.wait_until_ready()
+        pc = PluginCore(CONFIG_PATH)
+        _patch_networking_for_mtls(pc, mtls)
+        await pc.wait_until_ready()
+    except Exception:
+        # Cycle 2 fresh-eyes / verifier MED fix: ensure the temp dirs +
+        # env vars are cleaned up even if PluginCore startup raises.
+        # The downstream try/finally only fires if pc was constructed
+        # successfully.
+        _cleanup_test_mtls_identities(mtls)
+        raise
 
     try:
         report = await pc.execute(
