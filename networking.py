@@ -10,7 +10,7 @@ import struct
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union, Optional, Tuple
-from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors
+from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors, async_gen_log_errors
 from exceptions import (
     NetworkRequestException,
     NodeException,
@@ -1002,6 +1002,16 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + err_payload)
                     await writer.drain()
+                    # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
+                    # chunk so the client decoder's sentinel check in the
+                    # MSG_STREAM_ITEM_END branch fires (lines 3083-3105 of
+                    # this file). Without ITEM_END, the chunk gets buffered
+                    # and yielded as a normal final item via MSG_END_STREAM
+                    # path, with the client's caller seeing the error tuple
+                    # as data and no exception.
+                    item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
+                    writer.write(item_end_header)
+                    await writer.drain()
                     break
 
             await self._send_end_stream(writer)
@@ -1012,6 +1022,12 @@ class NetworkManager:
             try:
                 err_obj = ("__STREAM_EXCEPTION__", str(e))
                 await self._send_stream_chunk(writer, err_obj)
+                # F5 fix: MSG_STREAM_ITEM_END before MSG_END_STREAM so the
+                # client decoder's sentinel check fires (line 3223+
+                # empty-payload ITEM_END branch).
+                item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
+                writer.write(item_end_header)
+                await writer.drain()
                 await self._send_end_stream(writer)
             except Exception:
                 pass
@@ -3052,7 +3068,7 @@ class NetworkManager:
                     except Exception:
                         pass
 
-    @async_gen_handle_errors(None)
+    @async_gen_log_errors
     async def execute_remote_stream(
         self,
         IP: str,
@@ -3196,13 +3212,34 @@ class NetworkManager:
                         )
 
                 elif msg_type == MSG_STREAM_ITEM_END:
-                    # Item boundary with no payload — same handling
+                    # Item boundary with no payload — same handling.
+                    # F5 fix: must check for __STREAM_ERROR__ /
+                    # __STREAM_EXCEPTION__ sentinels in this path too —
+                    # MSG_STREAM_ITEM_END is normally sent with no payload
+                    # (chunk_length=1, payload_length=0), so this is the
+                    # path that actually fires on every item boundary. The
+                    # parallel with-payload branch above (line 3154-3194)
+                    # has the same sentinel check; both paths must agree.
                     if current_item_chunks:
                         full_pickled = b"".join(current_item_chunks)
                         try:
                             item = pickle.loads(full_pickled)
+                            if isinstance(item, tuple) and len(item) == 2:
+                                if item[0] == "__STREAM_ERROR__":
+                                    self._logger.exception(
+                                        f"Stream error from {IP}: {item[1]}"
+                                    )
+                                    yield ("__REMOTE_STREAM_DECODE_ERROR__", item[1])
+                                    break
+                                elif item[0] == "__STREAM_EXCEPTION__":
+                                    self._logger.exception(
+                                        f"Stream exception from {IP}: {item[1]}"
+                                    )
+                                    raise NetworkRequestException(item[1])
                             items_yielded += 1
                             yield item
+                        except NetworkRequestException:
+                            raise
                         except Exception as e:
                             self._logger.exception(
                                 f"Failed to unpickle stream item from {IP}"
@@ -3230,9 +3267,23 @@ class NetworkManager:
                         f"Unexpected message type: {msg_type}"
                     )
 
+        except NetworkRequestException:
+            # F5 fix: NetworkRequestException raised from the decoder's
+            # sentinel-detection path means the remote handler reported
+            # a real error. Re-raise so _process_request_stream's outer
+            # except (PluginCore.py) handles it (sets request error,
+            # propagates as RequestException to local consumer via B-044
+            # path). Previously this fell to the generic "yield sentinel"
+            # branch below and the error was tunneled as data.
+            raise
         except Exception as e:
             self._logger.exception(f"Error in execute_remote_stream to {IP}")
-            yield ("__REMOTE_STREAM_ERROR__", str(e))
+            # Same fix as above — re-raise the underlying error rather
+            # than yielding a sentinel, so the caller's `_process_request_
+            # stream` can mark the request errored.
+            raise NetworkRequestException(
+                f"Remote stream error from {IP}: {e}"
+            ) from e
         finally:
             # Return connection to pool (or close if error)
             if reader and writer and not connection_returned:
