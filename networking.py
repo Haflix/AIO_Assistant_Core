@@ -2323,10 +2323,11 @@ class NetworkManager:
 
             reader = None
             writer = None
-            connection_returned = False
+            send_ok = False
             try:
                 reader, writer = await self._get_connection(peer_ip)
                 await self._send_message(writer, MSG_SUB_ADVERTISE, wire_payload)
+                send_ok = True
             except Exception:
                 self._logger.debug(
                     "[ADVERTISE] failed to send snapshot to %s", peer_hostname,
@@ -2338,11 +2339,21 @@ class NetworkManager:
                     self._outbound_adverts.pop(peer_hostname, None)
                 raise
             finally:
-                if reader and writer and not connection_returned:
-                    try:
-                        await self._return_connection(peer_ip, reader, writer)
-                        connection_returned = True
-                    except Exception:
+                # Cycle-4 fix: only pool on confirmed send success. Mirrors
+                # send_sub_delta_remote pattern. Without send_ok, a partial
+                # MSG_SUB_ADVERTISE would pool a framing-corrupt writer that
+                # the next caller's PING health-check then has to evict.
+                if reader and writer:
+                    if send_ok:
+                        try:
+                            await self._return_connection(peer_ip, reader, writer)
+                        except Exception:
+                            try:
+                                writer.close()
+                                await writer.wait_closed()
+                            except Exception:
+                                pass
+                    else:
                         try:
                             writer.close()
                             await writer.wait_closed()
@@ -2750,7 +2761,16 @@ class NetworkManager:
                 # _resolve_port returns OUR self.port → connect-back hits our
                 # own server (self-loop).
                 resolved_port: Optional[int]
-                if isinstance(client_listener_port, int) and client_listener_port > 0:
+                # Cycle-4 fix: cap upper bound on wire-supplied
+                # listener_port. Previously only `> 0` was checked; an
+                # authenticated peer could advertise listener_port=70000
+                # which gets stored on Node.port, then asyncio.open_connection
+                # raises ValueError("port out of range 0-65535") forever
+                # afterward — the peer is permanently DoS'd in our routing.
+                if (
+                    isinstance(client_listener_port, int)
+                    and 0 < client_listener_port <= 65535
+                ):
                     resolved_port = client_listener_port
                 else:
                     resolved_port = None
@@ -3812,12 +3832,30 @@ class NetworkManager:
                     return MockResponse()
                 return None
             else:
+                # Cycle-4 fix: unexpected msg_type — close rather than pool,
+                # wire state indeterminate.
+                if reader and writer and not connection_returned:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    connection_returned = True
                 return None
 
         except Exception as e:
             self._logger.debug(f"[GET_INFO] Failed to reach {IP}: {e}")
+            # Cycle-4 fix: transport error — close rather than pool.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             return None
         finally:
+            # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits.
             if reader and writer and not connection_returned:
                 try:
                     self._logger.debug(f"[GET_INFO] Returning connection for {IP}")
@@ -4020,12 +4058,36 @@ class NetworkManager:
                 self._logger.warning(
                     f"[ENDPOINT] Unexpected message type {msg_type} from {IP}"
                 )
+                # Cycle-4 fix: unexpected msg_type means the wire state is
+                # indeterminate (server may still write more frames). Close
+                # rather than pool — pooling would corrupt the next caller's
+                # framing.
+                if reader and writer and not connection_returned:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    connection_returned = True
                 return None
 
         except Exception as e:
             self._logger.exception(f"[ENDPOINT] Error checking endpoint on {IP}: {e}")
+            # Cycle-4 fix: transport error mid-exchange — close rather than
+            # pool a writer in unknown state. Mirrors execute_remote /
+            # heartbeat_node patterns from cycles 2-3.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             return None
         finally:
+            # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits
+            # (which left framing intact). Unexpected-type and exception
+            # paths already closed above.
             if reader and writer and not connection_returned:
                 try:
                     self._logger.debug(
@@ -4097,14 +4159,35 @@ class NetworkManager:
                 self._logger.warning(f"[TAG_SEARCH] Node {IP} returned error: {data}")
                 return None
 
+            # Cycle-4 fix: any other msg_type is unexpected — close rather
+            # than pool, since wire state is indeterminate.
+            self._logger.warning(
+                f"[TAG_SEARCH] Unexpected message type {msg_type} from {IP}"
+            )
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             return None
 
         except Exception as e:
             self._logger.exception(
                 f"[TAG_SEARCH] Error querying node {IP} for tag '{tag}': {e}"
             )
+            # Cycle-4 fix: transport error — close rather than pool.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             return None
         finally:
+            # Defensive: only reached on clean MSG_RESULT / MSG_ERROR exits.
             if reader and writer and not connection_returned:
                 try:
                     await self._return_connection(IP, reader, writer)
