@@ -1920,12 +1920,22 @@ class GeneratorRequest:
                     self.ready = True
                     self.timeout = True
                     await self.set_result(self.result, True, True)
-                    raise
+                    # B-045 fix: surface as RequestException, symmetric with
+                    # execute(). Without this, callers `except RequestException`
+                    # miss timeouts and get a stray asyncio.TimeoutError.
+                    raise RequestException(self.result) from None
 
                 try:
                     if error:
+                        # B-044 fix: yield the error tuple BEFORE breaking so
+                        # PluginCore.execute_stream's `if error: raise
+                        # RequestException(result)` branch fires. Previously
+                        # broke silently — consumer saw clean iteration end
+                        # with no signal of the underlying error. `self.result`
+                        # holds the actual error message string; `item` here is
+                        # EndOfQueue() (set by set_result).
                         await self.set_result(self.result, True, self.timeout)
-                        # raise Exception(f"Request failed: {self.result}")
+                        yield self.result, error, timed_out
                         break
                     if type(item) == EndOfQueue:
                         break

@@ -30,7 +30,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 
 TARGET = "TestEventTarget"
 STREAM_TARGET = "TestStreamTarget"
@@ -613,12 +613,12 @@ class TestBugSuite(Plugin):
 
         # ---- B-044 ---------------------------------------------------
         async def body_b_044_silent_truncation_on_error(c):
-            # B-044: error chunk in queue stream breaks loop without
-            # yielding — consumer sees clean end. Test: drive a stream
-            # against TestStreamTarget that raises after N items, then
-            # consume via execute_stream. If RequestException is
-            # raised, the bug is fixed; if no exception fires after
-            # exactly N items, the bug still reproduces.
+            # B-044: FIXED in Stage G (utils.py Request.get_queue_stream now
+            # yields the error tuple before breaking, so execute_stream's
+            # `if error: raise RequestException(result)` branch fires).
+            # This case asserts the FIXED behavior: a stream that yields N
+            # items then raises must propagate RequestException to the
+            # consumer (NOT silently truncate). Regression guard.
             received = []
             try:
                 async for v in self.execute_stream(
@@ -626,25 +626,22 @@ class TestBugSuite(Plugin):
                 ):
                     received.append(v)
             except RequestException:
-                # Fixed — propagation works. Body completes normally;
-                # expected_status="fail" => unexpected_pass => bug
-                # fixed.
+                # Expected: error surfaces. Verify we got the pre-error
+                # items first (so they weren't dropped on the floor).
+                c.expect(len(received), 3)
                 return
-            # No exception fired. Bug still present iff we got the
-            # pre-error items silently.
-            if len(received) >= 1:
-                raise AssertionError(
-                    f"B-044: stream truncated silently "
-                    f"(got {len(received)} items, no exception)"
-                )
+            raise AssertionError(
+                f"B-044 regression: stream completed silently "
+                f"(got {len(received)} items, no RequestException)"
+            )
 
         # ---- B-045 ---------------------------------------------------
         async def body_b_045_stream_timeout_exception_type(c):
-            # B-045: stream timeout used to surface as
-            # asyncio.TimeoutError instead of RequestException — verify
-            # which wins now. Drive a long-yielding stream with a tight
-            # timeout via execute_stream. RequestException = fixed;
-            # TimeoutError surfacing = bug still present.
+            # B-045: FIXED in Stage G (utils.py Request.get_queue_stream
+            # now wraps asyncio.TimeoutError as RequestException, symmetric
+            # with execute()). Asserts the FIXED behavior: stream timeout
+            # surfaces as RequestException, never as raw asyncio.TimeoutError.
+            # Regression guard.
             import asyncio as _asyncio
             try:
                 async for _ in self.execute_stream(
@@ -655,14 +652,15 @@ class TestBugSuite(Plugin):
                 ):
                     pass
             except RequestException:
-                # Fixed — symmetric with execute(). Body completes;
-                # expected_status="fail" => unexpected_pass.
-                return
+                return  # Expected post-fix.
             except _asyncio.TimeoutError as e:
                 raise AssertionError(
-                    f"B-045: stream timeout surfaced as "
+                    f"B-045 regression: stream timeout surfaced as "
                     f"asyncio.TimeoutError, not RequestException ({e!r})"
                 )
+            raise AssertionError(
+                "B-045 regression: stream timeout produced no exception at all"
+            )
 
         # ---- B-046 ---------------------------------------------------
         async def body_b_046_plugin_lock_held_across_on_enable(c):
@@ -825,33 +823,22 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "active", "deferred"), bug_ids=("B-021",),
             **kw,
         )
-        # B-044: expected_status="fail" — bug expected to repro
-        # (silent truncation); body raises AssertionError on confirmed
-        # repro, returns normally on fix.
+        # B-044: FIXED in Stage G. Case now asserts the FIXED behavior
+        # (RequestException propagated to consumer). Regression guard.
         await rec.run_case(
             "bug.B-044.silent_truncation_on_error",
             body_b_044_silent_truncation_on_error,
             category=category,
-            tags=("bug_repro", "active"), bug_ids=("B-044",),
-            expected_status="fail",
-            expected_signature={
-                "exception_type": "AssertionError",
-                "message_regex": r"silent",
-            },
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-044",),
             **kw,
         )
-        # B-045: expected_status="fail" — bug expected to repro
-        # (TimeoutError instead of RequestException).
+        # B-045: FIXED in Stage G. Case asserts FIXED behavior
+        # (RequestException for timeouts, never asyncio.TimeoutError).
         await rec.run_case(
             "bug.B-045.stream_timeout_exception_type",
             body_b_045_stream_timeout_exception_type,
             category=category,
-            tags=("bug_repro", "active"), bug_ids=("B-045",),
-            expected_status="fail",
-            expected_signature={
-                "exception_type": "AssertionError",
-                "message_regex": r"asyncio\.TimeoutError",
-            },
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-045",),
             **kw,
         )
         # B-046: expected_status="fail" — bug expected to repro
