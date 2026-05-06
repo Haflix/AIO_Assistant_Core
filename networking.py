@@ -66,6 +66,7 @@ MSG_AUTH = 20  # Authentication message (shared secret)
 
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
+MAX_ADVERT_SUBS_PER_PEER = 100_000  # Cap MSG_SUB_ADVERTISE entries to bound _adverts_struct_lock hold time
 
 # Sentinel returned by request_event_remote when server sends no result data.
 # Distinguishes "handler returned None" (valid) from "no response received."
@@ -1912,6 +1913,21 @@ class NetworkManager:
             if not isinstance(subs_payload, list):
                 self._logger.warning(
                     "[SUB_ADVERTISE] subscriptions not a list from %s", author_host
+                )
+                return
+
+            # Cycle-6 fix: cap entries before acquiring the global advert
+            # lock. Without this cap, an authenticated-but-misbehaving peer
+            # could send a single MSG_SUB_ADVERTISE with millions of entries
+            # and stall every concurrent advert-protocol operation cluster-
+            # wide for the duration of the loop below. MAX_MESSAGE_SIZE
+            # already bounds the wire payload, but the per-entry processing
+            # cost (two dict insertions + AdvertSub construction) compounds.
+            if len(subs_payload) > MAX_ADVERT_SUBS_PER_PEER:
+                self._logger.warning(
+                    "[SUB_ADVERTISE] rejecting oversized advert from %s: "
+                    "%d entries exceeds cap %d",
+                    author_host, len(subs_payload), MAX_ADVERT_SUBS_PER_PEER,
                 )
                 return
 
