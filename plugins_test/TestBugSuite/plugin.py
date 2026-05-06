@@ -1,9 +1,9 @@
-"""TestBugSuite — PR3 Stage F bughunt repro suite.
+"""TestBugSuite — PR3 Stage F bughunt repro suite + PR4 Stage K B-066 regressions.
 
-One case per open `bugtracker.md` entry. Verdicts are recorded by the
-parent post-run (annotated on bugtracker.md). NO bug fixes here — only
-repros that prove which bugs are real vs fixed-by-construction under
-the post-PR3 architecture.
+One case per open `bugtracker.md` entry plus 7 PR4 Stage K B-066
+regression cases (Test 1, 1b, 2, 2b, 3, 4, 5). Verdicts are recorded by
+the parent post-run (annotated on bugtracker.md). NO bug fixes here —
+only repros that prove which bugs are real vs fixed-by-construction.
 
 Categories (one method per):
   _b_legacy_removed     — API surface deleted in Stage D — assert .gone
@@ -11,6 +11,7 @@ Categories (one method per):
   _b_active             — still-broken — repro and let recorder mark
   _b_deferred           — test infeasible without fixture work — skip
   _b_already_covered    — repro lives in another suite — skip-and-cite
+  _b_security           — PR4 Stage K B-066 regression guards
 
 See PLAN.md (alongside this file in the worktree) for the per-bug spec
 table and pattern recipes.
@@ -20,17 +21,197 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import asyncio  # noqa: E402
 import inspect  # noqa: E402
+import logging  # noqa: E402
+import os  # noqa: E402
+import pickle  # noqa: E402
+import shutil  # noqa: E402
+import ssl  # noqa: E402
+import struct  # noqa: E402
+import tempfile  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 from utils import Plugin  # noqa: E402
 from decorators import async_log_errors, log_errors  # noqa: E402
 from exceptions import RequestException  # noqa: E402
 
+from networking import (  # noqa: E402
+    MSG_EXECUTE,
+    MSG_REQUEST_EVENT,
+    MSG_PING,
+    MSG_RESULT,
+    MSG_STREAM_CHUNK,
+    MSG_END_STREAM,
+    MSG_ERROR,
+    PeerSpec,
+)
+from serialization import generate_keypair, Serializable  # noqa: E402
+
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# PR4 Stage K B-066 — module-level helpers + payload classes.
+#
+# Pickle resolves classes/callables by (module, qualname). For payloads
+# that traverse the wire, the class definition MUST be at module scope
+# so the receiver-side find_class can resolve them. PluginCore loads
+# this file via spec_from_file_location(name="TestBugSuite", ...) so
+# __module__ is "TestBugSuite" (not the dotted file path).
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _b066_sentinel_create(sentinel_dir: str) -> None:
+    """Module-level callable used as Test 1's __reduce__ target. A
+    receiver still vulnerable to pre-/post-auth pickle RCE would invoke
+    this. K-1 SafeUnpickler rejects in find_class — defense.
+    """
+    (Path(sentinel_dir) / "PWNED").write_bytes(b"pwned")
+
+
+class _B066PrePwnPickle:
+    """Test 1 payload. __reduce__ returns module-level callable."""
+
+    def __init__(self, sentinel_dir: str) -> None:
+        self.sentinel_dir = sentinel_dir
+
+    def __reduce__(self):
+        return (_b066_sentinel_create, (self.sentinel_dir,))
+
+
+class _B066NotRegistered:
+    """Test 2 payload. Plain class NOT inheriting Serializable.
+    pickle.dumps succeeds; receiver's safe_loads rejects on find_class.
+    """
+
+    def __init__(self, value: str = "test") -> None:
+        self.value = value
+
+
+class _B066RegisteredButPwn(Serializable):
+    """Test 2b payload. Inherits Serializable (CLASS lookup passes via
+    SERIALIZABLE_REGISTRY) BUT __reduce__ returns a non-allowlisted
+    callable — SafeUnpickler rejects on the *callable* lookup.
+    """
+
+    def __init__(self, sentinel_dir: str) -> None:
+        self.sentinel_dir = sentinel_dir
+
+    def __reduce__(self):
+        return (_b066_sentinel_create, (self.sentinel_dir,))
+
+
+class _B066LogCapture:
+    """Inline log handler that buffers records on a logger to a list.
+    Use as:
+        cap = _B066LogCapture("networking", logging.DEBUG)
+        cap.attach()
+        try:
+            ...
+        finally:
+            cap.detach()
+    """
+
+    def __init__(self, logger_name: str = "networking",
+                 min_level: int = logging.DEBUG) -> None:
+        self.logger_name = logger_name
+        self.min_level = min_level
+        self.records: List[logging.LogRecord] = []
+        self._handler: Optional[logging.Handler] = None
+        self._saved_level: int = logging.NOTSET
+        self._attached: bool = False
+
+    def attach(self) -> None:
+        h = logging.Handler()
+        h.setLevel(self.min_level)
+        h.emit = lambda record: self.records.append(record)
+        lg = logging.getLogger(self.logger_name)
+        self._saved_level = lg.level
+        if lg.level == logging.NOTSET or lg.level > self.min_level:
+            lg.setLevel(self.min_level)
+        lg.addHandler(h)
+        self._handler = h
+        self._attached = True
+
+    def detach(self) -> None:
+        # Cycle 4 fresh-eyes MED fix: only restore logger level if
+        # attach() actually ran. A `finally`-block detach() called after
+        # an exception during attach setup must not silently reset the
+        # logger to NOTSET (which would suppress WARNING messages later
+        # security tests rely on).
+        if not self._attached:
+            return
+        lg = logging.getLogger(self.logger_name)
+        if self._handler is not None:
+            lg.removeHandler(self._handler)
+            self._handler = None
+        lg.setLevel(self._saved_level)
+        self._attached = False
+
+    def has_message(self, substring: str, min_level: int = 0) -> bool:
+        for r in self.records:
+            if r.levelno < min_level:
+                continue
+            if substring in r.getMessage():
+                return True
+        return False
+
+
+async def _b066_send_msg(writer: asyncio.StreamWriter, msg_type: int,
+                         data: Any) -> None:
+    """Wire-frame send matching networking._send_message format.
+    Sender uses raw pickle.dumps — receiver runs the bytes through
+    safe_loads, which is the code under test.
+    """
+    payload = pickle.dumps(data)
+    msg_length = len(payload) + 1
+    header = struct.pack(">IB", msg_length, msg_type)
+    writer.write(header + payload)
+    await writer.drain()
+
+
+async def _b066_recv_msg(reader: asyncio.StreamReader, *,
+                         timeout: float = 5.0):
+    """Wire-frame receive. Returns (msg_type, data).
+
+    Raises asyncio.IncompleteReadError if peer closed mid-frame, or
+    asyncio.TimeoutError if no full frame arrives within `timeout` (one
+    overall bound, not per-segment).
+    """
+    async def _inner():
+        length_bytes = await reader.readexactly(4)
+        msg_length = struct.unpack(">I", length_bytes)[0]
+        msg_type = (await reader.readexactly(1))[0]
+        payload_length = msg_length - 1
+        if payload_length > 0:
+            payload = await reader.readexactly(payload_length)
+            data = pickle.loads(payload)
+        else:
+            data = None
+        return msg_type, data
+
+    return await asyncio.wait_for(_inner(), timeout)
+
+# PluginCore loads this file via spec_from_file_location + exec_module
+# without auto-registering in sys.modules. pickle.dumps validates that
+# obj.__module__ resolves via sys.modules to an importable module
+# containing the class — without this registration, pickling our payload
+# classes raises PicklingError ("attribute lookup _B066NotRegistered on
+# TestBugSuite failed"). Register an empty proxy module here so import-
+# system probes find a placeholder; the proxy is populated with the
+# final `globals()` snapshot at the BOTTOM of this file (after every
+# module-level symbol — including TestBugSuite — is defined). Anything
+# pickle resolves needs to be added to the file BEFORE the populate
+# call at file bottom; the populate-at-end pattern means new helpers
+# defined anywhere above that call are picked up automatically.
+import types as _b066_types
+_b066_proxy_mod = _b066_types.ModuleType(__name__)
+sys.modules[__name__] = _b066_proxy_mod
+
 
 TARGET = "TestEventTarget"
 STREAM_TARGET = "TestStreamTarget"
@@ -84,7 +265,86 @@ class TestBugSuite(Plugin):
         await self._b_active(rec, kw)
         await self._b_deferred(rec, kw)
         await self._b_already_covered(rec, kw)
+        await self._b_security(rec, kw)
         return rec.to_dict()
+
+    # ──────────────────────────────────────────────────────────────────
+    # PR4 Stage K B-066 — instance-level test fixtures.
+    # ──────────────────────────────────────────────────────────────────
+    _b066_peer_seq: int = 0
+
+    async def _b066_make_test_peer(
+        self,
+        *,
+        system_caller: bool = False,
+        register_in_maps: bool = True,
+        add_to_trust_store: bool = True,
+        fake_port: Optional[int] = None,
+        hostname: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        nm = self._plugin_core.network
+        # Cycle 4 fix: every test peer uses a UNIQUE subject CN. If
+        # two self-signed CA certs in the trust store share Subject DN,
+        # OpenSSL's chain-builder picks the FIRST match by name and
+        # validates the presented cert's signature against the WRONG
+        # public key — handshake fails for everything but the originally
+        # presented cert. Unique hostname == unique Subject DN.
+        type(self)._b066_peer_seq += 1
+        seq = type(self)._b066_peer_seq
+        if hostname is None:
+            hostname = f"b066_test_peer_{seq:03d}"
+        keys_dir = tempfile.mkdtemp(prefix="b066_test_")
+        cert_path, key_path, fp, cert_pem = generate_keypair(keys_dir, hostname)
+        spec = None
+        if fake_port is None:
+            fake_port = 19999 + seq
+        if register_in_maps:
+            spec = PeerSpec(
+                hostname=hostname,
+                ip="127.0.0.1",
+                port=fake_port,
+                cert_pem=cert_pem,
+                fingerprint=fp,
+                system_caller=system_caller,
+            )
+            nm.peers.append(spec)
+            nm.peers_by_fingerprint[fp] = spec
+            nm.peers_by_endpoint[("127.0.0.1", fake_port)] = spec
+        if add_to_trust_store:
+            nm.ssl_context.load_verify_locations(cadata=cert_pem)
+        return {
+            "keys_dir": keys_dir,
+            "cert_path": str(cert_path),
+            "key_path": str(key_path),
+            "fingerprint": fp,
+            "cert_pem": cert_pem,
+            "spec": spec,
+            "fake_port": fake_port,
+        }
+
+    def _b066_cleanup_test_peer(self, peer_info: Dict[str, Any]) -> None:
+        nm = self._plugin_core.network
+        spec = peer_info.get("spec")
+        if spec is not None:
+            nm.peers_by_fingerprint.pop(spec.fingerprint, None)
+            nm.peers_by_endpoint.pop((spec.ip, spec.port), None)
+            nm.peers = [p for p in nm.peers if p.fingerprint != spec.fingerprint]
+        shutil.rmtree(peer_info["keys_dir"], ignore_errors=True)
+
+    def _b066_make_client_ssl_context(
+        self, peer_info: Dict[str, Any], *, trust_parent: bool = True,
+    ) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = False
+        ctx.load_cert_chain(peer_info["cert_path"], peer_info["key_path"])
+        if trust_parent:
+            nm = self._plugin_core.network
+            ctx.load_verify_locations(
+                cadata=Path(nm.cert_path).read_text(encoding="utf-8")
+            )
+        return ctx
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1272,3 +1532,459 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-043",),
             **kw,
         )
+
+    # ==================================================================
+    # _b_security — PR4 Stage K B-066 regression guards (Tests 1, 1b, 2,
+    # 2b, 3, 4, 5). Each test impersonates a peer locally inside the
+    # parent's NetworkManager and exercises one mTLS pinning / SafeUnpickler
+    # / B-018b guard code path.
+    # ==================================================================
+    async def _b_security(self, rec: CaseRecorder, kw: Dict) -> None:
+        category = "security"
+
+        # ---- Test 1 — pre-auth pickle RCE (handshake-rejected) -----
+        async def body_b_066_pre_auth_pickle_rce(c):
+            # The malicious peer's cert is NOT in the parent's trust store
+            # (add_to_trust_store=False) and not pinned (register_in_maps=
+            # False). The server rejects at TLS handshake. In TLS 1.3 the
+            # client's asyncio.open_connection may NOT raise — the alert
+            # arrives only when reading. Either path is acceptable; the
+            # security property is that the malicious payload's __reduce__
+            # never invokes the sentinel callable on the receiver.
+            sentinel_dir = tempfile.mkdtemp(prefix="b066_test1_sentinel_")
+            peer = await self._b066_make_test_peer(
+                register_in_maps=False, add_to_trust_store=False
+            )
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(
+                            "127.0.0.1",
+                            self._plugin_core.network.port,
+                            ssl=client_ctx,
+                        ),
+                        timeout=5.0,
+                    )
+                except (OSError, asyncio.TimeoutError):
+                    # TLS handshake was rejected at the asyncio layer.
+                    # The malicious payload was never on the wire.
+                    pass
+                else:
+                    # asyncio returned a transport but the server-side
+                    # rejected mid-handshake — exercise the worst case
+                    # by attempting to ship the malicious pickle anyway,
+                    # and verify the receiver did NOT execute it.
+                    try:
+                        await _b066_send_msg(writer, MSG_EXECUTE, {
+                            "plugin": "TestEventTarget",
+                            "method": "echo_author_id",
+                            "args": (_B066PrePwnPickle(sentinel_dir),),
+                            "author": "remote",
+                            "author_id": "remote",
+                            "author_host": "b066_test1_peer",
+                        })
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(reader.read(1), timeout=2.0)
+                    except Exception:
+                        pass
+                # Definitive security assertion: sentinel never fired.
+                c.expect(os.listdir(sentinel_dir), [])
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                shutil.rmtree(sentinel_dir, ignore_errors=True)
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 1b — handshake passes, pin check fails -----------
+        async def body_b_066_handshake_passes_pin_fails(c):
+            peer = await self._b066_make_test_peer(
+                register_in_maps=False, add_to_trust_store=True
+            )
+            cap = _B066LogCapture("networking", logging.DEBUG)
+            cap.attach()
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plugin_core.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                got = await asyncio.wait_for(reader.read(1), timeout=5.0)
+                c.expect(got, b"")
+                c.expect(
+                    cap.has_message(
+                        "[B066] unpinned peer", min_level=logging.DEBUG
+                    ),
+                    True,
+                )
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                cap.detach()
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 2 — post-auth disallowed-class injection ---------
+        async def body_b_066_post_auth_disallowed_class(c):
+            peer = await self._b066_make_test_peer(system_caller=False)
+            cap = _B066LogCapture("networking", logging.WARNING)
+            cap.attach()
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plugin_core.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                await _b066_send_msg(writer, MSG_EXECUTE, {
+                    "plugin": "TestEventTarget",
+                    "method": "echo_author_id",
+                    "args": (_B066NotRegistered("malicious"),),
+                    "author": "remote",
+                    "author_id": "remote",
+                    "author_host": "b066_test_peer",
+                    "request_id": "b066-test2",
+                })
+                got = await asyncio.wait_for(reader.read(1), timeout=5.0)
+                c.expect(got, b"")
+                c.expect(
+                    cap.has_message(
+                        "[B066] disallowed-class deserialization",
+                        min_level=logging.WARNING,
+                    ),
+                    True,
+                )
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                cap.detach()
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 2b — post-auth __reduce__ payload ---------------
+        async def body_b_066_post_auth_reduce_payload(c):
+            sentinel_dir = tempfile.mkdtemp(prefix="b066_test2b_sentinel_")
+            peer = await self._b066_make_test_peer(system_caller=False)
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plugin_core.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                # The send may itself raise on Windows if the server
+                # already RST'd the previous TLS handshake's tail-end —
+                # the security guarantee is that the sentinel never
+                # fires, regardless of where the path aborts.
+                try:
+                    await _b066_send_msg(writer, MSG_EXECUTE, {
+                        "plugin": "TestEventTarget",
+                        "method": "echo_author_id",
+                        "args": (_B066RegisteredButPwn(sentinel_dir),),
+                        "author": "remote",
+                        "author_id": "remote",
+                        "author_host": "b066_test_peer",
+                        "request_id": "b066-test2b",
+                    })
+                    try:
+                        got = await asyncio.wait_for(
+                            reader.read(1), timeout=5.0
+                        )
+                    except (ConnectionError, OSError):
+                        got = b""
+                except (ConnectionError, OSError):
+                    got = b""
+                c.expect(got, b"")
+                c.expect((Path(sentinel_dir) / "PWNED").exists(), False)
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                shutil.rmtree(sentinel_dir, ignore_errors=True)
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 3 — system_caller=False denial + alive --------
+        async def body_b_066_system_caller_privilege_denial(c):
+            peer = await self._b066_make_test_peer(system_caller=False)
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plugin_core.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+                # Action 1 — denial.
+                await _b066_send_msg(writer, MSG_EXECUTE, {
+                    "plugin": "TestEventTarget",
+                    "method": "get_state",
+                    "args": None,
+                    "author": "system",
+                    "author_id": "system",
+                    "author_host": "b066_test_peer",
+                    "request_id": "b066-test3-deny",
+                })
+                msg_type, data = await _b066_recv_msg(reader, timeout=5.0)
+                c.expect(msg_type, MSG_ERROR)
+                c.expect("system_caller=false" in str(data), True)
+
+                # Action 2 — connection still alive: ping + result.
+                await _b066_send_msg(writer, MSG_PING, {})
+                msg_type2, data2 = await _b066_recv_msg(reader, timeout=5.0)
+                c.expect(msg_type2, MSG_RESULT)
+                c.expect(data2, {"status": "ok"})
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 4 — system_caller=True grant + sub-tests -------
+        async def body_b_066_system_caller_privilege_grant(c):
+            peer = await self._b066_make_test_peer(system_caller=True)
+            writer = None
+            try:
+                client_ctx = self._b066_make_client_ssl_context(peer)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        "127.0.0.1",
+                        self._plugin_core.network.port,
+                        ssl=client_ctx,
+                    ),
+                    timeout=5.0,
+                )
+
+                async def _round_trip(*, author, author_id):
+                    await _b066_send_msg(writer, MSG_REQUEST_EVENT, {
+                        "topic": "test_b066/echo_author_id",
+                        "payload": None,
+                        "author": author,
+                        "author_id": author_id,
+                        "author_host": peer["spec"].hostname,
+                        "timestamp": 0.0,
+                        "timeout": 5.0,
+                    })
+                    mt1, d1 = await _b066_recv_msg(reader, timeout=5.0)
+                    if mt1 != MSG_STREAM_CHUNK:
+                        raise AssertionError(
+                            f"expected MSG_STREAM_CHUNK ({MSG_STREAM_CHUNK}), "
+                            f"got msg_type={mt1} data={d1!r}"
+                        )
+                    mt2, _ = await _b066_recv_msg(reader, timeout=5.0)
+                    if mt2 != MSG_END_STREAM:
+                        raise AssertionError(
+                            f"expected MSG_END_STREAM ({MSG_END_STREAM}) "
+                            f"trailing the chunk, got msg_type={mt2}"
+                        )
+                    return d1
+
+                # 4-main — preserved author + pass-through author_id
+                result = await _round_trip(
+                    author="system", author_id="non-uuid-pass-through"
+                )
+                if result != {
+                    "author": "system",
+                    "author_id": "non-uuid-pass-through",
+                }:
+                    raise AssertionError(
+                        f"Test 4-main: expected author='system' + "
+                        f"pass-through author_id, got {result!r}"
+                    )
+
+                # 4a — privileged peer + author_id matches local UUID
+                local_uuid = self.plugin_uuid
+                result_4a = await _round_trip(
+                    author="system", author_id=local_uuid
+                )
+                if not (
+                    result_4a["author"] == "system"
+                    and result_4a["author_id"].startswith("remote-peer:")
+                ):
+                    raise AssertionError(
+                        f"Test 4a (privileged + spoofed UUID): expected "
+                        f"author='system' AND author_id startswith "
+                        f"'remote-peer:', got {result_4a!r}"
+                    )
+
+                # 4b — privileged peer + author_id NOT matching anything
+                result_4b = await _round_trip(
+                    author="system",
+                    author_id="aaaa-bbbb-cccc-dddd-not-a-real-uuid",
+                )
+                if result_4b != {
+                    "author": "system",
+                    "author_id": "aaaa-bbbb-cccc-dddd-not-a-real-uuid",
+                }:
+                    raise AssertionError(
+                        f"Test 4b (privileged + non-spoofed): expected "
+                        f"author='system' + pass-through author_id, "
+                        f"got {result_4b!r}"
+                    )
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                self._b066_cleanup_test_peer(peer)
+
+        # ---- Test 5 — client-side pin rejects unpinned server ----
+        async def body_b_066_client_side_pin_rejects_unpinned_server(c):
+            nm = self._plugin_core.network
+            actual_keys_dir = tempfile.mkdtemp(prefix="b066_test5_actual_")
+            expected_keys_dir = tempfile.mkdtemp(prefix="b066_test5_expected_")
+            actual_cert_path, actual_key_path, actual_fp, actual_cert_pem = \
+                generate_keypair(actual_keys_dir, "b066_test5_actual")
+            _, _, expected_fp, _ = generate_keypair(
+                expected_keys_dir, "b066_test5_expected"
+            )
+
+            server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            server_ctx.verify_mode = ssl.CERT_REQUIRED
+            server_ctx.check_hostname = False
+            server_ctx.load_cert_chain(actual_cert_path, actual_key_path)
+            server_ctx.load_verify_locations(
+                cadata=Path(nm.cert_path).read_text(encoding="utf-8")
+            )
+
+            async def _accept(reader, writer):
+                try:
+                    await reader.read(1)
+                except Exception:
+                    pass
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+            srv = await asyncio.start_server(
+                _accept, "127.0.0.1", 0, ssl=server_ctx
+            )
+            test_port = srv.sockets[0].getsockname()[1]
+
+            bad_spec = PeerSpec(
+                hostname="b066_test5_server",
+                ip="127.0.0.1",
+                port=test_port,
+                cert_pem=actual_cert_pem,
+                fingerprint=expected_fp,
+                system_caller=False,
+            )
+            orig_peers = nm.peers
+            orig_pbf = nm.peers_by_fingerprint
+            orig_pbe = nm.peers_by_endpoint
+            nm.peers = [bad_spec]
+            nm.peers_by_fingerprint = {expected_fp: bad_spec}
+            nm.peers_by_endpoint = {("127.0.0.1", test_port): bad_spec}
+
+            try:
+                c.expect_exception(
+                    ConnectionError, match=r"not in peers config"
+                )
+                await nm._create_connection("127.0.0.1")
+            finally:
+                nm.peers = orig_peers
+                nm.peers_by_fingerprint = orig_pbf
+                nm.peers_by_endpoint = orig_pbe
+                srv.close()
+                try:
+                    await srv.wait_closed()
+                except Exception:
+                    pass
+                shutil.rmtree(actual_keys_dir, ignore_errors=True)
+                shutil.rmtree(expected_keys_dir, ignore_errors=True)
+
+        # -- run_case calls -------------------------------------------
+        await rec.run_case(
+            "bug.B-066.pre_auth_pickle_rce",
+            body_b_066_pre_auth_pickle_rce,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.handshake_passes_pin_fails",
+            body_b_066_handshake_passes_pin_fails,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.post_auth_disallowed_class",
+            body_b_066_post_auth_disallowed_class,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.post_auth_reduce_payload",
+            body_b_066_post_auth_reduce_payload,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.system_caller_privilege_denial",
+            body_b_066_system_caller_privilege_denial,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.system_caller_privilege_grant",
+            body_b_066_system_caller_privilege_grant,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+        await rec.run_case(
+            "bug.B-066.client_side_pin_rejects_unpinned_server",
+            body_b_066_client_side_pin_rejects_unpinned_server,
+            category=category,
+            tags=("bug_repro", "security", "b066"), bug_ids=("B-066",),
+            hard_timeout_s=10.0, **kw,
+        )
+
+
+# Populate the sys.modules proxy with the final module globals — see the
+# header comment near `_b066_proxy_mod = ...` for the rationale. Placing
+# this at the bottom of the file means every module-level symbol defined
+# above is visible to pickle's `find_class` resolution.
+_b066_proxy_mod.__dict__.update(globals())

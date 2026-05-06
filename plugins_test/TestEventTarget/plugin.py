@@ -122,6 +122,9 @@ class TestEventTarget(Plugin):
     async def handle_mixed_topic(self, event):
         self._record("mixed_topic", event)
 
+    async def echo_author_id(self, event):
+        return {"author": event.author, "author_id": event.author_id}
+
     # ------------------------------------------------------------------
     # Sync handler — runs on the SyncDispatcher executor (def, not async)
     # ------------------------------------------------------------------

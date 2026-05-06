@@ -1,5 +1,5 @@
 description: PR3 Stage E target — passive subscriber for cross-plugin event tests
-version: "0.1.0"
+version: "0.2.0"
 remote: false
 arguments:
 events:
@@ -47,6 +47,10 @@ subscriptions:
     topic: "{prefix}/mixed/*/x"
     target_access_name: handle_mixed_topic
     hosts: "local"
+  b066_echo_sub:
+    topic: "test_b066/echo_author_id"
+    target_access_name: echo_author_id
+    hosts: "any"
 endpoints:
   handle_cross:
     internal_name: handle_cross
@@ -136,6 +140,13 @@ endpoints:
     internal_name: handle_mixed_topic
     remote: false
     accessible_by_other_plugins: true
+    arguments:
+      - name: event
+  echo_author_id:
+    internal_name: echo_author_id
+    remote: false
+    accessible_by_other_plugins: true
+    description: B-066 Test 4 observable — returns post-guard author/author_id
     arguments:
       - name: event
   reset_state:
