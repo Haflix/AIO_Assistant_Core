@@ -365,8 +365,16 @@ class NetworkManager:
                         "system_caller=false in your peer config. "
                         "Set system_caller=true on this peer's entry to permit."
                     ))
-                except Exception:
-                    pass
+                except Exception as _send_err:
+                    # K-5 review MED fix: log instead of silently swallowing.
+                    # If the writer is broken at this moment, the caller may
+                    # observe a hang via its own _receive_message timeout —
+                    # a logged WARNING gives operators a trail.
+                    self._logger.warning(
+                        "%s B-018b denial: failed to send privilege-denial "
+                        "MSG_ERROR to peer (hostname=%s): %s",
+                        log_prefix, conn_context.get("peer_hostname"), _send_err,
+                    )
                 return author, author_id, True
 
         # Part 2 — author_id impersonation rewrite, runs in all paths that
@@ -480,8 +488,48 @@ class NetworkManager:
                 )
             seen_fps.add(derived_fp)
 
-            ip, _, port_str = address.partition(":")
-            port = int(port_str) if port_str else self.port
+            # K-2 review MED fix: handle IPv6 (bracketed and bare). A bare
+            # IPv6 address like "::1" has multiple colons; partition would
+            # split at the first colon and yield port="1". The bracketed
+            # form "[::1]:2511" is the standard host:port wire format. We
+            # accept both bracketed (with explicit port) and bare (port
+            # defaults to self.port).
+            if address.startswith("["):
+                end_bracket = address.find("]")
+                if end_bracket == -1:
+                    raise RuntimeError(
+                        f"Peer {hostname} address {address!r}: opening bracket "
+                        "without closing bracket. Use [ipv6]:port form."
+                    )
+                ip = address[1:end_bracket]
+                rest = address[end_bracket + 1:]
+                if rest.startswith(":"):
+                    try:
+                        port = int(rest[1:])
+                    except ValueError:
+                        raise RuntimeError(
+                            f"Peer {hostname} address {address!r}: bracketed IPv6 "
+                            "port suffix is not a valid integer."
+                        )
+                elif rest == "":
+                    port = self.port
+                else:
+                    raise RuntimeError(
+                        f"Peer {hostname} address {address!r}: unexpected suffix "
+                        f"{rest!r} after closing bracket."
+                    )
+            elif address.count(":") > 1:
+                # Bare IPv6 — treat the whole string as the IP, port defaults.
+                ip = address
+                port = self.port
+                self._logger.warning(
+                    "[CONFIG] Peer %s address %r is bare IPv6; using default port "
+                    "%d. To specify a non-default port, use [%s]:port form.",
+                    hostname, address, port, address,
+                )
+            else:
+                ip, _, port_str = address.partition(":")
+                port = int(port_str) if port_str else self.port
             endpoint = (ip, port)
             if endpoint in seen_endpoints:
                 raise RuntimeError(
@@ -565,8 +613,15 @@ class NetworkManager:
                 "via NTFS ACLs or move it to a per-user directory."
             )
 
+        # K-2 review HIGH fix: also print the cert PEM for paste-into-peer-config
+        # bootstrapping. Operators can grep the log for the SHARE block instead
+        # of running networking_cli show-fingerprint separately.
         self._logger.info(
-            "[NETWORKING] Identity ready. Fingerprint: %s", self.own_fingerprint,
+            "[NETWORKING] Identity ready. Fingerprint: %s\n"
+            "[NETWORKING] Cert PEM (paste into peers[].cert_pem on other "
+            "nodes, OR save as their _keys/peers/<this-hostname>.pem and "
+            "use cert_file):\n%s",
+            self.own_fingerprint, cert_pem,
         )
 
     def _extract_peer_fingerprint(self, writer: asyncio.StreamWriter) -> str:
@@ -1116,6 +1171,18 @@ class NetworkManager:
                 except (ConnectionError, ConnectionResetError):
                     self._logger.debug(
                         f"Connection lost while handling client {client_addr}"
+                    )
+                    break
+                except pickle.UnpicklingError as e:
+                    # K-3 review HIGH fix: SafeUnpickler rejection from a
+                    # pinned peer is treated as RCE attempt. Log and SILENT
+                    # close — no _send_error wire response (don't help an
+                    # attacker map the allowlist by observing error frames).
+                    self._logger.warning(
+                        "[B066] disallowed-class deserialization from %s "
+                        "(fp=%s hostname=%s): %s",
+                        client_addr, peer_fp,
+                        conn_context.get("peer_hostname"), e,
                     )
                     break
 
