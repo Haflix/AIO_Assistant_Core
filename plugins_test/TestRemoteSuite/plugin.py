@@ -122,6 +122,14 @@ class TestRemoteSuite(Plugin):
             if os.path.exists(self._ready_file):
                 os.remove(self._ready_file)
 
+            # PR4 Stage K (B-066): forward mTLS provisioning to subnode.
+            # test_application.py pre-generated parent + subnode keypairs
+            # and stashed them in env vars; pass them as flags to run_node.py.
+            sub_keys_dir = os.environ.get("AIO_TEST_SUB_KEYS_DIR")
+            parent_cert_pem_file = os.environ.get("AIO_TEST_PARENT_CERT_PEM_FILE")
+            parent_hostname = os.environ.get("AIO_TEST_PARENT_HOSTNAME", "aio-test-parent")
+            parent_port = os.environ.get("AIO_TEST_PARENT_PORT", "2510")
+
             cmd = [
                 sys.executable,
                 str(SUBNODE_SCRIPT),
@@ -129,28 +137,21 @@ class TestRemoteSuite(Plugin):
                 "--port", str(SUBNODE_PORT_DEFAULT),
                 "--ready-file", self._ready_file,
             ]
-            self._logger.info(f"TestRemoteSuite: spawning subnode: {cmd}")
-            # Forward NETWORKING_SECRET so the subprocess can authenticate
-            # with the parent. NetworkManager refuses to start without one.
-            child_env = dict(os.environ)
-            parent_secret = (
-                getattr(self._plugin_core.network, "secret", None)
-                if getattr(self._plugin_core, "network", None) is not None
-                else None
-            )
-            if parent_secret:
-                # NetworkManager stores secret as bytes; decode for env var.
-                if isinstance(parent_secret, bytes):
-                    child_env["NETWORKING_SECRET"] = parent_secret.decode(
-                        "utf-8", errors="replace",
-                    )
-                else:
-                    child_env["NETWORKING_SECRET"] = str(parent_secret)
-            elif "NETWORKING_SECRET" not in child_env:
+            if sub_keys_dir and parent_cert_pem_file:
+                cmd.extend([
+                    "--keys-dir", sub_keys_dir,
+                    "--parent-cert-pem-file", parent_cert_pem_file,
+                    "--parent-hostname", parent_hostname,
+                    "--parent-port", parent_port,
+                ])
+            else:
                 self._logger.warning(
-                    "TestRemoteSuite: no NETWORKING_SECRET in parent env or "
-                    "NetworkManager; subnode will fail to authenticate"
+                    "TestRemoteSuite: AIO_TEST_SUB_KEYS_DIR or "
+                    "AIO_TEST_PARENT_CERT_PEM_FILE missing from env; subnode "
+                    "will start with empty peers and fail at NetworkManager.start()"
                 )
+            self._logger.info(f"TestRemoteSuite: spawning subnode: {cmd}")
+            child_env = dict(os.environ)
             self._subproc = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_ROOT),

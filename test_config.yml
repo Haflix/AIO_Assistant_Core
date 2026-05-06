@@ -130,15 +130,16 @@ general:
 
 
 networking:
-    # PR4 Stage K (B-066): networking disabled in default test_config.yml
-    # because mTLS pinning requires a per-process cert/key pair generated
-    # before NetworkManager starts, plus the peer's cert in the trust
-    # store. TestRemoteSuite cases that depended on a live subnode
-    # connection now skip when networking is unavailable. The smoke
-    # harness (plugins_test/_smoke_node/run_smoke.py) sets up full mTLS
-    # at runtime and runs separately.
-    enabled: false
+    # PR4 Stage K (B-066): mTLS pinning. test_application.py generates
+    # parent + subnode certs at startup and patches keys_dir + peers
+    # into yaml_config before NetworkManager is constructed. The
+    # subnode subprocess receives its keys + the parent cert via flags
+    # forwarded by TestRemoteSuite._spawn_subnode through env vars.
+    # No fields here for keys_dir / peers — those are runtime-injected
+    # so a stale config can never be honored standalone.
+    enabled: true
     port: 2510
-    discover_nodes: false
-    direct_discoverable: false
-    auto_discoverable: false
+    hostname: aio-test-parent          # explicit so subnode peers entry matches
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true
