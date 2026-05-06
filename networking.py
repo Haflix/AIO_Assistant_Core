@@ -796,7 +796,16 @@ class NetworkManager:
                         ),
                         None,
                     )
-                    if node is not None and not node.enabled:
+                    if node is None:
+                        # Cycle-5 fix: client-only peer (never in
+                        # self.nodes — e.g. an inbound publish_event from a
+                        # transient one-shot client). Heartbeat only watches
+                        # self.nodes, so deferring to heartbeat would leak
+                        # _inbound_adverts / _inbound_global_order entries
+                        # forever. With no Node entry there is no heartbeat
+                        # ownership to defer to — drop directly.
+                        await self._drop_peer_advert_state(peer_hostname)
+                    elif not node.enabled:
                         await self._drop_peer_advert_state(peer_hostname)
                     else:
                         self._logger.debug(
