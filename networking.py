@@ -79,7 +79,8 @@ MSG_REQUEST_EVENT_STREAM = 17
 MSG_SUB_ADVERTISE = 18
 MSG_SUB_DELTA = 19
 
-MSG_AUTH = 20  # Authentication message — removed in K-3, kept here for K-2 atomicity
+# MSG_AUTH = 20 was removed in PR4 Stage K K-3 (B-066 fix). The message-type
+# number is reserved and must not be reused for new message types.
 
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
@@ -110,15 +111,13 @@ class NetworkManager:
         self.plugin_core = plugin_core
         self._logger = logger
 
-        # PR4 Stage K (B-066) — legacy node_ips deprecation. K-2 deviation
-        # from plan_final.md: hard error deferred to K-3 (after K-2b reworks
-        # the smoke harness configs that still use node_ips). K-2 only emits
-        # a warning so test_application.py's per-commit invariant is preserved.
+        # PR4 Stage K (B-066) — hard error on legacy node_ips schema.
+        # Operators must migrate to the peers: schema. Fires BEFORE any other
+        # init so a misconfigured node fails fast with an actionable message.
         nw_cfg = networking_config or {}
         if "node_ips" in nw_cfg:
-            logger.warning(
-                "[NETWORKING] DEPRECATION: networking.node_ips schema is being "
-                "removed in PR4 Stage K (B-066 fix). Migrate to:\n"
+            raise RuntimeError(
+                "node_ips schema removed in PR4 Stage K (B-066 fix). Migrate to:\n"
                 "  networking:\n"
                 "    peers:\n"
                 "      - hostname: <peer-name>\n"
@@ -126,8 +125,9 @@ class NetworkManager:
                 "        cert_file: _keys/peers/<peer-name>.pem  # OR cert_pem: |\n"
                 "        system_caller: false\n"
                 f"After migrating, run '{FINGERPRINT_CLI_CMD} --config <path>' on each "
-                "node to print its fingerprint. K-3 of Stage K will turn this "
-                "warning into a hard error."
+                "node to print its fingerprint, then paste each node's cert PEM "
+                "(or save it under _keys/peers/<name>.pem and reference via "
+                "cert_file) into the other nodes' peers[] entries."
             )
 
         # Internal node_ips is normalized to list[tuple[str, Optional[int]]].
@@ -164,6 +164,14 @@ class NetworkManager:
             (p.ip, p.port): p for p in self.peers
         }
         self.own_fingerprint: str = ""  # populated by _load_or_generate_identity
+
+        # PR4 Stage K (B-066): seed self.node_ips from peers so the existing
+        # discovery flow (update_all_nodes / heartbeat) can find peers via
+        # the new schema without rewriting discovery itself.
+        for spec in self.peers:
+            entry = (spec.ip, spec.port)
+            if entry not in self.node_ips:
+                self.node_ips.append(entry)
 
         # Legacy security configuration (K-3 removes these together with the
         # MSG_AUTH handshake in _handle_client and _create_connection).
@@ -794,20 +802,29 @@ class NetworkManager:
         return context
 
     async def start(self):
-        """Starts socket server without blocking the main loop."""
-        if not self.secret:
+        """Starts socket server without blocking the main loop.
+
+        K-3 (B-066): identity is loaded/generated, peers must be configured
+        non-empty (else the trust store is empty and OpenSSL rejects every
+        connection with an opaque error — fail fast with an actionable
+        message instead).
+        """
+        if not self.peers:
             raise RuntimeError(
-                "Networking cannot start without a shared secret. "
-                "Set 'secret' in networking config or NETWORKING_SECRET env var."
+                "[NETWORKING] Cannot start with empty peers list. The mTLS "
+                "trust store would be empty, causing every incoming and outgoing "
+                "connection to fail with an opaque OpenSSL error. Either:\n"
+                "  - Add at least one peer to networking.peers in your config, OR\n"
+                "  - Disable networking entirely by removing the networking section."
             )
+        self._load_or_generate_identity()
         self._logger.info(
             f"[SERVER] Starting server: port={self.port}, discover_nodes={self.discover_nodes}, "
             f"direct_discoverable={self.direct_discoverable}, auto_discoverable={self.auto_discoverable}, "
             f"heartbeat_interval={self.heartbeat_interval}, lookup_interval={self.lookup_interval}, "
             f"liveness_timeout={self.liveness_timeout}"
         )
-        # Create SSL context
-        self.ssl_context = self._create_ssl_context()
+        self.ssl_context = self._create_server_ssl_context()
 
         # Create socket server
         async def handle_client(
@@ -975,41 +992,52 @@ class NetworkManager:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        """Main server-side connection handler with authentication."""
+        """Main server-side connection handler with mTLS pin check.
+
+        K-3 (B-066) FIRST ACT: extract peer SPKI fingerprint, look up in
+        peers_by_fingerprint. Pin failure -> SILENT close, NO _send_message
+        ever fires on a non-pinned peer. Pin check is in its own try/except
+        so unexpected exceptions (e.g. ssl_object is None) also take the
+        silent-close path — the outer except Exception is unreachable from
+        a pre-pin failure.
+        """
         client_addr = writer.get_extra_info("peername")
         self._logger.debug(f"New client connection from {client_addr}")
 
-        # PR3 Stage C (locked #17): per-connection state dict. PR3 receiver
-        # handlers populate ``conn_context["peer_hostname"]`` on first
-        # sight of a non-None ``payload["author_host"]`` (after the
-        # self-impersonation gate). Finally block reads it for cleanup.
         conn_context: Dict[str, Any] = {}
 
+        # === FIRST ACT — pin check (silent close on fail) ===
         try:
-            # Authenticate client
-            try:
-                msg_type, data = await asyncio.wait_for(
-                    self._receive_message(reader), timeout=5.0
+            peer_fp = self._extract_peer_fingerprint(writer)
+            peer_cfg = self.peers_by_fingerprint.get(peer_fp)
+            if peer_cfg is None:
+                self._logger.warning(
+                    "[B066] unpinned peer fingerprint=%s from %s — closing silently",
+                    peer_fp, client_addr,
                 )
-            except (asyncio.TimeoutError, ConnectionError, ConnectionResetError):
-                self._logger.debug(
-                    f"Auth phase failed/timeout from {client_addr}; closing connection"
-                )
+                writer.close()
+                try: await writer.wait_closed()
+                except Exception: pass
                 return
-            if msg_type != MSG_AUTH:
-                await self._send_error(
-                    writer, "Authentication required as first message"
-                )
-                return
+        except Exception as e:
+            self._logger.warning(
+                "[B066] pin extraction failed for %s: %s — closing silently",
+                client_addr, e,
+            )
+            writer.close()
+            try: await writer.wait_closed()
+            except Exception: pass
+            return
 
-            if data != self.secret:
-                await self._send_error(writer, "Authentication failed")
-                self._logger.warning(f"Authentication failed for {client_addr}")
-                return
+        conn_context["peer_fingerprint"] = peer_fp
+        conn_context["peer_hostname"] = peer_cfg.hostname
+        conn_context["system_caller"] = peer_cfg.system_caller
+        self._logger.info(
+            "[NETWORKING] Pinned connection from %s hostname=%s system_caller=%s",
+            client_addr, peer_cfg.hostname, peer_cfg.system_caller,
+        )
 
-            # Authentication successful — send confirmation so client knows
-            await self._send_message(writer, MSG_RESULT, {"status": "authenticated"})
-
+        try:
             # Process requests
             while True:
                 try:
@@ -3195,19 +3223,15 @@ class NetworkManager:
     async def _create_connection(
         self, IP: str
     ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Create a new TLS connection to a node.
+        """Create a new TLS connection to a node, then verify the peer's
+        SPKI fingerprint as the FIRST act after the handshake (B-066).
 
         Resolves the per-node port via _resolve_port(IP). Connections to two
         peers on the same IP with different ports are tracked separately.
         """
         port = self._resolve_port(IP)
         self._logger.debug(f"[CONNECTION] Creating new TLS connection to {IP}:{port}")
-        # Create SSL context for client
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_context.check_hostname = False  # Allow self-signed certs
-        ssl_context.verify_mode = (
-            ssl.CERT_NONE
-        )  # For testing - production should verify
+        ssl_context = self._create_client_ssl_context()
 
         try:
             reader, writer = await asyncio.open_connection(
@@ -3224,52 +3248,67 @@ class NetworkManager:
             )
             raise
 
-        # Authenticate with shared secret
-        self._logger.debug(f"[CONNECTION] Authenticating with {IP}")
-        await self._send_message(writer, MSG_AUTH, self.secret)
-        self._logger.debug(f"[CONNECTION] Authentication message sent to {IP}")
-
-        # Wait for auth confirmation
+        # === FIRST ACT — pin check, before any _send_message / _receive_message ===
         try:
-            msg_type, data = await asyncio.wait_for(
-                self._receive_message(reader), timeout=5.0
-            )
-            if msg_type == MSG_ERROR:
-                # Cycle-3 fresh-F2 fix: close writer on auth failure paths.
-                # Previously only the timeout path closed; ERROR and
-                # unexpected-type raises leaked the open TLS connection.
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-                raise ConnectionError(f"Authentication failed: {data}")
-            if msg_type != MSG_RESULT:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-                raise ConnectionError(f"Unexpected auth response type: {msg_type}")
-            self._logger.debug(f"[CONNECTION] Authenticated with {IP}")
-        except asyncio.TimeoutError:
-            writer.close()
-            await writer.wait_closed()
-            raise ConnectionError(f"Authentication timeout with {IP}")
-        except ConnectionError:
-            # Already closed in the branch that raised — re-raise unchanged.
-            raise
+            peer_fp = self._extract_peer_fingerprint(writer)
         except Exception as e:
-            # Any other exception during _receive_message (transport drop,
-            # etc.) — also close the writer.
+            writer.close()
+            try: await writer.wait_closed()
+            except Exception: pass
+            raise ConnectionError(f"Server pin extract failed for {IP}:{port}: {e}")
+
+        peer_cfg = self.peers_by_endpoint.get((IP, port))
+        if peer_cfg is None or peer_cfg.fingerprint != peer_fp:
+            writer.close()
+            try: await writer.wait_closed()
+            except Exception: pass
+            raise ConnectionError(
+                f"Server fingerprint {peer_fp} for {IP}:{port} not in peers config"
+            )
+
+        self._logger.debug(
+            f"[CONNECTION] Pinned connection established to {IP}:{port} "
+            f"hostname={peer_cfg.hostname} fp={peer_fp}"
+        )
+        return reader, writer
+
+    async def revoke_peer(self, fingerprint: str) -> int:
+        """Force-close all pooled connections to a peer with the given
+        fingerprint. Removes the peer from peers_by_fingerprint /
+        peers_by_endpoint / self.peers BEFORE draining the pool so any
+        concurrent _create_connection mid-await fails its own pin check
+        rather than completing and pooling a now-revoked connection.
+        Returns count of connections closed.
+        """
+        closed = 0
+        spec = next((p for p in self.peers if p.fingerprint == fingerprint), None)
+        if spec is None:
+            return 0
+        self.peers_by_endpoint.pop((spec.ip, spec.port), None)
+        self.peers_by_fingerprint.pop(spec.fingerprint, None)
+        self.peers = [p for p in self.peers if p.fingerprint != fingerprint]
+        pool_key = (spec.ip, spec.port)
+        pool = self.connection_pools.pop(pool_key, None)
+        if pool is None:
+            return 0
+        while True:
+            try:
+                _reader, writer = pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            except Exception as e:
+                self._logger.warning("revoke_peer drain unexpected error: %s", e)
+                break
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
-            raise ConnectionError(f"Auth-phase exception with {IP}: {e}")
-
-        return reader, writer
+                closed += 1
+            except Exception as e:
+                self._logger.warning(
+                    "revoke_peer close error for %s:%s: %s — continuing drain",
+                    spec.ip, spec.port, e,
+                )
+        return closed
 
     async def _get_connection(
         self, IP: str

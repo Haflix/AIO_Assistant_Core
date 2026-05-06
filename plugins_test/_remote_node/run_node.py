@@ -31,6 +31,14 @@ async def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--ready-file", required=True)
+    # PR4 Stage K (B-066): subprocess-driven mTLS bootstrap. The parent
+    # passes its keys_dir + cert PEM file path; the subprocess loads its
+    # OWN cert from keys_dir and pins the parent via the cert PEM file.
+    ap.add_argument("--keys-dir", default=None)
+    ap.add_argument("--parent-cert-pem-file", default=None)
+    ap.add_argument("--parent-hostname", default="parent")
+    ap.add_argument("--parent-port", type=int, default=2510)
+    ap.add_argument("--parent-ip", default="127.0.0.1")
     args = ap.parse_args()
 
     pc = PluginCore(args.config)
@@ -38,7 +46,22 @@ async def main() -> None:
     # Override port BEFORE wait_until_ready: NetworkManager is constructed
     # there and reads pc.networking_port (the INSTANCE attribute), not yaml.
     pc.networking_port = args.port
-    pc.yaml_config.setdefault("networking", {})["port"] = args.port
+    nw_cfg = pc.yaml_config.setdefault("networking", {})
+    nw_cfg["port"] = args.port
+
+    if args.keys_dir is not None:
+        nw_cfg["keys_dir"] = args.keys_dir
+    if args.parent_cert_pem_file is not None:
+        parent_cert_pem = Path(args.parent_cert_pem_file).read_text(encoding="utf-8")
+        nw_cfg["peers"] = [
+            {
+                "hostname": args.parent_hostname,
+                "address": f"{args.parent_ip}:{args.parent_port}",
+                "cert_pem": parent_cert_pem,
+                "system_caller": False,
+            },
+        ]
+        nw_cfg.pop("node_ips", None)
 
     await pc.wait_until_ready()
 

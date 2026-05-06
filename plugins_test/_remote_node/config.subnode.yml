@@ -20,14 +20,14 @@ general:
         urllib3: "MUTE"
 
 networking:
+    # PR4 Stage K (B-066): TestRemoteSuite spawns this subnode via
+    # run_node.py. The parent injects --keys-dir + --parent-cert-pem-file
+    # at runtime so this file does NOT carry the legacy node_ips entries.
+    # If TestRemoteSuite is updated to bring up mTLS for the subnode, it
+    # MUST pass those flags. Without them, networking starts with empty
+    # peers and refuses to start (hard error in start()).
     enabled: true
-    # Parent's listener port — required so the subnode connects to the parent
-    # rather than its own listener (which would happen with bare "127.0.0.1").
-    # The suite passes the parent's port explicitly; default 2510 here.
-    node_ips: ["127.0.0.1:2510"]
     port: 0                             # overridden via run_node.py --port
     discover_nodes: true
     direct_discoverable: true
     auto_discoverable: true
-    # secret is read from the NETWORKING_SECRET env var which run_node.py
-    # forwards from the parent process. No literal secret in this config.

@@ -16,10 +16,11 @@ general:
         urllib3: "MUTE"
 
 networking:
+    # PR4 Stage K (B-066): run_node.py --keys-dir / --parent-cert-pem-file
+    # inject keys_dir + peers at runtime. Omitting them here prevents
+    # stale shared-secret entries from being honored.
     enabled: true
-    node_ips: ["127.0.0.1:2510"]
     port: 0                              # overridden via run_node.py --port
     discover_nodes: true
     direct_discoverable: true
     auto_discoverable: true
-    secret: "aio_smoke_secret"
