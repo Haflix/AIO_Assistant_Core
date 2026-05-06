@@ -1128,23 +1128,33 @@ class NetworkManager:
             )
 
             endpoints = []
+            # F4 fix: skip plugins/endpoints not flagged remote-eligible
+            # so wire callers can't enumerate non-public endpoint metadata
+            # via tag search. Mirrors find_endpoint's remote-eligibility
+            # gate (PluginCore.py:2104-2107). Tag-search bypassed it
+            # entirely before this guard.
             for plugin in self.plugin_core.plugins.values():
-                if plugin.enabled:
-                    for endpoint in plugin.endpoints.values():
-                        if tag in endpoint.get("tags", []):
-                            endpoints.append(
-                                {
-                                    "plugin_name": plugin.plugin_name,
-                                    "plugin_uuid": plugin.plugin_uuid,
-                                    "plugin_version": getattr(
-                                        plugin, "version", "unknown"
-                                    ),
-                                    "plugin_description": getattr(
-                                        plugin, "description", ""
-                                    ),
-                                    "endpoint": endpoint,
-                                }
-                            )
+                if not plugin.enabled:
+                    continue
+                if not getattr(plugin, "remote", False):
+                    continue
+                for endpoint in plugin.endpoints.values():
+                    if not endpoint.get("remote", False):
+                        continue
+                    if tag in endpoint.get("tags", []):
+                        endpoints.append(
+                            {
+                                "plugin_name": plugin.plugin_name,
+                                "plugin_uuid": plugin.plugin_uuid,
+                                "plugin_version": getattr(
+                                    plugin, "version", "unknown"
+                                ),
+                                "plugin_description": getattr(
+                                    plugin, "description", ""
+                                ),
+                                "endpoint": endpoint,
+                            }
+                        )
 
             self._logger.info(
                 f"[TAG_SEARCH] Found {len(endpoints)} endpoint(s) for tag '{tag}', "
