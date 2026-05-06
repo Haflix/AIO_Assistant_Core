@@ -837,7 +837,17 @@ class NetworkManager:
             _peer_repr = (
                 f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
             )
-            if author == "system" or author_id in self.plugin_core.plugins_by_uuid:
+            # Cycle-2 V1 fix: also guard against author_id == hostname.
+            # find_endpoint's is_local_system check (PluginCore.py:2055) is
+            # `requester_id == self.hostname`. The original B-018b guard only
+            # caught the rewrite-via-execute path (author=="system" → hostname);
+            # a peer that directly sends author_id=<receiver_hostname> bypasses
+            # both the original 2-condition guard and the rewrite block.
+            if (
+                author == "system"
+                or author_id in self.plugin_core.plugins_by_uuid
+                or author_id == self.plugin_core.hostname
+            ):
                 self._logger.warning(
                     "[EXECUTE] B-018b guard: rejected wire-supplied author=%r "
                     "author_id=%r from peer=%s; rewriting to remote sentinel",
@@ -930,7 +940,13 @@ class NetworkManager:
             _peer_repr = (
                 f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
             )
-            if author == "system" or author_id in self.plugin_core.plugins_by_uuid:
+            # Cycle-2 V1 fix (mirror of _handle_execute): include
+            # author_id == hostname for is_local_system spoof coverage.
+            if (
+                author == "system"
+                or author_id in self.plugin_core.plugins_by_uuid
+                or author_id == self.plugin_core.hostname
+            ):
                 self._logger.warning(
                     "[EXECUTE_STREAM] B-018b guard: rejected wire-supplied "
                     "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
@@ -1962,6 +1978,16 @@ class NetworkManager:
                     "[SUB_DELTA] empty subscriptions from %s", author_host
                 )
                 return
+            # Cycle-2 B-F6 fix: handler processes only subs_payload[0]
+            # below (sender always sends 1-entry deltas). Warn if a peer
+            # sends a multi-entry delta so the silent truncation surfaces.
+            if len(subs_payload) > 1:
+                self._logger.warning(
+                    "[SUB_DELTA] received multi-entry delta from %s "
+                    "(len=%d); only the first entry is processed — "
+                    "remaining %d entries dropped",
+                    author_host, len(subs_payload), len(subs_payload) - 1,
+                )
 
             # Soft anti-spoof check (same as advertise).
             peer_ip = self._safe_peer_ip(writer)
@@ -3053,9 +3079,24 @@ class NetworkManager:
 
         except Exception as e:
             self._logger.exception(f"Error in execute_remote to {IP}")
+            # Cycle-2 B-F2 fix: on exception, close (don't return) the
+            # connection. Mid-stream errors leave stale bytes in the reader
+            # buffer; pooling a framing-corrupted connection forces a wasted
+            # ping-then-discard cycle on the next caller. Mirror the
+            # request_event_remote pattern (line 2101+).
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True  # prevent finally from also touching it
             raise NetworkRequestException(f"Remote execution failed: {e}")
         finally:
-            # Return connection to pool (or close if error)
+            # Return connection to pool ONLY on success (success path sets
+            # connection_returned=True via _return_connection). On exception
+            # the except-block above closed it and set connection_returned=True
+            # to prevent double-touch here.
             if reader and writer and not connection_returned:
                 try:
                     self._logger.debug(f"[REMOTE] Returning connection for {IP}")
@@ -3143,28 +3184,32 @@ class NetworkManager:
                         item_bytes += len(payload)
 
                     elif msg_type == MSG_STREAM_ITEM_END:
-                        # Item boundary — reconstruct and yield accumulated chunks
+                        # Item boundary — reconstruct and yield accumulated chunks.
+                        # Cycle-2 V3 fix: align both sentinel paths to raise
+                        # NetworkRequestException so _process_request_stream's
+                        # except handler marks the request errored and the
+                        # B-044 chain propagates as RequestException to the
+                        # local consumer. Previously __STREAM_ERROR__ yielded
+                        # a sentinel that was put on the queue as data.
+                        # NOTE: this with-payload branch is structurally
+                        # unreachable today (server always sends ITEM_END
+                        # with payload_length=0), but kept aligned with the
+                        # empty-payload path below for defense-in-depth.
                         if current_item_chunks:
                             full_pickled = b"".join(current_item_chunks)
                             try:
                                 item = pickle.loads(full_pickled)
-                                # Check if it's an error marker
                                 if isinstance(item, tuple) and len(item) == 2:
                                     if item[0] == "__STREAM_ERROR__":
                                         self._logger.exception(
                                             f"Stream error from {IP}: {item[1]}"
                                         )
-                                        yield (
-                                            "__REMOTE_STREAM_DECODE_ERROR__",
-                                            item[1],
-                                        )
-                                        break
+                                        raise NetworkRequestException(item[1])
                                     elif item[0] == "__STREAM_EXCEPTION__":
                                         self._logger.exception(
                                             f"Stream exception from {IP}: {item[1]}"
                                         )
-                                        yield ("__REMOTE_STREAM_ERROR__", item[1])
-                                        break
+                                        raise NetworkRequestException(item[1])
                                 items_yielded += 1
                                 try:
                                     item_type = type(item).__name__
@@ -3175,6 +3220,10 @@ class NetworkManager:
                                     f"chunks={item_chunks}, bytes={item_bytes}, type={item_type}"
                                 )
                                 yield item
+                            except NetworkRequestException:
+                                # Cycle-2 V3 fix: let our own raise propagate
+                                # (don't re-catch it as a "decode error").
+                                raise
                             except Exception as e:
                                 self._logger.exception(
                                     f"Failed to unpickle stream item from {IP}"
@@ -3226,11 +3275,15 @@ class NetworkManager:
                             item = pickle.loads(full_pickled)
                             if isinstance(item, tuple) and len(item) == 2:
                                 if item[0] == "__STREAM_ERROR__":
+                                    # Cycle-2 V3 fix: align with __STREAM_EXCEPTION__
+                                    # path — raise instead of yielding sentinel,
+                                    # so _process_request_stream marks the
+                                    # request errored and the local consumer
+                                    # sees RequestException via B-044 chain.
                                     self._logger.exception(
                                         f"Stream error from {IP}: {item[1]}"
                                     )
-                                    yield ("__REMOTE_STREAM_DECODE_ERROR__", item[1])
-                                    break
+                                    raise NetworkRequestException(item[1])
                                 elif item[0] == "__STREAM_EXCEPTION__":
                                     self._logger.exception(
                                         f"Stream exception from {IP}: {item[1]}"
@@ -3278,6 +3331,18 @@ class NetworkManager:
             raise
         except Exception as e:
             self._logger.exception(f"Error in execute_remote_stream to {IP}")
+            # Cycle-2 B-F7 fix: on exception, close the connection rather
+            # than returning it to the pool. Mid-stream errors (especially
+            # from break-after-sentinel paths) leave stale frames in the
+            # reader buffer; pooling a framing-corrupted connection forces
+            # a wasted ping-then-discard cycle on the next caller.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             # Same fix as above — re-raise the underlying error rather
             # than yielding a sentinel, so the caller's `_process_request_
             # stream` can mark the request errored.
@@ -3285,7 +3350,8 @@ class NetworkManager:
                 f"Remote stream error from {IP}: {e}"
             ) from e
         finally:
-            # Return connection to pool (or close if error)
+            # Success-path: return to pool. Exception path already closed
+            # (sets connection_returned=True above).
             if reader and writer and not connection_returned:
                 try:
                     self._logger.debug(f"[REMOTE_STREAM] Returning connection for {IP}")
