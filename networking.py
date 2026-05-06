@@ -772,6 +772,12 @@ class NetworkManager:
         except asyncio.IncompleteReadError as e:
             self._logger.debug(f"[MESSAGE] Incomplete read: {e}")
             raise ConnectionError("Connection closed unexpectedly")
+        except pickle.UnpicklingError:
+            # Cycle 3 fresh-eyes LOW fix: re-raise without ERROR-level
+            # traceback. _handle_client's inner loop catches this and
+            # logs at WARNING with peer context. Letting the bare except
+            # below run would double-log every disallowed-class event.
+            raise
         except Exception as e:
             self._logger.exception("[MESSAGE] Error receiving message")
             raise
