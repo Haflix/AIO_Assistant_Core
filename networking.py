@@ -1027,6 +1027,27 @@ class NetworkManager:
             requester_id = data.get("requester_id")
             target_plugin = data.get("target_plugin")
 
+            # F3 fix (B-018b sibling): wire-supplied requester_id cannot
+            # be trusted for find_endpoint's trust calculus. A peer can
+            # claim requester_id == self.hostname (is_local_system=True)
+            # or requester_id in plugins_by_uuid (is_local_plugin=True),
+            # bypassing the remote: false eligibility check. Force a
+            # remote-classified sentinel that is neither.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if (
+                requester_id == self.plugin_core.hostname
+                or requester_id in self.plugin_core.plugins_by_uuid
+            ):
+                self._logger.warning(
+                    "[ENDPOINT] B-018b guard: rejected wire-supplied "
+                    "requester_id=%r from peer=%s; rewriting to remote sentinel",
+                    requester_id, _peer_repr,
+                )
+                requester_id = f"remote-peer:{_peer_repr}"
+
             self._logger.info(
                 f"[ENDPOINT] Received HAS_ENDPOINT request from {client_addr}: "
                 f"access_name='{access_name}', plugin_uuid={plugin_uuid}, "
