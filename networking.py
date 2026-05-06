@@ -2667,6 +2667,18 @@ class NetworkManager:
         for node in list(self.nodes):
             if node.hostname == self.plugin_core.hostname:
                 continue
+            # Cycle-3 fresh-F3 fix: skip nodes whose hostname hasn't been
+            # discovered yet (newly-created Node before first INFO/discovery
+            # response). Without this guard, _hosts_match(..., None) returns
+            # False silently, so publish events never reach the peer until
+            # discovery completes. Make the skip explicit and traceable.
+            if node.hostname is None:
+                self._logger.debug(
+                    "[REMOTE_DISPATCH] skipping node %s — hostname not yet "
+                    "discovered",
+                    node.IP,
+                )
+                continue
             try:
                 if not (node.enabled and await node.is_alive()):
                     continue
@@ -2833,14 +2845,39 @@ class NetworkManager:
                 self._receive_message(reader), timeout=5.0
             )
             if msg_type == MSG_ERROR:
+                # Cycle-3 fresh-F2 fix: close writer on auth failure paths.
+                # Previously only the timeout path closed; ERROR and
+                # unexpected-type raises leaked the open TLS connection.
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
                 raise ConnectionError(f"Authentication failed: {data}")
             if msg_type != MSG_RESULT:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
                 raise ConnectionError(f"Unexpected auth response type: {msg_type}")
             self._logger.debug(f"[CONNECTION] Authenticated with {IP}")
         except asyncio.TimeoutError:
             writer.close()
             await writer.wait_closed()
             raise ConnectionError(f"Authentication timeout with {IP}")
+        except ConnectionError:
+            # Already closed in the branch that raised — re-raise unchanged.
+            raise
+        except Exception as e:
+            # Any other exception during _receive_message (transport drop,
+            # etc.) — also close the writer.
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            raise ConnectionError(f"Auth-phase exception with {IP}: {e}")
 
         return reader, writer
 
@@ -3328,6 +3365,18 @@ class NetworkManager:
             # propagates as RequestException to local consumer via B-044
             # path). Previously this fell to the generic "yield sentinel"
             # branch below and the error was tunneled as data.
+            #
+            # Cycle-3 fix: also close the connection here. After raising
+            # on a sentinel (CHUNK + ITEM_END seen), the wire still has
+            # an unread MSG_END_STREAM frame. Pooling the connection
+            # leaves stale bytes for the next caller; close instead.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             raise
         except Exception as e:
             self._logger.exception(f"Error in execute_remote_stream to {IP}")
@@ -3861,28 +3910,57 @@ class NetworkManager:
             if msg_type == MSG_RESULT and data.get("status") == "ok":
                 await node.heartbeat()
                 self._logger.debug(f"[HEARTBEAT] Node {node.IP} is alive")
+                # Cycle-3 fresh-F1 fix: ONLY return to pool on confirmed
+                # success. On any non-success exit (return False / except),
+                # the connection's reader buffer may carry a stale
+                # MSG_RESULT frame from a delayed ping response, which
+                # would corrupt the next caller's framing.
+                if reader and writer and not connection_returned:
+                    try:
+                        await self._return_connection(node.IP, reader, writer)
+                        connection_returned = True
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
                 return True
+            # Unexpected msg_type — close the connection (don't pool a
+            # framing-suspicious connection).
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
             return False
 
         except Exception as e:
             self._logger.debug(
                 f"Pinging Node with IP {node.IP} was not successful: {e}"
             )
-            return False
-        finally:
+            # Cycle-3 fresh-F1 fix: any exception path means the connection
+            # is in an indeterminate state — close it.
             if reader and writer and not connection_returned:
                 try:
-                    self._logger.debug(
-                        f"[HEARTBEAT] Returning connection for {node.IP}"
-                    )
-                    await self._return_connection(node.IP, reader, writer)
-                    connection_returned = True
+                    writer.close()
+                    await writer.wait_closed()
                 except Exception:
-                    try:
-                        writer.close()
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
+                    pass
+                connection_returned = True
+            return False
+        finally:
+            # Defensive: if for some reason connection_returned is still
+            # False (early exit before the success/error branches), close
+            # the writer rather than pooling a connection of unknown state.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     @async_handle_errors(None)
     async def node_has_endpoint(
