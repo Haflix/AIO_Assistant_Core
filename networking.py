@@ -1417,6 +1417,31 @@ class NetworkManager:
                 )
                 return
 
+            # Cycle-7 fix: B-018b guard for PR3 publish path. Wire-supplied
+            # author flows to _sub_accepts_author which has a Q4 bypass:
+            # `if author == "system": return not _blocked(blocked_authors)`.
+            # A peer claiming author="system" therefore bypasses any
+            # subscription `authors:` whitelist. The same applies to
+            # author_id matching a local plugin uuid or our hostname.
+            # Mirror the _handle_execute guard: rewrite to remote-peer
+            # sentinel before any trust-decision call.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if (
+                author == "system"
+                or author_id in self.plugin_core.plugins_by_uuid
+                or author_id == self.plugin_core.hostname
+            ):
+                self._logger.warning(
+                    "[PUBLISH_EVENT] B-018b guard: rejected wire-supplied "
+                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
+                    author, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
+
             self._logger.debug(
                 "[PUBLISH_EVENT] topic=%r author=%s author_host=%s",
                 topic, author, author_host,
@@ -1507,6 +1532,25 @@ class NetworkManager:
                     NetworkRequestException("missing/invalid topic"),
                 )
                 return
+
+            # Cycle-7 fix: B-018b guard for PR3 request path (mirror of
+            # _handle_publish_event). See _handle_publish_event for rationale.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if (
+                author == "system"
+                or author_id in self.plugin_core.plugins_by_uuid
+                or author_id == self.plugin_core.hostname
+            ):
+                self._logger.warning(
+                    "[REQUEST_EVENT] B-018b guard: rejected wire-supplied "
+                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
+                    author, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
 
             try:
                 all_subs = await self.plugin_core.topic_registry.find_all(topic)
@@ -1651,6 +1695,26 @@ class NetworkManager:
                     writer, NetworkRequestException("missing/invalid topic")
                 )
                 return
+
+            # Cycle-7 fix: B-018b guard for PR3 stream-request path
+            # (mirror of _handle_publish_event). See _handle_publish_event
+            # for rationale.
+            _peer_addr = writer.get_extra_info("peername")
+            _peer_repr = (
+                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            )
+            if (
+                author == "system"
+                or author_id in self.plugin_core.plugins_by_uuid
+                or author_id == self.plugin_core.hostname
+            ):
+                self._logger.warning(
+                    "[REQUEST_EVENT_STREAM] B-018b guard: rejected wire-supplied "
+                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
+                    author, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
 
             try:
                 all_subs = await self.plugin_core.topic_registry.find_all(topic)
