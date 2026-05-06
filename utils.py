@@ -1850,6 +1850,10 @@ class GeneratorRequest:
 
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
+        # B-002 fix: producer task ref. PluginCore.create_gen_request
+        # attaches the task it spawns so set_collected() can cancel
+        # the producer when the consumer abandons the stream.
+        self._producer_task: Optional[asyncio.Task] = None
 
     async def set_result(
         self, result: Any, error: bool = False, timeout: bool = False
@@ -1866,8 +1870,22 @@ class GeneratorRequest:
             await self.queue.put((EndOfQueue(), self.error, self.timeout))
 
     async def set_collected(self) -> None:
-        """Mark the request as collected for cleanup."""
+        """Mark the request as collected for cleanup AND cancel the
+        producer task if still running.
+
+        B-002 fix: without the cancel, the producer keeps awaiting the
+        next item from an infinite source generator and pushing into an
+        abandoned queue — unbounded memory growth. Cancel is a no-op if
+        the task already completed naturally; the EndOfQueue sentinel is
+        defensive — covers a hypothetical late consumer that attaches
+        after collect (in practice none exist; the queue is unbounded so
+        put_nowait cannot raise).
+        """
         self.collected = True
+        t = self._producer_task
+        if t is not None and not t.done():
+            t.cancel()
+            self.queue.put_nowait((EndOfQueue(), False, False))
 
     def get_queue_stream_sync(self):
         """Get the result stream synchronously."""

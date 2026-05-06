@@ -1942,6 +1942,7 @@ class PluginCore:
         )
 
         task = asyncio.create_task(self._process_request_stream(request))
+        request._producer_task = task   # B-002: enable cancel-on-collect
         self.task_list.append(task)
 
         return request

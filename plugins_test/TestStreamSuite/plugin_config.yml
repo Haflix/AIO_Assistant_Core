@@ -1,5 +1,5 @@
 description: Phase 2 suite — execute_stream value/error/abandonment/timeout/payload cases (basic + edge)
-version: 0.1.0
+version: 0.2.0
 remote: False
 arguments:
 endpoints:

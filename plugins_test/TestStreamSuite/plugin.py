@@ -203,16 +203,11 @@ class TestStreamSuite(Plugin):
                     break
 
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
-            # Else: producer stopped → bug fixed → unexpected_pass (review)
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         async def body_consumer_cancel(c):
             req = await self._make_gen_request("ea_gen_infinite", None)
@@ -231,15 +226,11 @@ class TestStreamSuite(Plugin):
                 pass
 
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         async def body_consumer_break_sync(c):
             # Sync caller drives execute_stream_sync, breaks early, then we
@@ -264,38 +255,25 @@ class TestStreamSuite(Plugin):
             await asyncio.to_thread(sync_block)
             req = req_holder["req"]
             await req.set_collected()
+            await asyncio.sleep(0.1)              # let cancel propagate
             qsize_t1 = req.queue.qsize()
-            await asyncio.sleep(15)
+            await asyncio.sleep(1.0)              # bounded re-check
             qsize_t2 = req.queue.qsize()
-
-            if qsize_t2 > qsize_t1:
-                c.set_marker("producer_still_running")
-                raise AssertionError(
-                    f"producer_still_running: qsize {qsize_t1} -> {qsize_t2}"
-                )
+            c.expect(qsize_t2, qsize_t1)          # B-002 fix: producer cancelled, no growth
 
         await rec.run_case(
             "stream.B-002.consumer_break", body_consumer_break,
-            tags=("bug_repro",), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-002",),
             **kw,
         )
         await rec.run_case(
             "stream.B-002.consumer_cancel", body_consumer_cancel,
-            tags=("bug_repro",), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-002",),
             **kw,
         )
         await rec.run_case(
             "stream.B-002.consumer_break_sync", body_consumer_break_sync,
-            tags=("bug_repro", "sync"), bug_ids=("B-002",),
-            expected_status="fail",
-            expected_signature={"marker": "producer_still_running"},
-            hard_timeout_s=30.0,
+            tags=("bug_repro", "regression_guard", "sync"), bug_ids=("B-002",),
             **kw,
         )
 
