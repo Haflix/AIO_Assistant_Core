@@ -322,6 +322,77 @@ class NetworkManager:
                 return port
         return self.port
 
+    # ── PR4 Stage K (B-066) — B-018b split helper ────────────────────
+
+    async def _apply_b018b_guard(
+        self,
+        author: str,
+        author_id: str,
+        conn_context: Dict[str, Any],
+        writer: asyncio.StreamWriter,
+        log_prefix: str,
+    ) -> Tuple[str, str, bool]:
+        """Apply the split B-018b guard. Returns (author, author_id, denied).
+
+        Part 1: author == "system" gated by conn_context["system_caller"].
+        Permitted privileged peers keep author="system"; non-privileged
+        peers receive a MSG_ERROR and the caller MUST early-return.
+
+        Part 2: author_id impersonation rewrite — UNCONDITIONAL with
+        respect to author. If Part 1 permitted author="system", Part 2
+        rewrites only author_id. Otherwise rewrites both.
+        """
+        _peer_addr = writer.get_extra_info("peername")
+        _peer_repr = (
+            f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+        )
+
+        # Part 1
+        if author == "system":
+            if conn_context.get("system_caller"):
+                self._logger.info(
+                    "%s B-018b: author='system' permitted from privileged peer fp=%s",
+                    log_prefix, conn_context.get("peer_fingerprint"),
+                )
+            else:
+                self._logger.warning(
+                    "%s B-018b: rejected author='system' from non-privileged peer hostname=%s",
+                    log_prefix, conn_context.get("peer_hostname"),
+                )
+                try:
+                    await self._send_error_pickled(writer, NetworkRequestException(
+                        "author='system' not permitted from this peer; "
+                        "system_caller=false in your peer config. "
+                        "Set system_caller=true on this peer's entry to permit."
+                    ))
+                except Exception:
+                    pass
+                return author, author_id, True
+
+        # Part 2 — author_id impersonation rewrite, runs in all paths that
+        # didn't return above. Preserves author="system" if Part 1 permitted.
+        if (
+            author_id in self.plugin_core.plugins_by_uuid
+            or author_id == self.plugin_core.hostname
+        ):
+            if author == "system":
+                self._logger.warning(
+                    "%s B-018b: privileged peer=%s attempted author_id spoof "
+                    "(author_id=%r matched local entity); rewriting author_id only",
+                    log_prefix, _peer_repr, author_id,
+                )
+                author_id = f"remote-peer:{_peer_repr}"
+            else:
+                self._logger.warning(
+                    "%s B-018b: rejected wire-supplied author_id=%r from peer=%s; "
+                    "rewriting to remote sentinel",
+                    log_prefix, author_id, _peer_repr,
+                )
+                author = f"remote-peer:{_peer_repr}"
+                author_id = f"remote-peer:{_peer_repr}"
+
+        return author, author_id, False
+
     # ── PR4 Stage K (B-066) — peer parsing + identity helpers ─────────
 
     def _parse_peers(self, raw_peers) -> List[PeerSpec]:
@@ -1148,37 +1219,15 @@ class NetworkManager:
             request_id = data.get("request_id")
             args = data.get("args", [])
 
-            # B-018b GUARD — wire-supplied author/author_id cannot be trusted
-            # for access-control decisions. A peer can claim author="system"
-            # (rewritten to receiver hostname by execute() at PluginCore.py
-            # making is_local_system=True) or author_id=<a known local plugin
-            # uuid> (making is_local_plugin=True via find_endpoint), bypassing
-            # `remote: false` access checks. Wire requests are by definition
-            # remote; force a remote-classified sentinel so find_endpoint
-            # classifies them correctly. Original wire-supplied values
-            # preserved in the WARNING log for trace forensics.
-            _peer_addr = writer.get_extra_info("peername")
-            _peer_repr = (
-                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            # B-018b GUARD (split, K-5) — see _apply_b018b_guard for the full
+            # logic. Part 1 gates author=="system" on system_caller; Part 2
+            # rewrites impersonating author_id unconditionally (preserving
+            # author="system" if Part 1 permitted it).
+            author, author_id, _denied = await self._apply_b018b_guard(
+                author, author_id, conn_context, writer, "[EXECUTE]"
             )
-            # Cycle-2 V1 fix: also guard against author_id == hostname.
-            # find_endpoint's is_local_system check (PluginCore.py:2055) is
-            # `requester_id == self.hostname`. The original B-018b guard only
-            # caught the rewrite-via-execute path (author=="system" → hostname);
-            # a peer that directly sends author_id=<receiver_hostname> bypasses
-            # both the original 2-condition guard and the rewrite block.
-            if (
-                author == "system"
-                or author_id in self.plugin_core.plugins_by_uuid
-                or author_id == self.plugin_core.hostname
-            ):
-                self._logger.warning(
-                    "[EXECUTE] B-018b guard: rejected wire-supplied author=%r "
-                    "author_id=%r from peer=%s; rewriting to remote sentinel",
-                    author, author_id, _peer_repr,
-                )
-                author = f"remote-peer:{_peer_repr}"
-                author_id = f"remote-peer:{_peer_repr}"
+            if _denied:
+                return
 
             self._logger.info(
                 f"[EXECUTE] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
@@ -1264,25 +1313,12 @@ class NetworkManager:
             request_id = data.get("request_id")
             args = data.get("args", [])
 
-            # B-018b GUARD (mirror of _handle_execute) — see comment there.
-            _peer_addr = writer.get_extra_info("peername")
-            _peer_repr = (
-                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            # B-018b GUARD (split, K-5) — see _apply_b018b_guard.
+            author, author_id, _denied = await self._apply_b018b_guard(
+                author, author_id, conn_context, writer, "[EXECUTE_STREAM]"
             )
-            # Cycle-2 V1 fix (mirror of _handle_execute): include
-            # author_id == hostname for is_local_system spoof coverage.
-            if (
-                author == "system"
-                or author_id in self.plugin_core.plugins_by_uuid
-                or author_id == self.plugin_core.hostname
-            ):
-                self._logger.warning(
-                    "[EXECUTE_STREAM] B-018b guard: rejected wire-supplied "
-                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
-                    author, author_id, _peer_repr,
-                )
-                author = f"remote-peer:{_peer_repr}"
-                author_id = f"remote-peer:{_peer_repr}"
+            if _denied:
+                return
 
             self._logger.info(
                 f"[EXECUTE_STREAM] Request: plugin={plugin}, method={method}, plugin_uuid={plugin_uuid}, "
@@ -1746,30 +1782,12 @@ class NetworkManager:
                 )
                 return
 
-            # Cycle-7 fix: B-018b guard for PR3 publish path. Wire-supplied
-            # author flows to _sub_accepts_author which has a Q4 bypass:
-            # `if author == "system": return not _blocked(blocked_authors)`.
-            # A peer claiming author="system" therefore bypasses any
-            # subscription `authors:` whitelist. The same applies to
-            # author_id matching a local plugin uuid or our hostname.
-            # Mirror the _handle_execute guard: rewrite to remote-peer
-            # sentinel before any trust-decision call.
-            _peer_addr = writer.get_extra_info("peername")
-            _peer_repr = (
-                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            # B-018b GUARD (split, K-5) — see _apply_b018b_guard.
+            author, author_id, _denied = await self._apply_b018b_guard(
+                author, author_id, conn_context, writer, "[PUBLISH_EVENT]"
             )
-            if (
-                author == "system"
-                or author_id in self.plugin_core.plugins_by_uuid
-                or author_id == self.plugin_core.hostname
-            ):
-                self._logger.warning(
-                    "[PUBLISH_EVENT] B-018b guard: rejected wire-supplied "
-                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
-                    author, author_id, _peer_repr,
-                )
-                author = f"remote-peer:{_peer_repr}"
-                author_id = f"remote-peer:{_peer_repr}"
+            if _denied:
+                return
 
             self._logger.debug(
                 "[PUBLISH_EVENT] topic=%r author=%s author_host=%s",
@@ -1862,24 +1880,12 @@ class NetworkManager:
                 )
                 return
 
-            # Cycle-7 fix: B-018b guard for PR3 request path (mirror of
-            # _handle_publish_event). See _handle_publish_event for rationale.
-            _peer_addr = writer.get_extra_info("peername")
-            _peer_repr = (
-                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            # B-018b GUARD (split, K-5) — see _apply_b018b_guard.
+            author, author_id, _denied = await self._apply_b018b_guard(
+                author, author_id, conn_context, writer, "[REQUEST_EVENT]"
             )
-            if (
-                author == "system"
-                or author_id in self.plugin_core.plugins_by_uuid
-                or author_id == self.plugin_core.hostname
-            ):
-                self._logger.warning(
-                    "[REQUEST_EVENT] B-018b guard: rejected wire-supplied "
-                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
-                    author, author_id, _peer_repr,
-                )
-                author = f"remote-peer:{_peer_repr}"
-                author_id = f"remote-peer:{_peer_repr}"
+            if _denied:
+                return
 
             try:
                 all_subs = await self.plugin_core.topic_registry.find_all(topic)
@@ -2025,25 +2031,12 @@ class NetworkManager:
                 )
                 return
 
-            # Cycle-7 fix: B-018b guard for PR3 stream-request path
-            # (mirror of _handle_publish_event). See _handle_publish_event
-            # for rationale.
-            _peer_addr = writer.get_extra_info("peername")
-            _peer_repr = (
-                f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
+            # B-018b GUARD (split, K-5) — see _apply_b018b_guard.
+            author, author_id, _denied = await self._apply_b018b_guard(
+                author, author_id, conn_context, writer, "[REQUEST_EVENT_STREAM]"
             )
-            if (
-                author == "system"
-                or author_id in self.plugin_core.plugins_by_uuid
-                or author_id == self.plugin_core.hostname
-            ):
-                self._logger.warning(
-                    "[REQUEST_EVENT_STREAM] B-018b guard: rejected wire-supplied "
-                    "author=%r author_id=%r from peer=%s; rewriting to remote sentinel",
-                    author, author_id, _peer_repr,
-                )
-                author = f"remote-peer:{_peer_repr}"
-                author_id = f"remote-peer:{_peer_repr}"
+            if _denied:
+                return
 
             try:
                 all_subs = await self.plugin_core.topic_registry.find_all(topic)
