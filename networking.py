@@ -1406,7 +1406,15 @@ class NetworkManager:
             if self._self_impersonation_check(
                 author_host, writer, "MSG_REQUEST_EVENT"
             ):
-                # No response — caller will see TimeoutError / closed.
+                # F1 fix: send error frame instead of silently returning.
+                # request_event_remote's `while True: _receive_message`
+                # has no client-side timeout — silent return blocks the
+                # caller until TCP keepalive fires (minutes). Mirror the
+                # missing-topic error pattern below.
+                await self._send_error_pickled(
+                    writer,
+                    NetworkRequestException("self-impersonation rejected"),
+                )
                 return
 
             if author_host:
@@ -1545,6 +1553,13 @@ class NetworkManager:
             if self._self_impersonation_check(
                 author_host, writer, "MSG_REQUEST_EVENT_STREAM"
             ):
+                # F1 fix (mirror of _handle_request_event): send error
+                # frame so request_event_stream_remote doesn't deadlock
+                # on its `while True: _receive_message` loop.
+                await self._send_error_pickled(
+                    writer,
+                    NetworkRequestException("self-impersonation rejected"),
+                )
                 return
 
             if author_host:
