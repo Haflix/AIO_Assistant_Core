@@ -173,16 +173,12 @@ class NetworkManager:
             if entry not in self.node_ips:
                 self.node_ips.append(entry)
 
-        # Legacy security configuration (K-3 removes these together with the
-        # MSG_AUTH handshake in _handle_client and _create_connection).
+        # PR4 Stage K: legacy secret / cert_file / key_file kwargs accepted
+        # for PluginCore call-site compatibility but no longer used. The
+        # K-3 startup gate uses self.peers, not self.secret.
         self.secret = secret or os.getenv("NETWORKING_SECRET", "")
         if isinstance(self.secret, str):
             self.secret = self.secret.encode()
-        if not self.secret:
-            logger.warning(
-                "[SECURITY] No shared secret configured! Set 'secret' in networking "
-                "config or NETWORKING_SECRET env var. Networking will refuse to start."
-            )
         self.cert_file = cert_file
         self.key_file = key_file
         self.pool_size = pool_size
@@ -1137,7 +1133,11 @@ class NetworkManager:
             peer_fp = self._extract_peer_fingerprint(writer)
             peer_cfg = self.peers_by_fingerprint.get(peer_fp)
             if peer_cfg is None:
-                self._logger.warning(
+                # Security review MED fix: log at DEBUG, not WARNING.
+                # A port scanner sweeping the listener generates one log
+                # line per probe; at WARNING that floods the log and
+                # buries real security events.
+                self._logger.debug(
                     "[B066] unpinned peer fingerprint=%s from %s — closing silently",
                     peer_fp, client_addr,
                 )
@@ -1146,7 +1146,11 @@ class NetworkManager:
                 except Exception: pass
                 return
         except Exception as e:
-            self._logger.warning(
+            # Security review MED fix (companion): pin-extraction failure
+            # via TLS-layer probe is also high-volume during scans. DEBUG
+            # is correct severity; an actual misconfiguration produces a
+            # one-shot log because only legitimate peers ever reach here.
+            self._logger.debug(
                 "[B066] pin extraction failed for %s: %s — closing silently",
                 client_addr, e,
             )
@@ -3377,6 +3381,16 @@ class NetworkManager:
         self.peers_by_endpoint.pop((spec.ip, spec.port), None)
         self.peers_by_fingerprint.pop(spec.fingerprint, None)
         self.peers = [p for p in self.peers if p.fingerprint != fingerprint]
+        # Security review LOW fix: warn loudly when revoke leaves zero peers.
+        # Subsequent _create_pinned_ssl_context calls will skip
+        # load_verify_locations and outgoing connections fail with an
+        # opaque OpenSSL "certificate verify failed" message.
+        if not self.peers:
+            self._logger.warning(
+                "[NETWORKING] revoke_peer left peers list empty. All future "
+                "outgoing connections will fail with an opaque OpenSSL error "
+                "until a new peer is added (currently restart-required)."
+            )
         pool_key = (spec.ip, spec.port)
         pool = self.connection_pools.pop(pool_key, None)
         if pool is None:
