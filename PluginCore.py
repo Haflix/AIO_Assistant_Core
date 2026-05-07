@@ -1504,49 +1504,43 @@ class PluginCore:
 
     @async_log_errors
     async def purge_plugins(self):
+        # B-005 fix: delegate to pop_plugin per-name. pop_plugin fails
+        # pending requests (request_lock loop) BEFORE disable, then
+        # disables, pops dicts, unsubscribes, and clears logger levels
+        # — the full cleanup path. The previous implementation called
+        # _disable_plugin per plugin then swept the dicts in a single
+        # plugin_lock acquisition; that path skipped the pending-request
+        # cancellation step (B-005). Reuses Stage O's
+        # _pop_plugin_under_lock shared helper.
+        #
+        # Behavior on per-plugin failure: pop_plugin raises on error,
+        # the loop aborts, and remaining plugins stay loaded. Plugins
+        # already popped are fully cleaned up (different from the
+        # previous all-at-once dict sweep, which left disabled-but-
+        # still-in-dicts plugins on partial failure). Both shapes are
+        # partial cleanups; this one cleans up incrementally.
         self._logger.info("Purging plugins")
         try:
-            # Stage O: per-plugin disable acquires that plugin's
-            # lifecycle_lock via the public _disable_plugin wrapper.
-            # Concurrent ops on OTHER plugins are no longer blocked.
             for plugin_name in list(self.plugins.keys()):
-                await self._disable_plugin(plugin_name)
-            async with self.plugin_lock:
-                for plugin_name, plugin in self.plugins.items():
-                    plugin_uuid = getattr(plugin, "plugin_uuid", None)
-                    if plugin_uuid:
-                        await self.topic_registry.unsubscribe_plugin(plugin_uuid)
-                        LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
-                self.plugins.clear()
-                self.plugins_by_uuid.clear()
+                await self.pop_plugin(plugin_name)
             self._logger.info("Purged all plugins")
         except Exception as error:
             raise Exception(f"Error while purging plugins: {error}")
 
     @async_log_errors
     async def purge_plugins_except(self, excluded_names: List[str]):
-        """Purge all plugins except those in the excluded_names list."""
+        """Purge all plugins except those in the excluded_names list.
+
+        B-005 fix: delegate to pop_plugin per-name. See purge_plugins
+        for the full rationale.
+        """
         self._logger.info(f"Purging plugins except: {excluded_names}")
         try:
             plugins_to_purge = [
                 name for name in list(self.plugins.keys()) if name not in excluded_names
             ]
-            # Stage O: per-plugin disable goes through the lifecycle_lock-
-            # wrapping _disable_plugin (each name's lock acquired in turn).
             for plugin_name in plugins_to_purge:
-                await self._disable_plugin(plugin_name)
-            async with self.plugin_lock:
-                for plugin_name in plugins_to_purge:
-                    plugin = self.plugins.pop(plugin_name, None)
-                    if plugin:
-                        plugin_uuid = getattr(plugin, "plugin_uuid", None)
-                        if plugin_uuid:
-                            if plugin_uuid in self.plugins_by_uuid:
-                                self.plugins_by_uuid.pop(plugin_uuid, None)
-                            await self.topic_registry.unsubscribe_plugin(plugin_uuid)
-                            LogUtil.clear_logger_levels_owned_by(
-                                plugin_name, plugin_uuid
-                            )
+                await self.pop_plugin(plugin_name)
             self._logger.info(
                 f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
             )
@@ -1759,14 +1753,9 @@ class PluginCore:
                 # Rollback runs on Exception, CancelledError, or any
                 # other BaseException out of the try block above.
                 #
-                # Symmetric with _disable_plugin_under_lock: do all the
-                # SYNC state updates first (event clear/set, flag flip
-                # — atomic, can't raise) so they're guaranteed to run
-                # even if the async unregister below is cancelled or
-                # raises. Then async sub cleanup is wrapped in
-                # try/except so a failure there doesn't mask the
-                # original exception (which Python re-raises after
-                # finally).
+                # Sync state updates first (event clear/set — atomic,
+                # cannot raise) so they're guaranteed regardless of
+                # what happens during async cleanup below.
                 plugin._lifecycle_ready.clear()
                 # R1 HIGH-2 fix: restore plugin.ready to its
                 # default-set state. If the plugin author cleared
@@ -1778,20 +1767,60 @@ class PluginCore:
                 # on_enable can clear it again if they want manual
                 # control.
                 plugin.ready.set()
-                # Sync flag flip — atomic, no plugin_lock needed
-                # (readers don't lock either; they're already gated
-                # by _lifecycle_ready being cleared above).
-                plugin.enabled = False
-                # Async cleanup — best-effort.
+                # B-004 fix: call user on_disable to give the plugin
+                # a chance to undo partial setup from the failed
+                # on_enable (per README: "on_enable must be fully
+                # undoable by on_disable"). Author must write
+                # on_disable defensively against partial state
+                # (e.g. `if self.db_pool: await self.db_pool.close()`).
+                #
+                # Nested try/finally chain mirrors the shape used by
+                # _disable_plugin_under_lock so the `enabled = False`
+                # flip is the LAST action and runs unconditionally —
+                # even on CancelledError mid-await. Each async cleanup
+                # is wrapped in try/except Exception so a non-fatal
+                # raise doesn't skip the next step. CancelledError
+                # propagates through both try blocks (Exception
+                # doesn't catch it) but the outer finally chain still
+                # runs, guaranteeing the flag flip.
+                #
+                # No on_disable_timeout here: matches runtime
+                # _disable_plugin's no-timeout policy (B-009 is
+                # deferred). A misbehaving on_disable in rollback can
+                # hold lifecycle_lock until cancelled — same exposure
+                # as a misbehaving runtime on_disable.
                 try:
-                    await self._unregister_plugin_subscriptions(plugin)
-                except Exception:
-                    self._logger.exception(
-                        "[STAGE_O] _enable_plugin_under_lock rollback: "
-                        "_unregister_plugin_subscriptions raised for "
-                        "plugin %r — best-effort cleanup incomplete",
-                        plugin.plugin_name,
-                    )
+                    try:
+                        if asyncio.iscoroutinefunction(plugin.on_disable):
+                            await plugin.on_disable()
+                        else:
+                            await self.main_event_loop.run_in_executor(
+                                self._plugin_executor, plugin.on_disable
+                            )
+                    except Exception:
+                        self._logger.exception(
+                            "[STAGE_O] _enable_plugin_under_lock rollback: "
+                            "on_disable raised for plugin %r — partial "
+                            "cleanup incomplete (original on_enable error "
+                            "still propagates)",
+                            plugin.plugin_name,
+                        )
+                finally:
+                    try:
+                        try:
+                            await self._unregister_plugin_subscriptions(plugin)
+                        except Exception:
+                            self._logger.exception(
+                                "[STAGE_O] _enable_plugin_under_lock rollback: "
+                                "_unregister_plugin_subscriptions raised for "
+                                "plugin %r — best-effort cleanup incomplete",
+                                plugin.plugin_name,
+                            )
+                    finally:
+                        # Sync flag flip — atomic, guaranteed to run
+                        # via the outer finally chain even if both
+                        # async cleanups above are cancelled.
+                        plugin.enabled = False
 
     async def _disable_plugin_under_lock(
         self,
@@ -2851,10 +2880,27 @@ class PluginCore:
         await request.set_result(result, error)
 
     async def running_loop(self):
-        """Maintenance loop that cleans up tasks and requests."""
+        """Maintenance loop that cleans up tasks and requests.
+
+        B-006 fix: a single tick that raises must not kill the loop —
+        cleanup_requests is `@async_log_errors` which re-raises, and
+        any unexpected exception (e.g. a malformed entry in
+        self.requests with no .collected attribute) would otherwise
+        terminate the maintenance loop forever, leaking task_list and
+        requests for the rest of the process. Catch every Exception
+        (logging it) and continue. CancelledError is re-raised so
+        close() can stop the loop normally.
+        """
         while True:
-            self.task_list = [t for t in self.task_list if not t.done()]
-            await self.cleanup_requests()
+            try:
+                self.task_list = [t for t in self.task_list if not t.done()]
+                await self.cleanup_requests()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._logger.exception(
+                    "running_loop: cleanup tick raised; continuing"
+                )
             await asyncio.sleep(10)
 
     @async_log_errors

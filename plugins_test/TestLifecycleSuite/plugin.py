@@ -29,7 +29,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.3.1"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -220,11 +220,14 @@ class TestLifecycleSuite(Plugin):
                             pass
                 await self._ensure_victim_clean()
 
+        # Stage P (PR4): B-004 FIXED. Rollback in
+        # _enable_plugin_under_lock now calls plugin.on_disable to give
+        # the author a chance to undo partial setup from the failed
+        # on_enable. Test promoted to positive regression guard — body
+        # asserts plugin.db_open is False after the failed enable.
         await rec.run_case(
             "lifecycle.B-004.on_enable_raises_no_undo", body,
-            tags=("bug_repro",), bug_ids=("B-004",),
-            expected_status="fail",
-            expected_signature={"marker": "db_was_open_after_failed_enable"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-004",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -513,11 +516,15 @@ class TestLifecycleSuite(Plugin):
                     except Exception:
                         pass
 
+        # Stage P (PR4): B-005 FIXED. purge_plugins / purge_plugins_except
+        # now delegate to pop_plugin per-name, which fails pending
+        # requests targeting the popped plugin. Test promoted to
+        # positive regression guard — body asserts the pending task
+        # completes (via RequestException or normal return) within 3s
+        # of purge instead of hanging.
         await rec.run_case(
             "lifecycle.B-005.purge_except_skips_pending", body_purge,
-            tags=("bug_repro",), bug_ids=("B-005",),
-            expected_status="fail",
-            expected_signature={"marker": "task_did_not_get_unloaded_error"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-005",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -932,11 +939,16 @@ class TestLifecycleSuite(Plugin):
                         self._plugin_core.running_loop()
                     )
 
+        # Stage P (PR4): B-006 FIXED. running_loop now wraps each
+        # tick in try/except so a single bad request entry (or any
+        # other unexpected exception from cleanup_requests) no longer
+        # kills the maintenance loop. Test promoted to positive
+        # regression guard — body asserts the loop is still alive
+        # after a poisoned requests-dict entry.
         await rec.run_case(
             "lifecycle.B-006.running_loop_guard", body,
-            tags=("bug_repro", "terminal"), bug_ids=("B-006",),
-            expected_status="fail",
-            expected_signature={"marker": "running_loop_died"},
+            tags=("bug_repro", "regression_guard", "terminal"),
+            bug_ids=("B-006",),
             hard_timeout_s=30.0,
             destructive=True,
             **kw,
