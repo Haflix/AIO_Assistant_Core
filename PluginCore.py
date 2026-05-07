@@ -57,7 +57,14 @@ from notifier import TopicRegistry, Subscription, SyncDispatcher
 # access_names because they are framework-reserved keywords used in
 # config/system contexts. Future-proof: extend as new framework-reserved
 # names are introduced.
-_RESERVED_IDENTIFIER_NAMES = frozenset({"system", "general"})
+# Stage M (B-051): "any"/"remote" reserved by _normalize_hosts as host
+# keywords; "local" reserved as the loopback hostname keyword. Reusing
+# these as plugin names creates ambiguity in `authors:` and
+# `blocked_authors:` subscription filter lists (which delegate validation
+# to _normalize_hosts and would silently reject the literal name).
+_RESERVED_IDENTIFIER_NAMES = frozenset(
+    {"system", "general", "any", "remote", "local"}
+)
 
 
 def _validate_identifier_name(name, *, context: str) -> None:
@@ -2029,7 +2036,11 @@ class PluginCore:
         plugin_uuid: Optional[str] = None,
         requester_id: Optional[str] = None,
         target_plugin: Optional[str] = None,
-    ) -> Optional[tuple[Union[Plugin, RemotePlugin], dict, Optional[Node]]]:
+    ) -> tuple[
+        Optional[Union[Plugin, RemotePlugin]],
+        Optional[dict],
+        Optional[Node],
+    ]:
         """
         Finds a plugin endpoint locally or on remote nodes with access control.
 
@@ -2045,9 +2056,15 @@ class PluginCore:
             target_plugin: Optional plugin name filter
 
         Returns:
-            Tuple of (plugin, endpoint_dict, node) or None if not found
-            For local: (Plugin, endpoint_dict, None)
-            For remote: (RemotePlugin, endpoint_dict, Node)
+            A 3-tuple. On a found endpoint:
+                Local:  (Plugin, endpoint_dict, None)
+                Remote: (RemotePlugin, endpoint_dict, Node)
+            On a miss: (None, None, None) — NOT bare None. Callers must
+            unpack-then-check the first element rather than
+            `if result is None`. Stage M (B-048): annotation reads accurately;
+            behavior unchanged (every callsite already uses unpack-then-check
+            after PR3 Stage B cycle 5 fixed the one mismatched caller in
+            request_event_stream).
         """
 
         self._logger.debug(

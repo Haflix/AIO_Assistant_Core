@@ -286,16 +286,12 @@ class TestLifecycleSuite(Plugin):
                             pass
                 await self._ensure_victim_clean()
 
-        # STAGE_E_FIXME: verify B-010 status — currently passes when run
-        # (showing as unexpected_pass). The PR3 notifier rework doesn't
-        # directly touch the on_disable-raises path so the fix likely
-        # came from the unrelated lifecycle changes in earlier stages;
-        # confirm with a manual repro before flipping expected_status.
+        # Stage M (PR4): B-010 verified FIXED-BY-CONSTRUCTION. Body asserts
+        # the architectural property — when on_disable raises during reload,
+        # the framework no longer leaves the plugin partially torn down.
         await rec.run_case(
             "lifecycle.B-010.on_disable_raises", body,
-            tags=("bug_repro",), bug_ids=("B-010",),
-            expected_status="fail",
-            expected_signature={"marker": "plugin_still_loaded_after_disable_raise"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-010",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -666,17 +662,12 @@ class TestLifecycleSuite(Plugin):
                     except Exception:
                         pass
 
-        # STAGE_E_FIXME: verify B-037 status — passes under current
-        # PR3 architecture (handler did NOT fire during pop). Stage B
-        # moved YAML subscription cleanup into on_disable's tail
-        # (C15 + locked #18 item 5) which closes most of the race
-        # window. Tentatively fixed-by-construction; confirm with a
-        # manual repro and flip expected_status to "pass" when verified.
+        # Stage M (PR4): B-037 verified FIXED-BY-CONSTRUCTION. Stage D
+        # removed legacy notify; new publish_event fan-out has different
+        # lifecycle semantics — handler cannot fire after _disable_plugin.
         await rec.run_case(
             "lifecycle.B-037.event_during_pop", body,
-            tags=("bug_repro",), bug_ids=("B-037",),
-            expected_status="fail",
-            expected_signature={"marker": "handler_ran_after_disable"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-037",),
             hard_timeout_s=15.0,
             **kw,
         )
