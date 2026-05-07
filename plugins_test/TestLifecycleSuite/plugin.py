@@ -29,7 +29,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -84,6 +84,7 @@ class TestLifecycleSuite(Plugin):
         await self._basic_pop_pending(rec, kw)
         await self._basic_b005_purge(rec, kw)
         await self._basic_b008_concurrent_enable(rec, kw)
+        await self._basic_stage_o_ready_gate(rec, kw)
         await self._basic_b037_event_during_pop(rec, kw)
         await self._basic_b043_pop_failed_reaped(rec, kw)
         await self._basic_b007_missing_version(rec, kw)
@@ -601,11 +602,7 @@ class TestLifecycleSuite(Plugin):
 
         await rec.run_case(
             "lifecycle.B-008.concurrent_enable_race", body,
-            tags=("bug_repro",), bug_ids=("B-008",),
-            expected_status="fail",
-            expected_signature={
-                "marker": "endpoint_not_found_during_concurrent_enable"
-            },
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-008",),
             hard_timeout_s=20.0,
             **kw,
         )
@@ -942,6 +939,199 @@ class TestLifecycleSuite(Plugin):
             expected_signature={"marker": "running_loop_died"},
             hard_timeout_s=30.0,
             destructive=True,
+            **kw,
+        )
+
+    # ====================================================================
+    # BASIC Stage O — readiness gate (4 cases)
+    # ====================================================================
+
+    async def _basic_stage_o_ready_gate(
+        self, rec: CaseRecorder, kw: Dict,
+    ) -> None:
+        """Stage O readiness-gate cases.
+
+        Covers four behaviors:
+          1. gate_fires_for_unready_target: caller's execute() blocks
+             until the target's _lifecycle_ready is set (waits for
+             slow on_enable).
+          2. author_manual_clear_set: caller blocks on the
+             author-controlled `self.ready` event when on_enable spawns
+             a background-task setup.
+          3. cycle_timeout: two plugins waiting on each other surfaces
+             a clear "not ready within Ns" error after the configured
+             timeout instead of hanging forever.
+          4. self_call_skips_gate: a plugin's own on_enable calling
+             into itself bypasses the gate (otherwise it would deadlock
+             against its own _lifecycle_ready).
+        """
+        VICTIM = "TestLifecycleVictim"
+        VICTIM2 = "TestLifecycleVictim2"
+
+        # ---- 1. gate_fires_for_unready_target ----------------------
+        async def body_gate_fires_for_unready_target(c):
+            await self._ensure_victim_clean()
+            v = self._plugin_core.plugins[VICTIM]
+            v._on_enable_delay_secs = 0.0
+            await self._plugin_core._disable_plugin(VICTIM)
+            # 3.0s delay (generous margin for Windows scheduler jitter);
+            # threshold 2.0s leaves 1.0s slack for the asyncio.sleep(0.1)
+            # post-create_task stagger and dispatch overhead, so a loaded
+            # CI host that overshoots sleep(0.1) by half a second still
+            # passes — but a regression that bypasses the gate entirely
+            # would return in ~milliseconds and fail.
+            v._on_enable_delay_secs = 3.0
+            try:
+                # Start enable; while it sleeps, our execute() must
+                # block on the readiness gate, then succeed.
+                enable_task = asyncio.create_task(
+                    self._plugin_core._enable_plugin(VICTIM)
+                )
+                await asyncio.sleep(0.1)  # let on_enable start sleeping
+                t0 = asyncio.get_event_loop().time()
+                result = await self.execute(VICTIM, "is_db_open")
+                elapsed = asyncio.get_event_loop().time() - t0
+                await enable_task
+
+                c.expect(result, True)
+                if elapsed < 2.0:
+                    raise AssertionError(
+                        f"Stage O: gate did not block — execute() returned "
+                        f"in {elapsed:.3f}s while on_enable was still "
+                        f"sleeping (expected at least 2.0s)"
+                    )
+            finally:
+                v = self._plugin_core.plugins.get(VICTIM)
+                if v is not None:
+                    v._on_enable_delay_secs = 0.0
+                await self._ensure_victim_clean()
+
+        await rec.run_case(
+            "lifecycle.ready.gate_fires_for_unready_target",
+            body_gate_fires_for_unready_target,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+        # ---- 2. author_manual_clear_set ----------------------------
+        async def body_author_manual_clear_set(c):
+            # Caller is the suite plugin. Manually clear the victim's
+            # author-controlled ready flag (simulating an author who
+            # spawns background-task setup and only sets ready after
+            # the task finishes), then schedule a delayed set, then
+            # call execute() and verify the call waited.
+            await self._ensure_victim_clean()
+            v = self._plugin_core.plugins[VICTIM]
+            v.ready.clear()
+            try:
+                async def _delayed_ready():
+                    await asyncio.sleep(0.8)
+                    v.ready.set()
+
+                bg = asyncio.create_task(_delayed_ready())
+                t0 = asyncio.get_event_loop().time()
+                result = await self.execute(VICTIM, "is_db_open")
+                elapsed = asyncio.get_event_loop().time() - t0
+                await bg
+
+                c.expect(result, True)
+                if elapsed < 0.5:
+                    raise AssertionError(
+                        f"Stage O: author-controlled ready did not block "
+                        f"— execute() returned in {elapsed:.3f}s "
+                        f"(expected ≥ 0.5s)"
+                    )
+            finally:
+                v = self._plugin_core.plugins.get(VICTIM)
+                if v is not None:
+                    v.ready.set()
+
+        await rec.run_case(
+            "lifecycle.ready.author_manual_clear_set",
+            body_author_manual_clear_set,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=15.0,
+            **kw,
+        )
+
+        # ---- 3. cycle_timeout --------------------------------------
+        async def body_cycle_timeout(c):
+            # Two plugins both with cleared `ready`; neither will set
+            # it. With a short configured timeout, our execute() must
+            # surface the "not ready within Ns" error instead of
+            # hanging.
+            await self._ensure_victim_clean()
+            v = self._plugin_core.plugins[VICTIM]
+            core = self._plugin_core
+            saved_timeout = getattr(core, "_stage_o_ready_timeout", 60.0)
+            core._stage_o_ready_timeout = 1.0
+            v.ready.clear()
+            try:
+                t0 = asyncio.get_event_loop().time()
+                try:
+                    await self.execute(VICTIM, "is_db_open")
+                except RequestException as e:
+                    elapsed = asyncio.get_event_loop().time() - t0
+                    if "not ready" not in str(e).lower():
+                        raise AssertionError(
+                            f"Stage O: expected 'not ready' in error, "
+                            f"got: {e!r}"
+                        )
+                    if elapsed > 3.0:
+                        raise AssertionError(
+                            f"Stage O: cycle_timeout took {elapsed:.2f}s "
+                            f"(timeout was 1.0s)"
+                        )
+                    return
+                raise AssertionError(
+                    "Stage O: cycle_timeout did not raise; gate failed "
+                    "to enforce timeout"
+                )
+            finally:
+                v = self._plugin_core.plugins.get(VICTIM)
+                if v is not None:
+                    v.ready.set()
+                core._stage_o_ready_timeout = saved_timeout
+
+        await rec.run_case(
+            "lifecycle.ready.cycle_timeout",
+            body_cycle_timeout,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=10.0,
+            **kw,
+        )
+
+        # ---- 4. self_call_skips_gate -------------------------------
+        async def body_self_call_skips_gate(c):
+            # The suite plugin calls its OWN endpoint
+            # (`lifecycle_observer`, by way of an execute() targeted at
+            # itself). With self.ready cleared, the gate would
+            # otherwise block forever on the caller's own ready event;
+            # the requester==target self-call carve-out (Q23) must
+            # skip the gate so the call returns immediately.
+            saved_fired = self._lifecycle_b037_fired
+            self.ready.clear()
+            try:
+                t0 = asyncio.get_event_loop().time()
+                await self.execute(
+                    self.plugin_name, "lifecycle_observer", (None,)
+                )
+                elapsed = asyncio.get_event_loop().time() - t0
+                if elapsed > 2.0:
+                    raise AssertionError(
+                        f"Stage O: self-call took {elapsed:.2f}s — "
+                        f"gate did not skip for requester == target uuid"
+                    )
+            finally:
+                self.ready.set()
+                self._lifecycle_b037_fired = saved_fired
+
+        await rec.run_case(
+            "lifecycle.ready.self_call_skips_gate",
+            body_self_call_skips_gate,
+            tags=("stage_o", "regression_guard"),
+            hard_timeout_s=10.0,
             **kw,
         )
 

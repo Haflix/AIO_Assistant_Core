@@ -978,6 +978,28 @@ class ConfigUtil:
         plugin_core.plugin_package = general_config.get("plugin_package", "plugins")
         plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
 
+        # Stage O: readiness gate timeout. Default 60.0 seconds; spec
+        # forbids reducing below 30 in normal operation but tests may
+        # override via the same config key for cycle-timeout repros.
+        # Bad values fall back to default with a warning so a typo can
+        # never silently zero the timeout.
+        from PluginCore import _STAGE_O_DEFAULT_READY_TIMEOUT  # local import — avoids circular import at module load
+        raw_ready_timeout = general_config.get(
+            "plugin_ready_timeout", _STAGE_O_DEFAULT_READY_TIMEOUT
+        )
+        try:
+            ready_timeout = float(raw_ready_timeout)
+            if ready_timeout <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid general.plugin_ready_timeout=%r; defaulting to %.1f",
+                raw_ready_timeout,
+                _STAGE_O_DEFAULT_READY_TIMEOUT,
+            )
+            ready_timeout = _STAGE_O_DEFAULT_READY_TIMEOUT
+        plugin_core._stage_o_ready_timeout = ready_timeout
+
         networking_config = plugin_core.yaml_config.get("networking")
 
         plugin_core.networking_enabled = networking_config.get("enabled", False)
@@ -1061,6 +1083,21 @@ class Plugin(ABC):
         # by the on_enable lifecycle wrapper. Used by on_disable wrapper
         # to unregister exactly the subs that were registered.
         self._sub_uuids: list = []
+
+        # Stage O: readiness contract.
+        # self.ready: author-controlled. Defaults SET so plugins that
+        # don't care about manual control just work. Plugin authors who
+        # do background-task setup in on_enable can call self.ready.clear()
+        # before spawning the task and self.ready.set() once setup is
+        # actually finished — execute()/publish_event()/request_event()
+        # callers from OTHER plugins block on this.
+        self.ready: asyncio.Event = asyncio.Event()
+        self.ready.set()
+        # self._lifecycle_ready: framework-controlled. Set by PluginCore
+        # after on_enable returns successfully; cleared at the start of
+        # _disable_plugin (and on rollback when on_enable raises). Plugin
+        # authors should NOT touch this directly — use self.ready.
+        self._lifecycle_ready: asyncio.Event = asyncio.Event()
 
         self._logger = logger
         self._plugin_core = plugin_core

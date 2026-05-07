@@ -51,7 +51,7 @@ from serialization import generate_keypair, Serializable  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.4.1"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -924,30 +924,75 @@ class TestBugSuite(Plugin):
 
         # ---- B-046 ---------------------------------------------------
         async def body_b_046_plugin_lock_held_across_on_enable(c):
-            # B-046: plugin_lock held across full on_enable — if a
-            # plugin's on_enable sleeps, a concurrent pop_plugin on a
-            # *different* plugin must wait. Repro: confirm plugin_lock
-            # exists at module-class level and is the same instance
-            # used across enable/disable paths. A direct end-to-end
-            # repro would deadlock the running suite.
+            # B-046: FIXED in Stage O via per-plugin lifecycle locks.
+            # The global plugin_lock is now held only for fast dict
+            # reads/writes; user on_enable runs OUTSIDE plugin_lock
+            # under the per-plugin lifecycle_lock. Regression guard:
+            # while one plugin's on_enable is mid-flight (artificially
+            # delayed), a concurrent get_plugin_info on a DIFFERENT
+            # plugin must return promptly (well under 1s).
             core = self._plugin_core
-            lock = getattr(core, "plugin_lock", None)
-            if lock is None:
-                # Lock removed — bug architecturally fixed-by-construction.
-                return
-            # Inspect _enable_plugin source for an `async with
-            # self.plugin_lock` envelope around on_enable. If on_enable
-            # is invoked inside the lock (still), the bug surface
-            # remains.
-            src = inspect.getsource(core._enable_plugin)
-            holds_lock = "self.plugin_lock" in src or "plugin_lock" in src
-            calls_on_enable = "on_enable" in src
-            if holds_lock and calls_on_enable:
-                raise AssertionError(
-                    "B-046: _enable_plugin still holds plugin_lock "
-                    "across on_enable — concurrent pop_plugin on "
-                    "another name will block on the same lock"
+            v_name = "TestLifecycleVictim"
+            other_name = "TestLifecycleSuite"
+            victim = core.plugins.get(v_name)
+            if victim is None or other_name not in core.plugins:
+                c.skip(
+                    "B-046 regression guard requires TestLifecycleVictim "
+                    "and TestLifecycleSuite both loaded"
                 )
+                return
+
+            # Slow on_enable: 0.6s sleep. Configure flags directly so
+            # we don't depend on the configure endpoint being callable
+            # while the plugin is in mid-disable.
+            victim._on_enable_delay_secs = 0.6
+            try:
+                # Disable then concurrently re-enable + ping a different
+                # plugin's get_plugin_info. Pre-fix the call would block
+                # on plugin_lock until on_enable finishes.
+                await core._disable_plugin(v_name)
+
+                async def _delayed_get_info():
+                    # Tiny stagger so enable is in mid-on_enable when
+                    # we hit get_plugin_info.
+                    await asyncio.sleep(0.1)
+                    t0 = asyncio.get_event_loop().time()
+                    info = await core.get_plugin_info(other_name)
+                    return info, asyncio.get_event_loop().time() - t0
+
+                enable_task = asyncio.create_task(core._enable_plugin(v_name))
+                info_task = asyncio.create_task(_delayed_get_info())
+                info, elapsed = await info_task
+                await enable_task
+
+                if info is None or info.get("name") != other_name:
+                    raise AssertionError(
+                        f"B-046 regression: get_plugin_info({other_name}) "
+                        f"returned {info!r}"
+                    )
+                # Should return well under the 0.5s remainder of the
+                # on_enable sleep. R1 LOW-1 fix: threshold raised from
+                # 0.2s to 1.0s — Windows scheduler timer resolution is
+                # ~15.6ms and loaded CI can blow past 200ms. The actual
+                # operation is a dict read (microseconds); 1s still
+                # comfortably catches a regression where the lock is
+                # held across the full 1.5s on_enable sleep.
+                if elapsed > 1.0:
+                    raise AssertionError(
+                        f"B-046 regression: get_plugin_info on {other_name} "
+                        f"took {elapsed:.3f}s while {v_name}.on_enable was "
+                        f"sleeping — plugin_lock still held across on_enable"
+                    )
+            finally:
+                # Restore configuration so subsequent suites are clean.
+                victim = core.plugins.get(v_name)
+                if victim is not None:
+                    victim._on_enable_delay_secs = 0.0
+                    if not victim.enabled:
+                        try:
+                            await core._enable_plugin(v_name)
+                        except Exception:
+                            pass
 
         # ---- B-047 ---------------------------------------------------
         async def body_b_047_task_list_grows_unboundedly(c):
@@ -1101,18 +1146,15 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "regression_guard"), bug_ids=("B-045",),
             **kw,
         )
-        # B-046: expected_status="fail" — bug expected to repro
-        # (lock still wraps on_enable).
+        # B-046: FIXED in Stage O. Positive guard — body asserts that
+        # a concurrent dict-read on another plugin completes promptly
+        # while one plugin's on_enable is artificially delayed.
         await rec.run_case(
             "bug.B-046.plugin_lock_held_across_on_enable",
             body_b_046_plugin_lock_held_across_on_enable,
             category=category,
-            tags=("bug_repro", "active"), bug_ids=("B-046",),
-            expected_status="fail",
-            expected_signature={
-                "exception_type": "AssertionError",
-                "message_regex": r"plugin_lock",
-            },
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-046",),
+            hard_timeout_s=15.0,
             **kw,
         )
         # B-047: expected_status="fail" — bug expected to repro

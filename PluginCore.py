@@ -66,6 +66,11 @@ _RESERVED_IDENTIFIER_NAMES = frozenset(
     {"system", "general", "any", "remote", "local"}
 )
 
+# Stage O: default readiness-gate timeout (seconds). Per spec must not
+# be reduced below 30 in normal operation; the test suite overrides via
+# `general.plugin_ready_timeout` for the cycle-timeout repro.
+_STAGE_O_DEFAULT_READY_TIMEOUT: float = 60.0
+
 
 def _validate_identifier_name(name, *, context: str) -> None:
     """Validate that ``name`` is a Python-identifier-style string and not in
@@ -531,6 +536,16 @@ class PluginCore:
         self.plugins = {}
         self.plugins_by_uuid = {}
         self.plugin_lock = asyncio.Lock()
+        # Stage O: per-plugin lifecycle locks (B-046 fix). Each plugin
+        # gets its own asyncio.Lock for serializing on_enable / on_disable
+        # / pop_plugin / _reload_plugin on THAT plugin. plugin_lock
+        # (global) is now used only for fast dict reads/writes
+        # (plugins, plugins_by_uuid). Locks are leaked across the
+        # process lifetime — bounded by the number of distinct plugin
+        # names ever loaded; entries are not removed on pop_plugin so
+        # a concurrent waiter on a popped-and-reloaded plugin keeps
+        # lock identity.
+        self._lifecycle_locks: Dict[str, asyncio.Lock] = {}
         # Dedicated thread pool for sync plugin endpoints — isolated from
         # Python's default executor to prevent deadlock under load.
         # See README "Sync vs Async Plugins: Thread Pool Deadlock Risk".
@@ -704,27 +719,23 @@ class PluginCore:
                 continue
             self._logger.info("Shutdown: disabling %s...", name)
             try:
-                async with self.plugin_lock:
-                    try:
-                        if asyncio.iscoroutinefunction(plugin.on_disable):
-                            await asyncio.wait_for(plugin.on_disable(), timeout=30)
-                        else:
-                            await asyncio.wait_for(
-                                self.main_event_loop.run_in_executor(
-                                    self._plugin_executor, plugin.on_disable
-                                ),
-                                timeout=30,
-                            )
-                    finally:
-                        # PR3 Stage B C15: unregister YAML + runtime subs
-                        # for this plugin AFTER on_disable runs (or
-                        # raised/timed out). Mirrors _disable_plugin's
-                        # try/finally guarantee. Without this, later
-                        # plugins firing events during their on_disable
-                        # could match subs from already-stopped earlier
-                        # plugins.
-                        await self._unregister_plugin_subscriptions(plugin)
-                        plugin.enabled = False
+                # R1 MED-1 fix: delegate to _disable_plugin_under_lock
+                # instead of duplicating the lifecycle_ready.clear() +
+                # on_disable + unregister + enabled=False sequence
+                # inline. The 30s on_disable timeout is threaded through
+                # via the on_disable_timeout kwarg (runtime callers pass
+                # None to preserve existing no-timeout-on-disable
+                # behavior; only shutdown caps the user callback).
+                #
+                # Stage O: each plugin's lifecycle_lock instead of the
+                # global plugin_lock. Concurrent ops (e.g. an in-flight
+                # request still using a not-yet-disabled plugin) on
+                # OTHER names are not blocked by THIS plugin's shutdown.
+                lifecycle_lock = self._get_lifecycle_lock(name)
+                async with lifecycle_lock:
+                    await self._disable_plugin_under_lock(
+                        name, on_disable_timeout=30.0
+                    )
                 self._logger.info("Shutdown: %s disabled", name)
             except asyncio.TimeoutError:
                 self._logger.warning(
@@ -1482,30 +1493,12 @@ class PluginCore:
     async def pop_plugin(self, plugin_name: str) -> None:
         self._logger.info(f"Popping plugin: {plugin_name}")
         try:
-            if plugin_name in list(self.plugins.keys()):
-                # Resolve any pending requests targeting this plugin
-                async with self.request_lock:
-                    for req in self.requests.values():
-                        if req.target_plugin == plugin_name and not req._future.done():
-                            await req.set_result(
-                                f"Plugin {plugin_name} was unloaded while request was pending",
-                                error=True,
-                            )
-
-                if self.plugins[plugin_name].enabled:
-                    await self._disable_plugin(plugin_name)
-                async with self.plugin_lock:
-                    plugin = self.plugins.pop(plugin_name)
-                    # Remove from uuid index
-                    plugin_uuid = getattr(plugin, "plugin_uuid", None)
-                    if plugin_uuid and plugin_uuid in self.plugins_by_uuid:
-                        self.plugins_by_uuid.pop(plugin_uuid, None)
-                    # Remove all topic subscriptions for this plugin
-                    if plugin_uuid:
-                        await self.topic_registry.unsubscribe_plugin(plugin_uuid)
-                        LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
-            else:
+            if plugin_name not in self.plugins:
                 self._logger.warning(f'Plugin with name "{plugin_name}" doesnt exist')
+                return
+            lifecycle_lock = self._get_lifecycle_lock(plugin_name)
+            async with lifecycle_lock:
+                await self._pop_plugin_under_lock(plugin_name)
         except Exception as error:
             raise Exception(f'Error while popping plugin "{plugin_name}": {error}')
 
@@ -1513,6 +1506,9 @@ class PluginCore:
     async def purge_plugins(self):
         self._logger.info("Purging plugins")
         try:
+            # Stage O: per-plugin disable acquires that plugin's
+            # lifecycle_lock via the public _disable_plugin wrapper.
+            # Concurrent ops on OTHER plugins are no longer blocked.
             for plugin_name in list(self.plugins.keys()):
                 await self._disable_plugin(plugin_name)
             async with self.plugin_lock:
@@ -1535,6 +1531,8 @@ class PluginCore:
             plugins_to_purge = [
                 name for name in list(self.plugins.keys()) if name not in excluded_names
             ]
+            # Stage O: per-plugin disable goes through the lifecycle_lock-
+            # wrapping _disable_plugin (each name's lock acquired in turn).
             for plugin_name in plugins_to_purge:
                 await self._disable_plugin(plugin_name)
             async with self.plugin_lock:
@@ -1622,71 +1620,323 @@ class PluginCore:
         await self.close()
         # Note: Stopping the event loop should be handled by the main application
 
-    @async_handle_errors(None)
-    async def _enable_plugin(self, plugin_name: str):
-        """Method to enable a plugin.
+    # ── Stage O lock helpers ─────────────────────────────────────────
+    # Strict lock-acquisition order (deadlock-prevention rule):
+    #   1. lifecycle_lock(plugin_name) — per-plugin, returned by
+    #      _get_lifecycle_lock. Held across user on_enable / on_disable
+    #      so concurrent ops on the SAME plugin serialize, but ops on
+    #      DIFFERENT plugins do not (B-046 fix).
+    #   2. request_lock — global. May be nested INSIDE lifecycle_lock
+    #      (pop_plugin / _reload_plugin do this to fail pending requests
+    #      atomically with the lifecycle transition); MUST NOT be
+    #      acquired while holding plugin_lock.
+    #   3. plugin_lock — global. Held briefly for self.plugins /
+    #      self.plugins_by_uuid dict reads/writes; MUST be released
+    #      before any user callback runs.
+    #   4. topic_registry._lock — internal to TopicRegistry; acquired
+    #      inside subscribe / unsubscribe.
+    #
+    # Network I/O note: _register_yaml_subscriptions returns the list of
+    # newly-registered sub_uuids without broadcasting them; broadcast
+    # happens AFTER plugin_lock is released (avoiding network I/O while
+    # holding the global dict lock). Same for unregister: broadcast
+    # remove-deltas happen outside plugin_lock too.
+    def _get_lifecycle_lock(self, plugin_name: str) -> asyncio.Lock:
+        """Return the per-plugin lifecycle lock, creating it on demand.
 
-        PR3 Stage B (Q23 + C15): YAML-declared subscriptions register
-        BEFORE user.on_enable runs. So plugin code starts with subs
-        already live; events arriving during on_enable are dispatched
-        to handlers (which exist by definition — methods on the plugin
-        class).
+        Locks are leaked across the process lifetime — bounded by the
+        number of distinct plugin names ever loaded. Lock entries are
+        not removed on pop_plugin so a concurrent waiter on a
+        popped-and-reloaded plugin keeps lock identity (so a sequence
+        like: enable starts -> caller wants to pop -> reload re-creates
+        -> caller still serializes against reload's enable).
+        """
+        lock = self._lifecycle_locks.get(plugin_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lifecycle_locks[plugin_name] = lock
+        return lock
+
+    async def _wait_for_plugin_ready(self, plugin: Plugin) -> None:
+        """Stage O readiness gate: wait for both readiness events.
+
+        Waits for plugin._lifecycle_ready (framework-controlled, set
+        after on_enable returns) and plugin.ready (author-controlled).
+        Honors the configured timeout (`general.plugin_ready_timeout`)
+        and emits a slow-wait WARNING when the wait took more than 1s
+        so legitimate-but-slow startups are visible in logs.
+
+        Raises asyncio.TimeoutError on expiry.
+
+        R1 HIGH-1 fix: wait on BOTH events under a single
+        asyncio.wait_for budget. The previous split-timeout pattern
+        (wait on _lifecycle_ready, then on ready with `remaining`) hit
+        a zero-budget bug — when _lifecycle_ready consumed the entire
+        timeout, `remaining=0.0` and asyncio.wait_for(coro, timeout=0.0)
+        raises TimeoutError immediately even when plugin.ready was
+        already set.
+        """
+        timeout = getattr(
+            self, "_stage_o_ready_timeout", _STAGE_O_DEFAULT_READY_TIMEOUT
+        )
+        loop = self.main_event_loop or asyncio.get_event_loop()
+        start = loop.time()
+
+        async def _both():
+            await plugin._lifecycle_ready.wait()
+            await plugin.ready.wait()
+
+        await asyncio.wait_for(_both(), timeout=timeout)
+        elapsed = loop.time() - start
+        if elapsed > 1.0:
+            self._logger.warning(
+                "[STAGE_O] readiness gate waited %.2fs for plugin %s",
+                elapsed,
+                plugin.plugin_name,
+            )
+
+    # ── Stage O locked-body helpers ──────────────────────────────────
+    # The "_under_lock" suffix means: caller MUST already hold
+    # self._get_lifecycle_lock(plugin_name). These bodies are reused by
+    # pop_plugin / _reload_plugin without recursive lock acquisition.
+    async def _enable_plugin_under_lock(self, plugin_name: str) -> None:
+        """Body of _enable_plugin minus the lifecycle_lock acquisition.
+
+        Stage O: plugin_lock is held only for the dict read + flag flip
+        + YAML sub registration (microseconds). It is RELEASED before
+        the user on_enable callback runs so concurrent ops on OTHER
+        plugins (which acquire plugin_lock briefly themselves) are not
+        blocked. _lifecycle_ready is set after on_enable returns.
+
+        PR3 Stage B (Q23 + C15): YAML subs register BEFORE on_enable so
+        the plugin starts with subs already live; events arriving during
+        on_enable are dispatched to handlers (which exist by definition
+        — methods on the plugin class). The Stage O readiness gate then
+        blocks fan-out to a still-not-ready handler.
         """
         async with self.plugin_lock:
-            plugin = self.plugins[plugin_name]
-            if not plugin.enabled:
-                # Register YAML subscriptions FIRST. Disabled subs (Q13
-                # `enabled: false`) ARE registered, but with the
-                # Subscription.enabled=False flag so find_all/find_first
-                # skip them — keeps declared_id present in the registry
-                # for override-time toggling without dispatching.
-                await self._register_yaml_subscriptions(plugin)
+            plugin = self.plugins.get(plugin_name)
+            if plugin is None or plugin.enabled:
+                return
+            # Register YAML subs FIRST. Disabled subs (Q13 `enabled:
+            # false`) ARE registered, but with the Subscription.enabled=
+            # False flag so find_all/find_first skip them. Broadcast of
+            # add-deltas happens AFTER plugin_lock release (below) — see
+            # the Network I/O note in the lock-ordering rule.
+            new_sub_uuids = await self._register_yaml_subscriptions(plugin)
+            # Flip enabled BEFORE on_enable per Q23 + Q11 so handlers
+            # are callable for self-publish-from-on_enable. Roll back
+            # on raise.
+            plugin.enabled = True
 
-                # Flip plugin.enabled=True BEFORE user.on_enable per Q23
-                # + Q11: handlers must be callable (find_endpoint requires
-                # plugin.enabled) so self-publish-from-on_enable works.
-                # Roll back enabled + unregister subs on raise.
-                plugin.enabled = True
+        # plugin_lock RELEASED. lifecycle_lock still held. The broadcast
+        # loop and on_enable call run together under one cancellation-
+        # aware try/finally so a CancelledError mid-flight (which is a
+        # BaseException, NOT Exception, so a plain `except Exception:`
+        # would skip cleanup) still triggers full rollback.
+        ok = False
+        try:
+            # Broadcast add-deltas to peers OUTSIDE plugin_lock so a
+            # slow/multi-peer broadcast doesn't block other dict ops
+            # cluster-wide. _broadcast_yaml_sub_added is a no-op when
+            # networking is disabled / not ready.
+            for sub_uuid in new_sub_uuids:
+                await self._broadcast_yaml_sub_added(sub_uuid)
+
+            if asyncio.iscoroutinefunction(plugin.on_enable):
+                await plugin.on_enable()
+            else:
+                await self.main_event_loop.run_in_executor(
+                    self._plugin_executor, plugin.on_enable
+                )
+            # Stage O: signal lifecycle-ready AFTER on_enable returns
+            # successfully. Other plugins blocked in the readiness gate
+            # unblock here.
+            plugin._lifecycle_ready.set()
+            ok = True
+        finally:
+            if not ok:
+                # Rollback runs on Exception, CancelledError, or any
+                # other BaseException out of the try block above.
+                #
+                # Symmetric with _disable_plugin_under_lock: do all the
+                # SYNC state updates first (event clear/set, flag flip
+                # — atomic, can't raise) so they're guaranteed to run
+                # even if the async unregister below is cancelled or
+                # raises. Then async sub cleanup is wrapped in
+                # try/except so a failure there doesn't mask the
+                # original exception (which Python re-raises after
+                # finally).
+                plugin._lifecycle_ready.clear()
+                # R1 HIGH-2 fix: restore plugin.ready to its
+                # default-set state. If the plugin author cleared
+                # self.ready inside on_enable and then on_enable
+                # raised / was cancelled, the cleared event would
+                # otherwise persist on the same Plugin instance and
+                # stall any subsequent enable / cross-plugin call
+                # behind the gate until timeout. The author's next
+                # on_enable can clear it again if they want manual
+                # control.
+                plugin.ready.set()
+                # Sync flag flip — atomic, no plugin_lock needed
+                # (readers don't lock either; they're already gated
+                # by _lifecycle_ready being cleared above).
+                plugin.enabled = False
+                # Async cleanup — best-effort.
                 try:
-                    if asyncio.iscoroutinefunction(plugin.on_enable):
-                        await plugin.on_enable()
-                    else:
-                        await self.main_event_loop.run_in_executor(
-                            self._plugin_executor, plugin.on_enable
-                        )
-                except Exception:
-                    plugin.enabled = False
                     await self._unregister_plugin_subscriptions(plugin)
-                    raise
+                except Exception:
+                    self._logger.exception(
+                        "[STAGE_O] _enable_plugin_under_lock rollback: "
+                        "_unregister_plugin_subscriptions raised for "
+                        "plugin %r — best-effort cleanup incomplete",
+                        plugin.plugin_name,
+                    )
+
+    async def _disable_plugin_under_lock(
+        self,
+        plugin_name: str,
+        on_disable_timeout: Optional[float] = None,
+    ) -> None:
+        """Body of _disable_plugin minus the lifecycle_lock acquisition.
+
+        Stage O: clears _lifecycle_ready BEFORE on_disable so any
+        in-flight gate wait against this plugin times out rather than
+        dispatching to a tearing-down plugin. plugin_lock is held only
+        for the dict reads + final flag flip; user on_disable runs
+        without it held.
+
+        PR3 Stage B (C15): YAML + runtime subs are unregistered AFTER
+        on_disable returns. User code can publish/receive events during
+        shutdown teardown.
+
+        R1 MED-1 fix: optional ``on_disable_timeout`` wraps the user
+        on_disable callback in ``asyncio.wait_for``. ``close()`` passes
+        30.0 to bound shutdown; runtime callers (pop_plugin,
+        _reload_plugin, _disable_plugin) pass None to preserve the
+        existing "no per-call timeout on disable at runtime" behavior.
+        """
+        async with self.plugin_lock:
+            plugin = self.plugins.get(plugin_name)
+            if plugin is None or not plugin.enabled:
+                return
+
+        # Stage O: clear lifecycle-ready BEFORE on_disable so any
+        # in-flight gate wait either re-fires against the cleared event
+        # (and times out) rather than dispatching to a tearing-down
+        # plugin.
+        plugin._lifecycle_ready.clear()
+
+        # plugin_lock RELEASED — run on_disable without holding it.
+        # Outer try/finally guarantees the cleanup runs on any exit
+        # path including CancelledError. Cleanup is itself nested in
+        # try/finally so the enabled-flag flip is the LAST action and
+        # is unconditional — bool assignment is sync (atomic in CPython)
+        # so it cannot itself be interrupted by cancellation. Without
+        # this nesting, a cancellation hitting during
+        # _unregister_plugin_subscriptions would skip the flag flip and
+        # leave the plugin in a stuck enabled=True state.
+        try:
+            if asyncio.iscoroutinefunction(plugin.on_disable):
+                if on_disable_timeout is not None:
+                    await asyncio.wait_for(
+                        plugin.on_disable(), timeout=on_disable_timeout
+                    )
+                else:
+                    await plugin.on_disable()
+            else:
+                executor_call = self.main_event_loop.run_in_executor(
+                    self._plugin_executor, plugin.on_disable
+                )
+                if on_disable_timeout is not None:
+                    await asyncio.wait_for(
+                        executor_call, timeout=on_disable_timeout
+                    )
+                else:
+                    await executor_call
+        finally:
+            # Unregister all subs (YAML + runtime) regardless of
+            # whether on_disable raised, was cancelled, or timed out.
+            # Symmetric with rollback in _enable_plugin_under_lock.
+            try:
+                await self._unregister_plugin_subscriptions(plugin)
+            finally:
+                # Sync flag flip — guaranteed to run even if the
+                # unregister await above is cancelled. plugin_lock is
+                # not needed here: bool assignment is atomic, and any
+                # find_endpoint reader that sees enabled=True briefly
+                # before this line is already covered by the
+                # _lifecycle_ready.clear() at the top (gate blocks).
+                plugin.enabled = False
+
+    async def _pop_plugin_under_lock(self, plugin_name: str) -> bool:
+        """Body of pop_plugin minus the lifecycle_lock acquisition.
+
+        Caller MUST already hold ``self._get_lifecycle_lock(plugin_name)``.
+        Returns True if a plugin was popped, False if absent (or popped
+        by a concurrent caller between the caller's lock acquisition and
+        the dict mutation below — defensive).
+
+        Stage O: shared by ``pop_plugin`` and ``_reload_plugin`` so the
+        pop body is not duplicated. Both callers already hold the
+        per-plugin lifecycle_lock; this helper does not re-acquire it.
+        Lock-ordering: request_lock (nested inside lifecycle_lock per
+        the rule at ``_get_lifecycle_lock``) -> _disable_plugin_under_lock
+        (briefly takes plugin_lock) -> plugin_lock for the final dict pop.
+        """
+        if plugin_name not in self.plugins:
+            return False
+
+        async with self.request_lock:
+            for req in self.requests.values():
+                if req.target_plugin == plugin_name and not req._future.done():
+                    await req.set_result(
+                        f"Plugin {plugin_name} was unloaded while request was pending",
+                        error=True,
+                    )
+
+        if plugin_name in self.plugins and self.plugins[plugin_name].enabled:
+            await self._disable_plugin_under_lock(plugin_name)
+
+        async with self.plugin_lock:
+            plugin = self.plugins.pop(plugin_name, None)
+            if plugin is None:
+                return False
+            plugin_uuid = getattr(plugin, "plugin_uuid", None)
+            if plugin_uuid and plugin_uuid in self.plugins_by_uuid:
+                self.plugins_by_uuid.pop(plugin_uuid, None)
+            if plugin_uuid:
+                await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+                LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
+        return True
+
+    @async_handle_errors(None)
+    async def _enable_plugin(self, plugin_name: str):
+        """Public-facing enable that acquires the per-plugin
+        lifecycle_lock (Stage O) and delegates to
+        _enable_plugin_under_lock. Concurrent enable on the SAME plugin
+        serializes here; concurrent ops on OTHER plugins do not block."""
+        lifecycle_lock = self._get_lifecycle_lock(plugin_name)
+        async with lifecycle_lock:
+            await self._enable_plugin_under_lock(plugin_name)
 
     @async_log_errors
     async def _disable_plugin(self, plugin_name: str):
-        """Disable a plugin by calling its on_disable and setting enabled=False.
+        """Public-facing disable that acquires the per-plugin
+        lifecycle_lock (Stage O) and delegates to
+        _disable_plugin_under_lock. Waits for any in-progress
+        _enable_plugin on the same name to complete first."""
+        lifecycle_lock = self._get_lifecycle_lock(plugin_name)
+        async with lifecycle_lock:
+            await self._disable_plugin_under_lock(plugin_name)
 
-        PR3 Stage B (C15): YAML + runtime subs are unregistered AFTER
-        user.on_disable returns. User code can publish/receive events
-        during shutdown teardown.
-        """
-        async with self.plugin_lock:
-            plugin = self.plugins[plugin_name]
-            if plugin.enabled:
-                try:
-                    if asyncio.iscoroutinefunction(plugin.on_disable):
-                        await plugin.on_disable()
-                    else:
-                        await self.main_event_loop.run_in_executor(
-                            self._plugin_executor, plugin.on_disable
-                        )
-                finally:
-                    # Unregister all subs (YAML + runtime) regardless of
-                    # whether on_disable raised. Symmetric with the
-                    # rollback in _enable_plugin.
-                    await self._unregister_plugin_subscriptions(plugin)
-                    plugin.enabled = False
-
-    async def _register_yaml_subscriptions(self, plugin: Plugin) -> None:
+    async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
         """Register every YAML-declared subscription for ``plugin`` per
-        Q23 + C15 + LOCKED A subscriptions: shape.
+        Q23 + C15 + LOCKED A subscriptions: shape. Returns the list of
+        newly-registered sub_uuids — caller is responsible for invoking
+        ``_broadcast_yaml_sub_added`` on each AFTER releasing
+        ``plugin_lock``. This keeps network I/O out of the global lock
+        per the lock-ordering rule documented at _get_lifecycle_lock.
 
         Subscription registration runs at on_enable-time (not load-time)
         so that disable -> re-enable cycles re-register subs naturally.
@@ -1697,6 +1947,7 @@ class PluginCore:
         find_all/find_first matching.
         """
         # PR3 subscriptions: section.
+        new_sub_uuids: List[str] = []
         subs_dict = getattr(plugin, "subscriptions", {}) or {}
         if isinstance(subs_dict, dict):
             for declared_id, entry in subs_dict.items():
@@ -1715,9 +1966,8 @@ class PluginCore:
                     enabled=bool(entry.get("enabled", True)),
                 )
                 plugin._sub_uuids.append(sub_uuid)
-                # PR3 Stage C add-delta hook (locked #18 item 3) — YAML
-                # path. No-op when networking is disabled / not ready.
-                await self._broadcast_yaml_sub_added(sub_uuid)
+                new_sub_uuids.append(sub_uuid)
+        return new_sub_uuids
 
     async def _broadcast_yaml_sub_added(self, sub_uuid: str) -> None:
         """Helper used by YAML-registration sites to push add-delta to
@@ -1774,28 +2024,39 @@ class PluginCore:
 
     @async_handle_errors(None)
     async def _reload_plugin(self, plugin_name: str):
-        """Reload a plugin by disabling, removing, re-loading from config, and re-enabling."""
-        # Capture whether it was enabled before reload
-        previously_enabled = False
-        if plugin_name in self.plugins:
-            previously_enabled = self.plugins[plugin_name].enabled
+        """Reload a plugin by disabling, removing, re-loading from
+        config, and re-enabling.
 
-        await self.pop_plugin(plugin_name)
+        Stage O: the WHOLE pop+load+enable chain runs under the
+        per-plugin lifecycle_lock so a concurrent _enable_plugin caller
+        on the same name can't interleave between the pop and the
+        re-enable. The locked-body helpers (_pop_plugin_under_lock /
+        _enable_plugin_under_lock) avoid recursive lock acquisition.
+        """
+        lifecycle_lock = self._get_lifecycle_lock(plugin_name)
+        async with lifecycle_lock:
+            previously_enabled = False
+            if plugin_name in self.plugins:
+                previously_enabled = self.plugins[plugin_name].enabled
 
-        entry = next(
-            (
-                p
-                for p in self.yaml_config.get("plugins", [])
-                if p.get("name") == plugin_name
-            ),
-            None,
-        )
-        if not entry:
-            raise Exception(f"Plugin '{plugin_name}' not found in config for reload")
+            await self._pop_plugin_under_lock(plugin_name)
 
-        await self.load_plugin_with_conf(entry)
-        if previously_enabled:
-            await self._enable_plugin(plugin_name)
+            entry = next(
+                (
+                    p
+                    for p in self.yaml_config.get("plugins", [])
+                    if p.get("name") == plugin_name
+                ),
+                None,
+            )
+            if not entry:
+                raise Exception(
+                    f"Plugin '{plugin_name}' not found in config for reload"
+                )
+
+            await self.load_plugin_with_conf(entry)
+            if previously_enabled:
+                await self._enable_plugin_under_lock(plugin_name)
 
     @contextlib.asynccontextmanager
     async def request_context_async(self, request: Request):
@@ -2260,6 +2521,27 @@ class PluginCore:
                 )
                 return
 
+            # Stage O: readiness gate. Skip for remote plugins (no ready
+            # field) and for self-calls (Q23 — a plugin's own on_enable
+            # publishing to its own subscriber must not deadlock against
+            # its own _lifecycle_ready).
+            if isinstance(plugin, Plugin) and plugin.plugin_uuid != requester:
+                try:
+                    await self._wait_for_plugin_ready(plugin)
+                except asyncio.TimeoutError:
+                    timeout = getattr(
+                        self,
+                        "_stage_o_ready_timeout",
+                        _STAGE_O_DEFAULT_READY_TIMEOUT,
+                    )
+                    await self._set_request_result(
+                        request,
+                        f"Plugin {plugin.plugin_name!r} not ready within "
+                        f"{timeout}s",
+                        True,
+                    )
+                    return
+
             host_label = (
                 f"(local) {self.hostname}"
                 if isinstance(plugin, Plugin)
@@ -2432,6 +2714,25 @@ class PluginCore:
                     request, f"Endpoint {function_name} not found", True
                 )
                 return
+
+            # Stage O: readiness gate (stream variant). Same skip rules
+            # as _process_request — remote plugins and self-calls bypass.
+            if isinstance(plugin, Plugin) and plugin.plugin_uuid != requester:
+                try:
+                    await self._wait_for_plugin_ready(plugin)
+                except asyncio.TimeoutError:
+                    timeout = getattr(
+                        self,
+                        "_stage_o_ready_timeout",
+                        _STAGE_O_DEFAULT_READY_TIMEOUT,
+                    )
+                    await self._set_gen_request_result(
+                        request,
+                        f"Plugin {plugin.plugin_name!r} not ready within "
+                        f"{timeout}s",
+                        True,
+                    )
+                    return
 
             host_label = (
                 f"(local) {self.hostname}"
@@ -4031,6 +4332,33 @@ class PluginCore:
                 f"{local_match.target_access_name!r} not found on "
                 f"{local_match.target_plugin!r} (or access denied per C18)"
             )
+
+        # R1 HIGH-3 fix: Stage O readiness gate also applies on the
+        # LOCAL request_event_stream path. Without this gate, fan-out
+        # from a publisher to a subscriber that is mid-on_enable would
+        # bypass _process_request_stream's gate entirely (this path
+        # iterates the generator directly) and hit a not-yet-ready
+        # handler. Same skip rules as _process_request_stream — remote
+        # plugins (no readiness events) and self-calls (Q23 — avoid
+        # gating against own _lifecycle_ready from inside on_enable).
+        if (
+            isinstance(target_plugin, Plugin)
+            and target_plugin.plugin_uuid != publisher.plugin_uuid
+        ):
+            try:
+                await self._wait_for_plugin_ready(target_plugin)
+            except asyncio.TimeoutError as e:
+                ready_timeout = getattr(
+                    self,
+                    "_stage_o_ready_timeout",
+                    _STAGE_O_DEFAULT_READY_TIMEOUT,
+                )
+                raise RequestException(
+                    f"request_event_stream {event_id!r}: target plugin "
+                    f"{target_plugin.plugin_name!r} not ready within "
+                    f"{ready_timeout}s"
+                ) from e
+
         internal = endpoint.get("internal_name") or local_match.target_access_name
         func = getattr(target_plugin, internal, None)
         if func is None or not (
