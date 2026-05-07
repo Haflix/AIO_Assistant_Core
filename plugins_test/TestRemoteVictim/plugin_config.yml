@@ -1,69 +1,13 @@
-description: Phase 5 fixture — remote=False plugin used to demonstrate B-001 / B-042 access bypass via topics
-version: 0.2.0
+description: Phase 5 fixture — remote=False plugin used to verify the framework's plugin.remote=False gate blocks remote callers
+version: 0.3.0
 remote: False
 arguments:
-subscriptions:
-  topic_local_only_sub:
-    topic: "test/r/local"
-    target_access_name: r_topic_local_only
-    hosts: "local"
 endpoints:
   r_local_only:
     internal_name: r_local_only
     tags:
     remote: False
     accessible_by_other_plugins: True
-    description: Plugin-level remote=False blocks remote callers
+    description: Plugin-level remote=False blocks remote callers (contract test)
     arguments:
       - name: value
-
-  r_topic_local_only:
-    internal_name: r_topic_local_only
-    tags:
-    remote: False
-    accessible_by_other_plugins: True
-    description: Config-driven sub on remote=False plugin (B-001 boundary, via subscriptions block)
-    arguments:
-      - name: event
-
-  code_handler:
-    internal_name: code_handler
-    tags:
-    remote: False
-    accessible_by_other_plugins: True
-    description: Runtime-subscribed handler for test/r/code (B-001 driver)
-    arguments:
-      - name: event
-
-  code_stream_handler:
-    internal_name: code_stream_handler
-    tags:
-    remote: False
-    accessible_by_other_plugins: True
-    description: Runtime-subscribed async-gen handler for test/r/code_stream (B-042 driver)
-    arguments:
-      - name: event
-
-  get_bypass_count:
-    internal_name: get_bypass_count
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Returns the number of times the bypass handler fired
-    arguments:
-
-  get_stream_bypass_count:
-    internal_name: get_stream_bypass_count
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Returns the number of items the bypass stream yielded
-    arguments:
-
-  reset_bypass:
-    internal_name: reset_bypass
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Resets bypass counters to 0
-    arguments:

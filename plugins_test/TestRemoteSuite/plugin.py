@@ -1,60 +1,36 @@
 """TestRemoteSuite — Phase 5.
 
 Brings up a peer node as a subprocess (plugins_test/_remote_node/run_node.py)
-and drives wire-bug repros against it. If networking is disabled OR the
-subprocess fails to come up, all cases are recorded as skip with a clear
-reason.
-
-KNOWN FIXTURE GAPS (2026-04-28, after first end-to-end run with networking on):
-- TestRemoteVictim has plugin-level remote=False on purpose (it's the bug
-  target for B-001 / B-042 — code-driven sub on a remote=False plugin).
-  But its readback endpoints (get_bypass_count / reset_bypass) inherit
-  remote=False, so the parent CANNOT call them via execute(hosts="remote").
-  Catch-22: testing the bypass requires reading a counter that's only
-  reachable via the bypass we're testing. Fix path: split into two plugins
-  — Victim with remote=False holds the topic sub; a separate remote=True
-  plugin exposes the readback. Several B-001 / B-042 / B-018 cases
-  currently fail with "Endpoint reset_bypass not found" until that split
-  lands.
-- B-028.no_client_timeout case calls execute(timeout=2.0) — but execute_remote
-  DOES have request-level timeout. B-028 is specifically about
-  publish_event_remote / request_event_remote NOT having client-side
-  timeout. The case body needs to call those APIs directly to repro.
-- access_false_blocked case expects RequestException for a remote=True +
-  accessible_by_other_plugins=False endpoint. find_endpoint only checks
-  accessible_by_other_plugins for LOCAL cross-plugin calls; remote callers
-  pass through plugin.remote + endpoint.remote. The test expectation is
-  wrong; either redesign or remove the case.
-- B-020.publish_event_sync_blocks_on_remote subnode has no sub on
-  test/r/hang topic, so publish_event_sync doesn't block waiting for any
-  remote handler. Need a hanging sub on the subnode to repro the bug.
-
-Phase 5.1 cleanup: redesign these fixtures to repro the bugs they claim.
+and drives wire-bug repros + cross-node contract tests against it. If
+networking is disabled OR the subprocess fails to come up, all cases are
+recorded as skip with a clear reason.
 
 Phase 5 cases all declare hosts=["remote"]. The recorder auto-skips a remote
-sub-case when remote_available is False. The suite passes that flag based on
-subprocess startup success.
+sub-case when remote_available is False (subprocess never came up). The
+suite calls _wait_for_subnode_advert() once before iterating cases so the
+subnode's subscriptions are advertised to the parent before any
+request_event(hosts="remote") fires.
 
-Cases (~22):
-- remote.execute.remote_false_blocked / .access_false_blocked
-- remote.publish_event.remote_false_blocked_for_config
-- remote.B-001.code_driven_bypass
-- remote.B-042.code_driven_stream_bypass
-- remote.B-018.spoof_system_string / .spoof_known_uuid (skipped — Stage E)
-- remote.B-019.publish_event_count_per_node_not_per_sub
-- remote.B-021.first_sub_not_remote_eligible
-- remote.B-024.huge_item / .B-025.partial_then_failover
-- remote.B-011.stream_error_sentinel_via_item_end
-- remote.B-012.stream_error_sentinel_via_end_stream
-- remote.B-028.no_client_timeout
-- remote.B-029.code_driven_timeout_ignored
-- remote.B-030.unpicklable_args
-- remote.B-027.publish_event_return_count_misleading
-- remote.B-032.head_of_line_blocking
-- remote.B-033.request_event_stream_sync_host_remote
-- remote.B-020.publish_event_sync_blocks_on_remote
+Stage N (PR4) cleanup: legacy B-001 / B-042 / B-028 cases that targeted
+the now-removed request_topic / notify_remote API surface have been
+deleted. Those bugs are FIXED-BY-CONSTRUCTION (Stage D); structural
+canaries in TestBugSuite (`bug.B-001.request_topic_method_gone` etc.)
+remain authoritative. The same pass added five positive-guard cases
+covering the new request_event / request_event_stream wire path
+(remote.request_event.basic / .handler_raises / .timeout_honored,
+remote.request_event_stream.basic / .mid_stream_raise).
+
+Cases:
+- remote.execute.basic / .remote_false_blocked
+- remote.request_event.basic / .handler_raises / .timeout_honored
+- remote.request_event_stream.basic / .mid_stream_raise
+- remote.B-018.spoof_system_string / .spoof_known_uuid (skip — Stage E)
+- remote.B-019 / B-021 / B-025 / B-011_B-012 / B-029 / B-030 / B-027 /
+  B-032 / B-033 (skip — fixture wiring TBD)
+- remote.B-024.huge_item
+- remote.B-020.publish_event_sync_blocks_on_remote (positive regression
+  guard after Stage M)
 - remote.find_endpoints_by_tag
-- edge: tag.no_matches / tag.mixed_local_remote / pool.exhaustion / discovery.race
 """
 
 import sys
@@ -75,7 +51,7 @@ from decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.3.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
@@ -112,6 +88,39 @@ class TestRemoteSuite(Plugin):
     @async_log_errors
     async def on_disable(self):
         await self._terminate_subnode()
+
+    async def _wait_for_subnode_advert(self, timeout: float = 5.0) -> bool:
+        """Poll until the subnode's subscriptions are advertised to parent.
+
+        The advert protocol fires asynchronously after subnode startup;
+        request_event(hosts='remote') falls through to remote dispatch
+        only after the subnode's subs appear in network._inbound_adverts.
+        Returns True if any advert from the peer landed within `timeout`,
+        False on timeout or if networking/peer state is missing.
+        """
+        if not self._remote_available or not self._peer_info:
+            return False
+        peer_hostname = self._peer_info.get("hostname")
+        if not peer_hostname:
+            return False
+        network = getattr(self._plugin_core, "network", None)
+        if network is None:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            adverts = getattr(network, "_inbound_adverts", {}).get(
+                peer_hostname, {}
+            )
+            if adverts:
+                return True
+            await asyncio.sleep(0.05)
+        self._logger.warning(
+            "TestRemoteSuite: subnode advert did not appear within %.1fs "
+            "(peer=%s) — request_event(hosts='remote') cases may fail",
+            timeout, peer_hostname,
+        )
+        return False
 
     async def _spawn_subnode(self) -> None:
         """Spawn the peer subprocess and wait for the ready-file."""
@@ -244,6 +253,13 @@ class TestRemoteSuite(Plugin):
         )
         peer_ip = self._peer_info.get("ip") if self._peer_info else "127.0.0.1"
 
+        # Stage N (PR4): wait once for the subnode's advert to land before
+        # iterating cases. Without this, request_event(hosts="remote")
+        # cases fired immediately after subnode startup race the advert
+        # protocol and intermittently raise "no subscriber matches resolved
+        # topic". No-op when remote_available=False.
+        await self._wait_for_subnode_advert()
+
         async def body_remote_open(c):
             r = await self.execute(
                 "TestRemoteTarget", "r_open", {"value": "x"},
@@ -259,56 +275,118 @@ class TestRemoteSuite(Plugin):
                 hosts=c.hosts,
             )
 
-        async def body_access_false_blocked(c):
+        # ── Stage N (PR4): request_event coverage ──────────────────────
+        # Five positive-guard cases for the new request_event /
+        # request_event_stream wire path. Subnode-side handlers live on
+        # TestRemoteTarget (subscribed at runtime in on_enable to four
+        # dedicated topics: test/r/req_basic, test/r/req_raise,
+        # test/r/req_stream_basic, test/r/req_stream_raise).
+
+        async def body_request_event_basic(c):
+            """Happy path: parent → subnode → handler returns dict.
+            Verifies payload preservation across the wire."""
+            r = await self.request_event(
+                "r_request_basic", payload={"v": "x"},
+                hosts="remote", timeout=5.0,
+            )
+            c.expect(r, {"echoed": {"v": "x"}})
+
+        async def body_request_event_handler_raises(c):
+            """Remote handler raising ValueError must surface to caller as
+            RequestException with the original message preserved."""
             from exceptions import RequestException
-            c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
-            await self.execute(
-                "TestRemoteTarget", "r_remote_only", {"value": "x"},
-                hosts=c.hosts,
+            c.expect_exception(RequestException, match=r"requested-error-marker")
+            await self.request_event(
+                "r_request_raise", payload={},
+                hosts="remote", timeout=5.0,
             )
 
-        async def body_publish_event_remote_false_blocked_for_config(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
-            await self.publish_event(
-                "r_local", payload={"data": "x"}, hosts=c.hosts,
-            )
-            cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
-            )
-            c.expect(cnt, 0)
-
-        async def body_b001_code_driven_bypass(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
-            await self.publish_event(
-                "r_code", payload={"data": "bypass"}, hosts=c.hosts,
-            )
-            cnt = await self.execute(
-                "TestRemoteVictim", "get_bypass_count", hosts=c.hosts,
-            )
-            if cnt > 0:
-                c.set_marker("bypass_succeeded")
+        async def body_request_event_timeout_honored(c):
+            """request_event(timeout=2.0) against a hanging remote handler
+            must raise within budget. Peer-side enforcement (Request.
+            wait_for_result_async) sends the timeout result back, which
+            unblocks the client receive loop. Regression guard for the
+            B-028-class concern in the Stage-D-replacement API."""
+            from exceptions import RequestException
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            raised = False
+            try:
+                await self.request_event(
+                    "r_hang", payload={},
+                    hosts="remote", timeout=2.0,
+                )
+            except RequestException:
+                raised = True
+            elapsed = loop.time() - start
+            if not raised:
+                c.set_marker("no_exception")
                 raise AssertionError(
-                    f"B-001: code-driven sub on remote=False plugin fired "
-                    f"({cnt} times) via remote publish_event"
+                    f"request_event(timeout=2.0) returned without raising "
+                    f"after {elapsed:.2f}s — timeout not honored"
+                )
+            # Budget = 2.0s timeout + 3.0s wire/scheduling slack. If the
+            # call returned WAY late, peer-side enforcement is broken.
+            if elapsed > 5.0:
+                c.set_marker("timeout_too_late")
+                raise AssertionError(
+                    f"request_event(timeout=2.0) raised after {elapsed:.2f}s "
+                    f"(budget 5.0s) — timeout enforcement is too slow"
                 )
 
-        async def body_b042_code_driven_stream_bypass(c):
-            await self.execute("TestRemoteVictim", "reset_bypass", hosts=c.hosts)
-            try:
-                async for _ in self.request_event_stream(
-                    "r_code_stream", hosts=c.hosts,
-                ):
-                    pass
-            except Exception:
-                pass
-            cnt = await self.execute(
-                "TestRemoteVictim", "get_stream_bypass_count", hosts=c.hosts,
-            )
-            if cnt > 0:
-                c.set_marker("bypass_succeeded")
+        async def body_request_event_stream_basic(c):
+            """Happy-path streaming: 3 chunks. First chunk arrives wrapped
+            in an Event object (LOCKED I); subsequent chunks are raw."""
+            from utils import Event
+            chunks = []
+            async for chunk in self.request_event_stream(
+                "r_request_stream_basic", payload={},
+                hosts="remote", timeout=10.0,
+            ):
+                chunks.append(chunk)
+            c.expect(len(chunks), 3)
+            if not isinstance(chunks[0], Event):
+                c.set_marker("first_chunk_not_event")
                 raise AssertionError(
-                    f"B-042: code-driven async-gen sub on remote=False "
-                    f"plugin yielded {cnt} items via remote stream"
+                    f"first chunk should be Event-wrapped per LOCKED I; "
+                    f"got {type(chunks[0]).__name__}"
+                )
+            c.expect(chunks[0].payload, {"chunk": 0})
+            c.expect(chunks[1], {"chunk": 1})
+            c.expect(chunks[2], {"chunk": 2})
+
+        async def body_request_event_stream_mid_stream_raise(c):
+            """Mid-stream handler raise: 2 chunks then RequestException
+            with original message preserved. Caller's `async for` exits
+            via the exception, not silent termination."""
+            from exceptions import RequestException
+            chunks = []
+            raised: Optional[BaseException] = None
+            try:
+                async for chunk in self.request_event_stream(
+                    "r_request_stream_raise", payload={},
+                    hosts="remote", timeout=10.0,
+                ):
+                    chunks.append(chunk)
+            except RequestException as e:
+                raised = e
+            if raised is None:
+                c.set_marker("no_exception")
+                raise AssertionError(
+                    f"request_event_stream completed without raising; "
+                    f"got {len(chunks)} chunk(s)"
+                )
+            if "midstream-error-marker" not in str(raised):
+                c.set_marker("error_message_lost")
+                raise AssertionError(
+                    f"RequestException raised but original message lost: "
+                    f"{raised!r}"
+                )
+            if len(chunks) != 2:
+                c.set_marker("chunk_count_wrong")
+                raise AssertionError(
+                    f"expected 2 chunks before mid-stream raise, "
+                    f"got {len(chunks)}"
                 )
 
         async def body_b018_spoof_system_string(c):
@@ -391,16 +469,6 @@ class TestRemoteSuite(Plugin):
                 "sentinels — fixture for the unpicklable-payload trigger TBD"
             )
 
-        async def body_b028_no_client_timeout(c):
-            await c.assert_hang(
-                self.execute(
-                    "TestRemoteTarget", "r_hang",
-                    hosts=c.hosts, timeout=2.0,
-                ),
-                timeout_s=4.0,
-                marker="outer_wait_for_fired",
-            )
-
         async def body_b029_code_driven_timeout_ignored(c):
             c.skip(
                 "B-029 requires a code-driven topic handler that hangs and "
@@ -449,17 +517,23 @@ class TestRemoteSuite(Plugin):
             ("remote.execute.basic", body_remote_open, ("basic",), ()),
             ("remote.execute.remote_false_blocked",
              body_remote_false_blocked, ("access",), ()),
-            ("remote.execute.access_false_blocked",
-             body_access_false_blocked, ("access",), ()),
-            ("remote.publish_event.remote_false_blocked_for_config",
-             body_publish_event_remote_false_blocked_for_config,
-             ("access",), ()),
-            ("remote.B-001.code_driven_bypass",
-             body_b001_code_driven_bypass,
-             ("bug_repro", "security"), ("B-001",)),
-            ("remote.B-042.code_driven_stream_bypass",
-             body_b042_code_driven_stream_bypass,
-             ("bug_repro", "security"), ("B-042",)),
+            # Stage N (PR4) — request_event coverage
+            ("remote.request_event.basic",
+             body_request_event_basic,
+             ("basic", "request_event"), ()),
+            ("remote.request_event.handler_raises",
+             body_request_event_handler_raises,
+             ("basic", "request_event"), ()),
+            ("remote.request_event.timeout_honored",
+             body_request_event_timeout_honored,
+             ("basic", "request_event", "regression_guard"), ()),
+            ("remote.request_event_stream.basic",
+             body_request_event_stream_basic,
+             ("basic", "request_event_stream"), ()),
+            ("remote.request_event_stream.mid_stream_raise",
+             body_request_event_stream_mid_stream_raise,
+             ("basic", "request_event_stream", "regression_guard"), ()),
+            # End Stage N additions
             ("remote.B-018.spoof_system_string",
              body_b018_spoof_system_string,
              ("bug_repro", "security"), ("B-018",)),
@@ -480,9 +554,6 @@ class TestRemoteSuite(Plugin):
             ("remote.B-011_B-012.stream_error_sentinel",
              body_b011_b012_stream_error_sentinel,
              ("bug_repro",), ("B-011", "B-012")),
-            ("remote.B-028.no_client_timeout",
-             body_b028_no_client_timeout,
-             ("bug_repro",), ("B-028",)),
             ("remote.B-029.code_driven_timeout_ignored",
              body_b029_code_driven_timeout_ignored,
              ("bug_repro",), ("B-029",)),
@@ -500,7 +571,7 @@ class TestRemoteSuite(Plugin):
              ("bug_repro",), ("B-033",)),
             ("remote.B-020.publish_event_sync_blocks_on_remote",
              body_b020_publish_event_sync_blocks_on_remote,
-             ("bug_repro",), ("B-020",)),
+             ("bug_repro", "regression_guard"), ("B-020",)),
             ("remote.find_endpoints_by_tag", body_find_endpoints_by_tag,
              ("discovery", "basic"), ()),
         ]
@@ -508,33 +579,22 @@ class TestRemoteSuite(Plugin):
         for case_id, body, tags, bug_ids in cases:
             extra: Dict[str, Any] = {}
             if "bug_repro" in tags:
-                # Each bug-repro case needs an expected_status="fail" with
-                # a signature; we pin marker "bypass_succeeded" or
-                # "stream_aborted" or "outer_wait_for_fired" as appropriate.
-                # When skipped (no peer) the recorder records skip without
-                # checking signature.
+                # Bug-repro cases need expected_status="fail" with a
+                # signature when the body actually drives the bug; cases
+                # that skip via c.skip(...) don't need wiring.
                 if "B-024" in bug_ids:
                     extra = {
                         "expected_status": "fail",
                         "expected_signature": {"marker": "stream_aborted"},
                     }
-                elif "B-028" in bug_ids:
-                    extra = {
-                        "expected_status": "fail",
-                        "expected_signature": {"marker": "outer_wait_for_fired"},
-                    }
-                elif "B-020" in bug_ids:
-                    # Stage M (PR4): B-020 verified FIXED-BY-CONSTRUCTION.
-                    # Stage D removed notify_sync; replacement
-                    # publish_event_sync has different contract.
-                    pass  # extra stays {} — case passes as positive regression guard
-                elif "B-001" in bug_ids or "B-042" in bug_ids or "B-018" in bug_ids:
+                elif "B-018" in bug_ids:
                     extra = {
                         "expected_status": "fail",
                         "expected_signature": {"marker": "bypass_succeeded"},
                     }
-                # Other bug_repro cases skip via c.skip(...) inside the body
-                # so they don't need expected_status="fail" wiring.
+                # B-020 (Stage M) is a positive regression guard now —
+                # default extras={} is correct.
+                # Other bug_repro cases skip via c.skip(...) inside the body.
             await rec.run_case(
                 case_id, body,
                 hosts=("remote",),

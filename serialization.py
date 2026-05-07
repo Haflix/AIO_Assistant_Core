@@ -73,6 +73,19 @@ _PROJECT_EXCEPTIONS: FrozenSet[Tuple[str, str]] = frozenset({
 })
 
 
+# --- Project framework types — allowed across wire post-auth ---
+# Stage N (PR4) — B-067 fix. utils.Event is the wire envelope for the
+# first chunk of a request_event_stream response (LOCKED I). Without
+# this allowlist entry, the receiver's SafeUnpickler rejects the Event
+# pickled by the server and every cross-node request_event_stream call
+# fails with "Disallowed class during deserialization: utils.Event".
+# Static frozenset (not the dynamic Serializable opt-in) because Event
+# is part of the framework, not a plugin-defined type.
+_PROJECT_TYPES: FrozenSet[Tuple[str, str]] = frozenset({
+    ("utils", "Event"),
+})
+
+
 # --- Static exception registry (pre-populated at module import) ---
 
 _TRUSTED_EXCEPTION_MODULES: FrozenSet[str] = frozenset({
@@ -164,6 +177,8 @@ class SafeUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str):
         key = (module, name)
         if key in _BUILTIN_ALLOWLIST:
+            return super().find_class(module, name)
+        if key in _PROJECT_TYPES:
             return super().find_class(module, name)
         if key in _PROJECT_EXCEPTIONS:
             return super().find_class(module, name)

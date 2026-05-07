@@ -1,5 +1,5 @@
-description: Phase 5 fixture — remote=True endpoints + streaming generators for wire-bug repros
-version: 0.2.0
+description: Phase 5 fixture — remote=True endpoints + topic handlers used by TestRemoteSuite cases
+version: 0.3.0
 remote: True
 arguments:
 subscriptions:
@@ -18,15 +18,6 @@ endpoints:
     remote: True
     accessible_by_other_plugins: True
     description: Plain remote-callable endpoint
-    arguments:
-      - name: value
-
-  r_remote_only:
-    internal_name: r_remote_only
-    tags:
-    remote: True
-    accessible_by_other_plugins: False
-    description: remote=True but accessible_by_other_plugins=False
     arguments:
       - name: value
 
@@ -61,17 +52,9 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    description: Async gen yielding N items then raising (B-025 driver)
+    description: Async gen yielding N items then raising
     arguments:
       - name: n_yielded
-
-  r_hang:
-    internal_name: r_hang
-    tags:
-    remote: True
-    accessible_by_other_plugins: True
-    description: Awaits asyncio.Event().wait() forever (B-028 driver)
-    arguments:
 
   r_topic_open:
     internal_name: r_topic_open
@@ -87,6 +70,42 @@ endpoints:
     tags:
     remote: True
     accessible_by_other_plugins: True
-    description: B-020 hang handler subscribed at runtime to test/r/hang
+    description: Hang handler subscribed at runtime to test/r/hang (B-020 + Stage N timeout-honored driver)
+    arguments:
+      - name: event
+
+  r_request_basic_handler:
+    internal_name: r_request_basic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — happy-path request_event handler subscribed at runtime to test/r/req_basic; echoes payload back
+    arguments:
+      - name: event
+
+  r_request_raise_handler:
+    internal_name: r_request_raise_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event handler subscribed at runtime to test/r/req_raise; raises ValueError with marker
+    arguments:
+      - name: event
+
+  r_request_stream_basic_handler:
+    internal_name: r_request_stream_basic_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event_stream async-gen handler subscribed at runtime to test/r/req_stream_basic; yields 3 chunks
+    arguments:
+      - name: event
+
+  r_request_stream_raise_handler:
+    internal_name: r_request_stream_raise_handler
+    tags:
+    remote: True
+    accessible_by_other_plugins: True
+    description: Stage N (PR4) — request_event_stream handler subscribed at runtime to test/r/req_stream_raise; yields 2 chunks then raises ValueError with marker
     arguments:
       - name: event

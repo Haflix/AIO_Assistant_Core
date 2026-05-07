@@ -1,22 +1,26 @@
-description: Phase 5 suite — wire-bug repros (B-001/B-018/B-019/B-021/B-024/B-025/B-027/B-028/B-029/B-030/B-032/B-033/B-042) via subprocess peer
-version: 0.2.2
+description: Phase 5 suite — wire-bug repros (B-018/B-019/B-021/B-024/B-025/B-027/B-029/B-030/B-032/B-033) + Stage N (PR4) request_event coverage via subprocess peer
+version: 0.3.0
 remote: False
 arguments:
 events:
-  r_local:
-    topic: "test/r/local"
-    hosts: "any"
-  r_code:
-    topic: "test/r/code"
-    hosts: "any"
-  r_code_stream:
-    topic: "test/r/code_stream"
-    hosts: "any"
   r_hang:
     topic: "test/r/hang"
     hosts: "any"
   r_huge_stream:
     topic: "test/r/huge_stream"
+    hosts: "any"
+  # Stage N (PR4) — request_event / request_event_stream coverage
+  r_request_basic:
+    topic: "test/r/req_basic"
+    hosts: "any"
+  r_request_raise:
+    topic: "test/r/req_raise"
+    hosts: "any"
+  r_request_stream_basic:
+    topic: "test/r/req_stream_basic"
+    hosts: "any"
+  r_request_stream_raise:
+    topic: "test/r/req_stream_raise"
     hosts: "any"
 endpoints:
   run:
