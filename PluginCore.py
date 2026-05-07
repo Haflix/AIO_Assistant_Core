@@ -23,6 +23,7 @@ import inspect
 import asyncio
 import time
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
@@ -530,7 +531,19 @@ class PluginCore:
 
         self.requests = {}
         self.request_lock = asyncio.Lock()
-        self.task_list = []
+        # B-047 fix (Stage Q): task_list is currently-in-flight tasks
+        # only. Per-task done_callback in _spawn_tracked evicts on
+        # completion (replaces the previous 10s polling sweep that
+        # left the list growing in the gap between sweeps + never
+        # reclaimed hung tasks). recent_completed is a bounded buffer
+        # of (name, started, completed, error) records for TUI / log
+        # introspection of recently-finished tasks; counters provide
+        # exact aggregate dispatch numbers even when bursts overflow
+        # the deque.
+        self.task_list: set = set()
+        self.recent_completed: deque = deque(maxlen=200)
+        self.tasks_started_total: int = 0
+        self.tasks_completed_total: int = 0
 
         self.main_event_loop = None
         self.plugins = {}
@@ -667,7 +680,10 @@ class PluginCore:
             self._running_loop_task = None
 
         # 2. Wait for all in-flight request tasks to finish (up to 30s)
-        pending = [t for t in self.task_list if not t.done()]
+        # Snapshot via list() so concurrent done_callback eviction can't
+        # mutate the set during iteration. (Single-threaded loop already
+        # makes this safe but the snapshot keeps the intent explicit.)
+        pending = [t for t in list(self.task_list) if not t.done()]
         if pending:
             self._logger.info(
                 "Shutdown: waiting for %d in-flight request(s)...", len(pending)
@@ -681,7 +697,10 @@ class PluginCore:
                 for t in still_pending:
                     t.cancel()
                 await asyncio.gather(*still_pending, return_exceptions=True)
-        self.task_list = []
+        # In-place clear so any callback firing after this still
+        # operates on the same set object — discard() of an already-
+        # absent key is a no-op.
+        self.task_list.clear()
 
         # 2.5. Shutdown the SyncDispatcher (PR3 Stage A, Q17 + C8).
         # MUST happen AFTER the 30s in-flight drain. Per C8 spec: wrap
@@ -2155,8 +2174,10 @@ class PluginCore:
             f"Request {request.id} created by {author} targeting {plugin}.{method}"
         )
 
-        task = asyncio.create_task(self._process_request(request))
-        self.task_list.append(task)
+        self._spawn_tracked(
+            self._process_request(request),
+            name=f"request:{plugin}.{method}#{request.id[:8]}",
+        )
 
         return request
 
@@ -2238,9 +2259,11 @@ class PluginCore:
             f"GeneratorRequest {request.id} created by {author} targeting {plugin}.{method}"
         )
 
-        task = asyncio.create_task(self._process_request_stream(request))
+        task = self._spawn_tracked(
+            self._process_request_stream(request),
+            name=f"request_stream:{plugin}.{method}#{request.id[:8]}",
+        )
         request._producer_task = task   # B-002: enable cancel-on-collect
-        self.task_list.append(task)
 
         return request
 
@@ -2879,21 +2902,84 @@ class PluginCore:
 
         await request.set_result(result, error)
 
+    def _spawn_tracked(
+        self, coro, *, name: str
+    ) -> asyncio.Task:
+        """Create + register a tracked async task (B-047 fix).
+
+        Must be called from the event loop thread — uses
+        asyncio.create_task which requires a running loop in the
+        current thread. All current call sites are inside async def
+        methods that always run on the loop thread; sync entry points
+        (create_request_sync, publish_event_sync) bridge via
+        run_coroutine_threadsafe so the actual _spawn_tracked call
+        still happens on the loop. Calling from a worker thread
+        raises RuntimeError("no running event loop").
+
+        Returns the task. Callers should hold the returned reference
+        if they need it (e.g. request._producer_task = task); the
+        framework already holds a strong reference via self.task_list
+        so the task will not be GC'd mid-flight (per asyncio docs:
+        save a strong reference to created tasks).
+
+        The done_callback evicts from self.task_list on completion
+        (any terminal state — normal return, raise, cancel),
+        increments tasks_completed_total, and appends a record to
+        self.recent_completed (bounded deque). cancelled() is
+        checked BEFORE exception() because exception() raises
+        CancelledError on cancelled tasks. The whole introspection
+        block is wrapped in try/except so a pathological failure
+        cannot break asyncio's internal callback dispatch.
+        """
+        task = asyncio.create_task(coro, name=name)
+        self.task_list.add(task)
+        self.tasks_started_total += 1
+        started = time.monotonic()
+
+        def _on_done(t: asyncio.Task, _name=name, _started=started) -> None:
+            self.task_list.discard(t)
+            self.tasks_completed_total += 1
+            err: Optional[str] = None
+            try:
+                if t.cancelled():
+                    err = "cancelled"
+                else:
+                    exc = t.exception()
+                    if exc is not None:
+                        err = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                err = "introspection_failed"
+            self.recent_completed.append({
+                "name": _name,
+                "started": _started,
+                "completed": time.monotonic(),
+                "error": err,
+            })
+
+        task.add_done_callback(_on_done)
+        return task
+
     async def running_loop(self):
-        """Maintenance loop that cleans up tasks and requests.
+        """Maintenance loop that cleans up requests.
 
         B-006 fix: a single tick that raises must not kill the loop —
         cleanup_requests is `@async_log_errors` which re-raises, and
         any unexpected exception (e.g. a malformed entry in
         self.requests with no .collected attribute) would otherwise
-        terminate the maintenance loop forever, leaking task_list and
-        requests for the rest of the process. Catch every Exception
-        (logging it) and continue. CancelledError is re-raised so
-        close() can stop the loop normally.
+        terminate the maintenance loop forever, leaking requests for
+        the rest of the process. Catch every Exception (logging it)
+        and continue. CancelledError is re-raised so close() can stop
+        the loop normally.
+
+        B-047 fix (Stage Q): task_list eviction now happens via
+        per-task done_callback registered in _spawn_tracked. The
+        previous `self.task_list = [t for t in self.task_list if not
+        t.done()]` 10s polling sweep was removed — eviction is now
+        instant and O(1), and a reassignment here would orphan any
+        in-flight done_callbacks pointing at the original set.
         """
         while True:
             try:
-                self.task_list = [t for t in self.task_list if not t.done()]
                 await self.cleanup_requests()
             except asyncio.CancelledError:
                 raise
@@ -3937,8 +4023,13 @@ class PluginCore:
                 # leak fan-out Requests.
                 await request.set_collected()
 
-        task = asyncio.create_task(_run_and_collect())
-        self.task_list.append(task)
+        # Name uses `sub.target_plugin or sub.plugin_name` to mirror the
+        # actual dispatch target (line ~3876 already applies that
+        # fallback for the Request's `plugin` field).
+        self._spawn_tracked(
+            _run_and_collect(),
+            name=f"sub:{sub.target_plugin or sub.plugin_name}.{sub.target_access_name}<-{resolved_topic}",
+        )
 
         return request
 

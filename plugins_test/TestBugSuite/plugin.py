@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncio  # noqa: E402
+import time  # noqa: E402
 import inspect  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
@@ -51,7 +52,7 @@ from serialization import generate_keypair, Serializable  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.1"
+SUITE_VERSION = "0.4.2"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -996,27 +997,40 @@ class TestBugSuite(Plugin):
 
         # ---- B-047 ---------------------------------------------------
         async def body_b_047_task_list_grows_unboundedly(c):
-            # B-047: task_list grows unboundedly. Drive 200 publish_event
-            # calls (slow tag would make this 1000; keep moderate for
-            # default-run safety) and verify whether task_list grew by
-            # ~that count. Bug confirmed if growth is linear (no
-            # eviction).
+            # B-047 (Stage Q FIXED): task_list now uses set + per-task
+            # done_callback for O(1) self-eviction. This regression guard
+            # asserts that a 200-event burst does NOT cause sustained
+            # growth. b047_probe_event is registered → b047_probe_sub →
+            # handle_b047_probe so every publish spawns one real fan-out
+            # task that exercises the eviction path.
             core = self._plugin_core
             tlist = getattr(core, "task_list", None)
             if tlist is None:
                 # Attribute removed — fixed-by-construction.
                 return
-            before = len(tlist)
-            # Use a topic with no subs to make publish_event a near-noop.
+            # Snapshot baseline tasks. We measure the delta from the
+            # burst (tasks NOT in this snapshot) instead of total list
+            # size, so concurrent unrelated activity adding/removing
+            # its own tasks doesn't false-trigger the assertion.
+            before_set = frozenset(tlist)
             for _ in range(200):
-                await self.publish_event_for_repro_no_subs()
-            after = len(tlist)
-            growth = after - before
-            if growth >= 100:
+                await self.publish_event_for_repro()
+            # Poll until burst-spawned tasks drain. Each fan-out task
+            # awaits _process_request → endpoint dispatch → set_collected
+            # → done_callback fires via call_soon. One asyncio.sleep(0)
+            # is NOT enough; deadline-bounded poll handles slow CI.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                remaining = sum(1 for t in tlist if t not in before_set)
+                if remaining <= 5:
+                    break
+                await asyncio.sleep(0.01)
+            remaining = sum(1 for t in tlist if t not in before_set)
+            if remaining > 5:
                 raise AssertionError(
-                    f"B-047: task_list grew by {growth} entries over "
-                    f"200 publish_events — no eviction; unbounded leak "
-                    f"surface still present"
+                    f"B-047 regression: {remaining} burst-spawned tasks "
+                    f"remain in task_list after 5s drain — done_callback "
+                    f"eviction not firing"
                 )
 
         # ---- B-048 ---------------------------------------------------
@@ -1158,19 +1172,16 @@ class TestBugSuite(Plugin):
             **kw,
         )
         # B-047: expected_status="fail" — bug expected to repro
-        # (task_list grows unboundedly). slow=True so default fast-runs
-        # skip it.
+        # B-047: FIXED in Stage Q. Positive regression guard — body
+        # asserts burst-spawned tasks drain via the per-task
+        # done_callback within 5s. Success path completes in
+        # milliseconds; the deadline only fires on a regression.
+        # slow=True intentionally removed (no longer slow).
         await rec.run_case(
             "bug.B-047.task_list_grows_unboundedly",
             body_b_047_task_list_grows_unboundedly,
             category=category,
-            tags=("bug_repro", "active", "slow"), bug_ids=("B-047",),
-            expected_status="fail",
-            expected_signature={
-                "exception_type": "AssertionError",
-                "message_regex": r"unbounded|task_list grew",
-            },
-            slow=True,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-047",),
             **kw,
         )
         # B-048: expected_status="fail" — bug expected to repro
@@ -1215,10 +1226,11 @@ class TestBugSuite(Plugin):
             **kw,
         )
 
-    # Helper used by B-047 — dispatches a real declared event so
-    # _lookup_event succeeds and _fanout_sub appends a task to
-    # task_list (the surface the bug describes).
-    async def publish_event_for_repro_no_subs(self):
+    # Helper used by B-047 — publishes b047_probe_event which routes
+    # via b047_probe_sub → handle_b047_probe. Each call spawns one
+    # real fan-out task in PluginCore.task_list; the test asserts
+    # that the eviction path (Stage Q done_callback) drains them.
+    async def publish_event_for_repro(self):
         try:
             await self.publish_event("b047_probe_event")
         except Exception:
