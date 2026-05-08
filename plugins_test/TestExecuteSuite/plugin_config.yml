@@ -1,5 +1,5 @@
 description: Phase 1 suite — execute() value/error/timeout/multi-instance/cancellation cases (basic + edge), plus hosts/blocked_hosts validation + behavior cases
-version: 0.2.0
+version: 0.2.1
 remote: False
 arguments:
 endpoints:

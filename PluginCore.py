@@ -2891,7 +2891,16 @@ class PluginCore:
     ) -> None:
         """Set the result of a request."""
         if isinstance(result, asyncio.Future):
-            result = await result
+            try:
+                result = await result
+            except Exception as e:
+                # B-013 fix: a returned Future whose await raises must
+                # still resolve the request — otherwise @async_handle_errors
+                # swallows here and the caller hangs on request._future.
+                # CancelledError (BaseException) propagates uncaught so
+                # task cancellation tears down cleanly.
+                await request.set_result(f"{type(e).__name__}: {e}", True)
+                return
         await request.set_result(result, error)
 
     @async_handle_errors(None)

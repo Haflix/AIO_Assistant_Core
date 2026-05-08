@@ -42,7 +42,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.2.1"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -300,14 +300,14 @@ class TestExecuteSuite(Plugin):
             c.expect(r, "future_value")
 
         async def body_returns_failing_future(c):
-            # B-013: failing Future is awaited inside _set_request_result;
-            # @async_handle_errors swallows; request._future stays pending; caller hangs.
-            # Wrap in outer wait_for to detect.
-            await c.assert_hang(
-                self.execute(TARGET, "ea_returns_failing_future", hosts=c.hosts),
-                timeout_s=2.0,
-                marker="outer_wait_for_fired",
-            )
+            # B-013 regression guard: a returned Future that raises on
+            # await used to silently hang the caller (@async_handle_errors
+            # swallowed the inner exception; request._future never
+            # resolved). The fix catches inside _set_request_result and
+            # surfaces the exception as a normal request error, which
+            # the caller's execute() re-raises as RequestException.
+            c.expect_exception(RequestException, match=r"ValueError.*intentional")
+            await self.execute(TARGET, "ea_returns_failing_future", hosts=c.hosts)
 
         await rec.run_case(
             "exec.error.no_endpoint", body_no_endpoint,
@@ -335,9 +335,7 @@ class TestExecuteSuite(Plugin):
         )
         await rec.run_case(
             "exec.B-013.returns_failing_future", body_returns_failing_future,
-            tags=("bug_repro",), bug_ids=("B-013",),
-            expected_status="fail",
-            expected_signature={"marker": "outer_wait_for_fired"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-013",),
             hard_timeout_s=10.0,
             **kw,
         )

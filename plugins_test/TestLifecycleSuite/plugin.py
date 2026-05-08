@@ -29,7 +29,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.1"
+SUITE_VERSION = "0.3.2"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -387,21 +387,23 @@ class TestLifecycleSuite(Plugin):
             entry["enabled"] = False
 
             try:
-                # _reload_plugin captures previously_enabled, pops, re-loads
-                # (which now returns at the disabled-short-circuit), then
-                # tries to _enable_plugin — KeyError since plugin is gone.
-                # @async_handle_errors swallows; user sees nothing.
-                result = await self._plugin_core._reload_plugin(VICTIM)
-                # If the plugin is now absent and result is None, the bug
-                # silently swallowed the KeyError.
-                still_loaded = VICTIM in self._plugin_core.plugins
-                if not still_loaded:
-                    c.set_marker("silent_keyerror_swallowed")
+                # B-016 regression guard: pre-Stage-O, _reload_plugin's
+                # _enable_plugin call did self.plugins[plugin_name] (raw
+                # subscript) → KeyError → swallowed by @async_handle_errors.
+                # Stage O switched _enable_plugin_under_lock to .get() with
+                # a None-check; the reload path now cleanly honors the new
+                # disabled config — no silent exception swallow.
+                await self._plugin_core._reload_plugin(VICTIM)
+                # Expected end-state: plugin removed from self.plugins.
+                # _reload_plugin pops first; load_plugin_with_conf then
+                # short-circuits on the new enabled=false config without
+                # re-registering, and _enable_plugin_under_lock early-
+                # returns on .get()=None.
+                if VICTIM in self._plugin_core.plugins:
                     raise AssertionError(
-                        "B-016: reload with newly-disabled config silently "
-                        "popped the plugin and swallowed the re-enable KeyError"
+                        "B-016 regression: plugin still loaded after reload "
+                        "with newly-disabled config (expected unloaded)"
                     )
-                # If plugin is still loaded, the bug-fixed path was taken
             finally:
                 entry["enabled"] = original_enabled
                 if VICTIM not in self._plugin_core.plugins:
@@ -414,9 +416,7 @@ class TestLifecycleSuite(Plugin):
 
         await rec.run_case(
             "lifecycle.B-016.reload_disabled_in_new_config", body,
-            tags=("bug_repro",), bug_ids=("B-016",),
-            expected_status="fail",
-            expected_signature={"marker": "silent_keyerror_swallowed"},
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-016",),
             hard_timeout_s=15.0,
             **kw,
         )
