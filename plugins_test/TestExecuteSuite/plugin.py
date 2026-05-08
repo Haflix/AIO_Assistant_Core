@@ -42,7 +42,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
 
 
-SUITE_VERSION = "0.2.1"
+SUITE_VERSION = "0.2.2"
 TARGET = "TestExecuteTarget"
 TARGET2 = "TestExecuteTarget2"
 
@@ -255,8 +255,10 @@ class TestExecuteSuite(Plugin):
             r = await self.execute(TARGET, "ea_returns_arg", "hello", hosts=c.hosts)
             c.expect(r, "hello")
 
-        # These currently PASS because the framework silently accepts non-tuple/non-dict.
-        # When B-015 is fixed (validation added), the call should raise → unexpected_pass.
+        # B-015 reclassified BY-DESIGN (Stage S): single-positional
+        # pass-through is intentional convenience — args=42 calls
+        # func(42), args=[1,2,3] calls func([1,2,3]). Cases stay as
+        # positive regression guards locking the pass-through.
         await rec.run_case(
             "exec.B-015.single_int", body_single_int,
             tags=("args_contract",), bug_ids=("B-015",), **kw,

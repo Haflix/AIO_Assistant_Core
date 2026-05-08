@@ -917,7 +917,7 @@ Execute a plugin method asynchronously.
 
 - `plugin` (str): Name of the target plugin
 - `method` (str): Access name of the endpoint to execute
-- `args` (tuple/dict/None): Arguments to pass to the method. Tuples are unpacked as positional args, dicts as keyword args, single values passed directly.
+- `args` (any): Arguments to pass to the method. Tuples are unpacked as positional args (`func(*args)`), dicts are unpacked as keyword args (`func(**args)`), `None` calls the function with no arguments (`func()`), and any other single value is passed through as one positional argument (`func(args)`). The bare-single-value form is a convenience for endpoints that take exactly one argument — `args=42` calls `func(42)`.
 - `plugin_uuid` (str): Optional UUID to target a specific plugin instance
 - `host` (str): `"local"`, `"remote"`, `"any"`, or a specific hostname
 - `author` (str): Name of the caller (defaults to hostname)
