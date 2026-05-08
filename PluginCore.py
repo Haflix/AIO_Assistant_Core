@@ -639,6 +639,11 @@ class PluginCore:
             if getattr(self, "networking_enabled", False):
                 if self.network is None:
                     from pathlib import Path as _Path
+                    from networking import (
+                        DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
+                        DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
+                        DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
+                    )
                     _nw_cfg = self.yaml_config.get("networking") or {}
                     _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
                     self.network = NetworkManager(
@@ -655,6 +660,9 @@ class PluginCore:
                         pool_size=getattr(self, "networking_pool_size", 5),
                         networking_config=_nw_cfg,
                         config_dir=_cfg_dir,
+                        heartbeat_interval=getattr(self, "networking_heartbeat_interval", _DEF_HB),
+                        lookup_interval=getattr(self, "networking_lookup_interval", _DEF_LOOK),
+                        liveness_timeout=getattr(self, "networking_liveness_timeout", _DEF_LIVE),
                     )
                 self._init_tasks.append(asyncio.create_task(self.network.start()))
 
@@ -673,6 +681,11 @@ class PluginCore:
 
         if getattr(self, "networking_enabled", False):
             from pathlib import Path as _Path
+            from networking import (
+                DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
+                DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
+                DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
+            )
             _nw_cfg = self.yaml_config.get("networking") or {}
             _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
             self.network = NetworkManager(
@@ -689,6 +702,9 @@ class PluginCore:
                 pool_size=getattr(self, "networking_pool_size", 5),
                 networking_config=_nw_cfg,
                 config_dir=_cfg_dir,
+                heartbeat_interval=getattr(self, "networking_heartbeat_interval", _DEF_HB),
+                lookup_interval=getattr(self, "networking_lookup_interval", _DEF_LOOK),
+                liveness_timeout=getattr(self, "networking_liveness_timeout", _DEF_LIVE),
             )
             self._init_tasks.append(asyncio.create_task(self.network.start()))
 

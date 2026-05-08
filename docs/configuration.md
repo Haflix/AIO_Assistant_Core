@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for AIO Assistant Core 0.22.2*
 
 Reference for the top-level `config.yml` — the file PluginCore reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -378,6 +378,9 @@ networking:
 | `discover_nodes` | bool | `false` | Run periodic node-lookup loop (`update_all_nodes`). |
 | `direct_discoverable` | bool | `false` | Allow peers that explicitly know this node's IP to connect. Auto-coerced to `true` when `auto_discoverable=true`. |
 | `auto_discoverable` | bool | `false` | Allow peers to find this node via subnet scan. Forces `direct_discoverable=true`. |
+| `heartbeat_interval` | float | `10.0` | Seconds between heartbeat ticks. Each tick pings every peer; on failure the peer is marked dead. Bad values fall back to default with a warning. |
+| `lookup_interval` | float | `60.0` | Seconds between discovery / `update_all_nodes` loop ticks. Re-resolves peer addresses and reaps unreachable nodes. Bad values fall back to default with a warning. |
+| `liveness_timeout` | float | `30.0` | A peer whose last successful heartbeat is older than this is considered dead. Should be `>= heartbeat_interval`; 2-3× is typical. Bad values fall back to default with a warning. |
 
 The validators check `enabled`, `port`, `auto_discoverable`,
 `direct_discoverable`, and `discover_nodes` for presence (warn on
@@ -414,20 +417,6 @@ When `networking.enabled: true` and `peers` is empty,
 `NetworkManager.start()` raises a fail-fast error with migration
 guidance — an empty trust store would otherwise reject every connection
 with an opaque OpenSSL error.
-
-### Hardcoded networking constants (NOT user-tunable)
-
-These three values are set in `NetworkManager.__init__`
-(`networking.py:202-204`) and are NOT exposed as config keys today:
-
-| Constant | Value |
-|---|---|
-| `heartbeat_interval` | `10.0` seconds |
-| `lookup_interval` | `60.0` seconds |
-| `liveness_timeout` | `30.0` seconds |
-
-Exposing these as config knobs is tracked for a future framework
-iteration (internal bug ID **B-069**). For now they require a code change to alter.
 
 ### Removed / legacy fields
 
@@ -562,10 +551,6 @@ A few things that look like they ought to be tunable but aren't:
   cap (which `_disable_plugin` / `_pop_plugin_under_lock` honour).
 - The **30-second wait for in-flight tracked tasks at `close()` time**
   is hardcoded.
-- **Heartbeat / lookup / liveness timeouts** are `NetworkManager`
-  attributes, not config keys (see the hardcoded networking constants
-  table above).
 
 These are deliberate caps. If a deployment needs them tunable, raise
-it as a feature request — they are tracked for a future framework
-iteration.
+it as a feature request.

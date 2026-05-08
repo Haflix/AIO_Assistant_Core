@@ -91,6 +91,26 @@ MAX_ADVERT_SUBS_PER_PEER = 100_000  # Cap MSG_SUB_ADVERTISE entries to bound _ad
 REMOTE_NO_RESULT = object()
 
 
+# Default heartbeat tick interval (seconds). NetworkManager iterates the
+# node list every tick and pings each peer; on failure the peer is marked
+# dead via _mark_node_dead. Configurable via networking.heartbeat_interval
+# in config.yml; tests may override self.heartbeat_interval directly.
+DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+
+# Default discovery / node-lookup loop interval (seconds). Periodic
+# update_all_nodes loop tick that re-resolves peer addresses and reaps
+# unreachable nodes. Configurable via networking.lookup_interval in
+# config.yml; tests may override self.lookup_interval directly.
+DEFAULT_LOOKUP_INTERVAL: float = 60.0
+
+# Default liveness timeout (seconds). A peer whose last successful
+# heartbeat is older than this is considered dead and dropped from
+# advert state. Should be >= heartbeat_interval; in practice 2-3x is
+# typical. Configurable via networking.liveness_timeout in config.yml;
+# tests may override self.liveness_timeout directly.
+DEFAULT_LIVENESS_TIMEOUT: float = 30.0
+
+
 class NetworkManager:
     def __init__(
         self,
@@ -107,6 +127,9 @@ class NetworkManager:
         pool_size: int = 5,
         networking_config: Optional[dict] = None,
         config_dir: Optional[Path] = None,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        lookup_interval: float = DEFAULT_LOOKUP_INTERVAL,
+        liveness_timeout: float = DEFAULT_LIVENESS_TIMEOUT,
     ):
         self.plugin_core = plugin_core
         self._logger = logger
@@ -198,10 +221,15 @@ class NetworkManager:
         self.ssl_context = None
         self._temp_ssl_files = []  # Track temp cert/key files for cleanup
 
-        # Loop intervals and timeouts (defaults per plan)
-        self.heartbeat_interval: float = 10.0
-        self.lookup_interval: float = 60.0
-        self.liveness_timeout: float = 30.0
+        # Loop intervals and timeouts. Defaults are
+        # DEFAULT_HEARTBEAT_INTERVAL / DEFAULT_LOOKUP_INTERVAL /
+        # DEFAULT_LIVENESS_TIMEOUT; override via networking.heartbeat_interval
+        # / networking.lookup_interval / networking.liveness_timeout in
+        # config.yml (parsed by ConfigUtil.apply_configvalues and passed in
+        # by PluginCore at NetworkManager construction).
+        self.heartbeat_interval: float = heartbeat_interval
+        self.lookup_interval: float = lookup_interval
+        self.liveness_timeout: float = liveness_timeout
 
         # ── PR3 Stage C advert-protocol state ─────────────────────────
         # Per-peer table of subs the peer told us about. Keyed by peer

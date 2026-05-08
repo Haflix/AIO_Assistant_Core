@@ -1105,6 +1105,66 @@ class ConfigUtil:
                 "Using shared secret from config file. Consider using environment variable NETWORKING_SECRET for better security."
             )
 
+        # Heartbeat / lookup / liveness intervals (B-069 fix). Default
+        # values come from the DEFAULT_HEARTBEAT_INTERVAL /
+        # DEFAULT_LOOKUP_INTERVAL / DEFAULT_LIVENESS_TIMEOUT module
+        # constants in networking.py. Bad values fall back to default
+        # with a warning so a typo can never silently zero an interval
+        # and starve the heartbeat / discovery loops.
+        from networking import (  # local import — avoids circular import at module load
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_LOOKUP_INTERVAL,
+            DEFAULT_LIVENESS_TIMEOUT,
+        )
+
+        raw_heartbeat = networking_config.get(
+            "heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL
+        )
+        try:
+            heartbeat_interval = float(raw_heartbeat)
+            if heartbeat_interval <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid networking.heartbeat_interval=%r; defaulting to %.1f",
+                raw_heartbeat,
+                DEFAULT_HEARTBEAT_INTERVAL,
+            )
+            heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
+        plugin_core.networking_heartbeat_interval = heartbeat_interval
+
+        raw_lookup = networking_config.get(
+            "lookup_interval", DEFAULT_LOOKUP_INTERVAL
+        )
+        try:
+            lookup_interval = float(raw_lookup)
+            if lookup_interval <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid networking.lookup_interval=%r; defaulting to %.1f",
+                raw_lookup,
+                DEFAULT_LOOKUP_INTERVAL,
+            )
+            lookup_interval = DEFAULT_LOOKUP_INTERVAL
+        plugin_core.networking_lookup_interval = lookup_interval
+
+        raw_liveness = networking_config.get(
+            "liveness_timeout", DEFAULT_LIVENESS_TIMEOUT
+        )
+        try:
+            liveness_timeout = float(raw_liveness)
+            if liveness_timeout <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid networking.liveness_timeout=%r; defaulting to %.1f",
+                raw_liveness,
+                DEFAULT_LIVENESS_TIMEOUT,
+            )
+            liveness_timeout = DEFAULT_LIVENESS_TIMEOUT
+        plugin_core.networking_liveness_timeout = liveness_timeout
+
 
 class Plugin(ABC):
     """Base class for all plugins."""

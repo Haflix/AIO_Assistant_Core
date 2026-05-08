@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for AIO Assistant Core 0.22.1*
+*Last updated for AIO Assistant Core 0.22.2*
 
 PluginCore ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
@@ -128,17 +128,17 @@ Three flags control discovery behaviour:
 
 Discovery does not bypass trust: a discovered peer still needs a matching cert / fingerprint in `peers:` to connect. Auto-discovery is helpful in development; in production, an explicit peer list is usually clearer.
 
-Heartbeat parameters are currently hardcoded (`networking.py:202-204`):
+Heartbeat parameters live under the `networking:` block in `config.yml`:
 
-| Knob                | Value     | Meaning                                                                |
+| Knob                | Default   | Meaning                                                                |
 |---------------------|-----------|------------------------------------------------------------------------|
 | `heartbeat_interval`| `10.0` s  | How often to ping every peer.                                          |
 | `lookup_interval`   | `60.0` s  | How often the node-lookup loop runs.                                   |
-| `liveness_timeout`  | `30.0` s  | A peer is considered dead if its last heartbeat is older than this.    |
+| `liveness_timeout`  | `30.0` s  | A peer is considered dead if its last heartbeat is older than this. Should be `>= heartbeat_interval`; 2-3× is typical. |
 
 The heartbeat loop iterates the node list and calls `heartbeat_node(node, timeout=liveness_timeout)`. Failures route through `_mark_node_dead`, which drops advert state for that peer. `Node.is_alive(timeout=30)` returns `True` if the last heartbeat was within `timeout` seconds.
 
-> Exposing `heartbeat_interval` / `lookup_interval` / `liveness_timeout` as user-tunable config keys is tracked as a pending framework improvement. Today these values are set in `NetworkManager.__init__` (`networking.py:202-204`) and cannot be overridden via YAML.
+Bad values (non-numeric or `<= 0`) fall back to the defaults with a warning logged at config-load time, so a typo can never silently zero an interval and starve the heartbeat / discovery loops. See `docs/configuration.md` for the full `networking:` knob table.
 
 ---
 
