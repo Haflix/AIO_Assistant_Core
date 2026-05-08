@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for AIO Assistant Core 0.22.3*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -90,7 +90,7 @@ owner's `plugin_name` (`notifier.py:237`,
 `effective_target_plugin = target_plugin or plugin_name`).
 
 Subscriptions are registered with the topic registry BEFORE `on_enable`
-runs, by `_register_yaml_subscriptions` (`PluginCore.py:2092-2129`).
+runs, by `_register_yaml_subscriptions` (`PluginCore.py:2108-2145`).
 Subscriptions added at runtime via `await self.subscribe(...)` follow
 the YAML registrations in insertion order.
 
@@ -230,7 +230,7 @@ cleanly.
 
 ### 1. Publisher hosts gate
 
-`_publisher_targets_local` (`PluginCore.py:3721-3768`) decides whether
+`_publisher_targets_local` (`PluginCore.py:3737-3784`) decides whether
 this publish should target local subs at all. The publisher's effective
 `hosts` and `blocked_hosts` (manifest, optionally overridden per-call)
 gate this. Default `hosts="local"` if the publisher omits it. `"any"`,
@@ -239,21 +239,21 @@ those accepts. `blocked_hosts` excludes.
 
 ### 2. Sub-level local accept
 
-`_sub_accepts_local` (`PluginCore.py:3770-3798`). Whether the
+`_sub_accepts_local` (`PluginCore.py:3786-3814`). Whether the
 subscriber wants local events. The sub's `hosts` must accept `"local"`,
 own hostname, or `"any"`; the sub's `blocked_hosts` must not block
 them. Default sub `hosts="any"` accepts everything.
 
 ### 3. Sub-level remote-publisher accept
 
-`_sub_accepts_remote_publisher` (`PluginCore.py:3800-3855`). For
+`_sub_accepts_remote_publisher` (`PluginCore.py:3816-3871`). For
 inbound peer publishes only. A sub with `hosts="local"` rejects remote
 publishers. Otherwise the sub's `hosts` / `blocked_hosts` are checked
 against the remote publisher's `author_host`.
 
 ### 4. Author filter
 
-`_sub_accepts_author` (`PluginCore.py:3857-3890`). `authors` is a
+`_sub_accepts_author` (`PluginCore.py:3873-3906`). `authors` is a
 whitelist; `blocked_authors` is a blacklist. The publisher's
 `plugin_name` is checked against both.
 
@@ -306,7 +306,7 @@ activating them yet.
 ## What handlers receive
 
 Subscriber endpoints receive ONE positional argument: an `Event`
-dataclass (`utils.py:1694-1747`).
+dataclass (`utils.py:1754-1807`).
 
 ```python
 @async_log_errors
@@ -343,10 +343,10 @@ endpoints are usually one or the other.
 
 Use YAML when the subscription set is static — known at plugin load
 time. The framework registers YAML subs before `on_enable` runs
-(`PluginCore.py:2092-2129`), so the subscription is live from the
+(`PluginCore.py:2108-2145`), so the subscription is live from the
 moment the plugin enables.
 
-Use `await self.subscribe(...)` (`utils.py:1435-1470`) when the
+Use `await self.subscribe(...)` (`utils.py:1495-1530`) when the
 subscription set is dynamic — e.g. an orchestrator that subscribes to a
 per-user topic when a user appears.
 

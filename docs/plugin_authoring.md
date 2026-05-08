@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for AIO Assistant Core 0.22.3*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -468,7 +468,7 @@ async def on_enable(self):
 @async_log_errors
 async def on_disable(self):
     # framework auto-clears declared and runtime subs after `on_disable`
-    # returns (PluginCore.py:2151-2156)
+    # returns (PluginCore.py:2167-2198)
     pass
 ```
 

@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for AIO Assistant Core 0.22.2*
+*Last updated for AIO Assistant Core 0.22.3*
 
 Reference for the top-level `config.yml` — the file PluginCore reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -317,7 +317,7 @@ matching: `"httpx"` matches `httpx` and `httpx.SOMETHING`, but NOT
 
 In addition to config-driven `logger_levels`, plugins can adjust
 thresholds at runtime via two helpers on the Plugin base class
-(`utils.py:1177-1211`):
+(`utils.py:1237-1275`):
 
 ```python
 self.set_logger_level("noisy_lib", console="MUTE", file="DEBUG")

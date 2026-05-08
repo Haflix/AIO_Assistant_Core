@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for AIO Assistant Core 0.22.3*
 
 Reference manual for the public surface of `utils.Plugin` — the methods and attributes a plugin author calls from inside their own class. Methods on `PluginCore` itself are covered at the end for tooling and harness authors.
 
@@ -40,27 +40,27 @@ All entries cite the source file and line number. Argument types use Python conv
 
 These are abstract — every concrete plugin must define them. See [architecture](./architecture.md) for the lifecycle contract and [plugin authoring](./plugin_authoring.md) for examples.
 
-`Plugin.__init__` is `@final` (`utils.py:1112-1163`). Subclasses MUST NOT override it — declare instance state in `on_load` instead.
+`Plugin.__init__` is `@final` (`utils.py:1172-1223`). Subclasses MUST NOT override it — declare instance state in `on_load` instead.
 
 ### `on_load(self, *args, **kwargs) -> None`
 
-Source: `utils.py:1676-1679`. Synchronous. Called inside `Plugin.__init__`. Must NOT be `async def`.
+Source: `utils.py:1737-1739`. Synchronous. Called inside `Plugin.__init__`. Must NOT be `async def`.
 
 The arguments come from `plugin_config.yml`'s `arguments:` field, unpacked by shape: list/tuple → `*args`, dict → `**kwargs`, anything else → no args.
 
 ### `on_enable(self) -> None`
 
-Source: `utils.py:1682-1685`. May be `async def` or `def`. Called once, after framework registration. Sync versions run on the framework's plugin executor.
+Source: `utils.py:1743-1745`. May be `async def` or `def`. Called once, after framework registration. Sync versions run on the framework's plugin executor.
 
 ### `on_disable(self) -> None`
 
-Source: `utils.py:1688-1691`. May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `PluginCore.close()` (`PluginCore.py:781`) hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
+Source: `utils.py:1749-1751`. May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `PluginCore.close()` (`PluginCore.py:797`) hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
 
 ---
 
 ## Public attributes
 
-Set by `Plugin.__init__` (`utils.py:1112-1163`) before `on_load` runs, then partially overwritten by the framework after `on_load` returns.
+Set by `Plugin.__init__` (`utils.py:1172-1223`) before `on_load` runs, then partially overwritten by the framework after `on_load` returns.
 
 | Name                 | Type             | Description                                                                                                       |
 |----------------------|------------------|-------------------------------------------------------------------------------------------------------------------|
@@ -100,7 +100,7 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 
 ### `await self.execute(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
-Source: `utils.py:1217-1259`.
+Source: `utils.py:1278-1319`.
 
 | Argument | Type | Default | Notes |
 |---|---|---|---|
@@ -124,7 +124,7 @@ Source: `utils.py:1217-1259`.
 
 ### `self.execute_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
-Source: `utils.py:1261-1308`.
+Source: `utils.py:1322-1368`.
 
 Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestException` if no event loop is bound yet. Detects circular sync calls via a per-thread chain and raises `RequestException("Circular sync call: ...")` rather than deadlocking the executor. Bridges to the loop via `asyncio.run_coroutine_threadsafe`. Same args, same return, same `RequestException` on error.
 
@@ -134,17 +134,17 @@ Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestExc
 
 ### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
 
-Source: `utils.py:1311-1353`.
+Source: `utils.py:1371-1413`.
 
 Async generator. Yields each chunk produced by the target generator/async-generator method. If the producer raises mid-stream, the call surfaces as `RequestException`.
 
-No top-level decorator (the `@async_log_errors` line in source is commented out at `utils.py:1310`).
+No top-level decorator (the `@async_log_errors` line in source is commented out at `utils.py:1370`).
 
 ---
 
 ### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
 
-Source: `utils.py:1355-1404` (with inner generator at 1406-1431).
+Source: `utils.py:1416-1464` (with inner generator at 1466-1491).
 
 Sync generator. Pre-start guard fires at call time, not at first iteration.
 
@@ -158,7 +158,7 @@ These methods are how plugins emit and request events.
 
 ### `await self.publish_event(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None) -> int`
 
-Source: `utils.py:1490-1507`.
+Source: `utils.py:1551-1567`.
 
 Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote) the dispatch was scheduled for.
 
@@ -180,13 +180,13 @@ Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote
 
 ### `self.publish_event_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None) -> int`
 
-Source: `utils.py:1509-1527`. Sync equivalent. Pre-start guard included.
+Source: `utils.py:1570-1587`. Sync equivalent. Pre-start guard included.
 
 ---
 
 ### `await self.request_event(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None) -> Any`
 
-Source: `utils.py:1529-1548`.
+Source: `utils.py:1590-1608`.
 
 1:1 ask. Returns the FIRST matching handler's result, where matching order is the insertion order in the topic registry (YAML declaration order plus runtime registrations as they happen).
 
@@ -211,13 +211,13 @@ Local subs are tried first, in insertion order. On no local match, remote candid
 
 ### `self.request_event_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None) -> Any`
 
-Source: `utils.py:1550-1570`. Sync equivalent.
+Source: `utils.py:1611-1630`. Sync equivalent.
 
 ---
 
 ### `async for chunk in self.request_event_stream(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None)`
 
-Source: `utils.py:1572-1591`.
+Source: `utils.py:1632-1651`.
 
 Streaming 1:1 ask. Same selection rules as `request_event`. Pre-first-chunk fall-through is identical (skip `NoLocalSubException` / `NetworkRequestException`, propagate other `RequestException`). Once the first chunk yields, the consumer is committed to that producer — no fall-through past the first yield. The `timeout` is a whole-stream budget enforced by the producer's monotonic deadline.
 
@@ -225,13 +225,13 @@ Streaming 1:1 ask. Same selection rules as `request_event`. Pre-first-chunk fall
 
 ### `for chunk in self.request_event_stream_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None)`
 
-Source: `utils.py:1593-1629`. Sync equivalent. Pre-start guard fires at call time.
+Source: `utils.py:1654-1689`. Sync equivalent. Pre-start guard fires at call time.
 
 ---
 
 ### `topic_vars` constraints
 
-Validated in `PluginCore.py:3933-3981`.
+Validated in `PluginCore.py:3949-3997`.
 
 - Type: `Dict[str, str]` or `None`. A non-dict, non-None value raises `TypeError`.
 - Keys must be `str` (`TypeError` otherwise) and must NOT be in `{"prefix", "plugin_name", "hostname", "plugin_uuid"}` (`ValueError`).
@@ -248,7 +248,7 @@ These exceptions are NOT wrapped — `@async_log_errors` re-raises whatever was 
 
 ### `await self.subscribe(topic, target_access_name, *, target_plugin=None, target_plugin_uuid=None, hosts="any", blocked_hosts=None, authors=None, blocked_authors=None) -> str`
 
-Source: `utils.py:1435-1470`.
+Source: `utils.py:1495-1530`.
 
 Register a subscription at runtime (in addition to the declarative `subscriptions:` block).
 
@@ -266,8 +266,8 @@ Register a subscription at runtime (in addition to the declarative `subscription
 **Returns** `str` — the new `sub_uuid`. Pass this back to `unsubscribe`.
 
 **Raises**
-- `TypeError` if `target_access_name` is empty or non-string (`utils.py:1454-1458`).
-- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` (`PluginCore.py:5032`) and the `target_access_name` re-check at `PluginCore.py:5043-5048`. Topic and filter values are validated identically to YAML load.
+- `TypeError` if `target_access_name` is empty or non-string (`utils.py:1514-1518`).
+- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` (`PluginCore.py:5048`) and the `target_access_name` re-check at `PluginCore.py:5059-5064`. Topic and filter values are validated identically to YAML load.
 
 > **Do not use** the legacy `handler=` keyword form — it was removed. Runtime subs always route to a NAMED endpoint via `target_access_name`.
 
@@ -275,13 +275,13 @@ Register a subscription at runtime (in addition to the declarative `subscription
 
 ### `await self.unsubscribe(subscription_id) -> bool`
 
-Source: `utils.py:1472-1474`. Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
+Source: `utils.py:1532-1534`. Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
 
 ---
 
 ### `self.subscribe_sync(...)` and `self.unsubscribe_sync(...)`
 
-Source: `utils.py:1631-1673`. Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
+Source: `utils.py:1692-1733`. Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
 
 ---
 
@@ -291,15 +291,15 @@ Set per-logger thresholds at runtime. Plugin-source overrides survive config rel
 
 ### `self.set_logger_level(name, *, console=None, file=None) -> None`
 
-Source: `utils.py:1177-1195`. Override threshold on a specific logger. `name` is the dotted logger name (e.g. `"httpx"`). Pass `console=` and/or `file=` strings (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`, `"MUTE"`).
+Source: `utils.py:1237-1255`. Override threshold on a specific logger. `name` is the dotted logger name (e.g. `"httpx"`). Pass `console=` and/or `file=` strings (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`, `"MUTE"`).
 
 ### `self.clear_logger_level(name, *, console=True, file=True) -> None`
 
-Source: `utils.py:1197-1211`. Remove this plugin's overrides on the named logger. Other plugins' overrides on the same logger survive.
+Source: `utils.py:1257-1271`. Remove this plugin's overrides on the named logger. Other plugins' overrides on the same logger survive.
 
 ### `self.list_logger_levels() -> dict`
 
-Source: `utils.py:1213-1215`. Snapshot of all per-logger thresholds.
+Source: `utils.py:1273-1275`. Snapshot of all per-logger thresholds.
 
 ---
 
@@ -331,7 +331,7 @@ All decorators run a `_check_type` check (`decorators.py:9-64`) up front, so app
 
 ## The `Event` object
 
-Source: `utils.py:1694-1747`.
+Source: `utils.py:1754-1807`.
 
 Subscriber handlers receive ONE positional argument: an `Event`. Endpoints called via `execute()` are NOT wrapped — they get whatever the caller passed, unpacked per the [argument-shape contract](#argument-shape-contract-canonical).
 
@@ -366,7 +366,7 @@ In practice, catch `RequestException` — it covers `execute*`, `request_event*`
 
 ## Argument-shape contract (canonical)
 
-From `_call_endpoint` (`PluginCore.py:2822-2853`). Restated here for skim-readers:
+From `_call_endpoint` (`PluginCore.py:2838-2868`). Restated here for skim-readers:
 
 | `args=` value | Endpoint receives                  |
 |---------------|------------------------------------|
@@ -388,56 +388,56 @@ The methods below are on `PluginCore` itself. Plugin authors use the `Plugin` wr
 | Method | Source | Purpose |
 |--------|--------|---------|
 | `PluginCore(config_path: str)` | `PluginCore.py:526` | Constructor. Loads config. Does NOT load plugins or start networking. |
-| `await pc.start()` | `PluginCore.py:666-695` | Initialise background tasks, load plugins, start networking. |
-| `await pc.wait_until_ready()` | `PluginCore.py:624-665` | Idempotent variant — for callers that want lazy init. |
-| `await pc.close()` | `PluginCore.py:697-811` | Graceful shutdown. |
-| `await pc.graceful_shutdown()` | `PluginCore.py:1655-1658` | Alias for `close()`. |
+| `await pc.start()` | `PluginCore.py:674-711` | Initialise background tasks, load plugins, start networking. |
+| `await pc.wait_until_ready()` | `PluginCore.py:624-672` | Idempotent variant — for callers that want lazy init. |
+| `await pc.close()` | `PluginCore.py:713-827` | Graceful shutdown. |
+| `await pc.graceful_shutdown()` | `PluginCore.py:1670-1675` | Alias for `close()`. |
 
 ### Config
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `pc.load_config_yaml(path)` | `PluginCore.py:813-832` | Re-read, validate, re-apply (sync). |
-| `await pc.async_load_config_yaml(path)` | `PluginCore.py:834-836` | Async wrapper. |
-| `pc.list_config_files() -> Dict[str, str]` | `PluginCore.py:877-891` | Paths to main + per-plugin configs. |
-| `pc.read_config_file(path) -> str` | `PluginCore.py:893-913` | Read a known config file. |
-| `pc.save_config_file(path, content, backup=True)` | `PluginCore.py:915-949` | Validate YAML, save. Does NOT auto-reload. |
-| `pc.is_main_config(path) -> bool` | `PluginCore.py:951-953` | |
+| `pc.load_config_yaml(path)` | `PluginCore.py:829-848` | Re-read, validate, re-apply (sync). |
+| `await pc.async_load_config_yaml(path)` | `PluginCore.py:850-852` | Async wrapper. |
+| `pc.list_config_files() -> Dict[str, str]` | `PluginCore.py:894-907` | Paths to main + per-plugin configs. |
+| `pc.read_config_file(path) -> str` | `PluginCore.py:909-929` | Read a known config file. |
+| `pc.save_config_file(path, content, backup=True)` | `PluginCore.py:931-965` | Validate YAML, save. Does NOT auto-reload. |
+| `pc.is_main_config(path) -> bool` | `PluginCore.py:967-969` | |
 
 ### Plugin management
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `await pc.load_plugins()` | `PluginCore.py:955-963` | Load and enable every configured plugin. |
-| `await pc.get_plugins()` | `PluginCore.py:965-971` | Load (without enabling). |
-| `await pc.start_plugins()` | `PluginCore.py:973-991` | Enable all loaded plugins concurrently. |
-| `await pc.load_plugin_with_conf(entry)` | `PluginCore.py:993-1534` | Load one plugin from a config dict. |
-| `await pc.pop_plugin(plugin_name)` | `PluginCore.py:1536-1547` | Disable, remove, unsubscribe. |
-| `await pc.purge_plugins()` | `PluginCore.py:1549-1572` | Pop all. |
-| `await pc.purge_plugins_except(excluded_names)` | `PluginCore.py:1574-1592` | Pop all except listed. |
-| `await pc._reload_plugin(plugin_name)` | `PluginCore.py:2185-2218` | Hot-swap entry point. |
+| `await pc.load_plugins()` | `PluginCore.py:971-979` | Load and enable every configured plugin. |
+| `await pc.get_plugins()` | `PluginCore.py:981-987` | Load (without enabling). |
+| `await pc.start_plugins()` | `PluginCore.py:989-1007` | Enable all loaded plugins concurrently. |
+| `await pc.load_plugin_with_conf(entry)` | `PluginCore.py:1009-1550` | Load one plugin from a config dict. |
+| `await pc.pop_plugin(plugin_name)` | `PluginCore.py:1552-1563` | Disable, remove, unsubscribe. |
+| `await pc.purge_plugins()` | `PluginCore.py:1565-1588` | Pop all. |
+| `await pc.purge_plugins_except(excluded_names)` | `PluginCore.py:1590-1608` | Pop all except listed. |
+| `await pc._reload_plugin(plugin_name)` | `PluginCore.py:2200-2234` | Hot-swap entry point. |
 
 ### Introspection
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `await pc.get_plugin_info(plugin_name) -> Optional[dict]` | `PluginCore.py:1594-1610` | name/version/uuid/enabled/remote/description/arguments. |
-| `await pc.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | `PluginCore.py:1612-1639` | Per-endpoint metadata. |
-| `await pc.list_plugins_state() -> List[dict]` | `PluginCore.py:1641-1652` | name/enabled/description for every plugin. |
-| `await pc.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | `PluginCore.py:2452-2633` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
-| `await pc.find_endpoints_by_tag(tag) -> Optional[List]` | `PluginCore.py:2415-2450` | Tag-based discovery (local + remote). |
+| `await pc.get_plugin_info(plugin_name) -> Optional[dict]` | `PluginCore.py:1610-1626` | name/version/uuid/enabled/remote/description/arguments. |
+| `await pc.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | `PluginCore.py:1628-1655` | Per-endpoint metadata. |
+| `await pc.list_plugins_state() -> List[dict]` | `PluginCore.py:1657-1668` | name/enabled/description for every plugin. |
+| `await pc.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | `PluginCore.py:2468-2649` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
+| `await pc.find_endpoints_by_tag(tag) -> Optional[List]` | `PluginCore.py:2431-2466` | Tag-based discovery (local + remote). |
 
 ### Events and subscriptions (low-level)
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `await pc.publish_event(publisher, event_id, ...)` | `PluginCore.py:4044-4263` | Underlying publish path. |
-| `pc.publish_event_sync(...)` | `PluginCore.py:4392-4421` | Sync. |
-| `await pc.request_event(publisher, event_id, ...)` | `PluginCore.py:4423-4636` | Underlying request path. |
+| `await pc.publish_event(publisher, event_id, ...)` | `PluginCore.py:4060-4279` | Underlying publish path. |
+| `pc.publish_event_sync(...)` | `PluginCore.py:4409-4437` | Sync. |
+| `await pc.request_event(publisher, event_id, ...)` | `PluginCore.py:4440-4629` | Underlying request path. |
 | `pc.request_event_sync(...)` | as above | Sync. |
-| `await pc.request_event_stream(publisher, event_id, ...)` | `PluginCore.py:4638-5005` | Streaming request path. |
-| `await pc.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | `PluginCore.py:5007-5106` | Runtime sub registration with full validation and delta broadcast. |
-| `await pc.unsubscribe_event(sub_uuid) -> bool` | `PluginCore.py:5108-5141` | With remove-delta broadcast. |
+| `await pc.request_event_stream(publisher, event_id, ...)` | `PluginCore.py:4655-4954` | Streaming request path. |
+| `await pc.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | `PluginCore.py:5023-5122` | Runtime sub registration with full validation and delta broadcast. |
+| `await pc.unsubscribe_event(sub_uuid) -> bool` | `PluginCore.py:5124-5157` | With remove-delta broadcast. |
 
 ### Read-mostly attributes
 
