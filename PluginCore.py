@@ -24,6 +24,7 @@ import asyncio
 import time
 import threading
 from collections import deque
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, Callable, Union, Dict, List
 import yaml
@@ -1953,7 +1954,25 @@ class PluginCore:
             # whether on_disable raised, was cancelled, or timed out.
             # Symmetric with rollback in _enable_plugin_under_lock.
             try:
-                await self._unregister_plugin_subscriptions(plugin)
+                try:
+                    await self._unregister_plugin_subscriptions(plugin)
+                except Exception:
+                    # B-050 fix: don't let an unregister failure mask
+                    # the original on_disable exception. Without this
+                    # except, a TimeoutError from on_disable's wait_for
+                    # would be replaced by whatever
+                    # _unregister_plugin_subscriptions raised, and any
+                    # caller's `except asyncio.TimeoutError` would miss
+                    # it. Mirrors the pattern in
+                    # _enable_plugin_under_lock rollback.
+                    self._logger.exception(
+                        "_disable_plugin_under_lock: "
+                        "_unregister_plugin_subscriptions raised for "
+                        "plugin %r — original on_disable exception (if "
+                        "any) still propagates; best-effort cleanup "
+                        "incomplete",
+                        plugin.plugin_name,
+                    )
             finally:
                 # Sync flag flip — guaranteed to run even if the
                 # unregister await above is cancelled. plugin_lock is
@@ -4824,10 +4843,29 @@ class PluginCore:
             # out of the for loop early (without exhausting it). Without
             # this aclose() the async gen's try/finally / async with
             # blocks never run, leaking resources.
+            #
+            # B-055 fix: bound the wait with a 5s timeout so a hanging
+            # handler `finally`/`async with` cleanup can't block this
+            # caller's worker thread forever. On expiry, cancel the
+            # orphaned aclose task so it doesn't leak on the event loop;
+            # CancelledError propagates into the handler's hung await
+            # and unblocks the cleanup eventually.
+            # concurrent.futures.TimeoutError is what
+            # Future.result(timeout=...) raises on expiry (a separate
+            # class from asyncio.TimeoutError, even though they alias to
+            # builtins.TimeoutError on Python 3.11+).
+            fut = asyncio.run_coroutine_threadsafe(
+                async_gen.aclose(), self.main_event_loop
+            )
             try:
-                asyncio.run_coroutine_threadsafe(
-                    async_gen.aclose(), self.main_event_loop
-                ).result()
+                fut.result(timeout=5.0)
+            except concurrent.futures.TimeoutError:
+                fut.cancel()
+                self._logger.warning(
+                    "request_event_stream_sync: aclose() exceeded 5s — "
+                    "underlying handler's finally/async-with cleanup may "
+                    "be blocked; cancelled orphan task"
+                )
             except Exception:
                 pass
 
