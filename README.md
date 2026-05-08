@@ -509,7 +509,7 @@ The event system provides topic-based pub/sub and request-by-topic routing, deco
 
 | Pattern | Method | Description |
 |---|---|---|
-| Fire-and-forget | `publish_event()` / `publish_event_sync()` | One-to-many. All matching subscribers called concurrently, errors logged. Returns the number of subscribers that received the event (int). |
+| Fire-and-forget | `publish_event()` / `publish_event_sync()` | One-to-many. All matching subscribers dispatched concurrently as fire-and-forget tasks; per-sub errors logged. Returns the number of subscribers the dispatch was SCHEDULED for (int) — not a delivery confirmation. Use `request_event()` if you need to verify delivery. |
 | Request-by-event | `request_event()` / `request_event_sync()` | One-to-one. First matching handler called, result returned. |
 | Streaming request | `request_event_stream()` / `request_event_stream_sync()` | One-to-one streaming. |
 
@@ -966,7 +966,7 @@ Fire-and-forget publish for a declared event. All matching subscribers are dispa
 - `payload` (any): Payload forwarded to every subscriber as `event.payload`
 - `hosts` (str/list): `"local"`, `"remote"`, `"any"`, or a specific hostname / list of hostnames (defaults to the event's declared `hosts`)
 
-**Returns**: Number of subscribers that received the event (int — local + remote)
+**Returns**: Number of subscribers the dispatch was scheduled for (int — local + remote, post-filter). This is NOT a delivery guarantee — each per-sub fan-out runs as a fire-and-forget task and the count is computed before those tasks execute. Subs whose handler is missing, has the wrong signature, or raises mid-execution still count toward the return value. Use `request_event()` if you need a real delivery confirmation.
 
 #### `publish_event_sync(event_id, payload=None, hosts=None, ...)`
 

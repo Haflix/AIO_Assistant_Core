@@ -3795,8 +3795,15 @@ class PluginCore:
         """Publish an event (1:N fire-and-forget).
 
         Per PR3 PLAN F + LOCKED L FILTER LOOKUP. Returns the count of
-        local subs the publisher targeted (post-filter). Stage B is
-        LOCAL-only; remote dispatch lands in Stage C.
+        subscribers the dispatch was SCHEDULED for (local + remote,
+        post-filter) — NOT a guarantee of delivery. Each per-sub
+        fan-out runs as a fire-and-forget task; the count is computed
+        and returned BEFORE those tasks execute. Subs whose target
+        plugin is missing, whose handler signature is wrong, or whose
+        handler raises mid-execution all count toward the return
+        value (the per-sub Request resolves with error=True in those
+        cases, but the publisher does not see it). Use ``request_event``
+        when you need an actual delivery confirmation.
 
         Pure declaration model: ``event_id`` MUST exist in
         ``publisher.events``. Disabled events (``enabled: false``)
