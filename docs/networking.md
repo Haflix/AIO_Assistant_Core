@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for AIO Assistant Core 0.22.1*
 
 PluginCore ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
@@ -322,18 +322,29 @@ If a peer is offline at startup, that is fine — heartbeat / discovery loops br
 
 ---
 
-## Cluster bootstrap — pending framework fix
+## Cluster bootstrap
 
-Standing up a brand-new cluster from zero certificates (no node has a `cert.pem` yet) is currently NOT supported by a clean operator workflow.
+Standing up a brand-new cluster from zero certificates (no node has a `cert.pem` yet) follows a one-shot first-boot pattern. `NetworkManager.start()` loads or generates the node's identity BEFORE checking that `peers:` is non-empty, so the very first run on a fresh node always produces `cert.pem` and `key.pem` even if the run cannot complete startup.
 
-The reason is the order of operations inside `NetworkManager.start()` (`networking.py:949-957`): the empty-`peers:` check raises `RuntimeError` BEFORE `_load_or_generate_identity()` runs. A fresh node therefore cannot legally start with an empty trust store to generate its own cert, but it has no other way to obtain one — and the printable-fingerprint CLI helper requires a pre-existing `cert.pem` to read.
+### Per-node bootstrap procedure
 
-This is tracked as a pending framework improvement (internal bug ID **B-068**). Once the fix lands, the supported zero-cert bootstrap path is expected to be one of:
+For each node in the cluster, in any order:
 
-- A dedicated `init-identity` (or equivalent) CLI subcommand that generates `cert.pem` / `key.pem` and prints the fingerprint without booting NetworkManager, OR
-- Reordering `start()` so identity is loaded/generated BEFORE the peers-non-empty check, allowing a one-shot first-boot to produce a cert and exit cleanly.
+1. Install the framework on the node and write `config.yml` with `networking.enabled: true` and an empty `peers: []`.
+2. Run the application once. `start()` loads or generates the node's identity into `keys_dir` (default `_keys/`), logs the fingerprint and cert PEM at INFO level (look for `[NETWORKING] Identity ready`), then raises a `RuntimeError` because `peers:` is empty. This is expected.
+3. Copy the `sha256:...` fingerprint and the cert PEM block from the log. The same data can be re-read at any time with `python -m networking_cli show-fingerprint --config <config.yml>`.
+4. Exchange fingerprints + cert PEMs between nodes (out of band: secure messaging, encrypted file share, etc.). Each node's `peers:` block needs at least one entry per other node it wants to talk to, with that peer's `hostname`, `address`, `cert_file` or `cert_pem`, and `fingerprint`.
+5. Start each node again. With `peers:` populated, `start()` proceeds past the empty-peers check, builds the SSL context, opens the socket, and begins heartbeat / discovery loops.
 
-Until the fix lands, fresh-cluster bootstrap requires generating cert pairs out-of-band (for example, with a one-off OpenSSL or `cryptography` script that mirrors `_load_or_generate_identity`) before any node is started with `networking.enabled: true`. Document and pin that out-of-band step locally; do not rely on it for production rollout planning.
+### Adding a new node to an existing cluster
+
+Same procedure as above for the new node only. On the existing nodes, append a peer entry pointing at the new node and restart them (or hot-reload config if the application supports it).
+
+### Why the cert is generated even on a failed first boot
+
+The empty-peers check is the right place to fail — without peers the mTLS trust store is empty, and OpenSSL would otherwise reject every connection with an opaque error. But the operator needs the cert and fingerprint to populate `peers:` on other nodes. Loading or generating identity FIRST makes the failed first boot productive: the operator gets a clear error AND the data they need to fix it.
+
+The fingerprint and cert PEM are logged at INFO. If the console is configured at WARNING+ they will only appear in the file log — adjust `general.console_log_level` temporarily or read `_logs/` if that is the case.
 
 ---
 

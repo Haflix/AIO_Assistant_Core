@@ -941,20 +941,34 @@ class NetworkManager:
     async def start(self):
         """Starts socket server without blocking the main loop.
 
-        K-3 (B-066): identity is loaded/generated, peers must be configured
-        non-empty (else the trust store is empty and OpenSSL rejects every
+        Bootstrap order (B-068 fix): identity is loaded or generated FIRST,
+        then peers is checked. This lets a fresh-cluster operator boot once
+        with empty peers, get a clear error, AND walk away with a valid
+        cert.pem / key.pem on disk plus the fingerprint and cert PEM logged
+        at INFO. The operator can then share the fingerprint with peer
+        nodes, populate networking.peers in config, and restart.
+
+        K-3 (B-066): peers must still be configured non-empty (else the
+        mTLS trust store would be empty and OpenSSL would reject every
         connection with an opaque error — fail fast with an actionable
         message instead).
         """
+        self._load_or_generate_identity()
         if not self.peers:
             raise RuntimeError(
                 "[NETWORKING] Cannot start with empty peers list. The mTLS "
                 "trust store would be empty, causing every incoming and outgoing "
-                "connection to fail with an opaque OpenSSL error. Either:\n"
-                "  - Add at least one peer to networking.peers in your config, OR\n"
+                "connection to fail with an opaque OpenSSL error.\n"
+                f"This node's identity has been loaded or generated under "
+                f"{self.keys_dir}. The fingerprint and cert PEM are in the "
+                "log at INFO level (search for '[NETWORKING] Identity ready'). "
+                "You can also re-print the fingerprint at any time with "
+                "`python -m networking_cli show-fingerprint --config <config.yml>`. "
+                "Either:\n"
+                "  - Add at least one peer to networking.peers in your config "
+                "(use the cert PEM and fingerprint other nodes have logged), OR\n"
                 "  - Disable networking entirely by removing the networking section."
             )
-        self._load_or_generate_identity()
         self._logger.info(
             f"[SERVER] Starting server: port={self.port}, discover_nodes={self.discover_nodes}, "
             f"direct_discoverable={self.direct_discoverable}, auto_discoverable={self.auto_discoverable}, "
