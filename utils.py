@@ -978,14 +978,17 @@ class ConfigUtil:
         plugin_core.plugin_package = general_config.get("plugin_package", "plugins")
         plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
 
-        # Stage O: readiness gate timeout. Default 60.0 seconds; spec
+        # Plugin-readiness gate timeout. Default 60.0 seconds; spec
         # forbids reducing below 30 in normal operation but tests may
         # override via the same config key for cycle-timeout repros.
         # Bad values fall back to default with a warning so a typo can
         # never silently zero the timeout.
-        from PluginCore import _STAGE_O_DEFAULT_READY_TIMEOUT  # local import — avoids circular import at module load
+        from PluginCore import (  # local import — avoids circular import at module load
+            DEFAULT_PLUGIN_READY_TIMEOUT,
+            DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+        )
         raw_ready_timeout = general_config.get(
-            "plugin_ready_timeout", _STAGE_O_DEFAULT_READY_TIMEOUT
+            "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
         )
         try:
             ready_timeout = float(raw_ready_timeout)
@@ -995,10 +998,33 @@ class ConfigUtil:
             plugin_core._logger.warning(
                 "Invalid general.plugin_ready_timeout=%r; defaulting to %.1f",
                 raw_ready_timeout,
-                _STAGE_O_DEFAULT_READY_TIMEOUT,
+                DEFAULT_PLUGIN_READY_TIMEOUT,
             )
-            ready_timeout = _STAGE_O_DEFAULT_READY_TIMEOUT
-        plugin_core._stage_o_ready_timeout = ready_timeout
+            ready_timeout = DEFAULT_PLUGIN_READY_TIMEOUT
+        plugin_core.plugin_ready_timeout = ready_timeout
+
+        # Plugin-disable timeout. Default 30.0 seconds; matches
+        # close()'s on_disable cap. Wraps user on_disable in
+        # asyncio.wait_for in _disable_plugin / _pop_plugin_under_lock
+        # so a misbehaving on_disable can't hang pop_plugin /
+        # _reload_plugin / purge_plugins indefinitely. Bad values fall
+        # back to default with a warning so a typo can never silently
+        # zero the timeout.
+        raw_disable_timeout = general_config.get(
+            "plugin_disable_timeout", DEFAULT_PLUGIN_DISABLE_TIMEOUT
+        )
+        try:
+            disable_timeout = float(raw_disable_timeout)
+            if disable_timeout <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid general.plugin_disable_timeout=%r; defaulting to %.1f",
+                raw_disable_timeout,
+                DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+            )
+            disable_timeout = DEFAULT_PLUGIN_DISABLE_TIMEOUT
+        plugin_core.plugin_disable_timeout = disable_timeout
 
         networking_config = plugin_core.yaml_config.get("networking")
 

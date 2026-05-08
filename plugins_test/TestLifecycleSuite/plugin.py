@@ -29,7 +29,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.2"
+SUITE_VERSION = "0.3.3"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -312,42 +312,68 @@ class TestLifecycleSuite(Plugin):
             await self.execute(VICTIM, "configure",
                                {"on_disable_hangs_secs": 120.0})
 
+            # Override runtime disable timeout for fast test (production
+            # default 30s; 1s here so the timeout path runs within a few
+            # seconds rather than 30+).
+            core = self._plugin_core
+            saved_timeout = getattr(core, "plugin_disable_timeout", 30.0)
+            core.plugin_disable_timeout = 1.0
             try:
+                # B-009 regression guard: pre-fix, _reload_plugin's
+                # _disable_plugin call had no on_disable timeout — a
+                # hanging on_disable blocked the lifecycle lock
+                # indefinitely. Fix wraps on_disable in
+                # asyncio.wait_for(timeout=plugin_disable_timeout) in
+                # both _disable_plugin and _pop_plugin_under_lock.
                 await asyncio.wait_for(
-                    self._plugin_core._reload_plugin(VICTIM),
-                    timeout=10.0,
+                    core._reload_plugin(VICTIM),
+                    timeout=5.0,
                 )
-                # Reload completed within 10s — bug fixed (or hang config didn't take)
-                return
             except asyncio.TimeoutError:
-                c.set_marker("outer_wait_for_fired")
-                # Recovery: forcibly clear the hang flag on the (still
-                # reachable) victim instance, then pop it cleanly.
-                victim = self._plugin_core.plugins.get(VICTIM)
+                # Outer guard fired — fix not in place. Recovery + assert.
+                victim = core.plugins.get(VICTIM)
                 if victim is not None:
                     victim._on_disable_hangs_secs = 0.0
                     victim.enabled = False
                     try:
-                        await self._plugin_core.pop_plugin(VICTIM)
+                        await core.pop_plugin(VICTIM)
                     except Exception:
                         pass
-                # Re-load via yaml entry for subsequent cases
                 entry = self._find_yaml_entry(VICTIM)
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await core.load_plugin_with_conf(entry)
+                        await core._enable_plugin(VICTIM)
                     except Exception:
                         pass
-                raise AssertionError("hang_guard fired: outer_wait_for_fired")
+                raise AssertionError(
+                    "B-009 regression: _reload_plugin did not return "
+                    "within 5s despite 1s on_disable timeout"
+                )
+            finally:
+                core.plugin_disable_timeout = saved_timeout
+                # Recover: clear hang flag on whichever instance
+                # survived, ensure VICTIM is loaded + enabled for
+                # subsequent cases.
+                victim = core.plugins.get(VICTIM)
+                if victim is not None:
+                    victim._on_disable_hangs_secs = 0.0
+                if VICTIM not in core.plugins:
+                    entry = self._find_yaml_entry(VICTIM)
+                    if entry:
+                        entry["enabled"] = True
+                        try:
+                            await core.load_plugin_with_conf(entry)
+                            await core._enable_plugin(VICTIM)
+                        except Exception:
+                            pass
+                await self._ensure_victim_clean()
 
         await rec.run_case(
             "lifecycle.B-009.disable_no_timeout", body,
-            tags=("bug_repro",), bug_ids=("B-009",),
-            expected_status="fail",
-            expected_signature={"marker": "outer_wait_for_fired"},
-            hard_timeout_s=25.0,
+            tags=("bug_repro", "regression_guard"), bug_ids=("B-009",),
+            hard_timeout_s=15.0,
             **kw,
         )
 
@@ -1076,8 +1102,8 @@ class TestLifecycleSuite(Plugin):
             await self._ensure_victim_clean()
             v = self._plugin_core.plugins[VICTIM]
             core = self._plugin_core
-            saved_timeout = getattr(core, "_stage_o_ready_timeout", 60.0)
-            core._stage_o_ready_timeout = 1.0
+            saved_timeout = getattr(core, "plugin_ready_timeout", 60.0)
+            core.plugin_ready_timeout = 1.0
             v.ready.clear()
             try:
                 t0 = asyncio.get_event_loop().time()
@@ -1104,7 +1130,7 @@ class TestLifecycleSuite(Plugin):
                 v = self._plugin_core.plugins.get(VICTIM)
                 if v is not None:
                     v.ready.set()
-                core._stage_o_ready_timeout = saved_timeout
+                core.plugin_ready_timeout = saved_timeout
 
         await rec.run_case(
             "lifecycle.ready.cycle_timeout",

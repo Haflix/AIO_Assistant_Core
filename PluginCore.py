@@ -67,10 +67,22 @@ _RESERVED_IDENTIFIER_NAMES = frozenset(
     {"system", "general", "any", "remote", "local"}
 )
 
-# Stage O: default readiness-gate timeout (seconds). Per spec must not
-# be reduced below 30 in normal operation; the test suite overrides via
-# `general.plugin_ready_timeout` for the cycle-timeout repro.
-_STAGE_O_DEFAULT_READY_TIMEOUT: float = 60.0
+# Default plugin-readiness gate timeout (seconds). Used by
+# _wait_for_plugin_ready before dispatching to a plugin endpoint;
+# raises asyncio.TimeoutError on expiry. Per spec must not be reduced
+# below 30 in normal operation. Configurable via
+# general.plugin_ready_timeout in config.yml; tests may override
+# self.plugin_ready_timeout directly.
+DEFAULT_PLUGIN_READY_TIMEOUT: float = 60.0
+
+# Default plugin-disable timeout (seconds). Wraps user on_disable in
+# asyncio.wait_for in _disable_plugin / _pop_plugin_under_lock so a
+# misbehaving on_disable can't hang pop_plugin / _reload_plugin /
+# purge_plugins indefinitely. close() already had its own 30s; this
+# brings runtime hot-reload paths to parity. Configurable via
+# general.plugin_disable_timeout in config.yml; tests may override
+# self.plugin_disable_timeout directly.
+DEFAULT_PLUGIN_DISABLE_TIMEOUT: float = 30.0
 
 
 def _validate_identifier_name(name, *, context: str) -> None:
@@ -738,13 +750,13 @@ class PluginCore:
                 continue
             self._logger.info("Shutdown: disabling %s...", name)
             try:
-                # R1 MED-1 fix: delegate to _disable_plugin_under_lock
-                # instead of duplicating the lifecycle_ready.clear() +
-                # on_disable + unregister + enabled=False sequence
-                # inline. The 30s on_disable timeout is threaded through
-                # via the on_disable_timeout kwarg (runtime callers pass
-                # None to preserve existing no-timeout-on-disable
-                # behavior; only shutdown caps the user callback).
+                # Delegate to _disable_plugin_under_lock instead of
+                # duplicating the lifecycle_ready.clear() + on_disable +
+                # unregister + enabled=False sequence inline. The 30s
+                # on_disable timeout is hardcoded here (shutdown cap);
+                # runtime callers (_disable_plugin, _pop_plugin_under_lock)
+                # use the configurable plugin_disable_timeout per the
+                # B-009 fix.
                 #
                 # Stage O: each plugin's lifecycle_lock instead of the
                 # global plugin_lock. Concurrent ops (e.g. an in-flight
@@ -1690,7 +1702,7 @@ class PluginCore:
         already set.
         """
         timeout = getattr(
-            self, "_stage_o_ready_timeout", _STAGE_O_DEFAULT_READY_TIMEOUT
+            self, "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
         )
         loop = self.main_event_loop or asyncio.get_event_loop()
         start = loop.time()
@@ -1803,11 +1815,15 @@ class PluginCore:
                 # doesn't catch it) but the outer finally chain still
                 # runs, guaranteeing the flag flip.
                 #
-                # No on_disable_timeout here: matches runtime
-                # _disable_plugin's no-timeout policy (B-009 is
-                # deferred). A misbehaving on_disable in rollback can
-                # hold lifecycle_lock until cancelled — same exposure
-                # as a misbehaving runtime on_disable.
+                # No on_disable_timeout here: rollback calls
+                # plugin.on_disable() directly rather than going
+                # through _disable_plugin_under_lock, so it does not
+                # share runtime _disable_plugin's wait_for. A
+                # misbehaving on_disable in rollback can still hold
+                # lifecycle_lock until cancelled. Out of scope for
+                # B-009 (which targeted the runtime _disable_plugin /
+                # _pop_plugin_under_lock paths); track separately if
+                # rollback hangs become a real issue.
                 try:
                     try:
                         if asyncio.iscoroutinefunction(plugin.on_disable):
@@ -1858,11 +1874,29 @@ class PluginCore:
         on_disable returns. User code can publish/receive events during
         shutdown teardown.
 
-        R1 MED-1 fix: optional ``on_disable_timeout`` wraps the user
-        on_disable callback in ``asyncio.wait_for``. ``close()`` passes
-        30.0 to bound shutdown; runtime callers (pop_plugin,
-        _reload_plugin, _disable_plugin) pass None to preserve the
-        existing "no per-call timeout on disable at runtime" behavior.
+        Optional ``on_disable_timeout`` wraps the user on_disable
+        callback in ``asyncio.wait_for``. On expiry, raises
+        ``asyncio.TimeoutError``; the finally block still runs the
+        unregister + ``enabled = False`` flip, so callers that catch
+        the TimeoutError can safely treat the plugin as disabled.
+        Callers who do NOT want a timeout pass None.
+
+        Sync ``on_disable`` caveat: ``wait_for`` cancels the awaitable
+        but cannot interrupt a thread blocked inside the user's
+        synchronous callback running in ``_plugin_executor``. The
+        event loop unblocks on time and the framework's bookkeeping
+        (subs, ``enabled``, dict pop) all complete; the worker thread
+        keeps running until the user code naturally returns and may
+        hold thread-pool capacity / external resources until then.
+
+        Callers and their timeout values:
+          - ``close()``                → 30.0 (hardcoded shutdown cap)
+          - ``_disable_plugin``        → ``plugin_disable_timeout`` (B-009 fix)
+          - ``_pop_plugin_under_lock`` → ``plugin_disable_timeout`` (B-009 fix)
+
+        ``_enable_plugin_under_lock``'s rollback-on-failure path calls
+        ``plugin.on_disable()`` directly (not via this helper) and is
+        deliberately not timed — see comment at the rollback site.
         """
         async with self.plugin_lock:
             plugin = self.plugins.get(plugin_name)
@@ -1944,7 +1978,33 @@ class PluginCore:
                     )
 
         if plugin_name in self.plugins and self.plugins[plugin_name].enabled:
-            await self._disable_plugin_under_lock(plugin_name)
+            # B-009 fix: wrap user on_disable in asyncio.wait_for via
+            # the configured runtime timeout (default 30s) so a hanging
+            # on_disable can't block this plugin's lifecycle_lock
+            # indefinitely. Symmetric with close()'s 30s cap.
+            disable_timeout = getattr(
+                self,
+                "plugin_disable_timeout",
+                DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+            )
+            try:
+                await self._disable_plugin_under_lock(
+                    plugin_name, on_disable_timeout=disable_timeout
+                )
+            except asyncio.TimeoutError:
+                # B-009: on_disable exceeded the runtime timeout. The
+                # under-lock body's finally already flipped enabled=
+                # False and unregistered subs, so it's safe to proceed
+                # with the dict pop below. Without this catch the
+                # TimeoutError propagates up and leaves the plugin
+                # half-removed (still in self.plugins / plugins_by_uuid,
+                # topics + logger-level entries never cleaned).
+                self._logger.warning(
+                    "pop_plugin %r: on_disable exceeded %.1fs timeout; "
+                    "continuing with pop (subs already unregistered, "
+                    "enabled flag already cleared)",
+                    plugin_name, disable_timeout,
+                )
 
         async with self.plugin_lock:
             plugin = self.plugins.pop(plugin_name, None)
@@ -1973,10 +2033,30 @@ class PluginCore:
         """Public-facing disable that acquires the per-plugin
         lifecycle_lock (Stage O) and delegates to
         _disable_plugin_under_lock. Waits for any in-progress
-        _enable_plugin on the same name to complete first."""
+        _enable_plugin on the same name to complete first.
+
+        B-009 fix: user on_disable wrapped in asyncio.wait_for via
+        on_disable_timeout — symmetric with close()'s 30s cap.
+        Configurable via general.plugin_disable_timeout. On timeout
+        the under-lock body's finally still unregisters subs and
+        flips enabled=False; this wrapper logs and returns cleanly
+        rather than propagating asyncio.TimeoutError to callers
+        (parity with close()'s per-plugin TimeoutError catch).
+        """
+        disable_timeout = getattr(
+            self, "plugin_disable_timeout", DEFAULT_PLUGIN_DISABLE_TIMEOUT
+        )
         lifecycle_lock = self._get_lifecycle_lock(plugin_name)
         async with lifecycle_lock:
-            await self._disable_plugin_under_lock(plugin_name)
+            try:
+                await self._disable_plugin_under_lock(
+                    plugin_name, on_disable_timeout=disable_timeout
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "_disable_plugin %r: on_disable exceeded %.1fs timeout",
+                    plugin_name, disable_timeout,
+                )
 
     async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
         """Register every YAML-declared subscription for ``plugin`` per
@@ -2583,8 +2663,8 @@ class PluginCore:
                 except asyncio.TimeoutError:
                     timeout = getattr(
                         self,
-                        "_stage_o_ready_timeout",
-                        _STAGE_O_DEFAULT_READY_TIMEOUT,
+                        "plugin_ready_timeout",
+                        DEFAULT_PLUGIN_READY_TIMEOUT,
                     )
                     await self._set_request_result(
                         request,
@@ -2775,8 +2855,8 @@ class PluginCore:
                 except asyncio.TimeoutError:
                     timeout = getattr(
                         self,
-                        "_stage_o_ready_timeout",
-                        _STAGE_O_DEFAULT_READY_TIMEOUT,
+                        "plugin_ready_timeout",
+                        DEFAULT_PLUGIN_READY_TIMEOUT,
                     )
                     await self._set_gen_request_result(
                         request,
@@ -4496,8 +4576,8 @@ class PluginCore:
             except asyncio.TimeoutError as e:
                 ready_timeout = getattr(
                     self,
-                    "_stage_o_ready_timeout",
-                    _STAGE_O_DEFAULT_READY_TIMEOUT,
+                    "plugin_ready_timeout",
+                    DEFAULT_PLUGIN_READY_TIMEOUT,
                 )
                 raise RequestException(
                     f"request_event_stream {event_id!r}: target plugin "
