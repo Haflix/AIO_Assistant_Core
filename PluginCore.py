@@ -3026,6 +3026,182 @@ class PluginCore:
                     request, f"Unhandled error processing stream request: {e}", True
                 )
 
+    async def _process_request_event_stream(
+        self,
+        request: GeneratorRequest,
+        target_plugin: Plugin,
+        endpoint: dict,
+        event_meta: Event,
+        timeout: Optional[float] = None,
+        caller_chain: Optional[tuple] = None,
+    ) -> None:
+        """Producer for request_event_stream LOCAL fan-out (B-054 fix).
+
+        Mirrors _process_request_stream but for the topic-based
+        streaming path. Iterates the handler (async or sync generator),
+        wraps the first chunk in Event metadata (LOCKED I), and pushes
+        chunks into request.queue. The consumer side
+        (request_event_stream) reads from request.get_queue_stream()
+        and yields to the caller.
+
+        Spawned via _spawn_tracked, so close()'s 30s drain catches
+        in-flight streams and pop_plugin's pending-request walk can
+        fail the GeneratorRequest entry.
+
+        timeout is passed as a parameter (NOT read from
+        request.timeout_duration which is intentionally None to disable
+        get_queue_stream's redundant consumer-side timeout enforcement
+        — see consumer-site comment in request_event_stream).
+        """
+        try:
+            internal = endpoint.get("internal_name") or request.target_method
+            func = getattr(target_plugin, internal, None)
+            if func is None or not (
+                inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func)
+            ):
+                # Defense-in-depth — request_event_stream's consumer
+                # body checks this before spawning, so this branch is
+                # normally unreachable.
+                await self._set_gen_request_result(
+                    request,
+                    "request_event_stream: handler is not a generator function",
+                    True,
+                )
+                return
+
+            # Q8: timeout = whole-stream budget. Tracked via per-chunk
+            # asyncio.wait_for with the residual deadline.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout if timeout is not None else None
+
+            def _residual() -> Optional[float]:
+                if deadline is None:
+                    return None
+                rem = deadline - loop.time()
+                if rem <= 0:
+                    raise RequestException(
+                        f"request_event_stream timed out after "
+                        f"{timeout}s (whole-stream budget per Q8)"
+                    )
+                return rem
+
+            first = True
+
+            if inspect.isasyncgenfunction(func):
+                ait = func(event_meta).__aiter__()
+                try:
+                    while True:
+                        rem = _residual()
+                        try:
+                            if rem is None:
+                                chunk = await ait.__anext__()
+                            else:
+                                chunk = await asyncio.wait_for(
+                                    ait.__anext__(), timeout=rem
+                                )
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError as e:
+                            raise RequestException(
+                                f"request_event_stream timed out after "
+                                f"{timeout}s (whole-stream budget per Q8)"
+                            ) from e
+                        if first:
+                            first = False
+                            wrapped = Event(
+                                topic=event_meta.topic,
+                                payload=chunk,
+                                author=event_meta.author,
+                                author_id=event_meta.author_id,
+                                author_host=event_meta.author_host,
+                                subscription_id=event_meta.subscription_id,
+                                timestamp=event_meta.timestamp,
+                            )
+                            await request.queue.put((wrapped, False, False))
+                        else:
+                            await request.queue.put((chunk, False, False))
+                finally:
+                    with contextlib.suppress(Exception):
+                        await ait.aclose()
+            else:
+                # Sync generator branch — chain propagation +
+                # sync_dispatcher.executor (per Q17 + C3, this IS
+                # subscriber dispatch, so use the dedicated subscriber
+                # pool — NOT _plugin_executor like _process_request_stream
+                # uses for sync endpoints).
+                sentinel = object()
+                gen = func(event_meta)
+                # Mirrors current inline code (PluginCore.py:4780-4784):
+                # request_event_stream_sync passes non-None caller_chain;
+                # Plugin.request_event_stream (utils.py:1572) does NOT,
+                # so async callers leave it as None — fallback reads
+                # the loop thread's threadlocal (always () in current
+                # code, kept defensively for forward-compat).
+                stream_chain = (
+                    caller_chain
+                    if caller_chain is not None
+                    else getattr(_sync_call_chain, "chain", ())
+                )
+
+                def _next_with_chain(g, sent, ch):
+                    _sync_call_chain.chain = ch
+                    try:
+                        return next(g, sent)
+                    finally:
+                        _sync_call_chain.chain = ()
+
+                try:
+                    while True:
+                        rem = _residual()
+                        fut = loop.run_in_executor(
+                            self.sync_dispatcher.executor,
+                            _next_with_chain, gen, sentinel, stream_chain,
+                        )
+                        try:
+                            if rem is None:
+                                chunk = await fut
+                            else:
+                                chunk = await asyncio.wait_for(
+                                    fut, timeout=rem
+                                )
+                        except asyncio.TimeoutError as e:
+                            raise RequestException(
+                                f"request_event_stream timed out after "
+                                f"{timeout}s (whole-stream budget per Q8)"
+                            ) from e
+                        if chunk is sentinel:
+                            break
+                        if first:
+                            first = False
+                            wrapped = Event(
+                                topic=event_meta.topic,
+                                payload=chunk,
+                                author=event_meta.author,
+                                author_id=event_meta.author_id,
+                                author_host=event_meta.author_host,
+                                subscription_id=event_meta.subscription_id,
+                                timestamp=event_meta.timestamp,
+                            )
+                            await request.queue.put((wrapped, False, False))
+                        else:
+                            await request.queue.put((chunk, False, False))
+                finally:
+                    with contextlib.suppress(Exception):
+                        gen.close()
+
+            # Normal completion — push EndOfQueue terminator + resolve future.
+            await self._set_gen_request_result(request)
+        except RequestException as e:
+            if not request._future.done():
+                await self._set_gen_request_result(request, str(e), True)
+        except Exception as e:
+            if not request._future.done():
+                await self._set_gen_request_result(
+                    request,
+                    f"Unhandled error in request_event_stream producer: {e}",
+                    True,
+                )
+
     @async_handle_errors(None)
     async def _set_request_result(
         self, request: Request, result: Any, error: bool = False
@@ -4701,146 +4877,65 @@ class PluginCore:
             timestamp=now_ts,
         )
 
-        # Q8: timeout = whole-stream budget. Tracked via per-chunk
-        # asyncio.wait_for with the residual deadline. Caller passing
-        # timeout=N gets N seconds total across all chunks; on expiry
-        # raises RequestException("...timed out").
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout if timeout is not None else None
+        # B-054 fix: route through GeneratorRequest + _spawn_tracked
+        # so close()'s 30s drain catches the in-flight stream and
+        # pop_plugin's pending-request walk can fail the Request when
+        # the target plugin is unloaded mid-stream.
+        #
+        # CRITICAL — pass timeout=None to GeneratorRequest. The
+        # timeout we received is enforced by the producer's own
+        # _residual() (loop.time() monotonic deadline). If we also
+        # passed it here, get_queue_stream (utils.py:1999/2013)
+        # would enforce it independently with wall-clock time.time(),
+        # producing a double-trigger race. The current inline code
+        # had NO consumer-side get_queue_stream timeout, so timeout=
+        # None here preserves single-source-of-truth semantics.
+        request = GeneratorRequest(
+            author_host=self.hostname,
+            plugin=local_match.target_plugin or local_match.plugin_name,
+            method=local_match.target_access_name,
+            args=payload,
+            plugin_uuid=local_match.target_plugin_uuid,
+            target_hosts="local",
+            blocked_hosts=None,
+            author=publisher.plugin_name,
+            author_id=publisher.plugin_uuid,
+            timeout=None,  # B-054: producer enforces, see above
+            request_id=None,
+            event_loop=self.main_event_loop,
+            kind="request_event_stream",
+            topic=resolved_topic,
+            origin_subscription_id=event_meta.subscription_id,
+            timestamp=now_ts,
+            requester_id=local_match.plugin_uuid,
+        )
+        async with self.request_lock:
+            self.requests[request.id] = request
 
-        def _residual() -> Optional[float]:
-            if deadline is None:
-                return None
-            rem = deadline - loop.time()
-            if rem <= 0:
-                raise RequestException(
-                    f"request_event_stream {event_id!r} timed out after "
-                    f"{timeout}s (whole-stream budget per Q8)"
-                )
-            return rem
+        producer_task = self._spawn_tracked(
+            self._process_request_event_stream(
+                request, target_plugin, endpoint, event_meta,
+                timeout=timeout,
+                caller_chain=_caller_chain,
+            ),
+            name=f"event_stream:{request.target_plugin}.{request.target_method}<-{resolved_topic}",
+        )
+        request._producer_task = producer_task
 
-        first = True
-        # The handler is a plain endpoint generator — pass the Event as
-        # single positional argument, matching the non-streaming
-        # subscriber-handler convention (LOCKED I).
-        if inspect.isasyncgenfunction(func):
-            ait = func(event_meta).__aiter__()
-            try:
-                while True:
-                    rem = _residual()
-                    try:
-                        if rem is None:
-                            chunk = await ait.__anext__()
-                        else:
-                            chunk = await asyncio.wait_for(
-                                ait.__anext__(), timeout=rem
-                            )
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.TimeoutError as e:
-                        raise RequestException(
-                            f"request_event_stream {event_id!r} timed out after "
-                            f"{timeout}s (whole-stream budget per Q8)"
-                        ) from e
-                    if first:
-                        first = False
-                        # Yield Event-shaped wrapper: event with payload =
-                        # first chunk.
-                        wrapped = Event(
-                            topic=resolved_topic,
-                            payload=chunk,
-                            author=publisher.plugin_name,
-                            author_id=publisher.plugin_uuid,
-                            author_host=self.hostname,
-                            subscription_id=event_meta.subscription_id,
-                            timestamp=event_meta.timestamp,
-                        )
-                        yield wrapped
-                    else:
-                        yield chunk
-            finally:
-                # Close async generator on ANY exit path (timeout,
-                # caller-break, exception). Without aclose() the handler's
-                # `try/finally` and `async with` blocks never run, leaking
-                # resources held by the generator.
-                with contextlib.suppress(Exception):
-                    await ait.aclose()
-        else:
-            sentinel = object()
-            gen = func(event_meta)
-
-            # C10: thread the publisher's sync call chain into the
-            # SyncDispatcher worker thread before each `next()` call so
-            # cycle detection works for sync generators that call
-            # execute_sync internally. _caller_chain is set by the sync
-            # wrapper (request_event_stream_sync); falls back to the
-            # event loop's threadlocal otherwise (= () for async-loop
-            # callers; only sync callers passing through the wrapper
-            # populate it meaningfully).
-            stream_chain = (
-                _caller_chain
-                if _caller_chain is not None
-                else getattr(_sync_call_chain, "chain", ())
-            )
-
-            def _next_with_chain(g, sent, ch):
-                _sync_call_chain.chain = ch
-                try:
-                    return next(g, sent)
-                finally:
-                    _sync_call_chain.chain = ()
-
-            try:
-                while True:
-                    rem = _residual()
-                    # Sync handler iteration runs on the SyncDispatcher pool
-                    # per Q17 + C3 (NOT asyncio.to_thread, which uses the
-                    # default executor and breaks the executor isolation
-                    # invariant).
-                    fut = loop.run_in_executor(
-                        self.sync_dispatcher.executor,
-                        _next_with_chain, gen, sentinel, stream_chain,
+        try:
+            async for result, error, _ in request.get_queue_stream():
+                if error:
+                    self._logger.warning(
+                        f"Error in request_event_stream {event_id!r} "
+                        f"(GenReq-ID: {request.id}): {result}. You can "
+                        f"check the logs for this Req-ID."
                     )
-                    try:
-                        if rem is None:
-                            chunk = await fut
-                        else:
-                            chunk = await asyncio.wait_for(fut, timeout=rem)
-                    except asyncio.TimeoutError as e:
-                        # asyncio.wait_for cancels the future but the
-                        # underlying thread can't be interrupted — let
-                        # the finally below close the generator so its
-                        # try/finally blocks still run (best-effort: the
-                        # thread may still be advancing gen at this
-                        # moment, gen.close() races with that).
-                        raise RequestException(
-                            f"request_event_stream {event_id!r} timed out after "
-                            f"{timeout}s (whole-stream budget per Q8)"
-                        ) from e
-                    if chunk is sentinel:
-                        break
-                    if first:
-                        first = False
-                        wrapped = Event(
-                            topic=resolved_topic,
-                            payload=chunk,
-                            author=publisher.plugin_name,
-                            author_id=publisher.plugin_uuid,
-                            author_host=self.hostname,
-                            subscription_id=event_meta.subscription_id,
-                            timestamp=event_meta.timestamp,
-                        )
-                        yield wrapped
-                    else:
-                        yield chunk
-            finally:
-                # Close sync generator on ANY exit path. Mirrors the
-                # async branch's aclose() — invokes the handler's
-                # try/finally / with cleanup blocks. suppress because
-                # close() can raise GeneratorExit/RuntimeError if the
-                # generator is mid-step on a worker thread.
-                with contextlib.suppress(Exception):
-                    gen.close()
+                    raise RequestException(result)
+                yield result
+        finally:
+            # Mark for cleanup. Cancels the producer task on early
+            # break (B-002 pattern). Mirrors execute_stream's pattern.
+            await request.set_collected()
 
     @gen_log_errors
     def request_event_stream_sync(
