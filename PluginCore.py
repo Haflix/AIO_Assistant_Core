@@ -84,6 +84,18 @@ DEFAULT_PLUGIN_READY_TIMEOUT: float = 60.0
 # self.plugin_disable_timeout directly.
 DEFAULT_PLUGIN_DISABLE_TIMEOUT: float = 30.0
 
+# Default cleanup_requests interval (seconds). Two coupled values:
+# (1) running_loop sleeps this long between cleanup_requests ticks,
+# and (2) cleanup_requests reaps collected Request entries whose
+# (finished_at OR created_at) is older than this interval. Coupling
+# the tick rate to the reap window guarantees a collected entry is
+# observed for at least one tick before being reaped, so a consumer
+# that just collected can still read the final state. Configurable
+# via general.cleanup_request_interval in config.yml; tests may
+# override self.cleanup_request_interval directly to speed up
+# eventual-reap assertions.
+DEFAULT_CLEANUP_REQUEST_INTERVAL: float = 10.0
+
 
 def _validate_identifier_name(name, *, context: str) -> None:
     """Validate that ``name`` is a Python-identifier-style string and not in
@@ -3076,20 +3088,33 @@ class PluginCore:
                 self._logger.exception(
                     "running_loop: cleanup tick raised; continuing"
                 )
-            await asyncio.sleep(10)
+            interval = getattr(
+                self,
+                "cleanup_request_interval",
+                DEFAULT_CLEANUP_REQUEST_INTERVAL,
+            )
+            await asyncio.sleep(interval)
 
     @async_log_errors
     async def cleanup_requests(self):
-        """Remove collected requests older than 10 seconds.
+        """Remove collected requests older than ``cleanup_request_interval``.
 
         Uses created_at as the fallback when finished_at is unset — a few exit
         paths in Request.wait_for_result_async finalize state without setting
         finished_at (timeout/exception branches), and the previous filter
         (`finished_at is None` → keep forever) was leaking those forever.
         Falling back to created_at means even un-finalized-but-collected
-        requests get reaped 10 s after creation.
+        requests get reaped one interval after creation. Interval is
+        configurable via general.cleanup_request_interval (default 10s);
+        the running_loop tick rate uses the same value so a collected
+        entry survives at least one tick before reap.
         """
-        _timer = time.time() - 10
+        interval = getattr(
+            self,
+            "cleanup_request_interval",
+            DEFAULT_CLEANUP_REQUEST_INTERVAL,
+        )
+        _timer = time.time() - interval
         async with self.request_lock:
             self.requests = {
                 rid: req

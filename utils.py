@@ -986,6 +986,7 @@ class ConfigUtil:
         from PluginCore import (  # local import — avoids circular import at module load
             DEFAULT_PLUGIN_READY_TIMEOUT,
             DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+            DEFAULT_CLEANUP_REQUEST_INTERVAL,
         )
         raw_ready_timeout = general_config.get(
             "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
@@ -1025,6 +1026,29 @@ class ConfigUtil:
             )
             disable_timeout = DEFAULT_PLUGIN_DISABLE_TIMEOUT
         plugin_core.plugin_disable_timeout = disable_timeout
+
+        # cleanup_requests interval. Default 10.0 seconds. Two coupled
+        # values share this knob: (1) running_loop sleeps this long
+        # between cleanup_requests ticks; (2) cleanup_requests reaps
+        # collected Request entries older than this interval. Tests
+        # override to 0.5 for fast eventual-reap assertions. Bad values
+        # fall back to default with a warning so a typo can never
+        # silently zero the interval.
+        raw_cleanup_interval = general_config.get(
+            "cleanup_request_interval", DEFAULT_CLEANUP_REQUEST_INTERVAL
+        )
+        try:
+            cleanup_interval = float(raw_cleanup_interval)
+            if cleanup_interval <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plugin_core._logger.warning(
+                "Invalid general.cleanup_request_interval=%r; defaulting to %.1f",
+                raw_cleanup_interval,
+                DEFAULT_CLEANUP_REQUEST_INTERVAL,
+            )
+            cleanup_interval = DEFAULT_CLEANUP_REQUEST_INTERVAL
+        plugin_core.cleanup_request_interval = cleanup_interval
 
         networking_config = plugin_core.yaml_config.get("networking")
 

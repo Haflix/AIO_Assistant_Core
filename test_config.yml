@@ -122,6 +122,12 @@ general:
     file_log_level: "DEBUG"
     asyncio_debug: false
 
+    # Speed up eventual-reap assertions: cleanup_requests tick + reap
+    # window default to 10s in production. Tests that wait for cleanup
+    # (B-043, exec.cancellation.entry_reaped, stream.contract.collected_set,
+    # etc.) drop from ~14s each to under 1s.
+    cleanup_request_interval: 0.5
+
     logger_levels:
         asyncio: "MUTE"
         urllib3: "MUTE"
