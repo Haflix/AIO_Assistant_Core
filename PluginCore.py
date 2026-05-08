@@ -2969,9 +2969,39 @@ class PluginCore:
                     else:
                         generator = func(request.args)
 
+                    # B-041 fix: thread the caller's sync call chain
+                    # into the threadpool worker before each next() so
+                    # cycle detection works for sync generators that
+                    # call execute_sync internally. The chain comes
+                    # from request._call_chain (stamped by
+                    # execute_stream_sync); falls back to () for
+                    # async-loop callers that bypass the sync wrapper.
+                    #
+                    # Switched from asyncio.to_thread (default loop
+                    # executor) to self._plugin_executor — the
+                    # framework's dedicated pool for sync ENDPOINT
+                    # methods, matching _call_endpoint's sync branch.
+                    # The default pool was a pre-existing inconsistency:
+                    # sync gen endpoints competed with framework-
+                    # internal default-pool work and risked starvation.
+                    # NOT sync_dispatcher.executor — that's for sync
+                    # SUBSCRIBER handlers (Q17 + C3) and used by
+                    # request_event_stream, not endpoint dispatch.
+                    chain = getattr(request, "_call_chain", ())
+
+                    def _next_with_chain(g, sent, ch):
+                        _sync_call_chain.chain = ch
+                        try:
+                            return next(g, sent)
+                        finally:
+                            _sync_call_chain.chain = ()
+
                     sentinel = object()
                     while True:
-                        result = await asyncio.to_thread(next, generator, sentinel)
+                        result = await self.main_event_loop.run_in_executor(
+                            self._plugin_executor,
+                            _next_with_chain, generator, sentinel, chain,
+                        )
                         if result is sentinel:
                             break
                         await request.queue.put(
@@ -3449,6 +3479,16 @@ class PluginCore:
             author_host,
             request_id,
         )
+        # B-041 fix: stamp the caller's sync call chain on the
+        # GeneratorRequest so _process_request_stream's sync-gen
+        # branch can propagate it to the handler's threadpool worker.
+        # Mirrors _execute_sync_tracked's request._call_chain
+        # assignment for the non-stream path. Without this, a
+        # sync→stream→sync cycle (sync caller calls
+        # execute_stream_sync, stream handler is a sync gen that
+        # calls execute_sync back into the caller) deadlocks the
+        # threadpool with no "Circular sync call" RequestException.
+        request._call_chain = chain + (target,)
 
         try:
             for result, error, _ in request.get_queue_stream_sync():
