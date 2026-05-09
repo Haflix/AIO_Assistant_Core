@@ -1,5 +1,5 @@
 description: Interop target plugin exposing sync/async and generator endpoints
-version: 0.0.1
+version: 0.0.2
 remote: True
 arguments:
 endpoints:

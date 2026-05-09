@@ -20,6 +20,7 @@ import yaml
 from typing import Any, Optional, Tuple, Union, final
 from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
 from exceptions import RequestException, ConfigException
+from plugin_state import State
 from colorama import Fore, Style
 
 
@@ -1160,7 +1161,6 @@ class Plugin(ABC):
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
-        self.enabled = False
         self.remote = False
         self.arguments = arguments
         self.endpoints = {}
@@ -1206,6 +1206,42 @@ class Plugin(ABC):
                 arguments if isinstance(arguments, dict) else {}
             ),  # Unpack dict if applicable
         )
+
+    @property
+    def enabled(self) -> bool:
+        """Read-only since v0.26.0. Was a mutable attribute pre-state-machine.
+
+        Returns True for state in {ENABLING, ENABLED} — matches pre-S3
+        semantics where the `enabled = True` flag flipped BEFORE on_enable
+        ran (so cross-plugin calls from inside on_enable saw the target
+        as enabled). Code that needs to distinguish "fully ready" from
+        "mid-enable" should read pc.plugin_states[name].state directly
+        and check against State.ENABLED, or wait on
+        plugin._lifecycle_ready.
+
+        Returns False during init bootstrap (when _plugin_core is not
+        yet bound).
+
+        Subclasses MUST call super().__init__() BEFORE reading self.enabled.
+        The property depends on self._plugin_core being bound, which __init__
+        does at the end. Otherwise the read returns False even when the
+        plugin is enabled.
+        """
+        pc = getattr(self, "_plugin_core", None)
+        if pc is None:
+            return False
+        ps = pc.plugin_states.get(self.plugin_name)
+        if ps is None:
+            return False
+        return ps.state in (State.ENABLING, State.ENABLED)
+
+    def __setattr__(self, name: str, value):
+        if name == "enabled":
+            raise AttributeError(
+                "Plugin.enabled is read-only since v0.26.0. Use "
+                "pc.enable_plugin(name) / pc.disable_plugin(name) instead."
+            )
+        super().__setattr__(name, value)
 
     async def _to_dict(self):
         info_dict = {}

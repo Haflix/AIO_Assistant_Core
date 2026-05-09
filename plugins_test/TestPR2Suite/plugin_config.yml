@@ -1,5 +1,5 @@
 description: PR2 config-restructure regression suite — dict-form endpoints, apply_overrides, validation
-version: 0.1.0
+version: 0.1.1
 remote: false
 arguments:
 endpoints:

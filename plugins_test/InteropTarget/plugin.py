@@ -15,19 +15,17 @@ class InteropTarget(Plugin):
     @log_errors
     def on_load(self, *args, **kwargs):
         self.plugin_name = "InteropTarget"
-        self.version = "0.0.1"
+        self.version = "0.0.2"
         self.description = (
             "Exposes sync/async functions and generators for interop testing"
         )
 
     @async_log_errors
     async def on_enable(self):
-        self.enabled = True
         self._logger.debug("InteropTarget.on_enable")
 
     @async_log_errors
     async def on_disable(self):
-        self.enabled = False
         self._logger.debug("InteropTarget.on_disable")
 
     # ----- Value endpoints -----

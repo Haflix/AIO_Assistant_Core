@@ -52,7 +52,7 @@ from serialization import generate_keypair, Serializable  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.2"
+SUITE_VERSION = "0.4.3"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -361,7 +361,7 @@ class TestBugSuite(Plugin):
                 await self._plugin_core.load_plugin_with_conf(e)
                 if name in self._plugin_core.plugins:
                     try:
-                        await self._plugin_core._enable_plugin(name)
+                        await self._plugin_core.enable_plugin(name)
                     except Exception:
                         pass
                     return True
@@ -951,7 +951,7 @@ class TestBugSuite(Plugin):
                 # Disable then concurrently re-enable + ping a different
                 # plugin's get_plugin_info. Pre-fix the call would block
                 # on plugin_lock until on_enable finishes.
-                await core._disable_plugin(v_name)
+                await core.disable_plugin(v_name)
 
                 async def _delayed_get_info():
                     # Tiny stagger so enable is in mid-on_enable when
@@ -961,7 +961,7 @@ class TestBugSuite(Plugin):
                     info = await core.get_plugin_info(other_name)
                     return info, asyncio.get_event_loop().time() - t0
 
-                enable_task = asyncio.create_task(core._enable_plugin(v_name))
+                enable_task = asyncio.create_task(core.enable_plugin(v_name))
                 info_task = asyncio.create_task(_delayed_get_info())
                 info, elapsed = await info_task
                 await enable_task
@@ -991,7 +991,7 @@ class TestBugSuite(Plugin):
                     victim._on_enable_delay_secs = 0.0
                     if not victim.enabled:
                         try:
-                            await core._enable_plugin(v_name)
+                            await core.enable_plugin(v_name)
                         except Exception:
                             pass
 
@@ -1265,9 +1265,9 @@ class TestBugSuite(Plugin):
 
         async def body_b_049_deferred(c):
             c.skip(
-                "STAGE_F_FIXME: _enable_plugin no on_enable timeout. "
+                "STAGE_F_FIXME: enable_plugin no on_enable timeout. "
                 "Repro needs a controlled-startup harness — calling "
-                "_enable_plugin from inside a running suite would "
+                "enable_plugin from inside a running suite would "
                 "deadlock on plugin_lock. Same harness pattern as "
                 "B-007 in TestLifecycleSuite."
             )

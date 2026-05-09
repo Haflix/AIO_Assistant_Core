@@ -39,7 +39,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.2.0"
+SUITE_VERSION = "0.2.1"
 
 TARGET = "TestEventTarget"
 BAD_ACTOR = "TestEventBadActor"
@@ -295,7 +295,7 @@ class TestEventSuite(Plugin):
         await self._plugin_core.load_plugin_with_conf(entry_copy)
         if name in self._plugin_core.plugins:
             try:
-                await self._plugin_core._enable_plugin(name)
+                await self._plugin_core.enable_plugin(name)
             except Exception:
                 pass
             return True

@@ -32,7 +32,7 @@ from exceptions import RequestException  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.3"
+SUITE_VERSION = "0.3.4"
 VICTIM = "TestLifecycleVictim"
 VICTIM2 = "TestLifecycleVictim2"
 VICTIM_PATH = "./plugins_test/TestLifecycleVictim"
@@ -130,7 +130,7 @@ class TestLifecycleSuite(Plugin):
             victim.db_open = True if victim.enabled else False
             if not victim.enabled:
                 try:
-                    await self._plugin_core._enable_plugin(VICTIM)
+                    await self._plugin_core.enable_plugin(VICTIM)
                 except Exception:
                     pass
 
@@ -163,17 +163,17 @@ class TestLifecycleSuite(Plugin):
             await self._ensure_victim_clean()
             plugin = self._plugin_core.plugins[VICTIM]
             if not plugin.enabled:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plugin_core.enable_plugin(VICTIM)
             assert plugin.enabled
 
         async def body_disable_success(c):
             await self._ensure_victim_clean()
             plugin = self._plugin_core.plugins[VICTIM]
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plugin_core.disable_plugin(VICTIM)
             try:
                 assert not plugin.enabled
             finally:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plugin_core.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.enable.success", body_enable_success,
@@ -197,10 +197,10 @@ class TestLifecycleSuite(Plugin):
                 # on_enable's partial-setup phase.
                 await self.execute(VICTIM, "configure",
                                    {"on_enable_raises_after_setup": True})
-                await self._plugin_core._disable_plugin(VICTIM)
+                await self._plugin_core.disable_plugin(VICTIM)
 
                 try:
-                    await self._plugin_core._enable_plugin(VICTIM)
+                    await self._plugin_core.enable_plugin(VICTIM)
                 except Exception:
                     pass  # @async_handle_errors swallows; this is defensive
 
@@ -220,7 +220,7 @@ class TestLifecycleSuite(Plugin):
                     plugin._on_enable_raises_after_setup = False
                     if not plugin.enabled:
                         try:
-                            await self._plugin_core._enable_plugin(VICTIM)
+                            await self._plugin_core.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
@@ -290,7 +290,7 @@ class TestLifecycleSuite(Plugin):
                         entry["enabled"] = True
                         try:
                             await self._plugin_core.load_plugin_with_conf(entry)
-                            await self._plugin_core._enable_plugin(VICTIM)
+                            await self._plugin_core.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
@@ -339,7 +339,6 @@ class TestLifecycleSuite(Plugin):
                 victim = core.plugins.get(VICTIM)
                 if victim is not None:
                     victim._on_disable_hangs_secs = 0.0
-                    victim.enabled = False
                     try:
                         await core.pop_plugin(VICTIM)
                     except Exception:
@@ -349,7 +348,7 @@ class TestLifecycleSuite(Plugin):
                     entry["enabled"] = True
                     try:
                         await core.load_plugin_with_conf(entry)
-                        await core._enable_plugin(VICTIM)
+                        await core.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 raise AssertionError(
@@ -370,7 +369,7 @@ class TestLifecycleSuite(Plugin):
                         entry["enabled"] = True
                         try:
                             await core.load_plugin_with_conf(entry)
-                            await core._enable_plugin(VICTIM)
+                            await core.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
@@ -440,7 +439,7 @@ class TestLifecycleSuite(Plugin):
                 if VICTIM not in self._plugin_core.plugins:
                     try:
                         await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 await self._ensure_victim_clean()
@@ -485,7 +484,7 @@ class TestLifecycleSuite(Plugin):
                     entry["enabled"] = True
                     try:
                         await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -543,7 +542,7 @@ class TestLifecycleSuite(Plugin):
                     entry["enabled"] = True
                     try:
                         await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -597,12 +596,12 @@ class TestLifecycleSuite(Plugin):
                 })
 
                 # Now disable both, then re-enable concurrently
-                await self._plugin_core._disable_plugin(VICTIM)
-                await self._plugin_core._disable_plugin(VICTIM2)
+                await self._plugin_core.disable_plugin(VICTIM)
+                await self._plugin_core.disable_plugin(VICTIM2)
 
                 await asyncio.gather(
-                    self._plugin_core._enable_plugin(VICTIM),
-                    self._plugin_core._enable_plugin(VICTIM2),
+                    self._plugin_core.enable_plugin(VICTIM),
+                    self._plugin_core.enable_plugin(VICTIM2),
                     return_exceptions=True,
                 )
 
@@ -629,12 +628,12 @@ class TestLifecycleSuite(Plugin):
                     v2._on_enable_delay_secs = 0.0
                 if v is not None and not v.enabled:
                     try:
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 if v2 is not None and not v2.enabled:
                     try:
-                        await self._plugin_core._enable_plugin(VICTIM2)
+                        await self._plugin_core.enable_plugin(VICTIM2)
                     except Exception:
                         pass
 
@@ -693,7 +692,7 @@ class TestLifecycleSuite(Plugin):
                     entry["enabled"] = True
                     try:
                         await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -758,7 +757,7 @@ class TestLifecycleSuite(Plugin):
                     entry["enabled"] = True
                     try:
                         await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core._enable_plugin(VICTIM)
+                        await self._plugin_core.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -801,12 +800,12 @@ class TestLifecycleSuite(Plugin):
     ) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plugin_core.disable_plugin(VICTIM)
             try:
                 c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
                 await self.execute(VICTIM, "is_db_open")
             finally:
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plugin_core.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.disable.error.disabled_plugin_not_callable", body,
@@ -835,9 +834,9 @@ class TestLifecycleSuite(Plugin):
 
             # Drive disable in reverse config order: Victim2 first, then Victim
             # (matches what core.close() does at PluginCore.py:255 .reverse()).
-            await self._plugin_core._disable_plugin(VICTIM2)
+            await self._plugin_core.disable_plugin(VICTIM2)
             t_v2_disabled = time.perf_counter()
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plugin_core.disable_plugin(VICTIM)
             t_v1_disabled = time.perf_counter()
 
             try:
@@ -849,8 +848,8 @@ class TestLifecycleSuite(Plugin):
                         f"v2={t_v2_disabled} v1={t_v1_disabled}"
                     )
             finally:
-                await self._plugin_core._enable_plugin(VICTIM2)
-                await self._plugin_core._enable_plugin(VICTIM)
+                await self._plugin_core.enable_plugin(VICTIM2)
+                await self._plugin_core.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.contract.disable_reverse_order_via_disable_plugin",
@@ -984,7 +983,7 @@ class TestLifecycleSuite(Plugin):
             await self._ensure_victim_clean()
             v = self._plugin_core.plugins[VICTIM]
             v._on_enable_delay_secs = 0.0
-            await self._plugin_core._disable_plugin(VICTIM)
+            await self._plugin_core.disable_plugin(VICTIM)
             # 3.0s delay (generous margin for Windows scheduler jitter);
             # threshold 2.0s leaves 1.0s slack for the asyncio.sleep(0.1)
             # post-create_task stagger and dispatch overhead, so a loaded
@@ -996,7 +995,7 @@ class TestLifecycleSuite(Plugin):
                 # Start enable; while it sleeps, our execute() must
                 # block on the readiness gate, then succeed.
                 enable_task = asyncio.create_task(
-                    self._plugin_core._enable_plugin(VICTIM)
+                    self._plugin_core.enable_plugin(VICTIM)
                 )
                 await asyncio.sleep(0.1)  # let on_enable start sleeping
                 t0 = asyncio.get_event_loop().time()

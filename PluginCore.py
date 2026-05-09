@@ -23,6 +23,7 @@ import inspect
 import asyncio
 import time
 import threading
+import traceback
 from collections import deque
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,7 @@ from decorators import (
 )
 from networking import NetworkManager
 from notifier import TopicRegistry, Subscription, SyncDispatcher
+from plugin_state import State, Phase, ErrorRecord, PluginState
 
 
 # Reserved identifier names — disallowed as plugin names AND endpoint
@@ -78,7 +80,7 @@ _RESERVED_IDENTIFIER_NAMES = frozenset(
 DEFAULT_PLUGIN_READY_TIMEOUT: float = 60.0
 
 # Default plugin-disable timeout (seconds). Wraps user on_disable in
-# asyncio.wait_for in _disable_plugin / _pop_plugin_under_lock so a
+# asyncio.wait_for in disable_plugin / _pop_plugin_under_lock so a
 # misbehaving on_disable can't hang pop_plugin / _reload_plugin /
 # purge_plugins indefinitely. close() already had its own 30s; this
 # brings runtime hot-reload paths to parity. Configurable via
@@ -600,6 +602,10 @@ class PluginCore:
         self.main_event_loop = None
         self.plugins = {}
         self.plugins_by_uuid = {}
+        # Session 3 (v0.26.0): plugin state machine. Read-only data
+        # container; all mutations through pc._transition_plugin(name, state).
+        # External readers MUST snapshot before iterating: dict(pc.plugin_states).
+        self.plugin_states: Dict[str, PluginState] = {}
         self.plugin_lock = asyncio.Lock()
         # Stage O: per-plugin lifecycle locks (B-046 fix). Each plugin
         # gets its own asyncio.Lock for serializing on_enable / on_disable
@@ -988,9 +994,9 @@ class PluginCore:
             try:
                 # Delegate to _disable_plugin_under_lock instead of
                 # duplicating the lifecycle_ready.clear() + on_disable +
-                # unregister + enabled=False sequence inline. The 30s
+                # unregister + state-transition sequence inline. The 30s
                 # on_disable timeout is hardcoded here (shutdown cap);
-                # runtime callers (_disable_plugin, _pop_plugin_under_lock)
+                # runtime callers (disable_plugin, _pop_plugin_under_lock)
                 # use the configurable plugin_disable_timeout per the
                 # B-009 fix.
                 #
@@ -1859,12 +1865,21 @@ class PluginCore:
 
     @async_log_errors
     async def start_plugins(self) -> None:
-        """Start all plugin loops."""
+        """Start all plugin loops.
+
+        Session 3 (v0.26.0): check state directly rather than via the
+        Plugin.enabled property. The property returns True for ENABLING
+        (mid-enable), so a stuck-ENABLING plugin would otherwise be
+        silently skipped here. State == INACTIVE is the only enabling
+        candidate; everything else is either enabled, mid-transition,
+        or failed-load.
+        """
         tasks = []
         task_plugins = []
         for plugin in self.plugins.values():
-            if not plugin.enabled:
-                tasks.append(self._enable_plugin(plugin.plugin_name))
+            ps = self.plugin_states.get(plugin.plugin_name)
+            if ps is not None and ps.state == State.INACTIVE:
+                tasks.append(self.enable_plugin(plugin.plugin_name))
                 task_plugins.append(plugin)
 
         if tasks:
@@ -1874,7 +1889,7 @@ class PluginCore:
                     self._logger.warning(
                         f'Error occured while enabling plugin with name "{plugin.plugin_name}": {type(result).__name__}: {result}'
                     )
-                # task = asyncio.create_task(self._enable_plugin(plugin.plugin_name))
+                # task = asyncio.create_task(self.enable_plugin(plugin.plugin_name))
                 # self.task_list.append(task)
 
     @async_log_errors
@@ -1902,7 +1917,21 @@ class PluginCore:
             self._logger.debug(
                 f'Plugin "{name}" wont be loaded due to it being disabled'
             )
-            await self.pop_plugin(name)
+            if name in self.plugins:
+                # Existing instance from a prior load — pop it. pop_plugin
+                # transitions ENABLED→...→UNLOADED itself.
+                await self.pop_plugin(name)
+            else:
+                # No instance to pop. Create or transition the plugin_states
+                # entry so TUI/external code can see the plugin exists in
+                # config but has no instance.
+                if name in self.plugin_states:
+                    if self.plugin_states[name].state != State.UNLOADED:
+                        self._transition_plugin(name, State.UNLOADED)
+                else:
+                    self.plugin_states[name] = PluginState(
+                        name=name, state=State.UNLOADED
+                    )
             return
 
         if name in list(self.plugins.keys()):
@@ -2127,12 +2156,42 @@ class PluginCore:
             await error_config(f"No Plugin subclass found in {module_path}")
             return
 
-        # Instantiate with merged arguments
-        plugin = plugin_class(
-            self._logger.getChild(name),
-            self,
-            arguments=merged_args,
-        )
+        # Session 3 (v0.26.0): pre-create state entry BEFORE Plugin(...)
+        # so the @property read inside Plugin.__init__ works (returns False
+        # — only ENABLED state returns True from the property). On reload,
+        # transition any existing entry (UNLOADED / FAILED_LOAD) to INACTIVE.
+        if name in self.plugin_states:
+            if self.plugin_states[name].state != State.INACTIVE:
+                self._transition_plugin(name, State.INACTIVE)
+            # Clear stale errors from previous failed loads.
+            self.plugin_states[name].last_errors.clear()
+        else:
+            self.plugin_states[name] = PluginState(
+                name=name, state=State.INACTIVE
+            )
+
+        # Instantiate with merged arguments. on_load runs inside __init__;
+        # any raise (validation, missing config, plugin author error) puts
+        # plugin_states[name] into FAILED_LOAD with traceback recorded.
+        try:
+            plugin = plugin_class(
+                self._logger.getChild(name),
+                self,
+                arguments=merged_args,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                self.plugin_states[name].last_errors[Phase.LOAD] = ErrorRecord(
+                    exception=exc,
+                    traceback=traceback.format_exc(),
+                    ts=time.time(),
+                )
+            self._transition_plugin(name, State.FAILED_LOAD)
+            self._logger.error(
+                f"Plugin '{name}': on_load raised — "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
 
         plugin.plugin_name = name
         plugin.version = merged_config.get("version") or "0.0.0 - not given"
@@ -2410,9 +2469,12 @@ class PluginCore:
             plugin_uuid = getattr(plugin, "plugin_uuid", None)
             if plugin_uuid:
                 self.plugins_by_uuid[plugin_uuid] = plugin
+            # Session 3: bind instance into plugin_states (state already
+            # INACTIVE from pre-create above).
+            self.plugin_states[name].instance = plugin
 
         # PR3 Stage B moved YAML subscription registration to
-        # _register_yaml_subscriptions (called from _enable_plugin) so
+        # _register_yaml_subscriptions (called from enable_plugin) so
         # that disable -> re-enable re-registers subs. Stage D removed
         # the legacy `topic:` field auto-registration path entirely.
 
@@ -2422,14 +2484,72 @@ class PluginCore:
 
     @async_log_errors
     async def pop_plugin(self, plugin_name: str) -> None:
+        """Remove a plugin from the runtime.
+
+        Session 3 (v0.26.0) state-machine semantics: the resulting
+        plugin_states entry depends on whether config still references
+        the plugin.
+
+        - Config has the entry → state becomes UNLOADED (entry kept;
+          can be re-enabled later via enable_plugin).
+        - Config dropped the entry → entry is removed from plugin_states
+          entirely.
+
+        For FAILED_LOAD or UNLOADED entries with no live instance,
+        pop_plugin still applies these semantics — useful for clearing
+        a stale FAILED_LOAD record after the underlying issue is fixed
+        and the config entry has been removed.
+        """
         self._logger.info(f"Popping plugin: {plugin_name}")
         try:
+            config_has_entry = any(
+                p.get("name") == plugin_name
+                for p in self.yaml_config.get("plugins", [])
+            )
+
             if plugin_name not in self.plugins:
-                self._logger.warning(f'Plugin with name "{plugin_name}" doesnt exist')
+                if plugin_name in self.plugin_states:
+                    if config_has_entry:
+                        if self.plugin_states[plugin_name].state != State.UNLOADED:
+                            self._transition_plugin(plugin_name, State.UNLOADED)
+                    else:
+                        del self.plugin_states[plugin_name]
+                else:
+                    self._logger.warning(
+                        f'Plugin with name "{plugin_name}" doesnt exist'
+                    )
                 return
+
             lifecycle_lock = self._get_lifecycle_lock(plugin_name)
             async with lifecycle_lock:
-                await self._pop_plugin_under_lock(plugin_name)
+                try:
+                    await self._pop_plugin_under_lock(plugin_name)
+                finally:
+                    # Post-pop state transition. Cycle 1 review: must run
+                    # in finally so a partial failure inside
+                    # _pop_plugin_under_lock doesn't leave plugin_states
+                    # inconsistent. Only fires if the instance is gone
+                    # (i.e. the dict-pop step inside _pop_plugin_under_lock
+                    # ran). If _pop_plugin_under_lock raised before the
+                    # dict pop, the plugin is still in self.plugins, so
+                    # we skip the UNLOADED transition — its state was
+                    # set to INACTIVE by _disable_plugin_under_lock's
+                    # finally and the next pop attempt can resume cleanly.
+                    if (
+                        plugin_name in self.plugin_states
+                        and plugin_name not in self.plugins
+                    ):
+                        if config_has_entry:
+                            # Cycle 3 fix: clear instance BEFORE the
+                            # state transition so observers of
+                            # _core/plugin/state_changed reading
+                            # `instance` for state == UNLOADED see None,
+                            # not a stale reference to the just-popped
+                            # plugin.
+                            self.plugin_states[plugin_name].instance = None
+                            self._transition_plugin(plugin_name, State.UNLOADED)
+                        else:
+                            del self.plugin_states[plugin_name]
         except Exception as error:
             raise Exception(f'Error while popping plugin "{plugin_name}": {error}')
 
@@ -2439,7 +2559,7 @@ class PluginCore:
         # pending requests (request_lock loop) BEFORE disable, then
         # disables, pops dicts, unsubscribes, and clears logger levels
         # — the full cleanup path. The previous implementation called
-        # _disable_plugin per plugin then swept the dicts in a single
+        # disable_plugin per plugin then swept the dicts in a single
         # plugin_lock acquisition; that path skipped the pending-request
         # cancellation step (B-005). Reuses Stage O's
         # _pop_plugin_under_lock shared helper.
@@ -2625,13 +2745,19 @@ class PluginCore:
     # self._get_lifecycle_lock(plugin_name). These bodies are reused by
     # pop_plugin / _reload_plugin without recursive lock acquisition.
     async def _enable_plugin_under_lock(self, plugin_name: str) -> None:
-        """Body of _enable_plugin minus the lifecycle_lock acquisition.
+        """Body of enable_plugin minus the lifecycle_lock acquisition.
 
-        Stage O: plugin_lock is held only for the dict read + flag flip
-        + YAML sub registration (microseconds). It is RELEASED before
-        the user on_enable callback runs so concurrent ops on OTHER
-        plugins (which acquire plugin_lock briefly themselves) are not
-        blocked. _lifecycle_ready is set after on_enable returns.
+        Stage O: plugin_lock is held only for the dict read + state
+        transition + YAML sub registration (microseconds). It is RELEASED
+        before the user on_enable callback runs so concurrent ops on
+        OTHER plugins (which acquire plugin_lock briefly themselves) are
+        not blocked. _lifecycle_ready is set after on_enable returns.
+
+        Session 3 (v0.26.0): the INACTIVE → ENABLING transition happens
+        UNDER plugin_lock so concurrent observers see the consistent
+        state. ENABLING → ENABLED happens after on_enable succeeds.
+        ENABLING → INACTIVE happens in the rollback path. last_errors
+        [Phase.ENABLE] is populated on Exception (not CancelledError).
 
         PR3 Stage B (Q23 + C15): YAML subs register BEFORE on_enable so
         the plugin starts with subs already live; events arriving during
@@ -2641,7 +2767,16 @@ class PluginCore:
         """
         async with self.plugin_lock:
             plugin = self.plugins.get(plugin_name)
-            if plugin is None or plugin.enabled:
+            ps = self.plugin_states.get(plugin_name)
+            # Skip already-enabled or mid-enable plugins. Cycle 1 review:
+            # ENABLING included so a defensive re-entry (any caller that
+            # somehow bypasses the lifecycle_lock serialisation) cannot
+            # double-register YAML subs.
+            if (
+                plugin is None
+                or ps is None
+                or ps.state in (State.ENABLING, State.ENABLED)
+            ):
                 return
             # Register YAML subs FIRST. Disabled subs (Q13 `enabled:
             # false`) ARE registered, but with the Subscription.enabled=
@@ -2649,15 +2784,15 @@ class PluginCore:
             # add-deltas happens AFTER plugin_lock release (below) — see
             # the Network I/O note in the lock-ordering rule.
             new_sub_uuids = await self._register_yaml_subscriptions(plugin)
-            # Flip enabled BEFORE on_enable per Q23 + Q11 so handlers
-            # are callable for self-publish-from-on_enable. Roll back
-            # on raise.
-            plugin.enabled = True
+            # Transition INACTIVE → ENABLING per Q23 + Q11 so handlers
+            # are callable for self-publish-from-on_enable. Rollback to
+            # INACTIVE on raise.
+            self._transition_plugin(plugin_name, State.ENABLING)
 
         # plugin_lock RELEASED. lifecycle_lock still held. The broadcast
         # loop and on_enable call run together under one cancellation-
-        # aware try/finally so a CancelledError mid-flight (which is a
-        # BaseException, NOT Exception, so a plain `except Exception:`
+        # aware try/except/finally so a CancelledError mid-flight (which
+        # is a BaseException, NOT Exception, so a plain `except Exception:`
         # would skip cleanup) still triggers full rollback.
         ok = False
         try:
@@ -2678,7 +2813,21 @@ class PluginCore:
             # successfully. Other plugins blocked in the readiness gate
             # unblock here.
             plugin._lifecycle_ready.set()
+            self._transition_plugin(plugin_name, State.ENABLED)
             ok = True
+        except BaseException as exc:
+            # Session 3: capture on_enable failure for last_errors. Skip
+            # CancelledError — cancellation is not a plugin error (same
+            # pattern as _disable_plugin_under_lock skipping TimeoutError).
+            if not isinstance(exc, asyncio.CancelledError):
+                self.plugin_states[plugin_name].last_errors[Phase.ENABLE] = (
+                    ErrorRecord(
+                        exception=exc,
+                        traceback=traceback.format_exc(),
+                        ts=time.time(),
+                    )
+                )
+            raise
         finally:
             if not ok:
                 # Rollback runs on Exception, CancelledError, or any
@@ -2718,10 +2867,10 @@ class PluginCore:
                 # No on_disable_timeout here: rollback calls
                 # plugin.on_disable() directly rather than going
                 # through _disable_plugin_under_lock, so it does not
-                # share runtime _disable_plugin's wait_for. A
+                # share runtime disable_plugin's wait_for. A
                 # misbehaving on_disable in rollback can still hold
                 # lifecycle_lock until cancelled. Out of scope for
-                # B-009 (which targeted the runtime _disable_plugin /
+                # B-009 (which targeted the runtime disable_plugin /
                 # _pop_plugin_under_lock paths); track separately if
                 # rollback hangs become a real issue.
                 try:
@@ -2752,23 +2901,31 @@ class PluginCore:
                                 plugin.plugin_name,
                             )
                     finally:
-                        # Sync flag flip — atomic, guaranteed to run
-                        # via the outer finally chain even if both
-                        # async cleanups above are cancelled.
-                        plugin.enabled = False
+                        # Session 3: sync state transition (cannot raise),
+                        # guaranteed to run via the outer finally chain
+                        # even if both async cleanups above are cancelled.
+                        self._transition_plugin(plugin_name, State.INACTIVE)
 
     async def _disable_plugin_under_lock(
         self,
         plugin_name: str,
         on_disable_timeout: Optional[float] = None,
     ) -> None:
-        """Body of _disable_plugin minus the lifecycle_lock acquisition.
+        """Body of disable_plugin minus the lifecycle_lock acquisition.
 
         Stage O: clears _lifecycle_ready BEFORE on_disable so any
         in-flight gate wait against this plugin times out rather than
         dispatching to a tearing-down plugin. plugin_lock is held only
-        for the dict reads + final flag flip; user on_disable runs
+        for the dict reads + state transition; user on_disable runs
         without it held.
+
+        Session 3 (v0.26.0): the ENABLED → DISABLING transition happens
+        UNDER plugin_lock so observers see the consistent state. The
+        DISABLING → INACTIVE transition happens in the finally block —
+        unconditional regardless of whether on_disable raised, was
+        cancelled, or timed out (per O3). last_errors[Phase.DISABLE]
+        is populated on Exception (not CancelledError or TimeoutError —
+        TimeoutError is per-spec routine).
 
         PR3 Stage B (C15): YAML + runtime subs are unregistered AFTER
         on_disable returns. User code can publish/receive events during
@@ -2777,21 +2934,21 @@ class PluginCore:
         Optional ``on_disable_timeout`` wraps the user on_disable
         callback in ``asyncio.wait_for``. On expiry, raises
         ``asyncio.TimeoutError``; the finally block still runs the
-        unregister + ``enabled = False`` flip, so callers that catch
-        the TimeoutError can safely treat the plugin as disabled.
-        Callers who do NOT want a timeout pass None.
+        unregister + state transition, so callers that catch the
+        TimeoutError can safely treat the plugin as INACTIVE. Callers
+        who do NOT want a timeout pass None.
 
         Sync ``on_disable`` caveat: ``wait_for`` cancels the awaitable
         but cannot interrupt a thread blocked inside the user's
         synchronous callback running in ``_plugin_executor``. The
         event loop unblocks on time and the framework's bookkeeping
-        (subs, ``enabled``, dict pop) all complete; the worker thread
-        keeps running until the user code naturally returns and may
-        hold thread-pool capacity / external resources until then.
+        (subs, state, dict pop) all complete; the worker thread keeps
+        running until the user code naturally returns and may hold
+        thread-pool capacity / external resources until then.
 
         Callers and their timeout values:
           - ``close()``                → 30.0 (hardcoded shutdown cap)
-          - ``_disable_plugin``        → ``plugin_disable_timeout`` (B-009 fix)
+          - ``disable_plugin``         → ``plugin_disable_timeout`` (B-009 fix)
           - ``_pop_plugin_under_lock`` → ``plugin_disable_timeout`` (B-009 fix)
 
         ``_enable_plugin_under_lock``'s rollback-on-failure path calls
@@ -2800,8 +2957,13 @@ class PluginCore:
         """
         async with self.plugin_lock:
             plugin = self.plugins.get(plugin_name)
-            if plugin is None or not plugin.enabled:
+            ps = self.plugin_states.get(plugin_name)
+            if plugin is None or ps is None or ps.state != State.ENABLED:
                 return
+            # Session 3: transition ENABLED → DISABLING under plugin_lock
+            # so any concurrent enable check sees DISABLING (not ENABLED)
+            # and bails. Flip happens before plugin_lock release.
+            self._transition_plugin(plugin_name, State.DISABLING)
 
         # Stage O: clear lifecycle-ready BEFORE on_disable so any
         # in-flight gate wait either re-fires against the cleared event
@@ -2810,14 +2972,14 @@ class PluginCore:
         plugin._lifecycle_ready.clear()
 
         # plugin_lock RELEASED — run on_disable without holding it.
-        # Outer try/finally guarantees the cleanup runs on any exit
-        # path including CancelledError. Cleanup is itself nested in
-        # try/finally so the enabled-flag flip is the LAST action and
-        # is unconditional — bool assignment is sync (atomic in CPython)
-        # so it cannot itself be interrupted by cancellation. Without
-        # this nesting, a cancellation hitting during
-        # _unregister_plugin_subscriptions would skip the flag flip and
-        # leave the plugin in a stuck enabled=True state.
+        # Outer try/except/finally guarantees the cleanup runs on any
+        # exit path including CancelledError. Cleanup is itself nested
+        # in try/finally so the state transition is the LAST action and
+        # is unconditional — _transition_plugin is sync and cannot be
+        # interrupted by cancellation. Without this nesting, a
+        # cancellation hitting during _unregister_plugin_subscriptions
+        # would skip the transition and leave the plugin in a stuck
+        # DISABLING state.
         try:
             if asyncio.iscoroutinefunction(plugin.on_disable):
                 if on_disable_timeout is not None:
@@ -2836,6 +2998,21 @@ class PluginCore:
                     )
                 else:
                     await executor_call
+        except BaseException as exc:
+            # Session 3: capture on_disable failure for last_errors. Skip
+            # CancelledError (cancellation is not a plugin error) and
+            # TimeoutError (per-spec routine, callers handle it cleanly).
+            if not isinstance(
+                exc, (asyncio.CancelledError, asyncio.TimeoutError)
+            ):
+                self.plugin_states[plugin_name].last_errors[Phase.DISABLE] = (
+                    ErrorRecord(
+                        exception=exc,
+                        traceback=traceback.format_exc(),
+                        ts=time.time(),
+                    )
+                )
+            raise
         finally:
             # Unregister all subs (YAML + runtime) regardless of
             # whether on_disable raised, was cancelled, or timed out.
@@ -2861,13 +3038,13 @@ class PluginCore:
                         plugin.plugin_name,
                     )
             finally:
-                # Sync flag flip — guaranteed to run even if the
-                # unregister await above is cancelled. plugin_lock is
-                # not needed here: bool assignment is atomic, and any
-                # find_endpoint reader that sees enabled=True briefly
+                # Session 3: sync state transition (cannot raise),
+                # guaranteed to run even if the unregister await above
+                # is cancelled. plugin_lock is not needed here: any
+                # find_endpoint reader that briefly sees DISABLING
                 # before this line is already covered by the
                 # _lifecycle_ready.clear() at the top (gate blocks).
-                plugin.enabled = False
+                self._transition_plugin(plugin_name, State.INACTIVE)
 
     async def _pop_plugin_under_lock(self, plugin_name: str) -> bool:
         """Body of pop_plugin minus the lifecycle_lock acquisition.
@@ -2904,7 +3081,12 @@ class PluginCore:
                     error=True,
                 )
 
-        if plugin_name in self.plugins and self.plugins[plugin_name].enabled:
+        ps_check = self.plugin_states.get(plugin_name)
+        if (
+            plugin_name in self.plugins
+            and ps_check is not None
+            and ps_check.state == State.ENABLED
+        ):
             # B-009 fix: wrap user on_disable in asyncio.wait_for via
             # the configured runtime timeout (default 30s) so a hanging
             # on_disable can't block this plugin's lifecycle_lock
@@ -2920,16 +3102,16 @@ class PluginCore:
                 )
             except asyncio.TimeoutError:
                 # B-009: on_disable exceeded the runtime timeout. The
-                # under-lock body's finally already flipped enabled=
-                # False and unregistered subs, so it's safe to proceed
-                # with the dict pop below. Without this catch the
-                # TimeoutError propagates up and leaves the plugin
+                # under-lock body's finally already transitioned to
+                # INACTIVE and unregistered subs, so it's safe to
+                # proceed with the dict pop below. Without this catch
+                # the TimeoutError propagates up and leaves the plugin
                 # half-removed (still in self.plugins / plugins_by_uuid,
                 # topics + logger-level entries never cleaned).
                 self._logger.warning(
                     "pop_plugin %r: on_disable exceeded %.1fs timeout; "
                     "continuing with pop (subs already unregistered, "
-                    "enabled flag already cleared)",
+                    "state already INACTIVE)",
                     plugin_name, disable_timeout,
                 )
 
@@ -2952,27 +3134,36 @@ class PluginCore:
         return True
 
     @async_handle_errors(None)
-    async def _enable_plugin(self, plugin_name: str):
+    async def enable_plugin(self, plugin_name: str):
         """Public-facing enable that acquires the per-plugin
         lifecycle_lock (Stage O) and delegates to
         _enable_plugin_under_lock. Concurrent enable on the SAME plugin
-        serializes here; concurrent ops on OTHER plugins do not block."""
+        serializes here; concurrent ops on OTHER plugins do not block.
+
+        Session 3 (v0.26.0): renamed from `_enable_plugin` to public
+        `enable_plugin`. State machine transitions are emitted via
+        _transition_plugin under plugin_lock.
+        """
         lifecycle_lock = self._get_lifecycle_lock(plugin_name)
         async with lifecycle_lock:
             await self._enable_plugin_under_lock(plugin_name)
 
     @async_log_errors
-    async def _disable_plugin(self, plugin_name: str):
+    async def disable_plugin(self, plugin_name: str):
         """Public-facing disable that acquires the per-plugin
         lifecycle_lock (Stage O) and delegates to
         _disable_plugin_under_lock. Waits for any in-progress
-        _enable_plugin on the same name to complete first.
+        enable_plugin on the same name to complete first.
+
+        Session 3 (v0.26.0): renamed from `_disable_plugin` to public
+        `disable_plugin`. State machine transitions are emitted via
+        _transition_plugin.
 
         B-009 fix: user on_disable wrapped in asyncio.wait_for via
         on_disable_timeout — symmetric with close()'s 30s cap.
         Configurable via general.plugin_disable_timeout. On timeout
         the under-lock body's finally still unregisters subs and
-        flips enabled=False; this wrapper logs and returns cleanly
+        transitions to INACTIVE; this wrapper logs and returns cleanly
         rather than propagating asyncio.TimeoutError to callers
         (parity with close()'s per-plugin TimeoutError catch).
         """
@@ -2987,9 +3178,87 @@ class PluginCore:
                 )
             except asyncio.TimeoutError:
                 self._logger.warning(
-                    "_disable_plugin %r: on_disable exceeded %.1fs timeout",
+                    "disable_plugin %r: on_disable exceeded %.1fs timeout",
                     plugin_name, disable_timeout,
                 )
+
+    def _transition_plugin(self, name: str, new_state: State) -> None:
+        """Atomic state transition + _core/plugin/state_changed emit.
+
+        Session 3 (v0.26.0). All state mutations on PluginState go through
+        this method (D2). Direct field writes on PluginState are forbidden
+        — code review enforces.
+
+        Sync method (no await) so callers under existing locks can
+        transition without re-acquiring. Observer dispatch in
+        _internal_emit is sync per E2'. Sync observers must NOT acquire
+        plugin_lock / lifecycle_lock / request_lock — see api_reference.md
+        observer contract.
+        """
+        ps = self.plugin_states[name]
+        old_state = ps.state
+        ps.state = new_state
+        ps.last_state_change = time.time()
+        self._internal_emit(
+            "_core/plugin/state_changed",
+            name=name,
+            from_state=old_state.value,
+            to_state=new_state.value,
+            ts=ps.last_state_change,
+        )
+
+    @async_log_errors
+    async def get_unloaded_metadata(
+        self, plugin_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return metadata for an UNLOADED plugin by reading its on-disk
+        plugin_config.yml.
+
+        Returns None if the plugin is not in plugin_states or its state
+        is not UNLOADED. For ENABLED / INACTIVE / etc., callers should
+        use get_plugin_info(plugin_name) which reads from the live
+        instance.
+
+        Session 3 (v0.26.0): supports TUI listing of disabled-in-config
+        plugins (per B1 design decision).
+        """
+        ps = self.plugin_states.get(plugin_name)
+        if ps is None or ps.state != State.UNLOADED:
+            return None
+        entry = next(
+            (
+                p
+                for p in self.yaml_config.get("plugins", [])
+                if p.get("name") == plugin_name
+            ),
+            None,
+        )
+        if not entry:
+            return None
+        path = entry.get("path") or os.path.join(
+            self.plugin_package, plugin_name
+        )
+        path = os.path.abspath(path)
+        try:
+            with open(
+                os.path.join(path, "plugin_config.yml"),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            return None
+        return {
+            "name": plugin_name,
+            "version": cfg.get("version", "unknown"),
+            "description": cfg.get("description", ""),
+            "path": path,
+            "declared_endpoints": list((cfg.get("endpoints") or {}).keys()),
+            "declared_events": list((cfg.get("events") or {}).keys()),
+            "declared_subscriptions": list(
+                (cfg.get("subscriptions") or {}).keys()
+            ),
+        }
 
     async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
         """Register every YAML-declared subscription for ``plugin`` per
@@ -3099,18 +3368,34 @@ class PluginCore:
         config, and re-enabling.
 
         Stage O: the WHOLE pop+load+enable chain runs under the
-        per-plugin lifecycle_lock so a concurrent _enable_plugin caller
+        per-plugin lifecycle_lock so a concurrent enable_plugin caller
         on the same name can't interleave between the pop and the
         re-enable. The locked-body helpers (_pop_plugin_under_lock /
         _enable_plugin_under_lock) avoid recursive lock acquisition.
+
+        Session 3 (v0.26.0): the natural state transition sequence is:
+            ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED
+        for an enabled source. For an INACTIVE source:
+            INACTIVE → UNLOADED → INACTIVE
+        The INACTIVE → UNLOADED transition happens after
+        _pop_plugin_under_lock (which only transitions ENABLED→INACTIVE).
+        load_plugin_with_conf transitions back to INACTIVE on re-instantiation.
         """
         lifecycle_lock = self._get_lifecycle_lock(plugin_name)
         async with lifecycle_lock:
-            previously_enabled = False
-            if plugin_name in self.plugins:
-                previously_enabled = self.plugins[plugin_name].enabled
+            ps = self.plugin_states.get(plugin_name)
+            previously_enabled = ps is not None and ps.state == State.ENABLED
 
             await self._pop_plugin_under_lock(plugin_name)
+            # Session 3: transition INACTIVE → UNLOADED to match the
+            # public pop_plugin contract. load_plugin_with_conf will
+            # transition back to INACTIVE on re-instantiation. Cycle 3
+            # fix: clear instance BEFORE the transition so observers see
+            # instance=None for state==UNLOADED.
+            if plugin_name in self.plugin_states:
+                self.plugin_states[plugin_name].instance = None
+                if self.plugin_states[plugin_name].state != State.UNLOADED:
+                    self._transition_plugin(plugin_name, State.UNLOADED)
 
             entry = next(
                 (

@@ -1,3 +1,12 @@
+"""Networking-side data classes — RemotePlugin and Node.
+
+Note (v0.26.0): the Plugin state machine added in Session 3 applies to
+LOCAL plugins only. ``RemotePlugin.enabled`` is the snapshot of a remote
+plugin's enabled state at advertisement time — a distinct concept from
+the local state machine. ``RemotePlugin.enabled`` and ``Node.enabled``
+remain mutable attributes.
+"""
+
 import time
 import asyncio
 from typing import Any, Optional, Tuple, Union

@@ -1,5 +1,5 @@
 description: PR3 Stage F bughunt repro suite — one case per open bugtracker entry
-version: "0.3.2"
+version: "0.3.3"
 remote: false
 arguments:
 events:

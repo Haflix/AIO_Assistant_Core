@@ -495,7 +495,7 @@ async def on_disable(self):
 | `self.subscriptions` | dict | Parsed `subscriptions:` block. |
 | `self.prefix` | str | Resolved prefix (defaults to plugin_name). |
 | `self.verbose_notifier` | bool | Verbose dispatch logging flag. |
-| `self.enabled` | bool | True between successful `on_enable` and `on_disable`. |
+| `self.enabled` | bool (read-only `@property` since v0.26.0) | True for state in `{ENABLING, ENABLED}`. Direct writes raise `AttributeError`. |
 | `self.remote` | bool | Plugin-level remote flag. |
 | `self.description` | str | From `plugin_config`. |
 | `self.version` | str | From `plugin_config`. |
@@ -525,6 +525,77 @@ Other plugins calling `await self.execute("MyPlugin", ...)` will block at
 the readiness gate until `self.ready` is set.
 
 `_lifecycle_ready` is framework-controlled — never touch it.
+
+---
+
+## Lifecycle states (v0.26.0)
+
+Each plugin tracked by the framework follows a 6-state machine:
+
+| State | Meaning |
+|---|---|
+| `UNLOADED` | Config has the entry but no instance exists. Created when `enabled: false` in config or after `pop_plugin`. |
+| `INACTIVE` | Instance exists, `on_load` ran, plugin is not enabled. Default post-load and post-disable state. |
+| `ENABLING` | `on_enable` in progress. |
+| `ENABLED` | `on_enable` returned. Endpoints dispatchable. |
+| `DISABLING` | `on_disable` in progress. |
+| `FAILED_LOAD` | `on_load` raised. No instance. `last_errors[Phase.LOAD]` populated. |
+
+Read state with `pc.plugin_states[name].state`. The state enum lives in
+[`plugin_state.py`](../plugin_state.py); import as
+`from plugin_state import State`.
+
+`Plugin.enabled` is a read-only `@property` returning `True` for state in
+`{ENABLING, ENABLED}`. Author code MUST NOT write `self.enabled = ...` —
+the override raises `AttributeError`. Use `pc.enable_plugin(name)` /
+`pc.disable_plugin(name)` to change state.
+
+**Subclass init contract:** subclasses must call `super().__init__(...)`
+BEFORE reading `self.enabled` — the property depends on
+`self._plugin_core` being bound, which the parent `__init__` does at the
+end. Reading the property earlier in subclass init returns `False` even
+for an enabled plugin.
+
+**Re-entrant lifecycle warning:** calling `pc.disable_plugin(self.plugin_name)`
+from inside your own `on_load` / `on_enable` / handler body re-enters
+the per-plugin lifecycle lock and **deadlocks**. If you need to
+self-disable, schedule it on a separate task:
+```python
+asyncio.create_task(self._plugin_core.disable_plugin(self.plugin_name))
+```
+
+### Observers of `_core/plugin/state_changed`
+
+Internal event-bus observers (registered via `pc.internal_observe(...)`)
+receive a synchronous callback for every state transition with payload
+`(name, from_state, to_state, ts)` (state strings are the enum
+`.value`). Observer contract:
+
+- Sync only — observers MUST return in `<1ms`. Heavy work goes to
+  `asyncio.create_task(...)`.
+- Observers MUST NOT acquire `plugin_lock` / `lifecycle_lock` /
+  `request_lock` — the dispatch happens inside one of these locks; recursive
+  acquisition deadlocks.
+- Observers MUST NOT call `pc.enable_plugin(name)` /
+  `pc.disable_plugin(name)` for the SAME plugin whose state just changed —
+  same lock-recursion deadlock. For a DIFFERENT plugin, defer with
+  `asyncio.create_task(...)`.
+
+### Observable transition sequences
+
+Some operations emit multiple state-change events in rapid succession:
+
+| Operation | Sequence |
+|---|---|
+| `pc.disable_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE` |
+| `pc.pop_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED` |
+| `pc.pop_plugin(name)` on INACTIVE | `INACTIVE → UNLOADED` |
+| `pc._reload_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` |
+| `pc.enable_plugin(name)` on UNLOADED | `UNLOADED → INACTIVE → ENABLING → ENABLED` |
+
+Observers reacting to INACTIVE alone may take action assuming the plugin
+is just disabled (re-enableable) and then immediately see UNLOADED.
+Treat the sequence as a whole, not individual events.
 
 ---
 

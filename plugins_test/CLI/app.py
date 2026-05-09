@@ -1983,9 +1983,9 @@ class DashboardApp(App):
 
         try:
             if action == "enable":
-                await self._run_on_main(self.plugin_core._enable_plugin(plugin_name))
+                await self._run_on_main(self.plugin_core.enable_plugin(plugin_name))
             elif action == "disable":
-                await self._run_on_main(self.plugin_core._disable_plugin(plugin_name))
+                await self._run_on_main(self.plugin_core.disable_plugin(plugin_name))
             elif action == "reload":
                 await self._run_on_main(self.plugin_core._reload_plugin(plugin_name))
             elif action == "remove":

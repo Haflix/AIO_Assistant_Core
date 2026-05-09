@@ -37,7 +37,7 @@ from PluginCore import apply_overrides  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.1.0"
+SUITE_VERSION = "0.1.1"
 
 # Fixture plugin names (must match test_config.yml entries)
 FIXTURE        = "TestPR2Fixture"
@@ -174,7 +174,7 @@ class TestPR2Suite(Plugin):
                     f"{FIXTURE} failed to load (not in core.plugins)"
                 )
             try:
-                await self._plugin_core._enable_plugin(FIXTURE)
+                await self._plugin_core.enable_plugin(FIXTURE)
                 result = await self.execute(FIXTURE, "ping")
                 c.expect(result, "pong")
             finally:
@@ -212,7 +212,7 @@ class TestPR2Suite(Plugin):
                         f"got: {ep!r}"
                     )
                 # Verify dispatch actually resolves the key as the method name
-                await self._plugin_core._enable_plugin(FIXTURE)
+                await self._plugin_core.enable_plugin(FIXTURE)
                 result = await self.execute(FIXTURE, "ping")
                 c.expect(result, "pong")
             finally:
@@ -283,7 +283,7 @@ class TestPR2Suite(Plugin):
                         f"{MATCH} (access_name field == key)"
                     )
                 # Dispatch works
-                await self._plugin_core._enable_plugin(MATCH)
+                await self._plugin_core.enable_plugin(MATCH)
                 result = await self.execute(MATCH, "ping")
                 c.expect(result, "pong")
             finally:
@@ -324,7 +324,7 @@ class TestPR2Suite(Plugin):
                         "should only be accessible by key 'ping'"
                     )
                 # Dispatch works using the key
-                await self._plugin_core._enable_plugin(MISMATCH)
+                await self._plugin_core.enable_plugin(MISMATCH)
                 result = await self.execute(MISMATCH, "ping")
                 c.expect(result, "pong")
             finally:

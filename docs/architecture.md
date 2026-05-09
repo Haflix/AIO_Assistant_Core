@@ -99,11 +99,11 @@ Order of operations inside `_enable_plugin_under_lock`:
 
 1. The plugin's per-name lifecycle lock is acquired.
 2. The YAML `subscriptions:` block is registered with the `TopicRegistry` BEFORE `on_enable` runs. This means published events can already match the plugin's subscriptions while it is still mid-startup — the readiness gate (see below) is what blocks dispatch from completing.
-3. The framework flips `enabled = True`.
+3. The framework transitions the plugin's state from `INACTIVE` to `ENABLING` (emits `_core/plugin/state_changed`).
 4. Subscription add-deltas are broadcast to peers (no-op when networking is disabled or the manager is not ready).
 5. `on_enable` is called.
-6. On success, the framework sets `_lifecycle_ready`. Cross-plugin callers waiting on the readiness gate proceed.
-7. On failure (raise or cancel), `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and `enabled` is set back to `False`.
+6. On success: the framework sets `_lifecycle_ready` and transitions `ENABLING` → `ENABLED`. Cross-plugin callers waiting on the readiness gate proceed.
+7. On failure (raise or cancel): `_lifecycle_ready` stays cleared, `ready` is reset, `on_disable` is called defensively, subscriptions are unregistered, and the state transitions `ENABLING` → `INACTIVE`. `last_errors[Phase.ENABLE]` is populated for non-cancellation exceptions.
 
 Use `on_enable` to:
 
@@ -119,12 +119,15 @@ Called on shutdown, on `pop_plugin`, or on hot-swap. Must reverse exactly what `
 
 Order of operations inside `_disable_plugin_under_lock`:
 
-1. `_lifecycle_ready` is cleared BEFORE `on_disable` runs, so any in-flight readiness gate begins to time out.
-2. `on_disable` is invoked under the timeout.
-3. Whether `on_disable` returns, raises, or times out, the framework guarantees:
+1. The framework transitions the plugin's state from `ENABLED` to `DISABLING` (emits `_core/plugin/state_changed`) under `plugin_lock`.
+2. `_lifecycle_ready` is cleared BEFORE `on_disable` runs, so any in-flight readiness gate begins to time out.
+3. `on_disable` is invoked under the timeout.
+4. Whether `on_disable` returns, raises, or times out, the framework guarantees:
    - Subscriptions are unregistered from the `TopicRegistry`. This sweep covers BOTH YAML-declared subs and runtime subs created via `self.subscribe(...)` — both are keyed by `plugin_uuid`. Authors only need to unsubscribe manually if they want to remove a subscription mid-lifecycle.
-   - `enabled` is set to `False`.
+   - The state transitions `DISABLING` → `INACTIVE`.
    - The plugin's per-logger threshold overrides are cleared.
+
+`last_errors[Phase.DISABLE]` is populated for non-cancellation, non-timeout exceptions raised by `on_disable`.
 
 Caveat: a synchronous `on_disable` cannot be hard-interrupted; `wait_for` cancels the awaitable that wraps the worker thread, but the underlying thread keeps running until the user code returns. Framework bookkeeping still completes; only the user code keeps spinning.
 
@@ -163,23 +166,43 @@ If both events are not set within the budget, the caller's `execute()` raises `R
         |
         | (1) acquire lifecycle_lock
         | (2) register YAML subscriptions
-        | (3) flip enabled = True
+        | (3) transition INACTIVE -> ENABLING
         | (4) broadcast sub-add deltas to peers
         | (5) call on_enable (async or sync)
-        | (6) on success: _lifecycle_ready.set()
+        | (6) on success: _lifecycle_ready.set() + ENABLING -> ENABLED
         v
-   plugin running
+   plugin running (state: ENABLED)
         |
         v
    _disable_plugin_under_lock
         |
-        | (1) clear _lifecycle_ready
-        | (2) await on_disable with timeout
-        | (3) unregister all subs (YAML + runtime)
-        | (4) flip enabled = False
+        | (1) transition ENABLED -> DISABLING
+        | (2) clear _lifecycle_ready
+        | (3) await on_disable with timeout
+        | (4) unregister all subs (YAML + runtime)
+        | (5) transition DISABLING -> INACTIVE
         v
-   plugin offline
+   plugin offline (state: INACTIVE; can be re-enabled)
 ```
+
+### Plugin state machine (v0.26.0)
+
+Each plugin tracked in `pc.plugins` (and config-disabled plugins tracked in `pc.plugin_states`) follows a 6-state machine:
+
+| State | Meaning |
+|---|---|
+| `UNLOADED` | Config has the entry but no instance exists. Created when `enabled: false` in config or after `pop_plugin` if config still references the plugin. |
+| `INACTIVE` | Instance exists, `on_load` ran, plugin is not enabled. Default post-load state and post-disable state. |
+| `ENABLING` | `on_enable` in progress. |
+| `ENABLED` | `on_enable` returned successfully. Endpoints dispatchable. |
+| `DISABLING` | `on_disable` in progress. |
+| `FAILED_LOAD` | `on_load` raised. Instance is `None`. `last_errors[Phase.LOAD]` populated. |
+
+Every state mutation funnels through `pc._transition_plugin(name, new_state)`, which emits `_core/plugin/state_changed` on the internal event bus. Observers must NOT acquire `plugin_lock` / `lifecycle_lock` / `request_lock` during dispatch (sync observer contract — see [`api_reference.md`](./api_reference.md)).
+
+`Plugin.enabled` is a read-only `@property` that returns `True` for state in `{ENABLING, ENABLED}` (matches pre-v0.26 semantics). To distinguish "fully ready" from "mid-enable" externally, read `pc.plugin_states[name].state` directly.
+
+Public lifecycle API: `await pc.enable_plugin(name)` / `await pc.disable_plugin(name)`. Direct writes to `plugin.enabled` raise `AttributeError`.
 
 ---
 

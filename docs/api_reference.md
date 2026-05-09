@@ -74,7 +74,7 @@ Set by `Plugin.__init__` (`utils.py:1172-1223`) before `on_load` runs, then part
 | `self.subscriptions` | `dict`           | Parsed `subscriptions:` block.                                                                                    |
 | `self.prefix`        | `str`            | Resolved prefix for `{prefix}` substitution. Defaults to `plugin_name`.                                           |
 | `self.verbose_notifier` | `bool`        | When `true`, notifier dispatch logs include match counts.                                                         |
-| `self.enabled`       | `bool`           | `True` between successful `on_enable` and `on_disable`.                                                           |
+| `self.enabled`       | `bool` (read-only `@property` since v0.26.0) | `True` for state in `{ENABLING, ENABLED}`. Direct writes raise `AttributeError`. Use `pc.enable_plugin(name)` / `pc.disable_plugin(name)` to change state. |
 | `self.remote`        | `bool`           | Plugin-level remote flag from manifest.                                                                            |
 | `self.description`   | `str`            | From manifest.                                                                                                    |
 | `self.version`       | `str`            | From manifest.                                                                                                    |
@@ -406,16 +406,19 @@ The methods below are on `PluginCore` itself. Plugin authors use the `Plugin` wr
 
 ### Plugin management
 
-| Method | Source | Purpose |
-|--------|--------|---------|
-| `await pc.load_plugins()` | `PluginCore.py:971-979` | Load and enable every configured plugin. |
-| `await pc.get_plugins()` | `PluginCore.py:981-987` | Load (without enabling). |
-| `await pc.start_plugins()` | `PluginCore.py:989-1007` | Enable all loaded plugins concurrently. |
-| `await pc.load_plugin_with_conf(entry)` | `PluginCore.py:1009-1550` | Load one plugin from a config dict. |
-| `await pc.pop_plugin(plugin_name)` | `PluginCore.py:1552-1563` | Disable, remove, unsubscribe. |
-| `await pc.purge_plugins()` | `PluginCore.py:1565-1588` | Pop all. |
-| `await pc.purge_plugins_except(excluded_names)` | `PluginCore.py:1590-1608` | Pop all except listed. |
-| `await pc._reload_plugin(plugin_name)` | `PluginCore.py:2200-2234` | Hot-swap entry point. |
+| Method | Purpose |
+|--------|---------|
+| `await pc.load_plugins()` | Load and enable every configured plugin. |
+| `await pc.get_plugins()` | Load (without enabling). |
+| `await pc.start_plugins()` | Enable all loaded plugins concurrently. |
+| `await pc.load_plugin_with_conf(entry)` | Load one plugin from a config dict. |
+| `await pc.enable_plugin(plugin_name)` | Public-facing enable; transitions `INACTIVE → ENABLING → ENABLED`. UNLOADED / FAILED_LOAD plugins silently no-op — call `_reload_plugin(name)` first to (re-)instantiate. (v0.26.0) |
+| `await pc.disable_plugin(plugin_name)` | Public-facing disable; transitions `ENABLED` → `DISABLING` → `INACTIVE`. (v0.26.0) |
+| `await pc.pop_plugin(plugin_name)` | Disable, remove, unsubscribe. State becomes `UNLOADED` if config still references the plugin, else entry removed from `plugin_states`. |
+| `await pc.purge_plugins()` | Pop all. |
+| `await pc.purge_plugins_except(excluded_names)` | Pop all except listed. |
+| `await pc._reload_plugin(plugin_name)` | Hot-swap entry point. State sequence: `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` (or shorter for non-enabled source). |
+| `await pc.get_unloaded_metadata(name) -> Optional[dict]` | Read on-disk `plugin_config.yml` for an UNLOADED plugin. Returns `None` for any other state. (v0.26.0) |
 
 ### Introspection
 
@@ -443,8 +446,9 @@ The methods below are on `PluginCore` itself. Plugin authors use the `Plugin` wr
 
 | Attribute | Description |
 |-----------|-------------|
-| `pc.plugins` | `dict[name, Plugin]` |
+| `pc.plugins` | `dict[name, Plugin]` — only plugins with a live instance (NOT including UNLOADED / FAILED_LOAD entries). |
 | `pc.plugins_by_uuid` | `dict[uuid, Plugin]` |
+| `pc.plugin_states` | `dict[name, PluginState]` — superset of `pc.plugins` keys; includes UNLOADED / FAILED_LOAD entries. v0.26.0. **Iteration contract:** snapshot via `dict(pc.plugin_states)` before iterating; concurrent `pop_plugin` may `del` entries. Single-key lookup via `.get(name)` / `[name]` is GIL-atomic and safe. |
 | `pc.hostname` | This node's hostname. |
 | `pc.network` | `NetworkManager` or `None`. |
 | `pc.networking_enabled` | `bool` |
