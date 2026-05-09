@@ -1,8 +1,10 @@
 """TestLifecycleVictim — Phase 4 fixture.
 
 Controllable victim plugin with configurable on_enable / on_disable behaviors.
-Used by TestLifecycleSuite for B-004 / B-005 / B-006 / B-008 / B-009 / B-010
-repros plus basic load/enable/disable/reload contract checks.
+Used by TestLifecycleSuite for B-004 / B-005 / B-008 / B-009 / B-010
+repros plus basic load/enable/disable/reload contract checks. The B-006
+``inject_bad_request`` endpoint was removed in B-073 Session 2 Step 5
+(running_loop killed → no failure mode left to inject bad requests for).
 """
 
 import asyncio
@@ -106,12 +108,10 @@ class TestLifecycleVictim(Plugin):
         await asyncio.sleep(float(secs))
         return "did_not_hang"
 
-    @async_log_errors
-    async def inject_bad_request(self, req_id: str = "bad-test-id") -> str:
-        # Direct write into core.requests for B-006. The recorder has the
-        # private-API carve-out for this in plan §3.4.
-        self._plugin_core.requests[req_id] = object()
-        return req_id
+    # B-073 Session 2 Step 5: ``inject_bad_request`` removed. Was the
+    # remote-callable poison endpoint for the B-006 running_loop test
+    # (TestLifecycleSuite). After Step 4 killed running_loop entirely
+    # the test was deleted; this companion endpoint is no longer used.
 
     @async_log_errors
     async def is_db_open(self) -> bool:

@@ -2221,10 +2221,15 @@ class NetworkManager:
                     )
                     return
                 result, error, _ = await request.wait_for_result_async()
-                try:
-                    await request.set_collected()
-                except Exception:
-                    pass
+                # B-073 Session 2 Step 3: done-callback eviction. Was
+                # ``await request.set_collected()`` (which set a flag for
+                # the now-removed cleanup_requests reap). Migrated to
+                # direct sync pop. Idempotent under ``pop(key, None)``;
+                # the producer's finally in ``_process_request`` also
+                # pops on completion. Try/except dropped — sync ``pop``
+                # cannot raise (the only failure mode of the old async
+                # path was an event-loop scheduling issue, gone now).
+                self.plugin_core.requests.pop(request.id, None)
                 if error:
                     if isinstance(result, BaseException):
                         await self._send_error_pickled(writer, result)

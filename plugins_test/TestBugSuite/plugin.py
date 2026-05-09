@@ -1016,9 +1016,11 @@ class TestBugSuite(Plugin):
             for _ in range(200):
                 await self.publish_event_for_repro()
             # Poll until burst-spawned tasks drain. Each fan-out task
-            # awaits _process_request → endpoint dispatch → set_collected
-            # → done_callback fires via call_soon. One asyncio.sleep(0)
-            # is NOT enough; deadline-bounded poll handles slow CI.
+            # awaits _process_request → endpoint dispatch → producer's
+            # finally pops from self.requests (B-073 Session 2 Step 3
+            # — was set_collected pre-migration) → done_callback fires
+            # via call_soon. One asyncio.sleep(0) is NOT enough;
+            # deadline-bounded poll handles slow CI.
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 remaining = sum(1 for t in tlist if t not in before_set)
@@ -1412,11 +1414,10 @@ class TestBugSuite(Plugin):
                 "verdict tracks there"
             )
 
-        async def body_b_006_covered(c):
-            c.skip(
-                "covered by TestLifecycleSuite (bug_ids=('B-006',)); "
-                "verdict tracks there"
-            )
+        # B-073 Session 2 Step 5: B-006 skip-stub deleted. The actual
+        # B-006 case in TestLifecycleSuite was deleted (Step 4 killed
+        # running_loop, removing the failure mode the case guarded
+        # against). No upstream case to defer to.
 
         async def body_b_007_covered(c):
             c.skip(
@@ -1508,12 +1509,8 @@ class TestBugSuite(Plugin):
             tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-005",),
             **kw,
         )
-        await rec.run_case(
-            "bug.B-006.covered_by_test_lifecycle_suite", body_b_006_covered,
-            category=category,
-            tags=("bug_repro", "covered_elsewhere"), bug_ids=("B-006",),
-            **kw,
-        )
+        # B-073 Session 2 Step 5: bug.B-006.covered_by_test_lifecycle_suite
+        # registration removed alongside the body stub above.
         await rec.run_case(
             "bug.B-007.covered_by_test_lifecycle_suite", body_b_007_covered,
             category=category,

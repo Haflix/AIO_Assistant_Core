@@ -986,7 +986,6 @@ class ConfigUtil:
         from PluginCore import (  # local import — avoids circular import at module load
             DEFAULT_PLUGIN_READY_TIMEOUT,
             DEFAULT_PLUGIN_DISABLE_TIMEOUT,
-            DEFAULT_CLEANUP_REQUEST_INTERVAL,
         )
         raw_ready_timeout = general_config.get(
             "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
@@ -1027,28 +1026,14 @@ class ConfigUtil:
             disable_timeout = DEFAULT_PLUGIN_DISABLE_TIMEOUT
         plugin_core.plugin_disable_timeout = disable_timeout
 
-        # cleanup_requests interval. Default 10.0 seconds. Two coupled
-        # values share this knob: (1) running_loop sleeps this long
-        # between cleanup_requests ticks; (2) cleanup_requests reaps
-        # collected Request entries older than this interval. Tests
-        # override to 0.5 for fast eventual-reap assertions. Bad values
-        # fall back to default with a warning so a typo can never
-        # silently zero the interval.
-        raw_cleanup_interval = general_config.get(
-            "cleanup_request_interval", DEFAULT_CLEANUP_REQUEST_INTERVAL
-        )
-        try:
-            cleanup_interval = float(raw_cleanup_interval)
-            if cleanup_interval <= 0:
-                raise ValueError("must be > 0")
-        except (TypeError, ValueError):
-            plugin_core._logger.warning(
-                "Invalid general.cleanup_request_interval=%r; defaulting to %.1f",
-                raw_cleanup_interval,
-                DEFAULT_CLEANUP_REQUEST_INTERVAL,
-            )
-            cleanup_interval = DEFAULT_CLEANUP_REQUEST_INTERVAL
-        plugin_core.cleanup_request_interval = cleanup_interval
+        # B-073 Session 2 Step 4: ``cleanup_request_interval`` removed
+        # entirely. Done-callback eviction in ``_process_request*`` and
+        # outer-finally pops at all 7 framework Request sites replaced
+        # the polling reap. Config knob no longer has any effect even
+        # if present in user config — a stale ``cleanup_request_interval``
+        # value will be ignored (no warning; it's a fully-removed key,
+        # not a deprecation). Tests using the old override knob updated
+        # in Step 6 of Session 2.
 
         networking_config = plugin_core.yaml_config.get("networking")
 
@@ -1533,6 +1518,30 @@ class Plugin(ABC):
         """Remove a subscription by its sub_uuid."""
         return await self._plugin_core.unsubscribe_event(subscription_id)
 
+    # ── B-073: Internal event bus observer API ────────────────────────
+
+    def internal_observe(self, topic: str, callback) -> None:
+        """Register a sync observer for a ``_core/...`` framework topic.
+
+        Auto-fills ``plugin_uuid`` so framework auto-cleanup on
+        ``pop_plugin`` removes this registration. See
+        ``PluginCore.internal_observe`` for the full contract:
+        loop-thread only, observers must return < 1ms, ``Exception``
+        subclasses are logged + swallowed (``BaseException`` propagates),
+        idempotent (re-registering same ``(topic, callback)`` is a no-op).
+        """
+        self._plugin_core.internal_observe(self.plugin_uuid, topic, callback)
+
+    def internal_unobserve(self, topic: str, callback) -> bool:
+        """Remove an observer registration. Returns ``True`` if removed.
+
+        Auto-fills ``plugin_uuid``. See ``PluginCore.internal_unobserve``
+        for matching semantics (FIRST occurrence by equality; idempotent).
+        """
+        return self._plugin_core.internal_unobserve(
+            self.plugin_uuid, topic, callback
+        )
+
     # ── PR3 Stage B: publish_event / request_event API ────────────────
 
     def _check_framework_started(self) -> None:
@@ -1843,7 +1852,10 @@ class Request:
         self.target_hosts = target_hosts
         self.blocked_hosts = blocked_hosts
         self.args = args
-        self.collected = False
+        # B-073 Session 2 Step 4: ``self.collected`` field removed —
+        # was read only by ``cleanup_requests`` polling reap (killed
+        # in this step). Done-callback eviction at all 7 framework
+        # Request sites pops the entry from ``pc.requests`` directly.
         self.timeout = False
         self.ready = False
         self.error = False
@@ -1882,9 +1894,15 @@ class Request:
             self.ready = True
             self.finished_at = time.time()
 
-    async def set_collected(self) -> None:
-        """Mark the request as collected for cleanup."""
-        self.collected = True
+    # B-073 Session 2 Step 4: ``Request.set_collected`` removed. Pre-S2
+    # this set ``self.collected = True`` so the now-killed
+    # ``cleanup_requests`` polling reap could find the entry. After
+    # Steps 2+3 done-callback eviction at all 7 framework Request sites
+    # replaced the polling reap; the flag had no remaining consumer.
+    # External callers that still reference ``request.set_collected()``
+    # will hit AttributeError — this is intentional, surfaces the
+    # Step-3-required migration. ``GeneratorRequest.set_collected``
+    # KEPT — distinct B-002 producer-cancel + EndOfQueue logic.
 
     def get_result_sync(self) -> Any:
         """Get the result synchronously."""

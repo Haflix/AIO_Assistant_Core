@@ -673,8 +673,12 @@ class TestExecuteSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            # Mark collected since we never observed the (still-running) result.
-            await req.set_collected()
+            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # ``await req.set_collected()`` (cleanup_requests reaped
+            # after ``collected=True``). Migrated to direct sync pop;
+            # the producer's finally in ``_process_request`` will also
+            # pop on completion (idempotent under ``pop(key, None)``).
+            self._plugin_core.requests.pop(req.id, None)
 
             deadline = time.perf_counter() + 25.0
             while time.perf_counter() < deadline:

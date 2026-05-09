@@ -14,7 +14,7 @@ Categories covered (each method below corresponds to one category):
   9.  _basic_sync              — sync handler dispatch (Q17 + C3)
   10. _basic_logging           — verbose_notifier DEBUG line emission
   11. _basic_lifecycle         — subs registered/unregistered, hot-reload
-  12. _basic_request_cleanup   — set_collected (Q12) reaping
+  12. _basic_request_cleanup   — done-callback eviction (B-073 Session 2 Step 3)
   13. _basic_hard_removal      — Stage D legacy-API hard-removal asserts
   14. _basic_edge              — edge cases + unexpected_pass re-verification
 
@@ -1532,17 +1532,20 @@ class TestEventSuite(Plugin):
 
     async def _basic_request_cleanup(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_set_collected_called(c):
-            # request_event creates a fan-out Request and awaits result;
-            # _fanout_sub's _run_and_collect calls set_collected in its
-            # finally, AND request_event itself awaits + calls
-            # set_collected in a defensive finally. After the call
-            # returns, the request id should be reaped within the
-            # cleanup window.
+            # request_event creates a fan-out Request and awaits result.
+            # B-073 Session 2 Step 3: eviction migrated from
+            # set_collected → direct ``self.requests.pop`` at THREE
+            # sites (producer's finally in _process_request,
+            # _fanout_sub._run_and_collect's finally, AND
+            # request_event's outer finally). All three pops are
+            # idempotent — the request id should leave self.requests
+            # immediately on dispatch completion.
             r = await self.request_event(
                 "smoke_request", payload={"q": "cleanup"}, timeout=2.0,
             )
             c.expect(r, {"echo": "cleanup"})
-            # Allow a brief settle so cleanup_requests can sweep.
+            # Allow a brief settle for the done-callback eviction (B-073
+            # Session 2 Step 3) to fire across all 3 pop sites.
             deadline = time.perf_counter() + 5.0
             while time.perf_counter() < deadline:
                 live_count = sum(
@@ -1560,9 +1563,10 @@ class TestEventSuite(Plugin):
                 if req.kind == "request_event"
             )
             if live_count > 0:
-                # Mark as marker for diagnostics — don't fail. The reap
-                # may legitimately take longer; cleanup_requests sweeps
-                # every 30s by default.
+                # Mark as marker for diagnostics — don't fail. With B-073
+                # done-callback eviction in place this should be zero in
+                # practice; lingering would indicate a regression in one
+                # of the three pop sites.
                 c.set_marker(f"request_lingered_count={live_count}")
 
         await rec.run_case(

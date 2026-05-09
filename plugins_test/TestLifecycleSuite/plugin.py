@@ -1,17 +1,20 @@
 """TestLifecycleSuite — Phase 4.
 
 Exercises plugin lifecycle: load, enable, disable, reload, pop, purge plus
-bug repros B-004 / B-005 / B-006 / B-007 / B-008 / B-009 / B-010 / B-016 /
+bug repros B-004 / B-005 / B-007 / B-008 / B-009 / B-010 / B-016 /
 B-037 / B-043 and the disable-reverse-order regression lock.
+
+B-073 Session 2 Step 5: B-006 case removed — its target failure mode
+(``running_loop`` crashing on a poisoned ``self.requests`` entry)
+ceased to exist when Step 4 killed ``running_loop`` and
+``cleanup_requests`` entirely. Done-callback eviction at all 7
+framework Request sites replaced the polling reap; there is no
+maintenance loop left to test for survival.
 
 Args-override merging cases (8) and per-logger level cases (7) from the plan
 are deferred to a follow-up phase — they need fixture-heavy yaml manipulation
 and log-record interception machinery that's out of scope here. They are
 recorded as `skip` with explicit reasons so the suite still enumerates them.
-
-The B-006 case is destructive=True (running_loop dies) and runs LAST. Its
-finally restarts the maintenance loop via core._running_loop_task =
-asyncio.create_task(core.running_loop()) per the plan.
 """
 
 import sys
@@ -93,8 +96,10 @@ class TestLifecycleSuite(Plugin):
         await self._basic_args_overrides_skip(rec, kw)
         await self._basic_logger_levels_skip(rec, kw)
         await self._basic_async_reload_skip(rec, kw)
-        # Destructive case MUST run last
-        await self._basic_b006_running_loop(rec, kw)
+        # B-073 Session 2 Step 5: B-006 case deleted (tested
+        # _running_loop_task which was killed in Step 4). Done-callback
+        # eviction removes the entire failure mode the case guarded
+        # against (cleanup_requests crash → maintenance loop dead).
 
         return rec.to_dict()
 
@@ -730,7 +735,11 @@ class TestLifecycleSuite(Plugin):
                 await task
             except (asyncio.CancelledError, RequestException):
                 pass
-            await req.set_collected()
+            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # ``await req.set_collected()``; migrated to direct sync
+            # pop. The producer's finally in ``_process_request`` will
+            # also pop on completion (idempotent under ``pop(key, None)``).
+            self._plugin_core.requests.pop(req.id, None)
 
             try:
                 await self._plugin_core.pop_plugin(VICTIM)
@@ -933,52 +942,16 @@ class TestLifecycleSuite(Plugin):
             tags=("config", "contract", "deferred"), **kw,
         )
 
-    # ====================================================================
-    # BASIC B-006 running_loop guard — DESTRUCTIVE, MUST be last
-    # ====================================================================
-
-    async def _basic_b006_running_loop(
-        self, rec: CaseRecorder, kw: Dict,
-    ) -> None:
-        async def body(c):
-            old_task = self._plugin_core._running_loop_task
-            req_id = "lifecycle.b006.bad-test-id"
-            self._plugin_core.requests[req_id] = object()
-
-            try:
-                # cleanup_requests runs every 10s; sleep 13s gives one tick
-                # plus a slack buffer for slow Windows scheduler.
-                await asyncio.sleep(13.0)
-
-                if old_task.done() and old_task.exception() is not None:
-                    c.set_marker("running_loop_died")
-                    raise AssertionError(
-                        f"running_loop died: {type(old_task.exception()).__name__}: "
-                        f"{old_task.exception()}"
-                    )
-                # Bug fixed (loop survived) → unexpected_pass
-            finally:
-                # Restart the maintenance loop per plan §6 Phase 4 B-006.
-                self._plugin_core.requests.pop(req_id, None)
-                if self._plugin_core._running_loop_task.done():
-                    self._plugin_core._running_loop_task = asyncio.create_task(
-                        self._plugin_core.running_loop()
-                    )
-
-        # Stage P (PR4): B-006 FIXED. running_loop now wraps each
-        # tick in try/except so a single bad request entry (or any
-        # other unexpected exception from cleanup_requests) no longer
-        # kills the maintenance loop. Test promoted to positive
-        # regression guard — body asserts the loop is still alive
-        # after a poisoned requests-dict entry.
-        await rec.run_case(
-            "lifecycle.B-006.running_loop_guard", body,
-            tags=("bug_repro", "regression_guard", "terminal"),
-            bug_ids=("B-006",),
-            hard_timeout_s=30.0,
-            destructive=True,
-            **kw,
-        )
+    # B-073 Session 2 Step 5: ``_basic_b006_running_loop`` deleted.
+    # The B-006 case tested ``running_loop`` survival of a poisoned
+    # ``self.requests`` entry. After Step 4 killed ``running_loop`` +
+    # ``cleanup_requests`` entirely, the failure mode the case guarded
+    # against no longer exists — there is no maintenance loop to crash.
+    # Companion fixture ``inject_bad_request`` on TestLifecycleVictim
+    # also deleted (was the entry-point that this case used to poison
+    # ``self.requests`` from a remote-callable endpoint). TestBugSuite
+    # B-006 skip-stub at lines 1415-1419 + dispatch registration at
+    # 1511-1516 also removed.
 
     # ====================================================================
     # BASIC Stage O — readiness gate (4 cases)

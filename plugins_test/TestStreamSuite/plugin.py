@@ -460,8 +460,12 @@ class TestStreamSuite(Plugin):
                 pass
             await req.set_collected()
 
-            # Request entry should still be reaped within 30s via the
-            # cleanup_requests created_at fallback (B-043 covers reap window).
+            # GeneratorRequest entry: ``set_collected`` cancels the
+            # producer task (B-002 logic — distinct from Request which
+            # was migrated in B-073 Session 2 Step 3 to direct dict
+            # pop). Producer's finally in ``_process_request_stream``
+            # then pops the entry from ``self.requests``. Entry should
+            # leave well within 30s via that path.
             deadline = time.perf_counter() + 30.0
             while time.perf_counter() < deadline:
                 if req_id not in self._plugin_core.requests:

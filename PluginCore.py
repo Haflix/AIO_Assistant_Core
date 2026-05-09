@@ -26,7 +26,8 @@ import threading
 from collections import deque
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional, Callable, Union, Dict, List
+from contextvars import ContextVar
+from typing import Any, Optional, Callable, Union, Dict, List, Set, Tuple
 import yaml
 
 # Tracks the sync call chain on each threadpool worker thread.
@@ -84,19 +85,6 @@ DEFAULT_PLUGIN_READY_TIMEOUT: float = 60.0
 # general.plugin_disable_timeout in config.yml; tests may override
 # self.plugin_disable_timeout directly.
 DEFAULT_PLUGIN_DISABLE_TIMEOUT: float = 30.0
-
-# Default cleanup_requests interval (seconds). Two coupled values:
-# (1) running_loop sleeps this long between cleanup_requests ticks,
-# and (2) cleanup_requests reaps collected Request entries whose
-# (finished_at OR created_at) is older than this interval. Coupling
-# the tick rate to the reap window guarantees a collected entry is
-# observed for at least one tick before being reaped, so a consumer
-# that just collected can still read the final state. Configurable
-# via general.cleanup_request_interval in config.yml; tests may
-# override self.cleanup_request_interval directly to speed up
-# eventual-reap assertions.
-DEFAULT_CLEANUP_REQUEST_INTERVAL: float = 10.0
-
 
 def _validate_identifier_name(name, *, context: str) -> None:
     """Validate that ``name`` is a Python-identifier-style string and not in
@@ -167,6 +155,18 @@ _TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # auto_discoverable, secret, cert_file, key_file) trigger
 # _update_networking_in_place — no rebuild needed.
 _REBUILD_FIELDS = frozenset({"peers", "enabled", "port", "hostname", "keys_dir"})
+
+
+# B-073: Internal event bus recursion guard. Module-level ContextVar
+# (NOT instance attr) so the per-task counter is shared across emit
+# calls in the same task while remaining isolated between tasks via
+# Python's contextvars task-inheritance. Increment with
+# ``token = _EMIT_DEPTH.set(...)``; restore with ``_EMIT_DEPTH.reset(token)``
+# — naive ``set(get() - 1)`` corrupts inherited parent-task state under
+# nested ``asyncio.create_task`` fan-out. ``_MAX_EMIT_DEPTH = 5`` aborts
+# pathological recursive observer chains.
+_EMIT_DEPTH: ContextVar[int] = ContextVar("_aio_emit_depth", default=0)
+_MAX_EMIT_DEPTH: int = 5
 
 
 def _resolve_load_time_template(
@@ -609,7 +609,6 @@ class PluginCore:
             thread_name_prefix="plugin",
         )
         self._init_tasks = []
-        self._running_loop_task = None
         self.network = None
         # Hot-reload networking rebuild lock (Commit 2b). Acquired by
         # ``wait_until_ready()`` during boot AND by
@@ -619,6 +618,19 @@ class PluginCore:
         # HIGH-α + Option A (one canonical construction site lives in
         # ``wait_until_ready``; ``start()`` is a thin shim).
         self._network_rebuild_lock: asyncio.Lock = asyncio.Lock()
+        # B-073: Internal event bus state. Sync observer dispatch on the
+        # loop thread; observers must return < 1ms (heavy work goes to
+        # caller-spawned tasks). Topic prefix ``_core/`` reserved from
+        # plugin author code by Step 9 validator change. Auto-cleanup on
+        # pop_plugin via ``_unobserve_plugin`` called from
+        # ``_pop_plugin_under_lock`` alongside
+        # ``topic_registry.unsubscribe_plugin``. ``_observer_owners`` maps
+        # plugin_uuid -> set of (topic, callback) for bulk-unobserve on
+        # pop. Tuples are hashable because callables hash by identity
+        # (bound methods hash by ``(func, instance)`` identity); set
+        # membership and removal work correctly.
+        self._internal_observers: Dict[str, List[Callable]] = {}
+        self._observer_owners: Dict[str, Set[Tuple[str, Callable]]] = {}
         self.topic_registry = TopicRegistry(self._logger.getChild("notifier"))
         self._config_write_lock = threading.Lock()
 
@@ -667,8 +679,6 @@ class PluginCore:
             if self.yaml_config.get("general", {}).get("asyncio_debug", False):
                 self.main_event_loop.set_debug(True)
                 self.main_event_loop.slow_callback_duration = 0.5
-        if self._running_loop_task is None:
-            self._running_loop_task = asyncio.create_task(self.running_loop())
 
         if not self._init_tasks:
             async with self._network_rebuild_lock:
@@ -721,17 +731,193 @@ class PluginCore:
         """
         await self.wait_until_ready()
 
-    async def close(self):
-        """Gracefully shutdown: drain requests, disable plugins in reverse order, stop networking."""
-        # 1. Stop maintenance loop (no more cleanup cycles)
-        self._logger.info("Shutdown: stopping maintenance loop...")
-        if self._running_loop_task is not None:
-            self._running_loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._running_loop_task
-            self._running_loop_task = None
+    # ── B-073: Internal event bus ─────────────────────────────────────
 
-        # 2. Wait for all in-flight request tasks to finish (up to 30s)
+    def internal_observe(
+        self,
+        plugin_uuid: str,
+        topic: str,
+        callback: Callable[[str, dict], None],
+    ) -> None:
+        """Register a sync observer for a ``_core/...`` framework topic.
+
+        Loop-thread only. Plugin authors call via ``Plugin.internal_observe``
+        (utils.py) which auto-fills ``plugin_uuid``; direct callers (test
+        code, framework-internal) must pass ``plugin_uuid`` explicitly.
+
+        Observers are called sync from the loop thread inside
+        ``_internal_emit``; must return quickly (< 1ms). Heavy work goes
+        to caller-spawned tasks. ``Exception`` subclasses raised by a
+        callback are logged + swallowed (do not propagate to other
+        observers). ``BaseException`` subclasses (``CancelledError``,
+        ``KeyboardInterrupt``, ``SystemExit``) propagate up to the
+        framework caller — observer authors must NOT raise those.
+
+        Auto-cleanup: when the plugin owning ``plugin_uuid`` is popped via
+        ``_pop_plugin_under_lock``, every observer registration owned by
+        this plugin_uuid is removed (mirrors ``topic_registry.unsubscribe_plugin``).
+
+        Idempotent: registering the same ``(topic, callback)`` pair twice
+        for the same ``plugin_uuid`` is a no-op — single registration per
+        pair, single dispatch per emit. This keeps ``_internal_observers``
+        (per-topic list) and ``_observer_owners`` (per-plugin set) in
+        symmetric step so ``_unobserve_plugin`` cleans up exactly what
+        was registered.
+
+        Worker-thread call from a sync endpoint dispatched via
+        ``_plugin_executor`` races with loop-thread emits; not supported.
+        Bridge via ``asyncio.run_coroutine_threadsafe(...)`` if needed.
+        """
+        owned = self._observer_owners.setdefault(plugin_uuid, set())
+        pair = (topic, callback)
+        if pair in owned:
+            return  # idempotent — already registered
+        owned.add(pair)
+        self._internal_observers.setdefault(topic, []).append(callback)
+
+    def internal_unobserve(
+        self,
+        plugin_uuid: str,
+        topic: str,
+        callback: Callable[[str, dict], None],
+    ) -> bool:
+        """Remove an observer registration. Returns ``True`` if removed.
+
+        Removes the FIRST matching ``(topic, callback)`` pair owned by
+        ``plugin_uuid`` via ``list.remove`` (equality-based; bound methods
+        compare by ``(func, instance)`` identity). Silent no-op if the
+        registration is absent (returns ``False``). Idempotent.
+
+        Cleans up empty topic lists and empty owner sets so the dicts
+        don't grow indefinitely under register/unregister churn.
+        """
+        lst = self._internal_observers.get(topic)
+        if not lst:
+            return False
+        try:
+            lst.remove(callback)
+        except ValueError:
+            return False
+        if not lst:
+            self._internal_observers.pop(topic, None)
+        owned = self._observer_owners.get(plugin_uuid)
+        if owned is not None:
+            owned.discard((topic, callback))
+            if not owned:
+                self._observer_owners.pop(plugin_uuid, None)
+        return True
+
+    def _unobserve_plugin(self, plugin_uuid: str) -> int:
+        """Remove all observer registrations owned by ``plugin_uuid``.
+
+        Called from ``_pop_plugin_under_lock`` alongside
+        ``topic_registry.unsubscribe_plugin`` so observer state mirrors
+        topic-sub state on plugin removal. Without this, a popped plugin's
+        bound-method observers keep the Plugin instance alive in
+        ``_internal_observers`` indefinitely (memory leak) AND continue
+        firing against a torn-down plugin instance.
+
+        Returns count removed. Cleans up empty topic lists.
+        """
+        owned = self._observer_owners.pop(plugin_uuid, set())
+        count = 0
+        for topic, callback in owned:
+            lst = self._internal_observers.get(topic)
+            if not lst:
+                continue
+            try:
+                lst.remove(callback)
+                count += 1
+                # Cleanup empty list inside the try so it only runs on a
+                # successful remove. Outside the try, a ValueError (callback
+                # absent) would still hit the cleanup against the unmodified
+                # non-empty list — harmless today but a latent footgun under
+                # future refactor.
+                if not lst:
+                    self._internal_observers.pop(topic, None)
+            except ValueError:
+                pass
+        return count
+
+    def _internal_emit(self, topic: str, **payload: Any) -> None:
+        """Fire ``topic`` to all registered observers synchronously.
+
+        Module-level ``_EMIT_DEPTH`` ContextVar guards against pathological
+        recursive emits (depth >= ``_MAX_EMIT_DEPTH = 5`` aborts + logs).
+        ``token = _EMIT_DEPTH.set(...)`` + ``_EMIT_DEPTH.reset(token)``
+        restores parent-task state correctly under
+        ``asyncio.create_task`` context inheritance — naive
+        ``set(get() - 1)`` corrupts the parent slot.
+
+        Snapshots the observer list before iteration so unregister-during-
+        emit (e.g. an observer calling ``internal_unobserve`` on itself)
+        is safe. ``Exception`` subclasses raised by an observer are logged
+        + swallowed; never propagate to other observers or up to the
+        caller. ``BaseException`` subclasses (``CancelledError``,
+        ``KeyboardInterrupt``, ``SystemExit``) DO propagate — observer
+        authors must NOT raise those.
+
+        No-op fast path when no observer is registered for ``topic``
+        (~50ns dict lookup). Per-event cost negligible at any reasonable
+        load.
+
+        Framework-internal: bypasses the leading-underscore validator
+        that rejects plugin-author topics starting with ``_`` (Step 9).
+
+        **Observer contract — payload is a plain dict, NOT unpacked
+        kwargs.** Even though this method takes ``**payload`` kwargs at
+        the emitter side, the observer is called as ``cb(topic, payload)``
+        where ``payload`` is the captured-kwargs ``dict``. Observer
+        signature is ``Callable[[str, dict], None]``:
+
+            # emitter (framework code):
+            self._internal_emit("_core/request/started", request_id="abc", plugin="X")
+
+            # observer (plugin code):
+            def my_observer(topic: str, payload: dict) -> None:
+                request_id = payload["request_id"]
+                plugin_name = payload["plugin"]
+
+        Writing ``def my_observer(topic, **payload)`` would receive the
+        dict as a single positional arg ``payload``, NOT the unpacked
+        kwargs — TypeError on first key access.
+        """
+        listeners = self._internal_observers.get(topic)
+        if not listeners:
+            return
+        depth = _EMIT_DEPTH.get()
+        if depth >= _MAX_EMIT_DEPTH:
+            self._logger.warning(
+                "B-073 RECURSIVE EMIT DEPTH EXCEEDED at %d for topic %r — "
+                "dropping event. Observer fan-out exceeded max depth %d; "
+                "check observers for re-entrant framework calls.",
+                depth, topic, _MAX_EMIT_DEPTH,
+            )
+            return
+        snapshot = list(listeners)
+        token = _EMIT_DEPTH.set(depth + 1)
+        try:
+            for cb in snapshot:
+                try:
+                    cb(topic, payload)
+                except Exception:
+                    self._logger.exception(
+                        "B-073 internal observer raised on topic %r; "
+                        "swallowed and continuing to next observer", topic,
+                    )
+        finally:
+            _EMIT_DEPTH.reset(token)
+
+    async def close(self):
+        """Gracefully shutdown: drain requests, disable plugins in reverse order, stop networking.
+
+        B-073 Session 2 Step 4: ``running_loop`` + ``cleanup_requests``
+        + ``cleanup_request_interval`` knob removed entirely. Done-callback
+        eviction (Step 2's producer-finally pops + Step 3's outer-finally
+        pops at all 7 framework Request migration sites) replaces the
+        polling reap. There is no maintenance loop to stop on shutdown.
+        """
+        # 1. Wait for all in-flight request tasks to finish (up to 30s)
         # Snapshot via list() so concurrent done_callback eviction can't
         # mutate the set during iteration. (Single-threaded loop already
         # makes this safe but the snapshot keeps the intent explicit.)
@@ -754,7 +940,7 @@ class PluginCore:
         # absent key is a no-op.
         self.task_list.clear()
 
-        # 2.5. Shutdown the SyncDispatcher (PR3 Stage A, Q17 + C8).
+        # 2. Shutdown the SyncDispatcher (PR3 Stage A, Q17 + C8).
         # MUST happen AFTER the 30s in-flight drain. Per C8 spec: wrap
         # executor.shutdown(wait=True) in asyncio.wait_for with 30s
         # timeout. On timeout, fall through to wait=False semantics
@@ -778,7 +964,7 @@ class PluginCore:
             except Exception:
                 self._logger.exception("SyncDispatcher shutdown failed")
 
-        # 3. Disable plugins in REVERSE config order
+        # 3. Disable plugins in REVERSE config order.
         #    Reverse order ensures dependents shut down before their dependencies.
         #    e.g. Discord_Bot_Plugin → DataCollection → PostgreSQL
         plugin_names = list(self.plugins.keys())
@@ -2691,13 +2877,22 @@ class PluginCore:
         if plugin_name not in self.plugins:
             return False
 
+        # B-073 (Session 2 Step 2 prep): snapshot under the lock,
+        # iterate outside. Producer-side finally pops in
+        # ``_process_request*`` mutate ``self.requests`` lock-free
+        # (Python dict ``pop`` is GIL-atomic). Iterating directly
+        # under the lock would risk ``RuntimeError: dictionary changed
+        # size during iteration`` if a producer completes mid-await.
+        # Snapshot copies references; already-popped entries' futures
+        # short-circuit via the ``not done()`` check below.
         async with self.request_lock:
-            for req in self.requests.values():
-                if req.target_plugin == plugin_name and not req._future.done():
-                    await req.set_result(
-                        f"Plugin {plugin_name} was unloaded while request was pending",
-                        error=True,
-                    )
+            snapshot = list(self.requests.values())
+        for req in snapshot:
+            if req.target_plugin == plugin_name and not req._future.done():
+                await req.set_result(
+                    f"Plugin {plugin_name} was unloaded while request was pending",
+                    error=True,
+                )
 
         if plugin_name in self.plugins and self.plugins[plugin_name].enabled:
             # B-009 fix: wrap user on_disable in asyncio.wait_for via
@@ -2737,6 +2932,12 @@ class PluginCore:
                 self.plugins_by_uuid.pop(plugin_uuid, None)
             if plugin_uuid:
                 await self.topic_registry.unsubscribe_plugin(plugin_uuid)
+                # B-073: bulk-unobserve every internal-event-bus observer
+                # this plugin registered. Mirrors the topic-sub cleanup
+                # above so observer state can't outlive the Plugin
+                # instance (memory leak) AND post-pop emits don't
+                # dispatch to a torn-down plugin's bound methods.
+                self._unobserve_plugin(plugin_uuid)
                 LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
         return True
 
@@ -2920,27 +3121,42 @@ class PluginCore:
 
     @contextlib.asynccontextmanager
     async def request_context_async(self, request: Request):
-        """Async context manager to handle requests."""
+        """Async context manager to handle requests.
+
+        B-073 Session 2 Step 3: ``set_collected`` migrated to
+        ``self.requests.pop`` per the done-callback eviction model.
+        ``Request.set_collected`` was a no-op flag-setter; the producer's
+        finally in ``_process_request`` already pops the request, but
+        this outer context-manager pop is symmetric (idempotent under
+        ``pop(key, None)``) and matches the migration pattern across
+        all 6 framework Request sites.
+        """
         try:
             result, error, timed_out = await request.wait_for_result_async()
             if error:
                 raise Exception(f"Request {request.id} failed: {request.result}")
             yield result
         finally:
-            await request.set_collected()
+            self.requests.pop(request.id, None)
 
     @contextlib.contextmanager
     def request_context_sync(self, request: Request):
-        """Sync context manager to handle requests."""
+        """Sync context manager to handle requests.
+
+        B-073 Session 2 Step 3: replaced the ``run_coroutine_threadsafe``
+        bridge to ``set_collected`` with a direct sync ``pop``. The pop
+        is GIL-atomic so it's safe to call from a worker thread without
+        a loop-bridge — Python dict ``pop`` is implemented as a single
+        bytecode op. ``_pop_plugin_under_lock`` snapshots iteration so
+        concurrent eviction never trips dict-mutation-during-iteration.
+        """
         try:
             result = request.get_result_sync()
             if request.error:
                 raise Exception(f"Request failed: {request.result}")
             yield result
         finally:
-            asyncio.run_coroutine_threadsafe(
-                request.set_collected(), self.main_event_loop
-            )
+            self.requests.pop(request.id, None)
 
     @async_log_errors
     async def create_request(
@@ -3382,7 +3598,17 @@ class PluginCore:
 
     @async_handle_errors(None)
     async def _process_request(self, request: Request) -> None:
-        """Process a request by invoking the target plugin method."""
+        """Process a request by invoking the target plugin method.
+
+        B-073 Session 2 Step 2: ``finally`` block evicts the Request
+        from ``self.requests`` on every completion path (success, error,
+        cancellation). Replaces the 10s polling reap performed by the
+        ``cleanup_requests`` maintenance loop (killed in Step 4 — both
+        mechanisms run idempotently in the meantime). The pop is sync
+        + GIL-atomic; ``_pop_plugin_under_lock`` snapshots
+        ``self.requests`` under the lock so concurrent eviction never
+        triggers ``RuntimeError: dictionary changed size during iteration``.
+        """
         try:
             plugin_name = request.target_plugin
             function_name = request.target_method
@@ -3518,6 +3744,14 @@ class PluginCore:
                 await self._set_request_result(
                     request, f"Unhandled error processing request: {e}", True
                 )
+        finally:
+            # B-073 Session 2 Step 2: done-callback eviction. Pop the
+            # Request entry from ``self.requests`` on every completion
+            # path (success, exception, cancellation). Replaces the
+            # ``cleanup_requests`` polling reap (killed in Step 4).
+            # ``pop(key, None)`` is GIL-atomic and idempotent — safe
+            # under cancel mid-finally.
+            self.requests.pop(request.id, None)
 
     async def _call_endpoint(
         self,
@@ -3602,7 +3836,24 @@ class PluginCore:
 
     # @async_handle_errors(None)
     async def _process_request_stream(self, request: GeneratorRequest) -> None:
-        """Process a request by invoking the target plugin method."""
+        """Process a request by invoking the target plugin method.
+
+        B-073 Session 2 Step 2: ``finally`` block evicts the
+        GeneratorRequest from ``self.requests`` on every completion path
+        (success, error, cancellation). Symmetric with ``_process_request``
+        for non-stream Requests. Replaces the ``cleanup_requests``
+        polling reap (killed in Step 4). Sync GIL-atomic ``pop``;
+        ``_pop_plugin_under_lock`` snapshots iteration so concurrent
+        eviction never trips dict-mutation-during-iteration.
+
+        ``GeneratorRequest.set_collected`` (utils.py B-002 logic)
+        continues to be called by the consumer side — it cancels the
+        producer task + pushes EndOfQueue sentinel, distinct from
+        eviction. Both fire on completion: producer-side finally pops
+        from ``self.requests``; consumer-side ``set_collected`` handles
+        producer-task lifecycle. Symmetric, single-source-of-truth per
+        concern.
+        """
         try:
             plugin_name = request.target_plugin
             function_name = request.target_method
@@ -3795,6 +4046,11 @@ class PluginCore:
                 await self._set_gen_request_result(
                     request, f"Unhandled error processing stream request: {e}", True
                 )
+        finally:
+            # B-073 Session 2 Step 2: done-callback eviction. Symmetric
+            # with ``_process_request``'s finally — pop on any completion
+            # path. Sync, GIL-atomic, idempotent.
+            self.requests.pop(request.id, None)
 
     async def _process_request_event_stream(
         self,
@@ -3822,6 +4078,12 @@ class PluginCore:
         request.timeout_duration which is intentionally None to disable
         get_queue_stream's redundant consumer-side timeout enforcement
         — see consumer-site comment in request_event_stream).
+
+        B-073 Session 2 Step 2: ``finally`` block evicts the
+        GeneratorRequest from ``self.requests`` on every completion path
+        (success, RequestException, generic Exception). Symmetric with
+        ``_process_request`` and ``_process_request_stream``. Sync
+        GIL-atomic ``pop``.
         """
         try:
             internal = endpoint.get("internal_name") or request.target_method
@@ -3971,6 +4233,13 @@ class PluginCore:
                     f"Unhandled error in request_event_stream producer: {e}",
                     True,
                 )
+        finally:
+            # B-073 Session 2 Step 2: done-callback eviction. Symmetric
+            # with ``_process_request`` and ``_process_request_stream``
+            # finally blocks — pop the GeneratorRequest from
+            # ``self.requests`` on every completion path. Sync, GIL-atomic,
+            # idempotent.
+            self.requests.pop(request.id, None)
 
     @async_handle_errors(None)
     async def _set_request_result(
@@ -4055,67 +4324,16 @@ class PluginCore:
         task.add_done_callback(_on_done)
         return task
 
-    async def running_loop(self):
-        """Maintenance loop that cleans up requests.
-
-        B-006 fix: a single tick that raises must not kill the loop —
-        cleanup_requests is `@async_log_errors` which re-raises, and
-        any unexpected exception (e.g. a malformed entry in
-        self.requests with no .collected attribute) would otherwise
-        terminate the maintenance loop forever, leaking requests for
-        the rest of the process. Catch every Exception (logging it)
-        and continue. CancelledError is re-raised so close() can stop
-        the loop normally.
-
-        B-047 fix (Stage Q): task_list eviction now happens via
-        per-task done_callback registered in _spawn_tracked. The
-        previous `self.task_list = [t for t in self.task_list if not
-        t.done()]` 10s polling sweep was removed — eviction is now
-        instant and O(1), and a reassignment here would orphan any
-        in-flight done_callbacks pointing at the original set.
-        """
-        while True:
-            try:
-                await self.cleanup_requests()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._logger.exception(
-                    "running_loop: cleanup tick raised; continuing"
-                )
-            interval = getattr(
-                self,
-                "cleanup_request_interval",
-                DEFAULT_CLEANUP_REQUEST_INTERVAL,
-            )
-            await asyncio.sleep(interval)
-
-    @async_log_errors
-    async def cleanup_requests(self):
-        """Remove collected requests older than ``cleanup_request_interval``.
-
-        Uses created_at as the fallback when finished_at is unset — a few exit
-        paths in Request.wait_for_result_async finalize state without setting
-        finished_at (timeout/exception branches), and the previous filter
-        (`finished_at is None` → keep forever) was leaking those forever.
-        Falling back to created_at means even un-finalized-but-collected
-        requests get reaped one interval after creation. Interval is
-        configurable via general.cleanup_request_interval (default 10s);
-        the running_loop tick rate uses the same value so a collected
-        entry survives at least one tick before reap.
-        """
-        interval = getattr(
-            self,
-            "cleanup_request_interval",
-            DEFAULT_CLEANUP_REQUEST_INTERVAL,
-        )
-        _timer = time.time() - interval
-        async with self.request_lock:
-            self.requests = {
-                rid: req
-                for rid, req in self.requests.items()
-                if not req.collected or (req.finished_at or req.created_at) > _timer
-            }
+    # B-073 Session 2 Step 4: ``running_loop`` + ``cleanup_requests``
+    # removed. Pre-Step-2 the maintenance loop ticked every
+    # ``cleanup_request_interval`` seconds and reaped Request entries
+    # whose ``collected`` flag was set. Steps 2+3 replaced the polling
+    # reap with done-callback eviction at all 7 framework Request sites
+    # (3 producer-finally pops in ``_process_request*`` + 6 outer-finally
+    # pops at ``execute``/``request_event``/etc.). The maintenance loop
+    # has no work to do — eviction is now O(1) at completion time, no
+    # sweep needed. ``cleanup_request_interval`` config knob also
+    # removed from ``apply_configvalues`` in utils.py.
 
     def _validate_host_args(self, hosts, blocked_hosts):
         """Normalize hosts/blocked_hosts and warn on redundant combos.
@@ -4192,10 +4410,12 @@ class PluginCore:
                 raise RequestException(result)
             return result
         finally:
-            # Mark for cleanup. Runs on normal return, RequestException, AND
-            # CancelledError — without this, a cancelled caller would leave the
-            # Request lingering in self.requests forever.
-            await request.set_collected()
+            # B-073 Session 2 Step 3: done-callback eviction. Runs on
+            # normal return, RequestException, AND CancelledError —
+            # without this, a cancelled caller would leave the Request
+            # lingering in self.requests forever. Sync, GIL-atomic,
+            # idempotent with the producer-side pop in _process_request.
+            self.requests.pop(request.id, None)
 
     @log_errors
     def execute_sync(
@@ -4301,7 +4521,9 @@ class PluginCore:
                 raise RequestException(result)
             return result
         finally:
-            await request.set_collected()
+            # B-073 Session 2 Step 3: done-callback eviction. Idempotent
+            # with the producer-side pop in _process_request.
+            self.requests.pop(request.id, None)
 
     @async_gen_log_errors
     async def execute_stream(
@@ -5159,9 +5381,11 @@ class PluginCore:
             try:
                 await self._process_request(request)
             finally:
-                # Q12 fix: mark for cleanup so cleanup_requests doesn't
-                # leak fan-out Requests.
-                await request.set_collected()
+                # B-073 Session 2 Step 3: done-callback eviction. Was
+                # ``await request.set_collected()`` (Q12 fix); migrated
+                # to direct sync pop. Idempotent — _process_request's
+                # own finally already pops via the producer-side path.
+                self.requests.pop(request.id, None)
 
         # Name uses `sub.target_plugin or sub.plugin_name` to mirror the
         # actual dispatch target (line ~3876 already applies that
@@ -5393,13 +5617,13 @@ class PluginCore:
                 raise RequestException(result)
             return result
         finally:
-            # Defensive: matches execute() pattern at line 2554. Ensures
-            # set_collected runs even on caller cancellation /
-            # RequestException paths, so cleanup_requests can reap the
-            # Request entry. _run_and_collect (in _fanout_sub) also calls
-            # set_collected on dispatch completion, but that may take
-            # longer than the await here if the handler hangs. Idempotent.
-            await request.set_collected()
+            # B-073 Session 2 Step 3: done-callback eviction. Was
+            # ``await request.set_collected()``; migrated to direct sync
+            # pop. Defensive — _process_request's producer-side finally
+            # and _fanout_sub._run_and_collect's finally both also pop
+            # the same Request id. All three pops are idempotent under
+            # ``pop(key, None)``. Triple-pop is harmless.
+            self.requests.pop(request.id, None)
 
     @log_errors
     def request_event_sync(
