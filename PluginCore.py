@@ -234,6 +234,16 @@ def _validate_topic_static(
     if not stripped or not stripped.strip():
         raise ValueError(f"{context}: topic must not be empty (Q15)")
 
+    # B-073 Step 9: reject topics starting with the framework-internal
+    # prefix ``_``. ``_core/...`` is reserved for the internal event bus
+    # (PluginCore._internal_emit, exempt from this validator). Plugin
+    # authors must use a non-underscore-prefixed namespace.
+    if stripped.startswith("_"):
+        raise ValueError(
+            f"{context}: topic {topic!r} starts with reserved framework "
+            f"prefix '_' — '_core/' is framework-internal (B-073)"
+        )
+
     segments = stripped.split("/")
     for seg in segments:
         if not seg:
@@ -839,7 +849,7 @@ class PluginCore:
                 pass
         return count
 
-    def _internal_emit(self, topic: str, **payload: Any) -> None:
+    def _internal_emit(self, topic: str, /, **payload: Any) -> None:
         """Fire ``topic`` to all registered observers synchronously.
 
         Module-level ``_EMIT_DEPTH`` ContextVar guards against pathological
@@ -3613,6 +3623,16 @@ class PluginCore:
             plugin_name = request.target_plugin
             function_name = request.target_method
 
+            # B-073 Step 8 emit: request started.
+            self._internal_emit(
+                "_core/request/started",
+                request_id=request.id,
+                plugin=plugin_name,
+                method=function_name,
+                author=request.author,
+                ts=time.time(),
+            )
+
             # PR3 Stage A: prefer request.requester_id (set by Stage B
             # fan-out to sub OWNER's plugin_uuid per C18) over
             # author_id. None on execute-path Requests → falls back to
@@ -3745,6 +3765,25 @@ class PluginCore:
                     request, f"Unhandled error processing request: {e}", True
                 )
         finally:
+            # B-073 Step 8 emit: request completed. Defensive future-
+            # state read — cancelled future raises on .result(); guard
+            # explicitly. Latency clamped to 0.0 against clock jumps.
+            if request._future.done() and not request._future.cancelled():
+                try:
+                    _, _err_flag, _ = request._future.result()
+                    errored = bool(_err_flag)
+                except Exception:
+                    errored = True  # future yielded an exception
+            else:
+                errored = request._future.cancelled()
+            self._internal_emit(
+                "_core/request/completed",
+                request_id=request.id,
+                latency=max(0.0, time.time() - request.created_at),
+                error=errored,
+                ts=time.time(),
+            )
+
             # B-073 Session 2 Step 2: done-callback eviction. Pop the
             # Request entry from ``self.requests`` on every completion
             # path (success, exception, cancellation). Replaces the
@@ -4060,6 +4099,7 @@ class PluginCore:
         event_meta: Event,
         timeout: Optional[float] = None,
         caller_chain: Optional[tuple] = None,
+        verbose_notifier: bool = False,
     ) -> None:
         """Producer for request_event_stream LOCAL fan-out (B-054 fix).
 
@@ -4105,6 +4145,8 @@ class PluginCore:
             # asyncio.wait_for with the residual deadline.
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout if timeout is not None else None
+            # B-074 Step 10: producer-side first-chunk timing baseline.
+            producer_t0 = loop.time()
 
             def _residual() -> Optional[float]:
                 if deadline is None:
@@ -4149,6 +4191,22 @@ class PluginCore:
                                 subscription_id=event_meta.subscription_id,
                                 timestamp=event_meta.timestamp,
                             )
+                            # B-073 Step 8 emit: event streamed first chunk.
+                            self._internal_emit(
+                                "_core/event/streamed",
+                                publisher=event_meta.author,
+                                topic=event_meta.topic,
+                                phase="first_chunk",
+                                ts=time.time(),
+                            )
+                            # B-074 Step 10 verbose log: first chunk timing.
+                            if verbose_notifier:
+                                self._logger.debug(
+                                    "request_event_stream topic=%r first chunk "
+                                    "yielded after %.3fs",
+                                    event_meta.topic,
+                                    loop.time() - producer_t0,
+                                )
                             await request.queue.put((wrapped, False, False))
                         else:
                             await request.queue.put((chunk, False, False))
@@ -4214,6 +4272,22 @@ class PluginCore:
                                 subscription_id=event_meta.subscription_id,
                                 timestamp=event_meta.timestamp,
                             )
+                            # B-073 Step 8 emit: event streamed first chunk.
+                            self._internal_emit(
+                                "_core/event/streamed",
+                                publisher=event_meta.author,
+                                topic=event_meta.topic,
+                                phase="first_chunk",
+                                ts=time.time(),
+                            )
+                            # B-074 Step 10 verbose log: first chunk timing.
+                            if verbose_notifier:
+                                self._logger.debug(
+                                    "request_event_stream topic=%r first chunk "
+                                    "yielded after %.3fs",
+                                    event_meta.topic,
+                                    loop.time() - producer_t0,
+                                )
                             await request.queue.put((wrapped, False, False))
                         else:
                             await request.queue.put((chunk, False, False))
@@ -4688,7 +4762,16 @@ class PluginCore:
         declared_id: Optional[str] = None,
         enabled: bool = True,
     ) -> str:
-        """Register a topic subscription. Returns subscription ID."""
+        """Register a topic subscription. Returns subscription ID.
+
+        B-073 Step 9: validates ``topic`` against the subscription rules
+        (rejects empty/wildcard-mid-segment/{var}-templating/leading-``_``
+        framework prefix). Closes the bypass that runtime test/tooling
+        callers previously used to skip validation.
+        """
+        _validate_subscription_topic(
+            topic, context=f"PluginCore.subscribe(plugin={plugin_name!r})"
+        )
         return await self.topic_registry.subscribe(
             topic_pattern=topic,
             plugin_name=plugin_name,
@@ -5266,6 +5349,16 @@ class PluginCore:
                     "publish_event remote dispatch failed", exc_info=True
                 )
 
+        # B-073 Step 8 emit: event published. ALWAYS emit even when
+        # target_count=0 — useful for "publisher fired, nothing
+        # listened" debugging.
+        self._internal_emit(
+            "_core/event/published",
+            publisher=publisher.plugin_name,
+            topic=resolved_topic,
+            target_count=local_count + remote_count,
+            ts=now_ts,
+        )
         return local_count + remote_count
 
     async def _fanout_sub(
@@ -5525,20 +5618,26 @@ class PluginCore:
             # MED-B): mid-block hot-reload would otherwise leak calls
             # onto a stopped NM. None falls through to the bottom
             # ``raise RequestException("no subscriber matches...")``.
+            #
+            # B-073 Step 8: ``candidates`` + ``request_uuid`` initialized
+            # OUTSIDE the networking sub-block so (a) the emit fires
+            # even on the networking-disabled path with target_count=0,
+            # and (b) ``request_uuid`` is bound for the second
+            # networking guard's dispatch loop even if observer-driven
+            # state flips networking between the two guards.
+            from uuid import uuid4 as _uuid4
+            from notifier import TopicRegistry as _TR
+            candidates: list = []
+            request_uuid = _uuid4().hex
             nm = self.network
             if (
                 getattr(self, "networking_enabled", False)
                 and nm is not None
                 and getattr(nm, "is_ready", False)
             ):
-                from uuid import uuid4 as _uuid4
-                from notifier import TopicRegistry as _TR
-                request_uuid = _uuid4().hex
-
                 async with nm._adverts_struct_lock:
                     cands_raw = list(nm._inbound_global_order.items())
 
-                candidates = []
                 for (peer_hostname, _sub_uuid), advert in cands_raw:
                     node = next(
                         (
@@ -5568,6 +5667,31 @@ class PluginCore:
                         continue
                     candidates.append((peer_hostname, advert, node))
 
+            # B-073 Step 8 emit: event_requested on no-local-match path.
+            # target_count covers all 3 sub-paths (networking disabled
+            # → 0; networking on but no candidates → 0; networking on
+            # with candidates → N).
+            self._internal_emit(
+                "_core/event/requested",
+                publisher=publisher.plugin_name,
+                topic=resolved_topic,
+                target_count=len(candidates),
+                ts=now_ts,
+            )
+
+            # B-074 Step 10 verbose log: no-local-match branch.
+            if publisher.verbose_notifier:
+                self._logger.debug(
+                    "request_event %s topic=%r no local match, "
+                    "falling through to %d remote candidates",
+                    event_id, resolved_topic, len(candidates),
+                )
+
+            if (
+                getattr(self, "networking_enabled", False)
+                and nm is not None
+                and getattr(nm, "is_ready", False)
+            ):
                 last_exc: Optional[BaseException] = None
                 for peer_hostname, advert, node in candidates:
                     try:
@@ -5598,6 +5722,23 @@ class PluginCore:
             raise RequestException(
                 f"request_event {event_id!r}: no subscriber matches resolved "
                 f"topic {resolved_topic!r}"
+            )
+
+        # B-073 Step 8 emit: event_requested on local-match path.
+        self._internal_emit(
+            "_core/event/requested",
+            publisher=publisher.plugin_name,
+            topic=resolved_topic,
+            target_count=1,
+            ts=now_ts,
+        )
+
+        # B-074 Step 10 verbose log: local-match branch.
+        if publisher.verbose_notifier:
+            self._logger.debug(
+                "request_event %s topic=%r matched local sub uuid=%s, "
+                "dispatching",
+                event_id, resolved_topic, local_match.sub_uuid,
             )
 
         request = await self._fanout_sub(
@@ -5823,6 +5964,14 @@ class PluginCore:
                 f"resolved topic {resolved_topic!r}"
             )
 
+        # B-074 Step 10 verbose log: stream local-match opening.
+        if publisher.verbose_notifier:
+            self._logger.debug(
+                "request_event_stream %s topic=%r matched local sub uuid=%s, "
+                "opening stream",
+                event_id, resolved_topic, local_match.sub_uuid,
+            )
+
         # Route through find_endpoint so the C18 accessible_by_other_plugins
         # access check applies on the streaming path too. Pass
         # requester_id=local_match.plugin_uuid (the SUB OWNER's identity)
@@ -5935,22 +6084,53 @@ class PluginCore:
                 request, target_plugin, endpoint, event_meta,
                 timeout=timeout,
                 caller_chain=_caller_chain,
+                verbose_notifier=publisher.verbose_notifier,
             ),
             name=f"event_stream:{request.target_plugin}.{request.target_method}<-{resolved_topic}",
         )
         request._producer_task = producer_task
 
+        # B-074 Step 10: stream-end tracking for verbose log L5.
+        chunk_count = 0
+        exit_reason = "normal"
         try:
-            async for result, error, _ in request.get_queue_stream():
-                if error:
-                    self._logger.warning(
-                        f"Error in request_event_stream {event_id!r} "
-                        f"(GenReq-ID: {request.id}): {result}. You can "
-                        f"check the logs for this Req-ID."
-                    )
-                    raise RequestException(result)
-                yield result
+            try:
+                async for result, error, _ in request.get_queue_stream():
+                    if error:
+                        self._logger.warning(
+                            f"Error in request_event_stream {event_id!r} "
+                            f"(GenReq-ID: {request.id}): {result}. You can "
+                            f"check the logs for this Req-ID."
+                        )
+                        exit_reason = "exception"
+                        raise RequestException(result)
+                    chunk_count += 1
+                    yield result
+            except GeneratorExit:
+                # Consumer broke out of `async for chunk in ...:` early.
+                exit_reason = "consumer_break"
+                raise
+            except BaseException:
+                if exit_reason == "normal":
+                    exit_reason = "exception"
+                raise
         finally:
+            # B-073 Step 8 emit: event streamed ended. Captures all 3
+            # exit paths (natural exhaustion, consumer break, exception).
+            self._internal_emit(
+                "_core/event/streamed",
+                publisher=publisher.plugin_name,
+                topic=resolved_topic,
+                phase="ended",
+                ts=time.time(),
+            )
+            # B-074 Step 10 verbose log: stream ended.
+            if publisher.verbose_notifier:
+                self._logger.debug(
+                    "request_event_stream %s topic=%r stream ended "
+                    "(chunks=%d, %s)",
+                    event_id, resolved_topic, chunk_count, exit_reason,
+                )
             # Mark for cleanup. Cancels the producer task on early
             # break (B-002 pattern). Mirrors execute_stream's pattern.
             await request.set_collected()

@@ -10,6 +10,7 @@ import inspect
 import pickle
 import struct
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Set, Union, Optional, Tuple
@@ -1366,6 +1367,24 @@ class NetworkManager:
             client_addr, peer_cfg.hostname, peer_cfg.system_caller,
         )
 
+        # B-073 Step 8 emit: peer connected. Pre-pin-check failure paths
+        # return at lines above BEFORE this point, so port scanners do
+        # not produce spurious connect events. ``port`` is the TCP source
+        # port from the connecting client (typically ephemeral OS-assigned),
+        # NOT the peer's listener port — useful for connection tracing.
+        self.plugin_core._internal_emit(
+            "_core/peer/connected",
+            hostname=peer_cfg.hostname,
+            ip=client_addr[0],
+            port=client_addr[1],
+            ts=time.time(),
+        )
+
+        # B-073 Step 8: track disconnect reason for the finally emit.
+        # Each except clause below mutates this; defaults to "normal" on
+        # clean loop exit.
+        disconnect_reason: str = "normal"
+
         try:
             # Process requests
             while True:
@@ -1375,6 +1394,7 @@ class NetworkManager:
                     self._logger.debug(
                         f"Connection lost while handling client {client_addr}"
                     )
+                    disconnect_reason = "connection_error"
                     break
                 except pickle.UnpicklingError as e:
                     # K-3 review HIGH fix: SafeUnpickler rejection from a
@@ -1387,6 +1407,7 @@ class NetworkManager:
                         client_addr, peer_fp,
                         conn_context.get("peer_hostname"), e,
                     )
+                    disconnect_reason = "rce_attempt"
                     break
 
                 if msg_type == MSG_EXECUTE:
@@ -1426,8 +1447,10 @@ class NetworkManager:
 
         except ConnectionError:
             self._logger.debug(f"Client {client_addr} disconnected")
+            disconnect_reason = "connection_error"
         except Exception as e:
             self._logger.exception(f"Error handling client {client_addr}")
+            disconnect_reason = "error"
             try:
                 await self._send_error(writer, str(e))
             except Exception:
@@ -1437,8 +1460,8 @@ class NetworkManager:
             # close ONLY IF heartbeat has also marked the peer dead.
             # Heartbeat is the source-of-truth — pooled-connection-recycle
             # would over-eagerly drop on every transient pool churn.
+            peer_hostname = conn_context.get("peer_hostname")
             try:
-                peer_hostname = conn_context.get("peer_hostname")
                 if peer_hostname:
                     node = next(
                         (
@@ -1467,6 +1490,18 @@ class NetworkManager:
                 self._logger.debug(
                     "_handle_client finally: advert cleanup hook failed",
                     exc_info=True,
+                )
+
+            # B-073 Step 8 emit: peer disconnected. Only emit when pin
+            # check succeeded (peer_hostname set). disconnect_reason was
+            # mutated by the inner+outer except handlers above; defaults
+            # to "normal" on clean loop exit.
+            if peer_hostname:
+                self.plugin_core._internal_emit(
+                    "_core/peer/disconnected",
+                    hostname=peer_hostname,
+                    reason=disconnect_reason,
+                    ts=time.time(),
                 )
 
     async def _handle_execute(
