@@ -3765,24 +3765,32 @@ class PluginCore:
                     request, f"Unhandled error processing request: {e}", True
                 )
         finally:
-            # B-073 Step 8 emit: request completed. Defensive future-
-            # state read — cancelled future raises on .result(); guard
-            # explicitly. Latency clamped to 0.0 against clock jumps.
-            if request._future.done() and not request._future.cancelled():
-                try:
-                    _, _err_flag, _ = request._future.result()
-                    errored = bool(_err_flag)
-                except Exception:
-                    errored = True  # future yielded an exception
-            else:
-                errored = request._future.cancelled()
-            self._internal_emit(
-                "_core/request/completed",
-                request_id=request.id,
-                latency=max(0.0, time.time() - request.created_at),
-                error=errored,
-                ts=time.time(),
-            )
+            # B-073 Step 8 emit: request completed. Observer-presence
+            # gate skips the future-state read + payload assembly when
+            # nothing is listening — the production-default no-observer
+            # path saves ~500ns-1µs per request. The pop below stays
+            # outside the gate (eviction is unconditional). Cached
+            # ``now`` shared between latency calc + ts payload.
+            if "_core/request/completed" in self._internal_observers:
+                # Defensive future-state read — cancelled future raises
+                # on .result(); guard explicitly. Latency clamped to
+                # 0.0 against clock jumps.
+                if request._future.done() and not request._future.cancelled():
+                    try:
+                        _, _err_flag, _ = request._future.result()
+                        errored = bool(_err_flag)
+                    except Exception:
+                        errored = True  # future yielded an exception
+                else:
+                    errored = request._future.cancelled()
+                now = time.time()
+                self._internal_emit(
+                    "_core/request/completed",
+                    request_id=request.id,
+                    latency=max(0.0, now - request.created_at),
+                    error=errored,
+                    ts=now,
+                )
 
             # B-073 Session 2 Step 2: done-callback eviction. Pop the
             # Request entry from ``self.requests`` on every completion
