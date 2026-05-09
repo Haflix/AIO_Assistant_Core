@@ -46,7 +46,12 @@ class Node:
         self.IP = IP
         self.hostname = hostname
         self.enabled = enabled
-        self.last_heartbeat = 0
+        # B-072 fix: None sentinel for "never received a heartbeat".
+        # Previously 0 doubled as "never" and "received at epoch 0";
+        # ``is_alive*`` short-circuits on None so a freshly-created
+        # Node correctly reads as not-alive until the first successful
+        # heartbeat sets an int timestamp.
+        self.last_heartbeat: Optional[int] = None
         self.auto_discoverable = auto_discoverable
         self.port = port  # None → use NetworkManager.port default
 
@@ -80,9 +85,22 @@ class Node:
         await self.heartbeat()
 
     async def is_alive(self, timeout=30):
-        """Returns True if last heartbeat was within timeout seconds"""
+        """Returns True if last heartbeat was within timeout seconds.
+
+        B-072 fix: short-circuit on None — a Node that has never
+        received a heartbeat is not alive, regardless of timeout.
+        Without this guard, ``int(time.time()) - None`` would raise
+        TypeError.
+        """
+        if self.last_heartbeat is None:
+            return False
         return (int(time.time()) - self.last_heartbeat) < timeout
 
     def is_alive_sync(self, timeout=30):
-        """Returns True if last heartbeat was within timeout seconds"""
+        """Returns True if last heartbeat was within timeout seconds.
+
+        B-072 fix: short-circuit on None — symmetric with ``is_alive``.
+        """
+        if self.last_heartbeat is None:
+            return False
         return (int(time.time()) - self.last_heartbeat) < timeout
