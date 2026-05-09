@@ -433,9 +433,6 @@ class NetworkManager:
 
         Accepts None (bare YAML key with no value) and treats as empty.
         """
-        from cryptography import x509
-        from cryptography.hazmat.primitives import serialization as _ser
-
         if raw_peers is None:
             raw_peers = []
 
@@ -444,142 +441,169 @@ class NetworkManager:
         seen_endpoints: Set[Tuple[str, int]] = set()
 
         for entry in raw_peers:
-            hostname = entry.get("hostname")
-            address = entry.get("address")
-            if not hostname or not address:
-                raise RuntimeError(
-                    f"Peer entry missing hostname or address: {entry}"
-                )
-
-            cert_file = entry.get("cert_file")
-            cert_pem_inline = entry.get("cert_pem")
-            if cert_file and cert_pem_inline:
-                raise RuntimeError(
-                    f"Peer {hostname} has both cert_file and cert_pem set. "
-                    "Pick one (cert_file is preferred for cleaner config)."
-                )
-            if not cert_file and not cert_pem_inline:
-                raise RuntimeError(
-                    f"Peer {hostname} missing cert_file or cert_pem. "
-                    "Either provide a path-relative cert_file or paste the "
-                    "PEM body inline as cert_pem (multi-line YAML block)."
-                )
-
-            if cert_file:
-                cf_path = Path(cert_file)
-                if not cf_path.is_absolute():
-                    cf_path = (self.keys_dir.parent / cf_path).resolve()
-                try:
-                    cert_pem = cf_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as e:
-                    raise RuntimeError(
-                        f"Peer {hostname} cert_file {cf_path} could not be read: {e}. "
-                        "Check the path exists, is a file (not a directory), is "
-                        "readable, and contains UTF-8 PEM text (not DER binary)."
-                    )
-            else:
-                cert_pem = cert_pem_inline
-
-            cert_pem = cert_pem.strip()
-            if not cert_pem.startswith("-----BEGIN CERTIFICATE-----"):
-                raise RuntimeError(
-                    f"Peer {hostname} cert_pem missing PEM header after strip. "
-                    "Check YAML indentation or file content."
-                )
-
-            try:
-                cert = x509.load_pem_x509_certificate(cert_pem.encode())
-            except (ValueError, TypeError) as e:
-                raise RuntimeError(
-                    f"Peer {hostname} cert_pem is not valid PEM-encoded X.509: {e}"
-                )
-            spki = cert.public_key().public_bytes(
-                encoding=_ser.Encoding.DER,
-                format=_ser.PublicFormat.SubjectPublicKeyInfo,
-            )
-            derived_fp = f"sha256:{hashlib.sha256(spki).hexdigest()}"
-
-            declared_fp = entry.get("fingerprint")
-            if declared_fp and declared_fp != derived_fp:
-                raise RuntimeError(
-                    f"Peer {hostname} fingerprint mismatch: config says "
-                    f"{declared_fp} but cert hashes to {derived_fp}"
-                )
-
-            if derived_fp in seen_fps:
-                raise RuntimeError(
-                    f"Duplicate peer fingerprint across config: {derived_fp}"
-                )
-            seen_fps.add(derived_fp)
-
-            # K-2 review MED fix: handle IPv6 (bracketed and bare). A bare
-            # IPv6 address like "::1" has multiple colons; partition would
-            # split at the first colon and yield port="1". The bracketed
-            # form "[::1]:2511" is the standard host:port wire format. We
-            # accept both bracketed (with explicit port) and bare (port
-            # defaults to self.port).
-            if address.startswith("["):
-                end_bracket = address.find("]")
-                if end_bracket == -1:
-                    raise RuntimeError(
-                        f"Peer {hostname} address {address!r}: opening bracket "
-                        "without closing bracket. Use [ipv6]:port form."
-                    )
-                ip = address[1:end_bracket]
-                if not ip:
-                    # Cycle 2 verifier MED fix: reject empty bracket "[]:port"
-                    # at config-load time instead of letting it propagate to
-                    # PeerSpec(ip="") and surface later as a cryptic
-                    # socket.gaierror at connect time.
-                    raise RuntimeError(
-                        f"Peer {hostname} address {address!r}: empty bracket. "
-                        "Provide an IPv6 address inside the brackets, e.g. [::1]:2511."
-                    )
-                rest = address[end_bracket + 1:]
-                if rest.startswith(":"):
-                    try:
-                        port = int(rest[1:])
-                    except ValueError:
-                        raise RuntimeError(
-                            f"Peer {hostname} address {address!r}: bracketed IPv6 "
-                            "port suffix is not a valid integer."
-                        )
-                elif rest == "":
-                    port = self.port
-                else:
-                    raise RuntimeError(
-                        f"Peer {hostname} address {address!r}: unexpected suffix "
-                        f"{rest!r} after closing bracket."
-                    )
-            elif address.count(":") > 1:
-                # Bare IPv6 — treat the whole string as the IP, port defaults.
-                ip = address
-                port = self.port
-                self._logger.warning(
-                    "[CONFIG] Peer %s address %r is bare IPv6; using default port "
-                    "%d. To specify a non-default port, use [%s]:port form.",
-                    hostname, address, port, address,
-                )
-            else:
-                ip, _, port_str = address.partition(":")
-                port = int(port_str) if port_str else self.port
-            endpoint = (ip, port)
-            if endpoint in seen_endpoints:
-                raise RuntimeError(
-                    f"Duplicate peer endpoint across config: {ip}:{port}"
-                )
-            seen_endpoints.add(endpoint)
-
-            peers.append(PeerSpec(
-                hostname=hostname, ip=ip, port=port,
-                cert_pem=cert_pem, fingerprint=derived_fp,
-                system_caller=entry.get("system_caller", False),
+            peers.append(self._parse_one_peer(
+                entry,
+                port_default=self.port,
+                keys_dir=self.keys_dir,
+                seen_fps=seen_fps,
+                seen_endpoints=seen_endpoints,
             ))
 
         if not peers:
             self._logger.debug("[NETWORKING] _parse_peers returned empty list")
 
         return peers
+
+    def _parse_one_peer(
+        self,
+        entry: dict,
+        *,
+        port_default: int,
+        keys_dir: Path,
+        seen_fps: Set[str],
+        seen_endpoints: Set[Tuple[str, int]],
+    ) -> PeerSpec:
+        """Parse a single peer entry into a PeerSpec.
+
+        Mutates ``seen_fps`` / ``seen_endpoints`` in-place to enforce
+        cross-entry uniqueness within a single ``_parse_peers`` pass.
+        ``self`` is used only for ``self._logger.warning(...)`` on the
+        bare-IPv6 fallback branch.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization as _ser
+
+        hostname = entry.get("hostname")
+        address = entry.get("address")
+        if not hostname or not address:
+            raise RuntimeError(
+                f"Peer entry missing hostname or address: {entry}"
+            )
+
+        cert_file = entry.get("cert_file")
+        cert_pem_inline = entry.get("cert_pem")
+        if cert_file and cert_pem_inline:
+            raise RuntimeError(
+                f"Peer {hostname} has both cert_file and cert_pem set. "
+                "Pick one (cert_file is preferred for cleaner config)."
+            )
+        if not cert_file and not cert_pem_inline:
+            raise RuntimeError(
+                f"Peer {hostname} missing cert_file or cert_pem. "
+                "Either provide a path-relative cert_file or paste the "
+                "PEM body inline as cert_pem (multi-line YAML block)."
+            )
+
+        if cert_file:
+            cf_path = Path(cert_file)
+            if not cf_path.is_absolute():
+                cf_path = (keys_dir.parent / cf_path).resolve()
+            try:
+                cert_pem = cf_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                raise RuntimeError(
+                    f"Peer {hostname} cert_file {cf_path} could not be read: {e}. "
+                    "Check the path exists, is a file (not a directory), is "
+                    "readable, and contains UTF-8 PEM text (not DER binary)."
+                )
+        else:
+            cert_pem = cert_pem_inline
+
+        cert_pem = cert_pem.strip()
+        if not cert_pem.startswith("-----BEGIN CERTIFICATE-----"):
+            raise RuntimeError(
+                f"Peer {hostname} cert_pem missing PEM header after strip. "
+                "Check YAML indentation or file content."
+            )
+
+        try:
+            cert = x509.load_pem_x509_certificate(cert_pem.encode())
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(
+                f"Peer {hostname} cert_pem is not valid PEM-encoded X.509: {e}"
+            )
+        spki = cert.public_key().public_bytes(
+            encoding=_ser.Encoding.DER,
+            format=_ser.PublicFormat.SubjectPublicKeyInfo,
+        )
+        derived_fp = f"sha256:{hashlib.sha256(spki).hexdigest()}"
+
+        declared_fp = entry.get("fingerprint")
+        if declared_fp and declared_fp != derived_fp:
+            raise RuntimeError(
+                f"Peer {hostname} fingerprint mismatch: config says "
+                f"{declared_fp} but cert hashes to {derived_fp}"
+            )
+
+        if derived_fp in seen_fps:
+            raise RuntimeError(
+                f"Duplicate peer fingerprint across config: {derived_fp}"
+            )
+        seen_fps.add(derived_fp)
+
+        # K-2 review MED fix: handle IPv6 (bracketed and bare). A bare
+        # IPv6 address like "::1" has multiple colons; partition would
+        # split at the first colon and yield port="1". The bracketed
+        # form "[::1]:2511" is the standard host:port wire format. We
+        # accept both bracketed (with explicit port) and bare (port
+        # defaults to port_default).
+        if address.startswith("["):
+            end_bracket = address.find("]")
+            if end_bracket == -1:
+                raise RuntimeError(
+                    f"Peer {hostname} address {address!r}: opening bracket "
+                    "without closing bracket. Use [ipv6]:port form."
+                )
+            ip = address[1:end_bracket]
+            if not ip:
+                # Cycle 2 verifier MED fix: reject empty bracket "[]:port"
+                # at config-load time instead of letting it propagate to
+                # PeerSpec(ip="") and surface later as a cryptic
+                # socket.gaierror at connect time.
+                raise RuntimeError(
+                    f"Peer {hostname} address {address!r}: empty bracket. "
+                    "Provide an IPv6 address inside the brackets, e.g. [::1]:2511."
+                )
+            rest = address[end_bracket + 1:]
+            if rest.startswith(":"):
+                try:
+                    port = int(rest[1:])
+                except ValueError:
+                    raise RuntimeError(
+                        f"Peer {hostname} address {address!r}: bracketed IPv6 "
+                        "port suffix is not a valid integer."
+                    )
+            elif rest == "":
+                port = port_default
+            else:
+                raise RuntimeError(
+                    f"Peer {hostname} address {address!r}: unexpected suffix "
+                    f"{rest!r} after closing bracket."
+                )
+        elif address.count(":") > 1:
+            # Bare IPv6 — treat the whole string as the IP, port defaults.
+            ip = address
+            port = port_default
+            self._logger.warning(
+                "[CONFIG] Peer %s address %r is bare IPv6; using default port "
+                "%d. To specify a non-default port, use [%s]:port form.",
+                hostname, address, port, address,
+            )
+        else:
+            ip, _, port_str = address.partition(":")
+            port = int(port_str) if port_str else port_default
+        endpoint = (ip, port)
+        if endpoint in seen_endpoints:
+            raise RuntimeError(
+                f"Duplicate peer endpoint across config: {ip}:{port}"
+            )
+        seen_endpoints.add(endpoint)
+
+        return PeerSpec(
+            hostname=hostname, ip=ip, port=port,
+            cert_pem=cert_pem, fingerprint=derived_fp,
+            system_caller=entry.get("system_caller", False),
+        )
 
     def _load_or_generate_identity(self):
         """Load existing cert.pem / key.pem from keys_dir, or generate a
