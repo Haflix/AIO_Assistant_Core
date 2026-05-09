@@ -97,6 +97,11 @@ plugins:
     enabled: true
     path: ./plugins_test/TestHotReloadNetworkingSuite
 
+  # Session 2 internal event bus + done-callback eviction regression suite (B-073)
+  - name: TestInternalEventBusSuite
+    enabled: true
+    path: ./plugins_test/TestInternalEventBusSuite
+
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
   - name: TestPR2Fixture

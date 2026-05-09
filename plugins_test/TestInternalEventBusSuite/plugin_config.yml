@@ -1,0 +1,36 @@
+description: Session 2 — TestInternalEventBusSuite covering B-073 internal event bus + done-callback eviction
+version: "0.1.0"
+remote: false
+arguments:
+events:
+  bus_stream_event:
+    topic: "tibs/stream"
+    hosts: "local"
+subscriptions:
+  bus_stream_sub:
+    topic: "tibs/stream"
+    target_access_name: handle_bus_stream
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the internal-event-bus suite
+    arguments:
+      - name: category
+        description: 'basic | edge | null'
+      - name: host
+        description: 'local | remote | null'
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive
+
+  handle_bus_stream:
+    internal_name: handle_bus_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Async-generator handler used by eviction.event_stream.completed
+    arguments:
+      - name: event
