@@ -75,7 +75,6 @@ Suites are explicitly allowed to call private-ish PluginCore methods where repro
 - `core._reload_plugin(name)` — Lifecycle (B-010, B-016) AND Notifier (B-034, B-040)
 - `core._disable_plugin(name)` / `core._enable_plugin(name)` — Lifecycle, Notifier (BadActor on-demand load, B-003 disable angle, B-004)
 - `core.load_plugin_with_conf(entry_dict)` — Notifier (BadActor on-demand), Lifecycle
-- Mutating `core.requests`, `core._running_loop_task` — Lifecycle B-006 only
 - Mutating `core.yaml_config['plugins']` in-memory — Notifier (BadActor on-demand)
 
 Document the dependency in each suite's README. If PluginCore refactors any of these names, suites break loudly — that's intended.
@@ -206,7 +205,7 @@ with rec.case("event.publish.basic", hosts=["local", "remote"]) as c:
 **When a case can't matrix-expand cleanly:**
 - Different fixture setup per host (e.g. local-side vs subnode-side sub registration) → keep as separate single-host case
 - Assertion depends on host (e.g. "calling hosts='remote' with no peer raises X") → keep as `hosts=["remote"]` only
-- Mechanism is intrinsically local (B-002 producer task identity, B-006 running_loop, multi-instance uuid handling, sync chain, lifecycle private-API) → `hosts=["local"]`
+- Mechanism is intrinsically local (B-002 producer task identity, multi-instance uuid handling, sync chain, lifecycle private-API) → `hosts=["local"]`
 - Mechanism is intrinsically remote/wire (B-024 chunk corruption, B-025 partial yield, B-018 spoofing) → `hosts=["remote"]`
 
 **Default host annotations** (applied across all phases, listed by category for compactness rather than per-case):
@@ -227,7 +226,7 @@ with rec.case("event.publish.basic", hosts=["local", "remote"]) as c:
 - Lifecycle / reload / disable / pop / multi-instance / runner meta — intrinsically local per process state.
 - Sync API cases — sync calls run in the local threadpool by design; remote sync is undefined.
 - `event.contract.disabled_networking_no_remote_attempt` (Stage E) — assertion is "no remote attempt", so a remote variant is meaningless.
-- B-XXX bug-repro cases that test local mechanisms (B-002, B-006, B-008, B-039, B-040, B-041) — bug surface is local.
+- B-XXX bug-repro cases that test local mechanisms (B-002, B-008, B-039, B-040, B-041) — bug surface is local.
 
 **Phase 5 dedup:** the basic remote-execution / remote-publish_event / remote-request_event cases that v3 had (`remote.execute.basic`, `remote.publish_event.basic`, `remote.request_event.basic`, `remote.request_event_stream.basic`) are removed from Phase 5 — they're now Phase 1/3 cases with `hosts=["local","remote"]`. Phase 5's table only contains wire-only mechanisms.
 
@@ -240,7 +239,7 @@ A case may declare `destructive=True`. Destructive cases:
 
 When `allow_destructive=False`, all destructive cases skip cleanly. CI runs without destructive cases by default; manual runs use the default `True`.
 
-The Phase 4 `lifecycle.B-006.running_loop_guard` is the only currently-planned destructive case; its body restarts running_loop in `finally` via `core._running_loop_task = asyncio.create_task(core.running_loop())`, but the `destructive=True` flag is the contract guarantee.
+(Note: the B-073 Session 2 maintenance-loop kill removed `running_loop` + `cleanup_requests` entirely; the previously-planned `lifecycle.B-006.running_loop_guard` destructive case + the `inject_bad_request` companion endpoint were deleted alongside the framework code. No suite currently declares `destructive=True`; the flag remains supported for future use.)
 
 ---
 
@@ -386,7 +385,7 @@ Each phase is one iteration. Each phase delivers: suite plugin(s), target plugin
 | `exec.sync.from_sync` | `execute_sync` from sync context returns | — | sync |
 | `exec.multi_instance.distinct_uuids` | both instances loaded; uuids distinct; calls WITH `plugin_uuid` resolve correctly | — | multi_instance |
 | `exec.multi_instance.target_by_uuid` | `plugin_uuid=` filter selects specific instance | — | multi_instance |
-| `exec.cancellation.entry_reaped` | mid-await cancel; assert request id no longer in `core.requests` within 25s (≥2 cleanup ticks). `hard_timeout_s=40`. | — | cancellation |
+| `exec.cancellation.entry_reaped` | mid-await cancel; assert request id no longer in `core.requests` within 5s. (B-073: done-callback eviction at the producer's finally pops on cancel; near-instant. Generous budget covers scheduler slack only.) `hard_timeout_s=15`. | — | cancellation |
 | `exec.large_payload.return_value` | endpoint returns 100 KB; received intact (sanity, NOT B-024) | — | payload |
 
 **Cut from earlier drafts:**
@@ -462,7 +461,7 @@ These are boundary-condition / unusual-input variants. All `category="edge"`. Fa
 | `stream.local.large_item` | yields 100 KB item locally; received intact (NOT B-024) | — | payload |
 | `stream.sync.from_sync_context` | `execute_stream_sync` from sync iter | — | sync |
 | `stream.timeout.hanging_gen` | gen never yields; timeout fires | — | timeout |
-| `stream.contract.collected_set` | normal completion → request entry reaped within 30s. Detection: snapshot `set(core.requests.keys())` immediately before `execute_stream` and immediately after to capture the new request_id; assert it leaves the dict within 30s. | — | lifecycle |
+| `stream.contract.collected_set` | normal completion → request entry evicted by producer's finally pop. Detection: snapshot `set(core.requests.keys())` immediately before `execute_stream` and immediately after to capture the new request_id; assert it leaves the dict within 5s. (B-073: done-callback eviction is near-instant; generous budget covers scheduler slack only.) | — | lifecycle |
 | `stream.error.endpoint_not_generator` | calling execute_stream on a non-generator endpoint → clear error | — | error |
 
 (All cases above are `category="basic"`.)
@@ -510,7 +509,7 @@ cover cross-node verification at the integration level.
 - `on_enable_delay_secs` (int) — for concurrent enable race (B-008)
 - `on_disable_raises` (bool) (B-010)
 - `on_disable_hangs_secs` (int) (B-009) — must use `await asyncio.sleep(secs)` (NOT `time.sleep` — sync `time.sleep` inside an async coroutine freezes the event loop)
-- Endpoints: `is_db_open()`, `enable_count()`, `disable_count()`, `victim_hang_endpoint(secs)` (for B-005), `inject_bad_request()` (writes a malformed object into `self._plugin_core.requests` for B-006)
+- Endpoints: `is_db_open()`, `enable_count()`, `disable_count()`, `victim_hang_endpoint(secs)` (for B-005)
 
 **TestLifecycleBrokenVersion** static fixture: `plugin_config.yml` *without* a `version` field. Listed in `config.example.yml` BEFORE `TestLifecycleSentinel` so the B-007 KeyError-aborts-load-loop bug can be observed via Sentinel's absence in `core.plugins`.
 
@@ -537,7 +536,6 @@ cover cross-node verification at the integration level.
 | `lifecycle.B-005.purge_skips_pending` | task waiting on `victim_hang_endpoint`; purge_plugins; expected_status=fail, marker="task_did_not_get_unloaded_error" | B-005 | bug_repro |
 | `lifecycle.B-008.concurrent_enable_race` | TWO Victim plugins; runtime config-order assertion (Victim before Victim2 — `c.skip(...)` if mis-ordered); Victim2 has `on_enable_delay_secs=1`; Victim's on_enable calls `execute("TestLifecycleVictim2", "is_db_open")`. Today: bug present → "Endpoint not found" → expected; suite catches RequestException("Endpoint not found"). expected_status=fail, signature `exception_type="RequestException", message_regex="Endpoint .* not found"`. (When bug fixed: call succeeds, no exception → `unexpected_pass`.) | B-008 | bug_repro |
 | `lifecycle.B-037.event_during_pop` | publish_event on victim-owned sub topic; concurrently pop_plugin; expected_status=fail, marker="handler_ran_after_disable" | B-037 | bug_repro |
-| `lifecycle.B-006.running_loop_guard` | **destructive=True**. Body: snapshot `_running_loop_task`; inject `core.requests["bad-test-id"] = object()`; sleep 13s (>1 cleanup tick + slack); assert `_running_loop_task.done()` and `_running_loop_task.exception() is not None` → `c.set_marker("running_loop_died")`. `finally`: pop the bad request; restart `core._running_loop_task = asyncio.create_task(core.running_loop())`. `hard_timeout_s=30`. expected_signature `marker="running_loop_died"`. | B-006 | bug_repro, terminal |
 
 (All cases above are `category="basic"`.)
 
@@ -546,7 +544,7 @@ cover cross-node verification at the integration level.
 | ID | Case | bug_ids | tags |
 |---|---|---|---|
 | `lifecycle.B-005.purge_except_skips_pending` | task waiting on victim_hang_endpoint; `purge_plugins_except([keepers])`; same gap as B-005 in purge_plugins; expected_status=fail, marker="task_did_not_get_unloaded_error" | B-005 | bug_repro |
-| `lifecycle.B-043.pop_plugin_failed_requests_eventually_reaped` | pop a plugin while a long-running task awaits one of its endpoints; cancel the caller before it observes the result; assert request entry reaped within 30s via `created_at` fallback | B-043 | bug_repro |
+| `lifecycle.B-043.pop_plugin_failed_requests_eventually_reaped` | pop a plugin while a long-running task awaits one of its endpoints; cancel the caller before it observes the result; assert request entry evicted within 5s. (B-073 superseded the prior `created_at` fallback: caller's `execute()` finally now pops directly, so eviction is near-instant; generous budget covers scheduler slack only.) | B-043 | bug_repro |
 | `lifecycle.contract.disable_reverse_order_via_disable_plugin` | drive `_disable_plugin` against Victim then Victim2 in the order `close()` would use (reverse config order: Victim2 first, then Victim); track `disable_count` and timestamps on each; assert ordering matches reverse config order. Note: this tests `_disable_plugin` ordering logic, not the full `close()` path — full-shutdown reverse order is verified in Phase 5 via subprocess (subnode shut down with multiple plugins, log inspection). | — | shutdown, contract |
 | `lifecycle.args.deep_merge_preserves_siblings` | base `{a: {x:1, y:2}}`, override `{a: {x:10}}` → merged `{a: {x:10, y:2}}` | — | args_override, contract |
 | `lifecycle.args.replace_marker_clears` | base `{a: {x:1, y:2}}`, override `{a: {__replace__: True}}` → merged `{a: {}}` (sibling y dropped) | — | args_override, contract |

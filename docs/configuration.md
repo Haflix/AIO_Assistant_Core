@@ -217,7 +217,6 @@ general:
     httpx: "WARNING"
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
-  cleanup_request_interval: 10.0
   sync_dispatcher_workers: 4
 ```
 
@@ -233,7 +232,6 @@ general:
 | `asyncio_debug` | bool | `false` | Enables `loop.set_debug(True)` and `slow_callback_duration=0.5`. |
 | `plugin_ready_timeout` | float | `60.0` | Cross-plugin readiness gate budget. |
 | `plugin_disable_timeout` | float | `30.0` | Per-plugin `on_disable` cap during runtime disable / pop / reload. |
-| `cleanup_request_interval` | float | `10.0` | Maintenance loop sleep AND completed-request reap age. |
 | `sync_dispatcher_workers` | int | `4` | Workers in the dedicated `SyncDispatcher` thread pool. |
 
 ### `plugin_ready_timeout` (default 60.0)
@@ -258,19 +256,6 @@ If `on_disable` raises, times out, or returns, the framework still
 flips `enabled = False` and unregisters the plugin's subs — bookkeeping
 is in `try/finally`. The timeout exists so a hanging `on_disable` does
 not block reload of other plugins.
-
-### `cleanup_request_interval` (default 10.0)
-
-Coupled value:
-- Maintenance loop sleeps this long between sweeps.
-- Reaps completed `Request` / `GeneratorRequest` entries older than this.
-
-Tests drop this to `0.5` for fast cleanup — the maintenance loop is
-also responsible for releasing memory held by completed requests, so
-the integration test suite can't tolerate the production 10s default
-without inflating wall time. Production typically leaves the default;
-reducing it raises CPU usage of the maintenance loop without much
-benefit.
 
 ### `sync_dispatcher_workers` (default 4)
 
@@ -449,7 +434,6 @@ general:
   asyncio_debug: false
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
-  cleanup_request_interval: 10.0
   sync_dispatcher_workers: 4
   logger_levels:
     asyncio: "MUTE"
@@ -486,7 +470,6 @@ general:
   asyncio_debug: false
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
-  cleanup_request_interval: 10.0
   sync_dispatcher_workers: 4
 
 networking:

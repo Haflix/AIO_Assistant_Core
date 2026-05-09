@@ -1,4 +1,4 @@
-description: Phase 4 suite — load/enable/disable/reload + B-007/B-004/B-005/B-006/B-008/B-009/B-010/B-016/B-037/B-043
+description: Phase 4 suite — load/enable/disable/reload + B-007/B-004/B-005/B-008/B-009/B-010/B-016/B-037/B-043
 version: 0.3.3
 remote: False
 arguments:

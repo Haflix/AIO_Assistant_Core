@@ -44,10 +44,6 @@ endpoints:
     arguments:
       - name: secs
 
-  # B-073 Session 2 Step 5: inject_bad_request endpoint removed
-  # alongside its plugin.py method. Was used by the deleted
-  # B-006 running_loop test in TestLifecycleSuite.
-
   is_db_open:
     internal_name: is_db_open
     tags:

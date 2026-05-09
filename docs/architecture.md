@@ -217,13 +217,12 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 
 `PluginCore.close()` walks a deterministic sequence so dependents wind down before their dependencies:
 
-1. Cancel the maintenance loop.
-2. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
-3. Shut the `SyncDispatcher` down with `wait=True` and a 30-second budget. Falls back to `wait=False` on timeout.
-4. **Disable plugins in REVERSE config order.** Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
-5. Sweep stranded plugin-source per-logger thresholds.
-6. Stop `NetworkManager` if present.
-7. Shut down the plugin executor with `wait=False`.
+1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
+2. Shut the `SyncDispatcher` down with `wait=True` and a 30-second budget. Falls back to `wait=False` on timeout.
+3. **Disable plugins in REVERSE config order.** Each `on_disable` gets a 30-second cap (hardcoded for shutdown). Different plugins do not block each other — their per-plugin lifecycle locks are independent.
+4. Sweep stranded plugin-source per-logger thresholds.
+5. Stop `NetworkManager` if present.
+6. Shut down the plugin executor with `wait=False`.
 
 Reverse-order shutdown is deliberate: an orchestrator that depends on `Postgres` is disabled before `Postgres` is, so it has a chance to flush state cleanly.
 
