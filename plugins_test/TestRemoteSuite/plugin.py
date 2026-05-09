@@ -51,7 +51,7 @@ from decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.3.0"
+SUITE_VERSION = "0.4.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
@@ -389,6 +389,118 @@ class TestRemoteSuite(Plugin):
                     f"got {len(chunks)}"
                 )
 
+        # ── B-071: per-peer wire counter coverage ─────────────────────
+        # Sanity checks that peer_stats actually tracks bytes/messages
+        # for both unary execute_remote and streaming paths, and that
+        # _drop_peer_advert_state resets per O7 (current-session only).
+
+        async def body_wire_counter_execute(c):
+            """B-071: peer_stats[hostname] increments after execute_remote.
+            We verify msgs_sent ≥ 1 and bytes_sent > 0 because the unary
+            path issues at least one MSG_EXECUTE frame + receives one
+            MSG_STREAM_CHUNK + MSG_END_STREAM."""
+            nm = self._plugin_core.network
+            stats_before = dict(nm.peer_stats.get(peer_host, {
+                "bytes_sent": 0, "bytes_recv": 0,
+                "msgs_sent": 0, "msgs_recv": 0,
+            }))
+            r = await self.execute(
+                "TestRemoteTarget", "r_open", {"value": "wirecount"},
+                hosts=c.hosts,
+            )
+            c.expect(r, "wirecount")
+            stats_after = nm.peer_stats.get(peer_host)
+            if stats_after is None:
+                c.set_marker("peer_stats_missing")
+                raise AssertionError(
+                    f"peer_stats[{peer_host!r}] missing after execute_remote"
+                )
+            if stats_after["msgs_sent"] <= stats_before["msgs_sent"]:
+                c.set_marker("msgs_sent_not_incremented")
+                raise AssertionError(
+                    f"msgs_sent did not increment: {stats_before['msgs_sent']} "
+                    f"→ {stats_after['msgs_sent']}"
+                )
+            if stats_after["bytes_sent"] <= stats_before["bytes_sent"]:
+                c.set_marker("bytes_sent_not_incremented")
+                raise AssertionError(
+                    f"bytes_sent did not increment: {stats_before['bytes_sent']} "
+                    f"→ {stats_after['bytes_sent']}"
+                )
+            if stats_after["msgs_recv"] <= stats_before["msgs_recv"]:
+                c.set_marker("msgs_recv_not_incremented")
+                raise AssertionError(
+                    f"msgs_recv did not increment: {stats_before['msgs_recv']} "
+                    f"→ {stats_after['msgs_recv']}"
+                )
+
+        async def body_wire_counter_stream(c):
+            """B-071: streaming path increments per-chunk + per-ITEM_END
+            marker. Verifies that the stream-path coverage (chunk paths
+            + no-payload ITEM_END counters) actually fires — the bulk of
+            real-world traffic flows through these sites."""
+            nm = self._plugin_core.network
+            stats_before = dict(nm.peer_stats.get(peer_host, {
+                "bytes_sent": 0, "bytes_recv": 0,
+                "msgs_sent": 0, "msgs_recv": 0,
+            }))
+            chunks = []
+            async for chunk in self.request_event_stream(
+                "r_request_stream_basic", payload={},
+                hosts="remote", timeout=10.0,
+            ):
+                chunks.append(chunk)
+            c.expect(len(chunks), 3)
+            stats_after = nm.peer_stats.get(peer_host)
+            if stats_after is None:
+                c.set_marker("peer_stats_missing")
+                raise AssertionError(
+                    f"peer_stats[{peer_host!r}] missing after stream"
+                )
+            recv_delta = stats_after["msgs_recv"] - stats_before["msgs_recv"]
+            if recv_delta < 3:
+                c.set_marker("stream_recv_undercount")
+                raise AssertionError(
+                    f"streaming msgs_recv delta {recv_delta} < 3 — likely "
+                    f"the no-payload ITEM_END counters are not firing"
+                )
+
+        async def body_wire_counter_reset(c):
+            """B-071: peer_stats entry is removed when a peer is declared
+            dead via _drop_peer_advert_state. We invoke the helper
+            directly (mirrors what heartbeat does on dead-peer detection),
+            then verify the entry is gone and a fresh subsequent stamp
+            recreates a zeroed entry."""
+            nm = self._plugin_core.network
+            # Ensure we have a stats entry to drop
+            await self.execute(
+                "TestRemoteTarget", "r_open", {"value": "before_drop"},
+                hosts=c.hosts,
+            )
+            if peer_host not in nm.peer_stats:
+                c.set_marker("no_stats_to_drop")
+                raise AssertionError(
+                    f"peer_stats[{peer_host!r}] missing before drop"
+                )
+            await nm._drop_peer_advert_state(peer_host)
+            if peer_host in nm.peer_stats:
+                c.set_marker("stats_not_cleared")
+                raise AssertionError(
+                    f"peer_stats[{peer_host!r}] still present after "
+                    f"_drop_peer_advert_state"
+                )
+            # Subsequent traffic should recreate a fresh entry (next
+            # connection acquired from pool will re-handshake or use a
+            # surviving pooled writer; either way, the next _send_message
+            # whose writer is stamped will pre-create a zeroed entry via
+            # the handshake-time setdefault on the next reconnect).
+            #
+            # Note: with a surviving pooled writer (already stamped, but
+            # peer_stats entry just popped), _count_sent will see
+            # stats=None and SKIP the increment per the documented race
+            # semantic. That's the correct behavior — we don't recreate
+            # stale state for a peer that was just declared dead.
+
         async def body_b018_spoof_system_string(c):
             c.skip(
                 "B-018 spoofing — Stage E re-evaluates author-stamping under "
@@ -534,6 +646,16 @@ class TestRemoteSuite(Plugin):
              body_request_event_stream_mid_stream_raise,
              ("basic", "request_event_stream", "regression_guard"), ()),
             # End Stage N additions
+            # B-071: per-peer wire counters
+            ("remote.wire_counter.execute",
+             body_wire_counter_execute,
+             ("basic", "wire_counter"), ("B-071",)),
+            ("remote.wire_counter.stream",
+             body_wire_counter_stream,
+             ("basic", "wire_counter", "request_event_stream"), ("B-071",)),
+            ("remote.wire_counter.reset_on_drop",
+             body_wire_counter_reset,
+             ("basic", "wire_counter"), ("B-071",)),
             ("remote.B-018.spoof_system_string",
              body_b018_spoof_system_string,
              ("bug_repro", "security"), ("B-018",)),

@@ -1,5 +1,5 @@
 description: Phase 5 suite — wire-bug repros (B-018/B-019/B-021/B-024/B-025/B-027/B-029/B-030/B-032/B-033) + Stage N (PR4) request_event coverage via subprocess peer
-version: 0.3.0
+version: 0.4.0
 remote: False
 arguments:
 events:

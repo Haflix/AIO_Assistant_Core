@@ -276,6 +276,17 @@ class NetworkManager:
         # broadcast hooks to no-op until peers can be reached.
         self.is_ready: bool = False
 
+        # B-071: per-peer wire counters. Keyed by peer hostname; values are
+        # flat dicts {bytes_sent, bytes_recv, msgs_sent, msgs_recv}. Entry
+        # is pre-created at handshake-time stamp sites in _create_connection
+        # / _handle_client. Increment helpers (_count_sent / _count_recv) use
+        # dict.get + None-skip so a late frame after _drop_peer_advert_state
+        # popped the entry won't recreate stale state. Counters reset when
+        # peer is declared dead by heartbeat (_drop_peer_advert_state path),
+        # NOT on TCP-session close — persistent peers accumulate across pool
+        # churn. Per O7 (current-session only).
+        self.peer_stats: Dict[str, Dict[str, int]] = {}
+
     # ── Per-node port helpers ──────────────────────────────────────────
 
     def _parse_endpoint(self, entry) -> tuple[str, Optional[int]]:
@@ -736,6 +747,50 @@ class NetworkManager:
 
     # Message Protocol Utilities
 
+    def _count_sent(
+        self, writer: asyncio.StreamWriter, total_bytes: int
+    ) -> None:
+        """B-071: increment per-peer counters for one fully-drained frame.
+
+        ``total_bytes`` = header + payload sizes summed by caller. Counted
+        only on successfully drained writes — partial-frame bytes left in
+        the socket buffer when ``writer.drain()`` raises are NOT counted
+        (matches "current-session live-peer state" semantic).
+
+        No-op when:
+        - writer was never stamped (test fixtures bypassing pin-check), or
+        - peer entry was popped from peer_stats by _drop_peer_advert_state
+          (race with heartbeat-declared-dead — the late frame is correctly
+          omitted instead of recreating stale state for a now-dead peer).
+        """
+        hostname = getattr(writer, "_aio_peer_hostname", None)
+        if hostname is None:
+            return
+        stats = self.peer_stats.get(hostname)
+        if stats is None:
+            return
+        stats["bytes_sent"] += total_bytes
+        stats["msgs_sent"] += 1
+
+    def _count_recv(
+        self, reader: asyncio.StreamReader, total_bytes: int
+    ) -> None:
+        """B-071: increment per-peer counters for one fully-received frame.
+
+        Counted only on full-frame success — if any of the readexactly
+        calls in the receiving function raises IncompleteReadError mid-frame,
+        the bytes already off the socket are NOT counted (acceptable per
+        O7 'current-session only').
+        """
+        hostname = getattr(reader, "_aio_peer_hostname", None)
+        if hostname is None:
+            return
+        stats = self.peer_stats.get(hostname)
+        if stats is None:
+            return
+        stats["bytes_recv"] += total_bytes
+        stats["msgs_recv"] += 1
+
     async def _send_message(
         self, writer: asyncio.StreamWriter, msg_type: int, data: any
     ) -> None:
@@ -760,6 +815,7 @@ class NetworkManager:
 
             writer.write(header + payload)
             await writer.drain()
+            self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             msg_type_name = {
                 MSG_HAS_ENDPOINT: "HAS_ENDPOINT",
@@ -803,6 +859,10 @@ class NetworkManager:
                 data = safe_loads(payload)
             else:
                 data = None
+
+            # B-071: per-peer recv counter. 4-byte length header + 1-byte
+            # type + payload bytes = total wire bytes for this frame.
+            self._count_recv(reader, 4 + 1 + payload_length)
 
             # Log endpoint-related messages
             if msg_type == MSG_HAS_ENDPOINT:
@@ -850,6 +910,7 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
                     await writer.drain()
+                    self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
             else:
                 # Small chunk, send directly
@@ -857,6 +918,7 @@ class NetworkManager:
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
                 await writer.drain()
+                self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             self._logger.exception("Error sending stream chunk")
             raise
@@ -867,6 +929,7 @@ class NetworkManager:
             header = struct.pack(">IB", 1, MSG_END_STREAM)
             writer.write(header)
             await writer.drain()
+            self._count_sent(writer, len(header))
         except Exception as e:
             self._logger.exception("Error sending end stream marker")
             raise
@@ -1243,6 +1306,19 @@ class NetworkManager:
         conn_context["peer_fingerprint"] = peer_fp
         conn_context["peer_hostname"] = peer_cfg.hostname
         conn_context["system_caller"] = peer_cfg.system_caller
+
+        # B-071: stamp peer hostname on reader+writer for wire-counter
+        # accounting (mirrors _create_connection's outbound stamp). Server
+        # responses go through the same writer carrying the inbound peer's
+        # hostname, so peer_stats[hostname]['bytes_sent'] = bytes this node
+        # sent TO that peer (symmetric with the peer's bytes_recv).
+        writer._aio_peer_hostname = peer_cfg.hostname
+        reader._aio_peer_hostname = peer_cfg.hostname
+        self.peer_stats.setdefault(peer_cfg.hostname, {
+            "bytes_sent": 0, "bytes_recv": 0,
+            "msgs_sent": 0, "msgs_recv": 0,
+        })
+
         self._logger.info(
             "[NETWORKING] Pinned connection from %s hostname=%s system_caller=%s",
             client_addr, peer_cfg.hostname, peer_cfg.system_caller,
@@ -1417,6 +1493,7 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
                     await writer.drain()
+                    self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
                     sent += 1
                 self._logger.debug(
@@ -1428,6 +1505,7 @@ class NetworkManager:
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
                 await writer.drain()
+                self._count_sent(writer, len(header) + len(payload))
 
             try:
                 result_type = type(result).__name__
@@ -1511,6 +1589,7 @@ class NetworkManager:
                             header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                             writer.write(header + chunk_data)
                             await writer.drain()
+                            self._count_sent(writer, len(header) + len(chunk_data))
                             offset += CHUNK_SIZE
                             parts += 1
                         self._logger.debug(
@@ -1522,10 +1601,12 @@ class NetworkManager:
                         header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                         writer.write(header + payload)
                         await writer.drain()
+                        self._count_sent(writer, len(header) + len(payload))
                     # Mark end of this item so receiver knows where item boundaries are
                     item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                     writer.write(item_end_header)
                     await writer.drain()
+                    self._count_sent(writer, len(item_end_header))
                     sent_items += 1
                 except Exception as e:
                     self._logger.exception("Failed to send stream chunk")
@@ -1535,6 +1616,7 @@ class NetworkManager:
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + err_payload)
                     await writer.drain()
+                    self._count_sent(writer, len(header) + len(err_payload))
                     # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
                     # chunk so the client decoder's sentinel check in the
                     # MSG_STREAM_ITEM_END branch fires (lines 3083-3105 of
@@ -1545,6 +1627,7 @@ class NetworkManager:
                     item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                     writer.write(item_end_header)
                     await writer.drain()
+                    self._count_sent(writer, len(item_end_header))
                     break
 
             await self._send_end_stream(writer)
@@ -1561,6 +1644,7 @@ class NetworkManager:
                 item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                 writer.write(item_end_header)
                 await writer.drain()
+                self._count_sent(writer, len(item_end_header))
                 await self._send_end_stream(writer)
             except Exception:
                 pass
@@ -3175,6 +3259,11 @@ class NetworkManager:
             }
             self._outbound_adverts.pop(peer_hostname, None)
             self._snapshot_sent.discard(peer_hostname)
+            # B-071: reset per-peer wire counters on heartbeat-declared
+            # disconnect (current-session only per O7). Late frames after
+            # this pop are silently skipped by _count_sent/_count_recv
+            # (None-skip in helper), so we don't recreate stale state.
+            self.peer_stats.pop(peer_hostname, None)
             tasks = self._inflight_publishes.pop(peer_hostname, set())
             ex_task = self._initial_exchange_tasks.pop(peer_hostname, None)
 
@@ -3441,6 +3530,18 @@ class NetworkManager:
                 f"Server fingerprint {peer_fp} for {IP}:{port} not in peers config"
             )
 
+        # B-071: stamp peer hostname for wire-counter accounting in
+        # _send_message / _receive_message / _count_sent / _count_recv.
+        # Pool reuse keeps the attribute alive (pool keyed by (IP, port)
+        # → same peer). Pre-create entry so hot-path helpers can use
+        # dict.get without dict-literal allocation per call.
+        writer._aio_peer_hostname = peer_cfg.hostname
+        reader._aio_peer_hostname = peer_cfg.hostname
+        self.peer_stats.setdefault(peer_cfg.hostname, {
+            "bytes_sent": 0, "bytes_recv": 0,
+            "msgs_sent": 0, "msgs_recv": 0,
+        })
+
         self._logger.debug(
             f"[CONNECTION] Pinned connection established to {IP}:{port} "
             f"hostname={peer_cfg.hostname} fp={peer_fp}"
@@ -3665,6 +3766,9 @@ class NetworkManager:
                 if payload_length > 0:
                     payload = await reader.readexactly(payload_length)
 
+                    # B-071: per-peer recv counter (with-payload frame).
+                    self._count_recv(reader, 4 + 1 + payload_length)
+
                     if msg_type == MSG_STREAM_CHUNK:
                         # Collect raw pickled bytes
                         result_chunks_bytes.append(payload)
@@ -3710,6 +3814,8 @@ class NetworkManager:
                             f"Unexpected message type: {msg_type}"
                         )
                 elif msg_type == MSG_END_STREAM:
+                    # B-071: per-peer recv counter (no-payload END_STREAM).
+                    self._count_recv(reader, 4 + 1)
                     self._logger.debug(
                         f"[REMOTE] Received END_STREAM (no payload) from {IP}: chunks={chunks}, total_bytes={total_bytes}"
                     )
@@ -3839,6 +3945,9 @@ class NetworkManager:
                 if payload_length > 0:
                     payload = await reader.readexactly(payload_length)
 
+                    # B-071: per-peer recv counter (with-payload frame).
+                    self._count_recv(reader, 4 + 1 + payload_length)
+
                     if msg_type == MSG_STREAM_CHUNK:
                         current_item_chunks.append(payload)
                         item_chunks += 1
@@ -3932,6 +4041,9 @@ class NetworkManager:
                         )
 
                 elif msg_type == MSG_STREAM_ITEM_END:
+                    # B-071: per-peer recv counter (no-payload ITEM_END —
+                    # the common item-boundary marker; fires every yield).
+                    self._count_recv(reader, 4 + 1)
                     # Item boundary with no payload — same handling.
                     # F5 fix: must check for __STREAM_ERROR__ /
                     # __STREAM_EXCEPTION__ sentinels in this path too —
@@ -3974,6 +4086,8 @@ class NetworkManager:
                         item_bytes = 0
 
                 elif msg_type == MSG_END_STREAM:
+                    # B-071: per-peer recv counter (no-payload END_STREAM).
+                    self._count_recv(reader, 4 + 1)
                     # End of stream with no payload
                     if current_item_chunks:
                         full_pickled = b"".join(current_item_chunks)
