@@ -1,0 +1,23 @@
+description: Hot-reload networking suite — Commit 2b orchestrator + helpers (B-070)
+version: 0.1.0
+remote: false
+arguments:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the hot-reload networking test cases and return a suite result dict
+    arguments:
+      - name: category
+        description: 'basic | edge | null (both)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged slow
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

@@ -44,7 +44,12 @@ async def main() -> None:
     pc = PluginCore(args.config)
 
     # Override port BEFORE wait_until_ready: NetworkManager is constructed
-    # there and reads pc.networking_port (the INSTANCE attribute), not yaml.
+    # there via ``_build_network_manager``, which reads
+    # ``yaml_config["networking"]["port"]`` (NOT the ``pc.networking_port``
+    # instance attribute) per Commit 2b cycle 3 HIGH-γ. The instance
+    # attribute write below is kept for parity with code paths that
+    # still read ``self.networking_*`` (e.g. apply_configvalues' own
+    # state); the yaml write is the load-bearing one for construction.
     pc.networking_port = args.port
     nw_cfg = pc.yaml_config.setdefault("networking", {})
     nw_cfg["port"] = args.port

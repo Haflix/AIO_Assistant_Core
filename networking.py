@@ -452,7 +452,8 @@ class NetworkManager:
         seen_endpoints: Set[Tuple[str, int]] = set()
 
         for entry in raw_peers:
-            peers.append(self._parse_one_peer(
+            peers.append(NetworkManager._parse_one_peer(
+                self._logger,
                 entry,
                 port_default=self.port,
                 keys_dir=self.keys_dir,
@@ -465,8 +466,47 @@ class NetworkManager:
 
         return peers
 
+    @staticmethod
+    def _parse_peers_dryrun(
+        logger,
+        raw_peers,
+        *,
+        port_default: int,
+        keys_dir: Path,
+    ) -> None:
+        """Dry-run validation of a peers list — no side effects, no
+        instance state mutation, no SSL context, no socket binds.
+
+        Re-uses ``_parse_one_peer`` parse logic with throwaway
+        uniqueness sets. Raises ``RuntimeError`` on the first
+        malformed peer entry (cert PEM bad, IPv6 bracket missing,
+        fingerprint mismatch, duplicate fp/endpoint). Returns None
+        on success.
+
+        Static so callers without a live ``NetworkManager`` (e.g. a
+        transition from ``networking_enabled=False`` to ``True``
+        during hot reload) can validate before construction. Per
+        Commit 2b cycle 3 — the inline validation pattern would
+        otherwise need a temporary NetworkManager instance, defeating
+        the "no side effects" guarantee of pre-validation.
+        """
+        if raw_peers is None:
+            raw_peers = []
+        seen_fps: Set[str] = set()
+        seen_endpoints: Set[Tuple[str, int]] = set()
+        for entry in raw_peers:
+            NetworkManager._parse_one_peer(
+                logger,
+                entry,
+                port_default=port_default,
+                keys_dir=keys_dir,
+                seen_fps=seen_fps,
+                seen_endpoints=seen_endpoints,
+            )
+
+    @staticmethod
     def _parse_one_peer(
-        self,
+        logger,
         entry: dict,
         *,
         port_default: int,
@@ -478,8 +518,10 @@ class NetworkManager:
 
         Mutates ``seen_fps`` / ``seen_endpoints`` in-place to enforce
         cross-entry uniqueness within a single ``_parse_peers`` pass.
-        ``self`` is used only for ``self._logger.warning(...)`` on the
-        bare-IPv6 fallback branch.
+        ``logger`` is used only for ``logger.warning(...)`` on the
+        bare-IPv6 fallback branch — passed in as a parameter so the
+        Commit 2b dry-run path (``_parse_peers_dryrun``) can call this
+        without a live ``NetworkManager`` instance.
         """
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization as _ser
@@ -595,7 +637,7 @@ class NetworkManager:
             # Bare IPv6 — treat the whole string as the IP, port defaults.
             ip = address
             port = port_default
-            self._logger.warning(
+            logger.warning(
                 "[CONFIG] Peer %s address %r is bare IPv6; using default port "
                 "%d. To specify a non-default port, use [%s]:port form.",
                 hostname, address, port, address,

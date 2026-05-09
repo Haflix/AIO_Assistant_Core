@@ -151,6 +151,23 @@ _RESERVED_TEMPLATE_VARS = frozenset({"prefix", "plugin_name", "hostname", "plugi
 # {var}-style placeholder regex. Matches {name} where name is identifier-style.
 _TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# Networking-config fields whose change forces a full NetworkManager
+# rebuild (not in-place attribute update). Per Commit 2b cycle 3
+# settled design + framework_changes_plan.md Session 1 [A1]. Field
+# locations:
+#   - networking.peers            (list of peer entry dicts)
+#   - networking.enabled          (bool)
+#   - networking.port             (int)
+#   - networking.hostname         (str — read by NetworkManager.__init__:175)
+#   - general.hostname            (str — read by apply_configvalues for pc.hostname)
+#   - networking.keys_dir         (str — read by NetworkManager.__init__:176)
+# (``hostname`` covers BOTH source paths — see _networking_config_changed.)
+# All OTHER networking fields (heartbeat_interval, lookup_interval,
+# liveness_timeout, pool_size, discover_nodes, direct_discoverable,
+# auto_discoverable, secret, cert_file, key_file) trigger
+# _update_networking_in_place — no rebuild needed.
+_REBUILD_FIELDS = frozenset({"peers", "enabled", "port", "hostname", "keys_dir"})
+
 
 def _resolve_load_time_template(
     template: str,
@@ -594,6 +611,14 @@ class PluginCore:
         self._init_tasks = []
         self._running_loop_task = None
         self.network = None
+        # Hot-reload networking rebuild lock (Commit 2b). Acquired by
+        # ``wait_until_ready()`` during boot AND by
+        # ``_rebuild_networking`` (Step 7) during hot reload —
+        # non-reentrant, held across NetworkManager construction +
+        # ``network.start()`` so the two flows can't race. Per cycle 3
+        # HIGH-α + Option A (one canonical construction site lives in
+        # ``wait_until_ready``; ``start()`` is a thin shim).
+        self._network_rebuild_lock: asyncio.Lock = asyncio.Lock()
         self.topic_registry = TopicRegistry(self._logger.getChild("notifier"))
         self._config_write_lock = threading.Lock()
 
@@ -622,7 +647,20 @@ class PluginCore:
         )
 
     async def wait_until_ready(self):
-        """Ensure initialization tasks are started and await their completion."""
+        """Ensure initialization tasks are started and await completion.
+
+        Per Commit 2b Option A: this is the canonical NetworkManager
+        construction site. ``start()`` delegates here. Construction is
+        serialized via ``_network_rebuild_lock`` so a hot-reload
+        triggered during boot waits cleanly until init completes
+        (cycle 3 HIGH-α). The lock is held across both NM construction
+        AND the ``await asyncio.gather(*self._init_tasks)`` so a
+        rebuild triggered mid-``network.start()`` cannot race the
+        in-progress startup.
+
+        Idempotent — repeated calls re-await the existing init tasks
+        rather than reconstructing.
+        """
         # Ensure event loop and maintenance task
         if self.main_event_loop is None:
             self.main_event_loop = asyncio.get_running_loop()
@@ -632,82 +670,55 @@ class PluginCore:
         if self._running_loop_task is None:
             self._running_loop_task = asyncio.create_task(self.running_loop())
 
-        # If no init tasks yet, create them (backward-compat with older call sites)
         if not self._init_tasks:
-            self._init_tasks.append(asyncio.create_task(self.load_plugins()))
-
-            if getattr(self, "networking_enabled", False):
-                if self.network is None:
-                    from pathlib import Path as _Path
-                    from networking import (
-                        DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
-                        DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
-                        DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
+            async with self._network_rebuild_lock:
+                # Re-check under lock: another concurrent caller may
+                # have constructed while we awaited the lock. Without
+                # this guard, two parallel ``wait_until_ready`` callers
+                # would both attempt construction; the second would
+                # double-register tasks + duplicate the NM instance.
+                if not self._init_tasks:
+                    self._init_tasks.append(
+                        asyncio.create_task(self.load_plugins())
                     )
-                    _nw_cfg = self.yaml_config.get("networking") or {}
-                    _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
-                    self.network = NetworkManager(
-                        self,
-                        self._logger.getChild("networking"),
-                        node_ips=_nw_cfg.get("node_ips", []),
-                        discover_nodes=_nw_cfg.get("discover_nodes", False),
-                        direct_discoverable=self.networking_direct_discoverable,
-                        auto_discoverable=self.networking_auto_discoverable,
-                        port=self.networking_port,
-                        secret=getattr(self, "networking_secret", None),
-                        cert_file=getattr(self, "networking_cert_file", None),
-                        key_file=getattr(self, "networking_key_file", None),
-                        pool_size=getattr(self, "networking_pool_size", 5),
-                        networking_config=_nw_cfg,
-                        config_dir=_cfg_dir,
-                        heartbeat_interval=getattr(self, "networking_heartbeat_interval", _DEF_HB),
-                        lookup_interval=getattr(self, "networking_lookup_interval", _DEF_LOOK),
-                        liveness_timeout=getattr(self, "networking_liveness_timeout", _DEF_LIVE),
-                    )
-                self._init_tasks.append(asyncio.create_task(self.network.start()))
+                    if getattr(self, "networking_enabled", False):
+                        if self.network is None:
+                            self.network = self._build_network_manager(
+                                self.yaml_config
+                            )
+                        self._init_tasks.append(
+                            asyncio.create_task(self.network.start())
+                        )
+                    # Hold the lock until init tasks complete so a
+                    # concurrent hot-reload can't fire mid-
+                    # ``network.start()`` (cycle 3 HIGH-α).
+                    await asyncio.gather(*self._init_tasks)
+                    return
 
+        # Tasks already created (and possibly already done) — just
+        # await completion. Lock not needed: the construction-phase
+        # holder released after its own gather, so we observe
+        # post-construction state.
         if self._init_tasks:
             await asyncio.gather(*self._init_tasks)
 
         # NOTE: Wait for enabled?
 
     async def start(self):
-        """Initialize background tasks, load plugins, and start networking."""
-        self.main_event_loop = asyncio.get_running_loop()
-        if self._running_loop_task is None:
-            self._running_loop_task = asyncio.create_task(self.running_loop())
+        """Initialize background tasks, load plugins, and start networking.
 
-        self._init_tasks = [asyncio.create_task(self.load_plugins())]
+        Thin shim that delegates to ``wait_until_ready()``. Per
+        Commit 2b Option A: all NetworkManager construction lives in
+        ``wait_until_ready()`` under ``_network_rebuild_lock`` so the
+        boot path is serialized with concurrent hot-reload calls.
 
-        if getattr(self, "networking_enabled", False):
-            from pathlib import Path as _Path
-            from networking import (
-                DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
-                DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
-                DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
-            )
-            _nw_cfg = self.yaml_config.get("networking") or {}
-            _cfg_dir = _Path(self.config_path).parent if hasattr(self, "config_path") else _Path.cwd()
-            self.network = NetworkManager(
-                self,
-                self._logger.getChild("networking"),
-                node_ips=_nw_cfg.get("node_ips", []),
-                discover_nodes=_nw_cfg.get("discover_nodes", False),
-                direct_discoverable=self.networking_direct_discoverable,
-                auto_discoverable=self.networking_auto_discoverable,
-                port=self.networking_port,
-                secret=getattr(self, "networking_secret", None),
-                cert_file=getattr(self, "networking_cert_file", None),
-                key_file=getattr(self, "networking_key_file", None),
-                pool_size=getattr(self, "networking_pool_size", 5),
-                networking_config=_nw_cfg,
-                config_dir=_cfg_dir,
-                heartbeat_interval=getattr(self, "networking_heartbeat_interval", _DEF_HB),
-                lookup_interval=getattr(self, "networking_lookup_interval", _DEF_LOOK),
-                liveness_timeout=getattr(self, "networking_liveness_timeout", _DEF_LIVE),
-            )
-            self._init_tasks.append(asyncio.create_task(self.network.start()))
-
+        Pre-Commit-2b, ``start()`` separately constructed NM, then
+        called ``wait_until_ready()`` which would skip construction
+        (NM was already non-None). Now: ``start()`` just initializes
+        the loop reference + delegates. Behavior preserved on the
+        happy path; concurrent hot-reload races are now serialized
+        correctly.
+        """
         await self.wait_until_ready()
 
     async def close(self):
@@ -826,14 +837,56 @@ class PluginCore:
 
         self._logger.info("Shutdown complete")
 
-    @log_errors
-    def load_config_yaml(self, config_path: str):
+    def _load_yaml_dict(self, config_path: str) -> dict:
+        """Pure parse + integrity check. Does NOT mutate ``self``.
+
+        Returns the parsed dict (or raises ConfigException on integrity
+        failure / yaml.YAMLError on parse failure). The returned dict is
+        the SAME object the caller will pass to ``_apply_yaml``;
+        ``apply_configvalues`` (called from ``_apply_yaml``) mutates it
+        in place, writing back resolved defaults (e.g. ``hostname``,
+        ``port``, ``networking.enabled``). Callers wanting a stable
+        pre-apply snapshot must deep-copy the dict before passing it on
+        — Step 4's ``_normalize_networking_for_diff`` does exactly this.
+
+        Split out so the hot-reload path can pre-validate a candidate
+        config before any mutation hits self. Closes cycle 2 HIGH-3
+        state-lie (``apply_configvalues`` used to mutate ``self`` before
+        ``check_config_integrity`` completed; if integrity raised,
+        ``self.networking_*`` already reflected the new yaml but
+        ``self.network`` was old).
+
+        NOT decorated with ``@log_errors`` — the public
+        ``load_config_yaml`` wrapper carries the decorator, so failures
+        are logged once at the public-API boundary instead of twice on
+        the unwind.
+        """
         self._logger.info(f"Loading config from config_path: {config_path}")
-        self.yaml_config: dict = ConfigUtil.load_config(config_path)
-        self._logger.info(self.yaml_config)
+        yaml_dict = ConfigUtil.load_config(config_path)
+        self._logger.info(yaml_dict)
+        ConfigUtil.check_config_integrity(yaml_dict, self._logger)
+        return yaml_dict
 
-        ConfigUtil.check_config_integrity(self.yaml_config, self._logger)
+    def _apply_yaml(self, yaml_dict: dict) -> None:
+        """Apply parsed yaml to ``self`` state. Caller is responsible for
+        having already integrity-checked ``yaml_dict`` via
+        ``_load_yaml_dict``.
 
+        Mutates ``self.yaml_config`` (assigned to the passed-in dict by
+        reference — same object), then calls
+        ``ConfigUtil.apply_configvalues`` which writes resolved defaults
+        BACK into ``self.yaml_config`` in place (e.g. ``hostname``,
+        ``port``, ``networking.enabled``). The dict the caller passed is
+        therefore mutated as a side effect — see ``_load_yaml_dict``'s
+        docstring for the implication.
+
+        Also re-applies LogUtil thresholds so hot-reload picks up
+        log-level changes.
+
+        NOT decorated with ``@log_errors`` — see ``_load_yaml_dict``'s
+        note.
+        """
+        self.yaml_config = yaml_dict
         ConfigUtil.apply_configvalues(self)
 
         # Apply logging-related config last so hot-reload picks up changes.
@@ -847,9 +900,631 @@ class PluginCore:
         LogUtil.change_file_level(general.get("file_log_level", "DEBUG"))
         LogUtil.apply_logger_levels_config(general.get("logger_levels", {}))
 
+    @log_errors
+    def load_config_yaml(self, config_path: str):
+        """Sync entry point — load + integrity check + apply.
+
+        Behavior change vs pre-Step-1: integrity-check raises now leave
+        ``self.yaml_config`` unmodified (was previously overwritten with
+        the bad-but-parsed dict). Closes cycle 2 HIGH-3 state-lie.
+        """
+        self._apply_yaml(self._load_yaml_dict(config_path))
+
     async def async_load_config_yaml(self, config_path: str):
-        """Async wrapper around load_config_yaml for use outside __init__."""
-        self.load_config_yaml(config_path)
+        """Async config loader with hot-reload orchestration.
+
+        Behavior matrix:
+
+        * Bootstrap (``self.yaml_config is None``): apply new config
+          directly. NO networking action — NetworkManager construction
+          happens later in ``wait_until_ready()`` via Option A. NOTE:
+          unreachable in practice — ``PluginCore.__init__`` calls
+          ``load_config_yaml`` synchronously, populating
+          ``self.yaml_config`` before any caller reaches this method.
+          Kept as a defensive guard.
+        * No networking change (``_networking_config_changed=False``):
+          apply new config + update live NM attrs in place via
+          ``_update_networking_in_place``.
+        * Networking change (any field in ``_REBUILD_FIELDS``):
+          pre-validate via ``_validate_networking_config`` (raises →
+          abort, no state mutation), then ``_rebuild_networking``
+          (which acquires the rebuild lock + does the ordered
+          tear-down + rebuild).
+
+        Rebuild orchestrator design per Commit 2b cycle 3 settled spec.
+        """
+        new_yaml = self._load_yaml_dict(config_path)
+        old_yaml = self.yaml_config
+
+        if old_yaml is None:
+            # Defensive path — unreachable under current __init__
+            # ordering, but kept so a future change to construction
+            # order doesn't silently bypass the rebuild orchestrator.
+            self._apply_yaml(new_yaml)
+            return
+
+        if self._networking_config_changed(old_yaml, new_yaml):
+            # Pre-validate before any state mutation. Bad config →
+            # abort cleanly; old network keeps running.
+            try:
+                self._validate_networking_config(new_yaml)
+            except Exception as e:
+                self._logger.error(
+                    "async_load_config_yaml: networking config "
+                    "validation failed; reload aborted, old config "
+                    "remains active. Error: %s",
+                    e,
+                    exc_info=True,
+                )
+                return
+            await self._rebuild_networking(new_yaml)
+        else:
+            self._apply_yaml(new_yaml)
+            self._update_networking_in_place(new_yaml)
+
+    async def _rebuild_networking(self, new_yaml: dict) -> None:
+        """Rebuild the NetworkManager for hot-reload of peers /
+        enabled / port / hostname / keys_dir changes.
+
+        Acquires ``_network_rebuild_lock`` so concurrent boot or other
+        rebuild calls serialize. Per cycle 3 HIGH-α + Option A.
+
+        Ordering (cycle 3 design — DO NOT REORDER):
+
+        1. Build new NM via ``_build_network_manager(new_yaml)``. If
+           raises, no state mutation; old keeps running. (Skipped if
+           new yaml has ``networking.enabled=False`` — there's nothing
+           to construct in that case.)
+        2. ``_apply_yaml(new_yaml)`` — applies new config to
+           ``self.yaml_config`` and ``self.networking_*``.
+        3. Snapshot ``old_nm = self.network``.
+        4. ``self.network = None`` — guards in 4 sites + 7 snapshot
+           sites observe None from here. Held until end of rebuild.
+        5. Drain in-flight remote requests (10s budget) +
+           ``old_nm._inflight_publishes``. Pessimistic drain (per
+           cycle 7 fix): includes any not-done request not explicitly
+           stamped ``_is_remote=False``, since the stamp is set
+           INSIDE ``_process_request*`` AFTER the request is already
+           registered in ``self.requests``. Local requests resolve
+           quickly so this is safe.
+        6. ``await old_nm.stop()`` — try/except + log + continue. If
+           ``stop()`` raises, the lock is still held; rebuild
+           proceeds.
+        7. ``await new_nm.start()`` — on raise: ``self.network = None``
+           PERMANENTLY, log CRITICAL. Operator must reload-config to
+           recover.
+        8. ``self.network = new_nm`` — atomic assignment, end of gap.
+
+        If new yaml has ``networking.enabled=False``, steps 1, 7, 8
+        are skipped: ``self.network`` stays None permanently
+        (network is now disabled by config).
+
+        Cancellation: if this coroutine is cancelled between step 4
+        and step 8, ``self.network`` stays None permanently —
+        operator reload required to recover. Same terminal state as
+        new-NM start failure. No try/finally restores old_nm because
+        old has been stopped (step 6) and stopping a stopped NM is
+        undefined.
+
+        Documented imperfections (B-079):
+
+        * Drain MISSES ``request_event_remote`` /
+          ``request_event_stream_remote`` direct-await calls (no
+          Request object → no ``_is_remote`` stamp + no
+          ``self.requests`` registration). Caller may see
+          ``ConnectionResetError`` mid-rebuild; retry on caller side.
+        * Drain races against ``_drop_peer_advert_state`` cleanup —
+          if a peer disconnect fires concurrent with rebuild, drain
+          may miss tasks already cancelled by disconnect. Same
+          retry-on-caller acceptable.
+        * ``peer_stats`` counters reset (fresh NM = fresh dict).
+          Per O7 acceptable.
+        * Surviving tasks past the 10s drain timeout get cancelled
+          silently by ``old_nm.stop()`` via
+          ``_drop_peer_advert_state``. The drain warning fires first;
+          no second log when stop() does the cancellation.
+        """
+        async with self._network_rebuild_lock:
+            # Step 1: build new NM (no state mutation if this raises).
+            nw_cfg = new_yaml.get("networking") or {}
+            new_enabled = bool(nw_cfg.get("enabled", False))
+            new_nm = None
+            if new_enabled:
+                try:
+                    new_nm = self._build_network_manager(new_yaml)
+                except Exception as e:
+                    self._logger.error(
+                        "_rebuild_networking: NetworkManager "
+                        "construction failed; old network remains "
+                        "active. Error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    return  # NO state mutation
+
+            # Step 2: apply new yaml to self state.
+            self._apply_yaml(new_yaml)
+
+            # Step 3-4: snapshot old + null self.network for the gap.
+            # Guards in the 4 + 7 sites observe None from here on.
+            old_nm = self.network
+            self.network = None
+
+            # Step 5: drain in-flight remote requests + inflight
+            # publishes (best-effort; surviving tasks log warning +
+            # continue).
+            await self._drain_for_rebuild(old_nm, timeout=10.0)
+
+            # Step 6: stop old (best-effort; log on failure, continue).
+            if old_nm is not None:
+                try:
+                    await old_nm.stop()
+                except Exception as e:
+                    self._logger.warning(
+                        "_rebuild_networking: old NetworkManager "
+                        "stop() raised; continuing. Error: %s",
+                        e,
+                        exc_info=True,
+                    )
+
+            # Step 7+8: start new NM and assign atomically.
+            if new_nm is not None:
+                try:
+                    await new_nm.start()
+                except Exception as e:
+                    self._logger.critical(
+                        "_rebuild_networking: new NetworkManager "
+                        "start() failed; networking is DOWN until "
+                        "next reload. Error: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    # self.network stays None — operator-recovery via
+                    # reload.
+                    return
+                self.network = new_nm
+            # else: new yaml has networking.enabled=False → leave
+            # self.network = None.
+
+    async def _drain_for_rebuild(
+        self, old_nm, timeout: float = 10.0
+    ) -> None:
+        """Drain in-flight remote-bound work for a clean teardown.
+
+        Two snapshot sources:
+
+        * ``self.requests`` filtered for not-done + not explicitly
+          ``_is_remote=False``. **Pessimistic filter** (cycle 7 HIGH-1
+          fix): the stamp is set INSIDE ``_process_request*`` AFTER
+          the request is already in ``self.requests``, so a request
+          that hasn't yet reached the RemotePlugin branch wouldn't
+          be caught by a strict ``_is_remote=True`` filter. Including
+          unclassified requests is safe — local ones complete quickly
+          via the local dispatch path so ``asyncio.wait`` returns them
+          immediately.
+        * ``old_nm._inflight_publishes`` — fire-and-forget per-peer
+          publish tasks (PR3 Stage C).
+
+        Best-effort: surviving tasks log warning at timeout expiry;
+        the rebuild continues regardless. Per cycle 1 HIGH-1 + cycle
+        2 HIGH-C.
+        """
+        pending = []
+
+        # Snapshot Request-tracked in-flight requests under lock.
+        # Pessimistic: include any not-done request that isn't
+        # explicitly stamped ``_is_remote=False`` (no request ever is,
+        # so this catches stamped-True + unstamped).
+        async with self.request_lock:
+            for req in list(self.requests.values()):
+                if req._future.done():
+                    continue
+                if getattr(req, "_is_remote", None) is False:
+                    continue
+                pending.append(req._future)
+
+        # Snapshot old_nm's _inflight_publishes under its struct lock.
+        if old_nm is not None:
+            try:
+                async with old_nm._adverts_struct_lock:
+                    for peer_set in list(
+                        old_nm._inflight_publishes.values()
+                    ):
+                        pending.extend(
+                            t for t in peer_set if not t.done()
+                        )
+            except Exception:
+                self._logger.debug(
+                    "_drain_for_rebuild: snapshot "
+                    "_inflight_publishes raised; continuing with "
+                    "partial drain.",
+                    exc_info=True,
+                )
+
+        if not pending:
+            return
+
+        self._logger.info(
+            "_rebuild_networking: draining %d in-flight task(s) "
+            "(timeout=%.1fs)...",
+            len(pending),
+            timeout,
+        )
+        try:
+            done, still_pending = await asyncio.wait(
+                pending, timeout=timeout
+            )
+            if still_pending:
+                self._logger.warning(
+                    "_rebuild_networking: %d task(s) still pending "
+                    "after %.1fs; continuing rebuild (surviving "
+                    "tasks will be cancelled by old NM's stop()).",
+                    len(still_pending),
+                    timeout,
+                )
+        except Exception as e:
+            self._logger.warning(
+                "_rebuild_networking: drain await failed: %s; "
+                "continuing rebuild.",
+                e,
+            )
+
+    def _update_networking_in_place(self, yaml_config: dict) -> None:
+        """Update non-rebuild networking fields on the live NM in
+        place. Called from the rebuild orchestrator's else-branch
+        when ``_networking_config_changed`` returned False.
+
+        Fields updated:
+
+        * ``heartbeat_interval`` / ``lookup_interval`` /
+          ``liveness_timeout`` — live effect: heartbeat / discovery /
+          liveness loops use the new value on next tick.
+        * ``discover_nodes`` — toggle live; lookup_loop checks attr
+          each tick.
+        * ``direct_discoverable`` / ``auto_discoverable`` — read by
+          the INFO handler; next inbound INFO observes new value.
+        * ``pool_size`` — best-effort: only affects pools created
+          AFTER this call. Existing pools keep their construction-
+          time ``maxsize``.
+        * ``secret`` / ``cert_file`` / ``key_file`` — best-effort:
+          legacy fields; effective only at NM construction time.
+          Updating attrs has no real effect on existing connections.
+
+        NO rebuild needed because these don't change wire identity
+        or server bind state. No-op when ``self.network`` is None
+        (networking disabled or boot incomplete).
+        """
+        nm = self.network
+        if nm is None:
+            return
+
+        nw_cfg = yaml_config.get("networking") or {}
+        if not isinstance(nw_cfg, dict):
+            return
+
+        from networking import (
+            DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
+            DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
+            DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
+        )
+
+        def _safe_float(val, default):
+            try:
+                f = float(val)
+                return f if f > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        nm.heartbeat_interval = _safe_float(
+            nw_cfg.get("heartbeat_interval", _DEF_HB), _DEF_HB
+        )
+        nm.lookup_interval = _safe_float(
+            nw_cfg.get("lookup_interval", _DEF_LOOK), _DEF_LOOK
+        )
+        nm.liveness_timeout = _safe_float(
+            nw_cfg.get("liveness_timeout", _DEF_LIVE), _DEF_LIVE
+        )
+        nm.discover_nodes = nw_cfg.get("discover_nodes", False)
+        nm.direct_discoverable = nw_cfg.get("direct_discoverable", False)
+        nm.auto_discoverable = nw_cfg.get("auto_discoverable", False)
+        if nm.auto_discoverable and not nm.direct_discoverable:
+            nm.direct_discoverable = True
+        nm.pool_size = nw_cfg.get("pool_size", 5)
+        # Legacy fields — best-effort attr update, no real effect
+        # without a rebuild.
+        if nw_cfg.get("secret") is not None:
+            s = nw_cfg.get("secret")
+            nm.secret = s.encode() if isinstance(s, str) else s
+        nm.cert_file = nw_cfg.get("cert_file")
+        nm.key_file = nw_cfg.get("key_file")
+
+    def _build_network_manager(self, yaml_config: dict) -> NetworkManager:
+        """Construct a fresh NetworkManager from a yaml_config dict.
+
+        Reads EVERY field from ``yaml_config["networking"]`` dict — NOT
+        from ``self.networking_*`` attrs (which may be stale during a
+        rebuild that hasn't yet called ``_apply_yaml``). This independence
+        is the core of the rebuild ordering:
+          1. Build new NetworkManager from new_yaml (no self-state read)
+          2. If construct raises → no state mutation, abort cleanly
+          3. _apply_yaml(new_yaml) — only after construction succeeds
+
+        Per cycle 3 HIGH-γ.
+
+        Field source-of-truth (per cycle 3 HIGH-γ — must NOT read
+        ``self.networking_*``):
+
+        * ``port`` / ``auto_discoverable`` / ``direct_discoverable`` —
+          read from ``yaml_config["networking"]``. ``apply_configvalues``
+          writes these back to the dict in place after parsing
+          (utils.py:1056-1092), so post-apply or fresh-parse gives
+          identical values.
+        * ``heartbeat_interval`` / ``lookup_interval`` /
+          ``liveness_timeout`` — read from yaml_config and parsed via
+          ``_safe_float`` (matches ``apply_configvalues``' parsing with
+          identical ``<= 0`` rejection boundary, utils.py:1124-1166).
+        * ``secret`` / ``cert_file`` / ``key_file`` / ``pool_size`` —
+          read raw from yaml_config. ``apply_configvalues`` currently
+          passes these through unchanged (utils.py:1098-1101), so
+          behavior matches the inline construction sites'
+          ``getattr(self, "networking_*")`` path.
+
+        ASSUMPTION: any future change to ``apply_configvalues`` that
+        transforms ``secret`` / ``cert_file`` / ``key_file`` /
+        ``pool_size`` MUST either mirror that transformation here too,
+        or move the storage to a write-back-into-yaml_config style so
+        this helper continues to read the resolved value.
+
+        Mirrors the auto/direct_discoverable forcing rule from
+        ``ConfigUtil.apply_configvalues`` (auto=True → direct=True).
+        All numeric fields fall back to defaults on bad-type input,
+        matching ``apply_configvalues``' defensive parsing.
+        """
+        from pathlib import Path as _Path
+        from networking import (
+            DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
+            DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
+            DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
+        )
+
+        nw_cfg = yaml_config.get("networking") or {}
+
+        def _safe_float(val, default):
+            try:
+                f = float(val)
+                return f if f > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        auto_disc = nw_cfg.get("auto_discoverable", False)
+        direct_disc = nw_cfg.get("direct_discoverable", False)
+        if auto_disc and not direct_disc:
+            direct_disc = True
+
+        cfg_dir = _Path(self.config_path).parent
+
+        return NetworkManager(
+            self,
+            self._logger.getChild("networking"),
+            node_ips=nw_cfg.get("node_ips", []),
+            discover_nodes=nw_cfg.get("discover_nodes", False),
+            direct_discoverable=direct_disc,
+            auto_discoverable=auto_disc,
+            port=nw_cfg.get("port", 2510),
+            secret=nw_cfg.get("secret"),
+            cert_file=nw_cfg.get("cert_file"),
+            key_file=nw_cfg.get("key_file"),
+            pool_size=nw_cfg.get("pool_size", 5),
+            networking_config=nw_cfg,
+            config_dir=cfg_dir,
+            heartbeat_interval=_safe_float(
+                nw_cfg.get("heartbeat_interval", _DEF_HB), _DEF_HB
+            ),
+            lookup_interval=_safe_float(
+                nw_cfg.get("lookup_interval", _DEF_LOOK), _DEF_LOOK
+            ),
+            liveness_timeout=_safe_float(
+                nw_cfg.get("liveness_timeout", _DEF_LIVE), _DEF_LIVE
+            ),
+        )
+
+    def _normalize_networking_for_diff(self, yaml_dict: dict) -> dict:
+        """Return a copy of ``yaml_dict`` with rebuild-relevant defaults
+        filled in.
+
+        Used by Step 4's ``_networking_config_changed`` so the diff
+        doesn't false-positive when one side has had
+        ``apply_configvalues`` mutate it (writing back resolved defaults
+        in-place) while the other is freshly parsed.
+
+        Per cycle 3 HIGH-δ (originally cycle 3 LOW-1, upgraded).
+
+        Fields normalised:
+
+        * ``networking.enabled`` / ``networking.port`` /
+          ``networking.auto_discoverable`` /
+          ``networking.direct_discoverable`` — written back by
+          ``apply_configvalues`` (utils.py:1056-1092). Defaults match
+          ``apply_configvalues``'.
+        * ``networking.keys_dir`` — read by ``NetworkManager.__init__``
+          with default ``"_keys"`` (networking.py:176). Not written back
+          by ``apply_configvalues`` but in ``_REBUILD_FIELDS``, so an
+          implicit ``"_keys"`` candidate must compare equal to an
+          explicit ``"_keys"`` live yaml.
+        * ``general.hostname`` — written back by ``apply_configvalues``
+          with ``socket.gethostname()`` fallback (utils.py:970-973).
+          Also in ``_REBUILD_FIELDS`` (lives under ``general``, not
+          ``networking``).
+        * Auto-forces-direct rule mirrored (auto=True → direct=True)
+          so a candidate with explicit auto/no-direct doesn't
+          false-diff against post-apply live yaml that already had
+          direct flipped to True.
+
+        Top-level dict is shallow-copied; ``networking`` and ``general``
+        sub-dicts are shallow-copied. Other sections share refs with
+        the input — diff only inspects the rebuild fields, so deeper
+        isolation is unnecessary.
+        """
+        import socket as _socket
+
+        out = dict(yaml_dict)
+
+        # Networking section defaults.
+        nw_in = out.get("networking") or {}
+        if not isinstance(nw_in, dict):
+            nw_in = {}
+        nw_out = dict(nw_in)
+        nw_out.setdefault("enabled", False)
+        nw_out.setdefault("port", 2510)
+        nw_out.setdefault("auto_discoverable", False)
+        nw_out.setdefault("direct_discoverable", False)
+        nw_out.setdefault("keys_dir", "_keys")
+        # Step 4 cycle 1: peers absent vs explicit empty list both
+        # equal post-normalization. Without this default, an old
+        # yaml with peers: [] vs a new yaml dropping the key (or
+        # vice versa) would diff-as-different and trigger a spurious
+        # rebuild on a change that has no operational effect.
+        nw_out.setdefault("peers", [])
+        if nw_out["auto_discoverable"] and not nw_out["direct_discoverable"]:
+            nw_out["direct_discoverable"] = True
+        out["networking"] = nw_out
+
+        # General section: hostname is a rebuild field. apply_configvalues
+        # fills socket.gethostname() when absent or empty (utils.py:970-973);
+        # mirror exactly so a fresh-parsed candidate without hostname
+        # doesn't false-positive against a post-apply live yaml.
+        gen_in = out.get("general") or {}
+        if not isinstance(gen_in, dict):
+            gen_in = {}
+        gen_out = dict(gen_in)
+        if not gen_out.get("hostname"):
+            gen_out["hostname"] = _socket.gethostname()
+        out["general"] = gen_out
+
+        return out
+
+    def _validate_networking_config(self, yaml_config: dict) -> None:
+        """Pre-flight validation of a candidate networking config. Raises
+        on first malformed peer or bad config; returns None on success.
+
+        Called from the rebuild orchestrator BEFORE any state mutation
+        AND BEFORE the new ``NetworkManager`` is constructed. Lets the
+        rebuild abort cleanly on bad config — the live network keeps
+        running, no torn-down state.
+
+        No side effects: no SSL context creation, no socket binds, no
+        temp files, no instance-state mutation. Re-uses
+        ``NetworkManager._parse_peers_dryrun`` static helper.
+
+        Disabled-network candidate (``networking.enabled: false``)
+        short-circuits with no validation — nothing to validate when
+        the rebuild target is "stop networking".
+
+        Empty-peers-when-enabled is NOT caught here — it propagates to
+        the construction-failure path in Step 7 (``NetworkManager.start()``
+        already raises with an actionable message at networking.py:1072+
+        when peers is empty). The pre-validation gate covers per-peer
+        parse / fingerprint / endpoint-uniqueness errors that would
+        otherwise tear down the live network just to surface a config
+        typo.
+        """
+        nw_cfg = yaml_config.get("networking") or {}
+        if not isinstance(nw_cfg, dict):
+            raise ValueError("networking section must be a mapping")
+        if not nw_cfg.get("enabled", False):
+            return  # disabled → nothing to validate
+
+        port_default = nw_cfg.get("port", 2510)
+
+        from pathlib import Path as _Path
+        keys_dir_str = nw_cfg.get("keys_dir", "_keys")
+        keys_dir_path = _Path(keys_dir_str)
+        if not keys_dir_path.is_absolute():
+            keys_dir_path = (
+                _Path(self.config_path).parent / keys_dir_path
+            ).resolve()
+
+        NetworkManager._parse_peers_dryrun(
+            self._logger.getChild("networking"),
+            nw_cfg.get("peers") or [],
+            port_default=port_default,
+            keys_dir=keys_dir_path,
+        )
+
+    def _networking_config_changed(self, old_yaml: dict, new_yaml: dict) -> bool:
+        """Return True iff any field in ``_REBUILD_FIELDS`` differs
+        between ``old_yaml`` and ``new_yaml``.
+
+        Both sides are normalized via ``_normalize_networking_for_diff``
+        before comparison so a fresh-parsed candidate (no defaults
+        filled) doesn't false-positive against a post-apply live yaml
+        (where ``apply_configvalues`` has written resolved defaults
+        back in place). Per cycle 3 HIGH-δ.
+
+        Hostname has TWO source paths (cycle 4 finding):
+
+        * ``networking.hostname`` — read by ``NetworkManager.__init__``
+          at networking.py:175 for ``self.hostname`` (the value the
+          network layer uses on the wire).
+        * ``general.hostname`` — read by ``apply_configvalues`` at
+          utils.py:970-973 for ``plugin_core.hostname`` (the value the
+          framework uses for topic-dispatch / sub author-id / etc.).
+
+        ``apply_configvalues`` writes ONLY to ``general.hostname``
+        (with ``socket.gethostname()`` fallback when absent/empty); it
+        does NOT write to ``networking.hostname``. ``NetworkManager``
+        falls back to ``socket.gethostname()`` independently for its
+        own ``self.hostname`` if ``networking.hostname`` is absent.
+
+        Both source paths must trigger rebuild on change so the live
+        ``NetworkManager`` instance picks up a new hostname for either
+        purpose. The diff compares both.
+
+        Other networking fields (``heartbeat_interval`` /
+        ``lookup_interval`` / ``liveness_timeout`` / ``pool_size`` /
+        ``discover_nodes`` / ``direct_discoverable`` /
+        ``auto_discoverable`` / ``secret`` / ``cert_file`` /
+        ``key_file``) update the live NetworkManager attrs in place
+        via ``_update_networking_in_place`` (Step 7) — NOT in
+        ``_REBUILD_FIELDS``.
+
+        Caller contract: ``old_yaml`` and ``new_yaml`` MUST be non-None
+        dicts. The Step 7 orchestrator short-circuits the
+        ``old_yaml is None`` bootstrap case before reaching this
+        method; ``new_yaml`` is guaranteed non-None because
+        ``_load_yaml_dict``'s integrity check rejects empty/null yaml.
+        """
+        old_n = self._normalize_networking_for_diff(old_yaml)
+        new_n = self._normalize_networking_for_diff(new_yaml)
+
+        old_nw = old_n.get("networking") or {}
+        new_nw = new_n.get("networking") or {}
+        if old_nw.get("peers") != new_nw.get("peers"):
+            return True
+        if old_nw.get("enabled") != new_nw.get("enabled"):
+            return True
+        if old_nw.get("port") != new_nw.get("port"):
+            return True
+        if old_nw.get("keys_dir") != new_nw.get("keys_dir"):
+            return True
+        # networking.hostname — NetworkManager-internal source path.
+        # apply_configvalues never writes this key, so both sides read
+        # raw yaml. Both absent → both None → equal. Both fall back to
+        # socket.gethostname() inside NetworkManager.__init__ at
+        # construction time.
+        if old_nw.get("hostname") != new_nw.get("hostname"):
+            return True
+
+        # general.hostname — framework-canonical source path filled by
+        # apply_configvalues with socket.gethostname() fallback.
+        # _normalize_networking_for_diff mirrors that fallback so an
+        # absent-vs-explicit-default doesn't false-positive.
+        old_gen = old_n.get("general") or {}
+        new_gen = new_n.get("general") or {}
+        if old_gen.get("hostname") != new_gen.get("hostname"):
+            return True
+
+        return False
 
     # ── Per-logger threshold API (delegates to LogUtil) ─────────────
     # Plugins should call self.set_logger_level / self.clear_logger_level /
@@ -2148,17 +2823,23 @@ class PluginCore:
         """Helper used by YAML-registration sites to push add-delta to
         peers. Wraps the get_subscription + ready-flag check in one place
         so the YAML loop stays clean."""
+        # Snapshot nm. Per Commit 2b cycle 2 MED-B: a mid-block
+        # hot-reload could otherwise leak the broadcast call onto a
+        # stopped NM. Single-call site so the practical race window is
+        # tiny, but snapshotting matches the pattern used by the loop
+        # sites (publish_event / request_event / etc.) for consistency.
+        nm = self.network
         if not (
             getattr(self, "networking_enabled", False)
-            and self.network is not None
-            and getattr(self.network, "is_ready", False)
+            and nm is not None
+            and getattr(nm, "is_ready", False)
         ):
             return
         sub = await self.topic_registry.get_subscription(sub_uuid)
         if sub is None:
             return
         try:
-            await self.network.broadcast_local_sub_added(sub)
+            await nm.broadcast_local_sub_added(sub)
         except Exception:
             self._logger.debug(
                 "_broadcast_yaml_sub_added: broadcast failed", exc_info=True
@@ -2175,10 +2856,14 @@ class PluginCore:
         if plugin_uuid:
             # PR3 Stage C remove-delta loop (locked #18 item 5). Snapshot
             # subs BEFORE the bulk-unsubscribe, then per-sub broadcast.
+            # Snapshot nm (Commit 2b cycle 2 MED-B): the per-sub broadcast
+            # loop below would otherwise leak calls onto a stopped NM if
+            # a hot-reload swaps self.network mid-loop.
+            nm = self.network
             if (
                 getattr(self, "networking_enabled", False)
-                and self.network is not None
-                and getattr(self.network, "is_ready", False)
+                and nm is not None
+                and getattr(nm, "is_ready", False)
             ):
                 try:
                     subs_to_remove = await self.topic_registry.get_plugin_subscriptions(
@@ -2188,7 +2873,7 @@ class PluginCore:
                     subs_to_remove = []
                 for sub in subs_to_remove:
                     try:
-                        await self.network.broadcast_local_sub_removed(sub)
+                        await nm.broadcast_local_sub_removed(sub)
                     except Exception:
                         self._logger.debug(
                             "_unregister_plugin_subscriptions: broadcast failed",
@@ -2456,11 +3141,23 @@ class PluginCore:
                             )
                         )
 
-        if self.networking_enabled:
-            for node in self.network.nodes:
+        # Snapshot self.network once. Per Commit 2b cycle 3 HIGH-A:
+        # during a hot-reload rebuild, self.network is set to None for
+        # the entire rebuild duration; per cycle 2 MED-B: a mid-block
+        # swap would otherwise leak calls onto a stopped NM. Both
+        # conditions resolve cleanly here — None falls through to
+        # return the local-only endpoints list (existing no-match path
+        # for "no remote nodes available").
+        nm = self.network
+        if (
+            self.networking_enabled
+            and nm is not None
+            and getattr(nm, "is_ready", False)
+        ):
+            for node in nm.nodes:
                 node: Node
                 if node.enabled:
-                    result = await self.network.node_get_tagged_endpoints(node.IP, tag)
+                    result = await nm.node_get_tagged_endpoints(node.IP, tag)
                     if result:
                         endpoints.extend(result)
         return endpoints
@@ -2608,9 +3305,20 @@ class PluginCore:
             return True
 
         # Check remote nodes if networking is enabled
-        if getattr(self, "networking_enabled", False) and _other_than_local():
+        # Snapshot nm once. Per Commit 2b cycle 3 HIGH-A: during a
+        # hot-reload rebuild, self.network = None for the entire
+        # rebuild duration. cycle 2 MED-B: snapshot prevents mid-block
+        # swap from leaking calls onto a stopped NM. None falls through
+        # to the bottom `return None, None, None` no-match path.
+        nm = self.network
+        if (
+            getattr(self, "networking_enabled", False)
+            and _other_than_local()
+            and nm is not None
+            and getattr(nm, "is_ready", False)
+        ):
 
-            for node in self.network.nodes:
+            for node in nm.nodes:
                 if not (node.enabled and await node.is_alive()):
                     continue
 
@@ -2620,7 +3328,7 @@ class PluginCore:
                     continue
 
                 # Check remote node for endpoint
-                result = await self.network.node_has_endpoint(
+                result = await nm.node_has_endpoint(
                     node.IP,
                     access_name,
                     plugin_uuid if plugin_uuid != "remote" else None,
@@ -2733,7 +3441,31 @@ class PluginCore:
             if isinstance(
                 plugin, RemotePlugin
             ):  # NOTE: Fix the timeout thing. Warn if ping is higher than timeout
-                result = await self.network.execute_remote(
+                # Stamp _is_remote BEFORE the network check so the
+                # rebuild drain (Step 7) catches in-flight remote
+                # requests even when self.network transitions to None
+                # mid-await. Per cycle 1 HIGH-1 — drain filter uses
+                # this attribute to distinguish remote-bound requests
+                # from local execute path requests.
+                request._is_remote = True
+                # Snapshot nm. Per Commit 2b cycle 3 HIGH-A: during a
+                # hot-reload rebuild, self.network is None for the
+                # entire rebuild duration. cycle 3 HIGH-β requires a
+                # distinct fail-fast semantic here (not silent return)
+                # so the caller's future resolves with a clear error
+                # rather than hanging forever. Also gate on
+                # ``is_ready=False`` to cover the post-rebuild window
+                # where NM has been assigned but its ``start()`` task
+                # hasn't completed yet (cycle 6 fresh-eyes MED).
+                nm = self.network
+                if nm is None or not getattr(nm, "is_ready", False):
+                    await self._set_request_result(
+                        request,
+                        "Network unavailable mid-rebuild",
+                        True,
+                    )
+                    return
+                result = await nm.execute_remote(
                     IP=node.IP,
                     plugin=plugin_name,
                     method=function_name,
@@ -2923,7 +3655,29 @@ class PluginCore:
             )
 
             if isinstance(plugin, RemotePlugin):
-                async for result in self.network.execute_remote_stream(
+                # Stamp _is_remote BEFORE the network check (cycle 1
+                # HIGH-1) so the rebuild drain catches in-flight
+                # streaming-remote requests via the filter. Symmetry
+                # with the non-stream path's stamp.
+                request._is_remote = True
+                # Snapshot nm. Per Commit 2b cycle 3 HIGH-A + HIGH-β:
+                # mid-rebuild self.network is None; resolve the
+                # generator request with an error so the consumer sees
+                # a clean RequestException via B-044 chain rather than
+                # hanging on an empty queue. Also gate on
+                # ``is_ready=False`` to cover the post-rebuild window
+                # where NM has been assigned but ``start()`` hasn't
+                # completed (cycle 6 fresh-eyes MED — symmetry with
+                # _process_request guard).
+                nm = self.network
+                if nm is None or not getattr(nm, "is_ready", False):
+                    await self._set_gen_request_result(
+                        request,
+                        "Network unavailable mid-rebuild",
+                        True,
+                    )
+                    return
+                async for result in nm.execute_remote_stream(
                     IP=node.IP,
                     plugin=plugin_name,
                     method=function_name,
@@ -4195,17 +4949,25 @@ class PluginCore:
         # forget per-peer publish tasks for every advertised sub on
         # every reachable peer that survived per-peer + sub-level
         # filters. Best-effort; return count is local + remote.
+        # Snapshot ``nm = self.network`` once (Commit 2b cycle 2 MED-B):
+        # mid-block hot-reload would otherwise leak calls onto a
+        # stopped NM. cycle 4 HIGH-1: the ``_deregister`` closure below
+        # MUST capture ``nm`` via default-arg so done-callbacks fired
+        # AFTER a rebuild swap continue mutating the OLD NM's
+        # ``_inflight_publishes`` (drain is ongoing on it) instead of
+        # corrupting the NEW NM's accounting.
         local_count = len(survivors)
         remote_count = 0
+        nm = self.network
         if (
             getattr(self, "networking_enabled", False)
-            and self.network is not None
-            and getattr(self.network, "is_ready", False)
+            and nm is not None
+            and getattr(nm, "is_ready", False)
         ):
             try:
                 from uuid import uuid4 as _uuid4
                 request_uuid = _uuid4().hex
-                per_peer = await self.network._build_remote_dispatch(
+                per_peer = await nm._build_remote_dispatch(
                     topic=resolved_topic,
                     payload=payload,
                     author=publisher.plugin_name,
@@ -4222,7 +4984,7 @@ class PluginCore:
                 for peer_hostname, advs in per_peer.items():
                     node = next(
                         (
-                            n for n in list(self.network.nodes)
+                            n for n in list(nm.nodes)
                             if n.hostname == peer_hostname
                         ),
                         None,
@@ -4231,11 +4993,11 @@ class PluginCore:
                         continue
                     # locked #16: caller-acquires-_struct_lock-once;
                     # enabled recheck atomic with task creation.
-                    async with self.network._adverts_struct_lock:
+                    async with nm._adverts_struct_lock:
                         if not node.enabled:
                             continue
                         t = asyncio.create_task(
-                            self.network.publish_event_remote(
+                            nm.publish_event_remote(
                                 node.IP,
                                 resolved_topic,
                                 payload,
@@ -4246,19 +5008,25 @@ class PluginCore:
                                 request_uuid,
                             )
                         )
-                        self.network._inflight_publishes.setdefault(
+                        nm._inflight_publishes.setdefault(
                             peer_hostname, set()
                         ).add(t)
                     tasks.append(t)
 
-                    def _deregister(_t, ph=peer_hostname):
+                    # cycle 4 HIGH-1: capture ``nm`` via default-arg so
+                    # the done-callback uses the OLD NM's accounting
+                    # even if a hot-reload has swapped ``self.network``
+                    # mid-flight. Reading ``self.network`` inside
+                    # ``_drop`` would race with rebuild and corrupt
+                    # the NEW NM's ``_inflight_publishes``.
+                    def _deregister(_t, ph=peer_hostname, _nm=nm):
                         async def _drop():
-                            async with self.network._adverts_struct_lock:
-                                s = self.network._inflight_publishes.get(ph)
+                            async with _nm._adverts_struct_lock:
+                                s = _nm._inflight_publishes.get(ph)
                                 if s is not None:
                                     s.discard(_t)
                                     if not s:
-                                        self.network._inflight_publishes.pop(
+                                        _nm._inflight_publishes.pop(
                                             ph, None
                                         )
                         try:
@@ -4529,23 +5297,28 @@ class PluginCore:
             # PR3 Stage C step 19 — remote dispatch fall-through (locked
             # #6 + #13). Iterate _inbound_global_order in C11 insertion
             # order, apply ALL filters, try each surviving candidate.
+            # Snapshot ``nm = self.network`` once (Commit 2b cycle 2
+            # MED-B): mid-block hot-reload would otherwise leak calls
+            # onto a stopped NM. None falls through to the bottom
+            # ``raise RequestException("no subscriber matches...")``.
+            nm = self.network
             if (
                 getattr(self, "networking_enabled", False)
-                and self.network is not None
-                and getattr(self.network, "is_ready", False)
+                and nm is not None
+                and getattr(nm, "is_ready", False)
             ):
                 from uuid import uuid4 as _uuid4
                 from notifier import TopicRegistry as _TR
                 request_uuid = _uuid4().hex
 
-                async with self.network._adverts_struct_lock:
-                    cands_raw = list(self.network._inbound_global_order.items())
+                async with nm._adverts_struct_lock:
+                    cands_raw = list(nm._inbound_global_order.items())
 
                 candidates = []
                 for (peer_hostname, _sub_uuid), advert in cands_raw:
                     node = next(
                         (
-                            n for n in list(self.network.nodes)
+                            n for n in list(nm.nodes)
                             if n.hostname == peer_hostname
                         ),
                         None,
@@ -4557,7 +5330,7 @@ class PluginCore:
                             continue
                     except Exception:
                         continue
-                    if not self.network._hosts_match(
+                    if not nm._hosts_match(
                         eff_hosts, eff_blocked, peer_hostname
                     ):
                         continue
@@ -4574,7 +5347,7 @@ class PluginCore:
                 last_exc: Optional[BaseException] = None
                 for peer_hostname, advert, node in candidates:
                     try:
-                        return await self.network.request_event_remote(
+                        return await nm.request_event_remote(
                             node.IP,
                             resolved_topic,
                             payload,
@@ -4733,23 +5506,28 @@ class PluginCore:
             # #6 + #13). Pre-first-chunk fall-through ONLY; mid-stream
             # NetworkRequestException terminates without fall-through to
             # preserve the Event-first invariant.
+            # Snapshot ``nm = self.network`` once (Commit 2b cycle 2
+            # MED-B): mid-block hot-reload would otherwise leak calls
+            # onto a stopped NM. None falls through to the bottom
+            # ``raise RequestException("no subscriber matches...")``.
+            nm = self.network
             if (
                 getattr(self, "networking_enabled", False)
-                and self.network is not None
-                and getattr(self.network, "is_ready", False)
+                and nm is not None
+                and getattr(nm, "is_ready", False)
             ):
                 from uuid import uuid4 as _uuid4
                 from notifier import TopicRegistry as _TR
                 request_uuid = _uuid4().hex
 
-                async with self.network._adverts_struct_lock:
-                    cands_raw = list(self.network._inbound_global_order.items())
+                async with nm._adverts_struct_lock:
+                    cands_raw = list(nm._inbound_global_order.items())
 
                 candidates = []
                 for (peer_hostname, _sub_uuid), advert in cands_raw:
                     node = next(
                         (
-                            n for n in list(self.network.nodes)
+                            n for n in list(nm.nodes)
                             if n.hostname == peer_hostname
                         ),
                         None,
@@ -4761,7 +5539,7 @@ class PluginCore:
                             continue
                     except Exception:
                         continue
-                    if not self.network._hosts_match(
+                    if not nm._hosts_match(
                         eff_hosts, eff_blocked, peer_hostname
                     ):
                         continue
@@ -4777,7 +5555,7 @@ class PluginCore:
 
                 last_exc: Optional[BaseException] = None
                 for peer_hostname, advert, node in candidates:
-                    agen = self.network.request_event_stream_remote(
+                    agen = nm.request_event_stream_remote(
                         node.IP,
                         resolved_topic,
                         payload,
@@ -5104,15 +5882,20 @@ class PluginCore:
 
         # PR3 Stage C add-delta hook (locked #18 item 3). No-op when
         # networking is disabled or not yet ready.
+        # Snapshot nm (Commit 2b cycle 2 MED-B): single-call site;
+        # snapshotting matches the loop-site pattern for consistency
+        # and tightens the guard-vs-call window in case of mid-block
+        # hot-reload.
+        nm = self.network
         if (
             getattr(self, "networking_enabled", False)
-            and self.network is not None
-            and getattr(self.network, "is_ready", False)
+            and nm is not None
+            and getattr(nm, "is_ready", False)
         ):
             sub = await self.topic_registry.get_subscription(sub_uuid)
             if sub is not None:
                 try:
-                    await self.network.broadcast_local_sub_added(sub)
+                    await nm.broadcast_local_sub_added(sub)
                 except Exception:
                     self._logger.debug(
                         "subscribe_event: broadcast add-delta failed",
@@ -5132,14 +5915,17 @@ class PluginCore:
         # PR3 Stage C remove-delta hook (locked #18 item 4). Send BEFORE
         # the registry drop so the broadcast still has access to the
         # sub object and our peers see the remove cleanly.
+        # Snapshot nm (Commit 2b cycle 2 MED-B): single-call site,
+        # snapshotting for consistency with the loop-site pattern.
+        nm = self.network
         if (
             sub is not None
             and getattr(self, "networking_enabled", False)
-            and self.network is not None
-            and getattr(self.network, "is_ready", False)
+            and nm is not None
+            and getattr(nm, "is_ready", False)
         ):
             try:
-                await self.network.broadcast_local_sub_removed(sub)
+                await nm.broadcast_local_sub_removed(sub)
             except Exception:
                 self._logger.debug(
                     "unsubscribe_event: broadcast remove-delta failed",
