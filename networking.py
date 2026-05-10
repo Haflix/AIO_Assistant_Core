@@ -39,6 +39,14 @@ class AdvertSub:
     blocked_hosts: Union[str, list, None]
     authors: Union[str, list, None]
     blocked_authors: Union[str, list, None]
+    # Session 4 (v0.27.0): outbound-side ack tracking. Receiver-side
+    # AdvertSub instances leave these as defaults — only sender-side
+    # _outbound_adverts entries populate sent_at / acked_at / state /
+    # retry_count. Not wire-serialized (see _serialize_local_sub_for_peer).
+    sent_at: Optional[float] = None
+    acked_at: Optional[float] = None
+    state: str = "pending"  # "pending" / "acked" / "ack_timeout"
+    retry_count: int = 0
 
 
 # PR4 Stage K (B-066) — peer config entry. cert_pem is required (resolved
@@ -82,6 +90,14 @@ MSG_SUB_DELTA = 19
 
 # MSG_AUTH = 20 was removed in PR4 Stage K K-3 (B-066 fix). The message-type
 # number is reserved and must not be reused for new message types.
+
+# Session 4 (v0.27.0): receiver-side acknowledgement of MSG_SUB_ADVERTISE
+# / MSG_SUB_DELTA. Async-delivered via the receiver's outbound connection
+# back to the sender; sender does NOT block on ack arrival. Sender's
+# heartbeat loop scans _outbound_adverts for entries past 2 *
+# heartbeat_interval and resends once; second timeout marks state =
+# 'ack_timeout'.
+MSG_SUB_ADVERTISE_ACK = 21
 
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
@@ -872,6 +888,7 @@ class NetworkManager:
                 MSG_REQUEST_EVENT_STREAM: "REQUEST_EVENT_STREAM",
                 MSG_SUB_ADVERTISE: "SUB_ADVERTISE",
                 MSG_SUB_DELTA: "SUB_DELTA",
+                MSG_SUB_ADVERTISE_ACK: "SUB_ADVERTISE_ACK",
                 MSG_RESULT: "RESULT",
                 MSG_ERROR: "ERROR",
             }.get(msg_type, f"UNKNOWN({msg_type})")
@@ -1210,6 +1227,18 @@ class NetworkManager:
                                 pass
                 except Exception:
                     self._logger.debug("Heartbeat iteration failed")
+
+                # Session 4 (v0.27.0): scan outbound adverts for missing
+                # acks. The scan itself is fast (single struct_lock pass);
+                # per-peer resends are spawned as detached tasks so the
+                # heartbeat tick stays on schedule.
+                try:
+                    await self._check_advert_ack_timeouts()
+                except Exception:
+                    self._logger.debug(
+                        "Advert ack timeout scan failed", exc_info=True,
+                    )
+
                 await asyncio.sleep(self.heartbeat_interval)
 
         self._logger.debug("[SERVER] Starting heartbeat loop task")
@@ -1438,6 +1467,10 @@ class NetworkManager:
                     await self._handle_sub_advertise(reader, writer, data, conn_context)
                 elif msg_type == MSG_SUB_DELTA:
                     await self._handle_sub_delta(reader, writer, data, conn_context)
+                elif msg_type == MSG_SUB_ADVERTISE_ACK:
+                    await self._handle_sub_advertise_ack(
+                        reader, writer, data, conn_context
+                    )
                 else:
                     self._logger.warning(
                         f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
@@ -2636,6 +2669,8 @@ class NetworkManager:
                 return
 
             # Atomic purge + reinsert (per locked #5: empty list → {}).
+            # Session 4: accumulate processed_uuids for the ack frame.
+            processed_uuids: List[str] = []
             async with self._adverts_struct_lock:
                 self._inbound_adverts[author_host] = {}
                 self._inbound_global_order = {
@@ -2656,11 +2691,24 @@ class NetworkManager:
                     )
                     self._inbound_adverts[author_host][sub.sub_uuid] = sub
                     self._inbound_global_order[(author_host, sub.sub_uuid)] = sub
+                    processed_uuids.append(sub.sub_uuid)
 
             self._logger.debug(
                 "[SUB_ADVERTISE] recorded %d subs from %s",
                 len(subs_payload), author_host,
             )
+
+            # Session 4 (v0.27.0): schedule ack BEFORE the reciprocal
+            # exchange await so the ack-task is registered in the loop
+            # immediately on lock release. peer_ip was captured above
+            # via _safe_peer_ip(writer) for anti-spoof; reuse for the
+            # helper's fallback. No-op when nothing was ingested.
+            if processed_uuids:
+                asyncio.create_task(
+                    self._send_advert_ack_to(
+                        author_host, peer_ip, processed_uuids,
+                    )
+                )
 
             # Reciprocal: if we haven't yet advertised to this peer,
             # send our snapshot back (locked #7).
@@ -2737,6 +2785,11 @@ class NetworkManager:
                     )
 
             entry = subs_payload[0]
+            # Session 4: only kind="add" success paths produce an ack
+            # (sender's _outbound_adverts only tracks sent_at on add
+            # operations; remove paths delete the tracking entry, so an
+            # ack would have nothing to update).
+            processed_uuid: Optional[str] = None
             async with self._adverts_struct_lock:
                 if kind == "add":
                     if not self._filter_inbound_advert(entry):
@@ -2754,6 +2807,7 @@ class NetworkManager:
                     )
                     self._inbound_adverts.setdefault(author_host, {})[sub.sub_uuid] = sub
                     self._inbound_global_order[(author_host, sub.sub_uuid)] = sub
+                    processed_uuid = sub.sub_uuid
                 else:
                     sub_uuid = entry.get("sub_uuid") if isinstance(entry, dict) else None
                     if not isinstance(sub_uuid, str) or not sub_uuid:
@@ -2772,10 +2826,160 @@ class NetworkManager:
                         per_peer.pop(sub_uuid, None)
                         self._inbound_global_order.pop((author_host, sub_uuid), None)
 
+            # Session 4 (v0.27.0): schedule ack BEFORE the reciprocal
+            # exchange await. Only "add" success generates an ack;
+            # "remove" paths intentionally leave processed_uuid=None.
+            if processed_uuid is not None:
+                asyncio.create_task(
+                    self._send_advert_ack_to(
+                        author_host, peer_ip, [processed_uuid],
+                    )
+                )
+
             await self._maybe_reciprocal_exchange(author_host, writer)
 
         except Exception:
             self._logger.exception("[SUB_DELTA] handler crashed")
+
+    # ── Session 4 (v0.27.0) — sub-advert ack protocol ─────────────
+
+    async def _send_advert_ack_to(
+        self,
+        peer_hostname: str,
+        fallback_peer_ip: Optional[str],
+        processed_uuids: List[str],
+    ) -> None:
+        """Send MSG_SUB_ADVERTISE_ACK to peer_hostname via our outbound
+        connection. Best-effort: silent skip on send failure or unknown
+        peer. Called as a fire-and-forget task from _handle_sub_advertise
+        / _handle_sub_delta after lock release.
+
+        IP resolution order (NAT-correct):
+          1. peers_by_endpoint by hostname (mTLS config, authoritative)
+          2. self.nodes by hostname (discovered fallback)
+          3. fallback_peer_ip from inbound writer (last resort)
+        """
+        if not peer_hostname or not processed_uuids:
+            return
+        # is_ready guard: detached create_task may fire between
+        # _handle_sub_advertise's spawn and stop() flipping is_ready.
+        # Without this guard, the helper would call _get_connection on
+        # a half-torn-down pool. Mirrors _resend_and_bump_retry.
+        if not getattr(self, "is_ready", False):
+            return
+        peer_ip: Optional[str] = None
+        for (cfg_ip, _cfg_port), peer_cfg in self.peers_by_endpoint.items():
+            if peer_cfg.hostname == peer_hostname:
+                peer_ip = cfg_ip
+                break
+        if peer_ip is None:
+            node = next(
+                (n for n in list(self.nodes) if n.hostname == peer_hostname),
+                None,
+            )
+            if node is not None and node.IP:
+                peer_ip = node.IP
+        if peer_ip is None:
+            peer_ip = fallback_peer_ip
+        if peer_ip is None:
+            self._logger.debug(
+                "[ADVERT_ACK] no IP for peer_hostname=%r — skip",
+                peer_hostname,
+            )
+            return
+
+        reader = None
+        writer = None
+        send_ok = False
+        try:
+            reader, writer = await self._get_connection(peer_ip)
+            await self._send_message(
+                writer,
+                MSG_SUB_ADVERTISE_ACK,
+                {
+                    "author_host": self.plugin_core.hostname,
+                    "processed_uuids": list(processed_uuids),
+                },
+            )
+            send_ok = True
+        except Exception:
+            self._logger.debug(
+                "[ADVERT_ACK] send to %r (%s) failed",
+                peer_hostname, peer_ip, exc_info=True,
+            )
+        finally:
+            if reader and writer:
+                if send_ok:
+                    try:
+                        await self._return_connection(peer_ip, reader, writer)
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+    async def _handle_sub_advertise_ack(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        data: dict,
+        conn_context: Dict[str, Any],
+    ) -> None:
+        """MSG_SUB_ADVERTISE_ACK: peer confirms ingestion of our advert.
+        Updates _outbound_adverts[peer][sub_uuid].acked_at / state. No
+        reply. Ack-vs-disconnect: if peer disconnected post-ack-send,
+        _drop_peer_advert_state has cleared _outbound_adverts[peer] —
+        defensive None-skip; no raise.
+        """
+        try:
+            payload_dict = data if isinstance(data, dict) else {}
+            author_host = payload_dict.get("author_host")
+            if not isinstance(author_host, str) or not author_host:
+                self._logger.debug(
+                    "[SUB_ADVERTISE_ACK] invalid author_host=%r", author_host
+                )
+                return
+            # Anti-spoof: ack author_host MUST match pin-checked
+            # peer_hostname (set unconditionally at line ~1350 BEFORE
+            # dispatch loop). Reject on missing OR mismatch.
+            peer_hostname = conn_context.get("peer_hostname")
+            if not peer_hostname or peer_hostname != author_host:
+                self._logger.warning(
+                    "[SUB_ADVERTISE_ACK] anti-spoof: pinned peer %r vs "
+                    "author_host %r — drop",
+                    peer_hostname, author_host,
+                )
+                return
+            processed_uuids = payload_dict.get("processed_uuids", []) or []
+            if not isinstance(processed_uuids, list):
+                return
+
+            ts = time.time()
+            async with self._adverts_struct_lock:
+                peer_table = self._outbound_adverts.get(author_host)
+                if peer_table is None:
+                    self._logger.debug(
+                        "[SUB_ADVERTISE_ACK] peer %r dropped pre-ack — skip",
+                        author_host,
+                    )
+                    return
+                for sub_uuid in processed_uuids:
+                    if not isinstance(sub_uuid, str):
+                        continue
+                    sub = peer_table.get(sub_uuid)
+                    if sub is None:
+                        continue  # Sub removed between send and ack
+                    sub.acked_at = ts
+                    sub.state = "acked"
+        except Exception:
+            self._logger.exception("[SUB_ADVERTISE_ACK] handler crashed")
 
     # ── PR3 Stage C client methods (publish/request/advertise/delta) ──
 
@@ -3029,6 +3233,14 @@ class NetworkManager:
                     s for s in subs
                     if self._should_advertise_sub_to_peer(s, peer_hostname)
                 ]
+                # Session 4 (v0.27.0): stamp sent_at at build time. If
+                # _send_message fails below, the existing rollback at
+                # line ~3088 (_outbound_adverts.pop) wipes the entries —
+                # no orphan sent_at remains. The narrow race where send
+                # itself takes >2*heartbeat_interval is theoretical
+                # (sends complete in milliseconds; heartbeat is 10s
+                # default) and is documented as accepted in the plan.
+                ts = time.time()
                 projected = {
                     s.sub_uuid: AdvertSub(
                         sub_uuid=s.sub_uuid,
@@ -3037,6 +3249,8 @@ class NetworkManager:
                         blocked_hosts=s.blocked_hosts,
                         authors=s.authors,
                         blocked_authors=s.blocked_authors,
+                        sent_at=ts,
+                        state="pending",
                     )
                     for s in filtered
                 }
@@ -3113,6 +3327,9 @@ class NetworkManager:
                     outbound_for_peer = self._outbound_adverts.setdefault(
                         peer_hostname, {}
                     )
+                    # Session 4 (v0.27.0): stamp sent_at on the new
+                    # entry. Send-failure rollback at line ~3180
+                    # (outbound_now.pop) wipes the entry on failure.
                     outbound_for_peer[sub.sub_uuid] = AdvertSub(
                         sub_uuid=sub.sub_uuid,
                         topic_pattern=sub.topic_pattern,
@@ -3120,6 +3337,8 @@ class NetworkManager:
                         blocked_hosts=sub.blocked_hosts,
                         authors=sub.authors,
                         blocked_authors=sub.blocked_authors,
+                        sent_at=time.time(),
+                        state="pending",
                     )
                 else:
                     if sub.sub_uuid not in outbound_for_peer:
@@ -3180,6 +3399,129 @@ class NetworkManager:
                             await writer.wait_closed()
                         except Exception:
                             pass
+
+    # ── Session 4 (v0.27.0) — sub-advert ack timeout + retry ──────
+
+    async def _check_advert_ack_timeouts(self) -> None:
+        """Scan _outbound_adverts for entries past ack timeout. Coalesce
+        per-peer: one full-snapshot resend per peer per tick. retry_count
+        capped at 1 (one re-send attempt); second timeout marks state =
+        'ack_timeout' and stops retrying.
+
+        Called once per heartbeat-loop iteration AFTER the node-iteration
+        block. Per-peer resends are spawned as detached tasks via
+        _resend_and_bump_retry so the heartbeat tick stays on schedule
+        (advertise_subs_remote can take seconds per peer in the pool-
+        health-check + retry path).
+
+        Race-safety: stale_uuids captured at scan time. After the resend
+        rebuilds _outbound_adverts[peer], _resend_and_bump_retry bumps
+        retry_count=1 ONLY for stale_uuids that survived the rebuild;
+        new entries added by concurrent send_sub_delta_remote are NOT
+        bumped — they get a clean retry chance.
+        """
+        if not getattr(self, "is_ready", False):
+            return
+        threshold = 2 * self.heartbeat_interval
+        now = time.time()
+        stale_by_peer: Dict[str, Set[str]] = {}
+        peers_to_timeout: Dict[str, List[str]] = {}
+
+        async with self._adverts_struct_lock:
+            for peer_hostname, sub_table in self._outbound_adverts.items():
+                for sub_uuid, sub in sub_table.items():
+                    if sub.state != "pending":
+                        continue
+                    if sub.sent_at is None:
+                        continue
+                    if now - sub.sent_at <= threshold:
+                        continue
+                    if sub.retry_count < 1:
+                        stale_by_peer.setdefault(
+                            peer_hostname, set()
+                        ).add(sub_uuid)
+                    else:
+                        peers_to_timeout.setdefault(
+                            peer_hostname, []
+                        ).append(sub_uuid)
+
+            # Apply timeouts in-place under the lock. Skip peers that
+            # are also being resent — the resend rebuilds the projected
+            # dict (retry_count=0 again), so the timeout-eligible
+            # entries get a fresh lease via the rebuild rather than a
+            # terminal ack_timeout state from this tick.
+            for peer_hostname, uuids in peers_to_timeout.items():
+                if peer_hostname in stale_by_peer:
+                    continue
+                sub_table = self._outbound_adverts.get(peer_hostname, {})
+                for sub_uuid in uuids:
+                    sub = sub_table.get(sub_uuid)
+                    if sub is not None and sub.state == "pending":
+                        sub.state = "ack_timeout"
+
+        # Spawn per-peer resend tasks. Heartbeat tick proceeds without
+        # waiting (advertise_subs_remote can take seconds per peer).
+        for peer_hostname, stale_uuids in stale_by_peer.items():
+            asyncio.create_task(
+                self._resend_and_bump_retry(peer_hostname, stale_uuids)
+            )
+
+    async def _resend_and_bump_retry(
+        self,
+        peer_hostname: str,
+        stale_uuids: Set[str],
+    ) -> None:
+        """Per-peer resend + post-resend retry_count bump. Spawned as a
+        detached task from _check_advert_ack_timeouts. Resolves peer IP
+        internally via the same NAT-correct chain as _send_advert_ack_to
+        (peers_by_endpoint → self.nodes).
+
+        is_ready guard at task entry: detached tasks are not tracked in
+        any cancellation registry, so they could fire after stop()
+        flips is_ready=False. Without the guard, post-stop tasks would
+        call advertise_subs_remote on a half-torn-down manager.
+
+        Bump rule: only stale_uuids that survived the rebuild get
+        retry_count=1. New entries added by concurrent subscribes
+        between the scan and the resend are NOT bumped (they get a
+        clean retry chance).
+        """
+        if not getattr(self, "is_ready", False):
+            return
+        peer_ip: Optional[str] = None
+        for (cfg_ip, _cfg_port), peer_cfg in self.peers_by_endpoint.items():
+            if peer_cfg.hostname == peer_hostname:
+                peer_ip = cfg_ip
+                break
+        if peer_ip is None:
+            node = next(
+                (n for n in list(self.nodes) if n.hostname == peer_hostname),
+                None,
+            )
+            if node is not None and node.IP:
+                peer_ip = node.IP
+        if peer_ip is None:
+            self._logger.debug(
+                "[ADVERT_ACK_TIMEOUT] no IP for peer_hostname=%r — skip",
+                peer_hostname,
+            )
+            return
+        try:
+            await self.advertise_subs_remote(peer_ip, peer_hostname)
+        except Exception:
+            self._logger.debug(
+                "[ADVERT_ACK_TIMEOUT] resend to %r failed",
+                peer_hostname, exc_info=True,
+            )
+            return
+        async with self._adverts_struct_lock:
+            sub_table = self._outbound_adverts.get(peer_hostname)
+            if sub_table is None:
+                return
+            for sub_uuid in stale_uuids:
+                sub = sub_table.get(sub_uuid)
+                if sub is not None and sub.state == "pending":
+                    sub.retry_count = 1
 
     # ── Sub-broadcast helpers (called from PluginCore subscribe/unsubscribe) ──
 

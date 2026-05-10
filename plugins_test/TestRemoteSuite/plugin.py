@@ -51,7 +51,7 @@ from decorators import async_log_errors, log_errors  # noqa: E402
 from _test_helpers import CaseRecorder  # noqa: E402
 
 
-SUITE_VERSION = "0.4.0"
+SUITE_VERSION = "0.4.1"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SUBNODE_SCRIPT = REPO_ROOT / "plugins_test" / "_remote_node" / "run_node.py"
@@ -623,6 +623,55 @@ class TestRemoteSuite(Plugin):
             r = await self._plugin_core.find_endpoints_by_tag("nonexistent")
             assert isinstance(r, list)
 
+        # Session 4 (v0.27.0): sub-advert ack protocol regression guard.
+        # Registers a runtime sub on the parent — broadcast_local_sub_added
+        # fires an MSG_SUB_DELTA(add) to the subnode, which acks via
+        # MSG_SUB_ADVERTISE_ACK on its outbound back to the parent. Verify
+        # the parent's outbound entry transitions state="acked" and
+        # acked_at populates within a 3s deadline.
+        async def body_advert_ack_basic(c):
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            network = self._plugin_core.network
+            peer_hostname = self._peer_info["hostname"]
+            sub_uuid = await self._plugin_core.subscribe_event(
+                "test/advert_ack/probe",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_access_name="run",
+                hosts="any",
+            )
+            try:
+                deadline = time.time() + 3.0
+                entry = None
+                while time.time() < deadline:
+                    outbound = getattr(network, "_outbound_adverts", {}).get(
+                        peer_hostname, {}
+                    )
+                    entry = outbound.get(sub_uuid)
+                    if (
+                        entry is not None
+                        and entry.state == "acked"
+                        and entry.acked_at is not None
+                    ):
+                        break
+                    await asyncio.sleep(0.05)
+                if (
+                    entry is None
+                    or entry.state != "acked"
+                    or entry.acked_at is None
+                ):
+                    raise AssertionError(
+                        f"Expected _outbound_adverts[{peer_hostname}]"
+                        f"[{sub_uuid}].state=='acked' within 3s; "
+                        f"got entry={entry}"
+                    )
+            finally:
+                try:
+                    await self._plugin_core.unsubscribe_event(sub_uuid)
+                except Exception:
+                    pass
+
         # Run all cases in order (each declares hosts=("remote",); recorder
         # auto-skips when remote_available=False).
         cases = [
@@ -696,6 +745,9 @@ class TestRemoteSuite(Plugin):
              ("bug_repro", "regression_guard"), ("B-020",)),
             ("remote.find_endpoints_by_tag", body_find_endpoints_by_tag,
              ("discovery", "basic"), ()),
+            # Session 4 (v0.27.0) — sub-advert ack protocol
+            ("remote.advert_ack.basic", body_advert_ack_basic,
+             ("basic", "advert_ack"), ()),
         ]
 
         for case_id, body, tags, bug_ids in cases:

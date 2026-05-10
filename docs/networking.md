@@ -254,14 +254,19 @@ Inflight tasks tracked in `_inflight_publishes[hostname]` are cancelled when the
 
 ## Subscription advert protocol
 
-Two message types keep peer subscription tables in sync:
+Three message types keep peer subscription tables in sync:
 
 | Wire ID | Name              | Purpose                                                                                                           |
 |---------|-------------------|-------------------------------------------------------------------------------------------------------------------|
 | 18      | `MSG_SUB_ADVERTISE` | Initial sub-snapshot exchange between peers (sent once per connection).                                         |
 | 19      | `MSG_SUB_DELTA`     | Incremental subscribe/unsubscribe delta. Broadcast on every `_register_yaml_subscriptions` call after `plugin_lock` is released, and on every `subscribe_event` / `unsubscribe_event`. |
+| 21      | `MSG_SUB_ADVERTISE_ACK` | Async receiver-side acknowledgement of `MSG_SUB_ADVERTISE` snapshots and `MSG_SUB_DELTA` add-operations. Returned via the receiver's outbound connection back to the original sender; populates `acked_at` / `state` on the sender's `_outbound_adverts` entries. |
 
 Add-deltas broadcast AFTER the local registration completes; remove-deltas broadcast AFTER local removal. Each peer applies the delta to its own `_inbound_adverts` and `_inbound_global_order`.
+
+Adverts are fire-and-forget on the wire — the sender does not block awaiting an ack. The receiver schedules a `MSG_SUB_ADVERTISE_ACK` frame back to the sender via its own outbound connection (a short-lived `asyncio.create_task`). The sender's heartbeat loop scans `_outbound_adverts` for entries whose `sent_at` is older than `2 * heartbeat_interval` and triggers ONE full-snapshot re-send. A second timeout marks the entry `state = "ack_timeout"` and stops retrying. Acks are sent only for snapshot ingestion and `kind="add"` deltas; `kind="remove"` deltas have no tracking entry to update on the sender side, so no ack is sent.
+
+**Minimum compatible version: 0.27.0.** Older peers do not dispatch wire ID 21 and will close the receiver's outbound connection on receipt (sending `MSG_ERROR` then breaking the loop). In a same-version mesh this is a non-issue. In mixed-version meshes, expect periodic reconnect overhead on subscribe-heavy workloads — recommend coordinated rolling upgrades.
 
 ---
 
@@ -287,8 +292,9 @@ For tooling authors and protocol debuggers. Constants live at `networking.py:56-
 | 17 | `MSG_REQUEST_EVENT_STREAM` | request   | Streaming 1:1 request.                                                        |
 | 18 | `MSG_SUB_ADVERTISE`        | request   | Initial sub-snapshot exchange between peers.                                  |
 | 19 | `MSG_SUB_DELTA`            | request   | Incremental subscribe / unsubscribe delta.                                    |
+| 21 | `MSG_SUB_ADVERTISE_ACK`    | response  | Async ack of `MSG_SUB_ADVERTISE` snapshots / `MSG_SUB_DELTA` adds.            |
 
-IDs 7, 8, 9 are reserved and must not be reused; they held legacy `MSG_NOTIFY`, `MSG_TOPIC_REQUEST`, and `MSG_TOPIC_REQUEST_STREAM`, retired in PR3 Stage D when `notify` / `request_topic` were removed. ID 20 is also reserved (formerly `MSG_AUTH`, removed in PR4 Stage K-3 when SPKI-pinned mTLS replaced the shared-secret auth).
+IDs 7, 8, 9 are reserved and must not be reused; they held legacy `MSG_NOTIFY`, `MSG_TOPIC_REQUEST`, and `MSG_TOPIC_REQUEST_STREAM`, retired in PR3 Stage D when `notify` / `request_topic` were removed. ID 20 is also reserved (formerly `MSG_AUTH`, removed in PR4 Stage K-3 when SPKI-pinned mTLS replaced the shared-secret auth). ID 21 was claimed in v0.27.0 by `MSG_SUB_ADVERTISE_ACK`.
 
 The sentinel `REMOTE_NO_RESULT` (`networking.py:91`) distinguishes "handler returned `None`" (a valid result) from "no remote handler responded" (treated as no-match for fall-through).
 
