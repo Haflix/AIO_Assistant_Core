@@ -124,10 +124,12 @@ def _make_dashboard_app(plugin_core=None):
     app._stats_interval = 2.0
     app._plugin_interval = 3.0
     app._request_interval = 1.0
+    app._network_interval = 3.0  # Phase 1
     app._stats_timer = None
     app._plugin_timer = None
     app._request_timer = None
     app._log_timer = None
+    app._network_timer = None  # Phase 1
     app._id_counter = 0
     app._id_registry = {}
     app._plugin_tab_map = {}
@@ -647,7 +649,8 @@ async def test_tab_switching(mock_pc):
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
-        for tid in ["tab-plugins", "tab-config", "tab-logs", "tab-settings", "tab-home"]:
+        for tid in ["tab-plugins", "tab-config", "tab-logs",
+                    "tab-networking", "tab-settings", "tab-home"]:
             tabs.active = tid
             await pilot.pause()
             assert tabs.active == tid
@@ -663,7 +666,8 @@ async def test_keyboard_shortcuts(mock_pc):
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
         for key, expected in [("2", "tab-plugins"), ("3", "tab-config"),
-                              ("4", "tab-logs"), ("5", "tab-settings"), ("1", "tab-home")]:
+                              ("4", "tab-logs"), ("5", "tab-networking"),
+                              ("6", "tab-settings"), ("1", "tab-home")]:
             await pilot.press(key)
             await pilot.pause()
             assert tabs.active == expected
@@ -790,6 +794,190 @@ async def test_settings_peers_label_renamed(mock_pc):
         ]
         assert "Peers:" in labels
         assert "Node IPs:" not in labels
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1 — Networking tab
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_networking_tab_disabled_shows_banner(mock_pc):
+    """When networking_enabled=False, Networking tab shows the disabled
+    banner and all data cards are hidden."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(120, 40)) as pilot:
+        await pilot.pause()
+        banner = app.query_one("#net-disabled-banner", Static)
+        assert banner.display is True
+        for cid in ("#net-this-node", "#net-discovery", "#net-peers",
+                    "#net-bootstrap-card"):
+            assert app.query_one(cid).display is False
+
+
+@pytest.mark.asyncio
+async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_path):
+    """Networking on + NM present: This-Node table populated, banner
+    hidden, peers table renders peer rows."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static, DataTable
+
+    # Build a fake NetworkManager-like object exposing only the attrs
+    # the Networking tab reads. The dataclasses are simple enough that
+    # MagicMock would also work, but explicit fakes make assertions
+    # stable across MagicMock auto-attr quirks.
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("FAKE-CERT-BODY", encoding="utf-8")
+
+    class FakePeer:
+        def __init__(self, hostname, ip, port, fingerprint, system_caller=False):
+            self.hostname = hostname
+            self.ip = ip
+            self.port = port
+            self.fingerprint = fingerprint
+            self.system_caller = system_caller
+
+    class FakeNode:
+        def __init__(self, hostname, ip):
+            self.hostname = hostname
+            self.IP = ip
+            self.last_heartbeat = int(time.time())  # alive now
+        def is_alive_sync(self, timeout=30):
+            return True
+
+    class FakeNM:
+        def __init__(self):
+            self.peers = [
+                FakePeer("peer-one", "10.0.0.1", 2511,
+                         "fingerprint-aaaa-bbbb-cccc"),
+                FakePeer("peer-two", "10.0.0.2", 2511,
+                         "fingerprint-dddd-eeee-ffff",
+                         system_caller=True),
+            ]
+            self.nodes = [
+                FakeNode("peer-one", "10.0.0.1"),
+                FakeNode("peer-two", "10.0.0.2"),
+            ]
+            self.keys_dir = tmp_path
+            self.cert_path = cert_file
+            self.own_fingerprint = "self-fp-1234567890ab"
+            self.pool_size = 4
+            self.connection_pools = {}
+            self._inbound_adverts = {"peer-one": {"sub-1": object()}}
+            self._outbound_adverts = {
+                "peer-one": {"sub-2": object(), "sub-3": object()},
+            }
+            self._inflight_publishes = {"peer-two": {"req-1"}}
+            self.peer_stats = {
+                "peer-one": {
+                    "bytes_sent": 1024, "bytes_recv": 2048,
+                    "msgs_sent": 10, "msgs_recv": 12,
+                },
+            }
+            self.liveness_timeout = 30
+            self.discover_nodes = True
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await pilot.pause()  # peers worker dispatch
+
+        assert app.query_one("#net-disabled-banner", Static).display is False
+        assert app.query_one("#net-this-node").display is True
+        assert app.query_one("#net-discovery").display is True
+        assert app.query_one("#net-peers").display is True
+
+        # Bootstrap card hidden because peers are configured.
+        assert app.query_one("#net-bootstrap-card").display is False
+
+        peers_table = app.query_one("#net-peers-table", DataTable)
+        assert peers_table.row_count == 2
+
+        # Cert PEM card reads from disk.
+        pem_widget = app.query_one("#net-cert-pem", Static)
+        assert "FAKE-CERT-BODY" in pem_widget.content
+
+
+@pytest.mark.asyncio
+async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc, tmp_path):
+    """Bootstrap card visible iff networking on + peers=[] + cert.pem
+    exists on disk."""
+    from plugins_test.CLI.app import DashboardApp
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("BOOTSTRAP-CERT", encoding="utf-8")
+
+    class FakeNM:
+        peers = []  # no peers configured yet
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "boot-fp-aabbccdd"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        discover_nodes = True
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        assert app.query_one("#net-bootstrap-card").display is True
+
+
+@pytest.mark.asyncio
+async def test_networking_reload_button_dispatches(mock_pc):
+    """Clicking Reload config dispatches `async_load_config_yaml` and
+    sets a non-misleading status message (no 'Config reloaded' claim
+    since that function silently swallows networking-validation
+    errors)."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Button, Static
+
+    mock_pc.async_load_config_yaml = AsyncMock(return_value=None)
+    # Networking ON so the This-Node card (which contains the button)
+    # is visible and the button is hit-testable. NM stays None — we
+    # only care about button → handler → dispatch chain.
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Switch to Networking tab so the button is rendered.
+        from textual.widgets import TabbedContent
+        app.query_one("#main-tabs", TabbedContent).active = "tab-networking"
+        await pilot.pause()
+        await pilot.click("#btn-net-reload")
+        # Worker is @work(thread=False); pump the loop.
+        for _ in range(5):
+            await pilot.pause()
+
+        # `_run_on_main` short-circuits when the main loop is a
+        # MagicMock auto-attr (returns None without actually awaiting),
+        # so check `assert_called` (coroutine WAS created with the
+        # right config_path) rather than `assert_awaited`. This
+        # validates the button → handler → dispatch chain without
+        # requiring a real cross-loop bridge in the test environment.
+        mock_pc.async_load_config_yaml.assert_called_with(mock_pc.config_path)
+        status = app.query_one("#net-thisnode-status", Static).content
+        assert "Reload" in status  # honest non-claim message
+        assert "Config reloaded" not in status  # no false success
 
 
 @pytest.mark.asyncio

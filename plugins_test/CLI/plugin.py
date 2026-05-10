@@ -48,6 +48,7 @@ class CLI(Plugin):
         self._log_handler = TUILogHandler(max_buffer=1000)
         self._muted_handler = None
         self._main_loop = None
+        self._observed_topics: list = []
 
     @async_log_errors
     async def on_enable(self):
@@ -61,6 +62,20 @@ class CLI(Plugin):
         self._log_handler.setLevel(logging.DEBUG)
         root_logger.addHandler(self._log_handler)
 
+        # Phase 1: subscribe to internal-bus topics for live-update of
+        # the Networking tab. Registration happens on the loop thread
+        # (this method's caller); callbacks bridge to the TUI thread
+        # via `app.call_from_thread`. Phase 2 / 3 will extend this
+        # list with event/state topics. The `app and app.is_running`
+        # guard in each callback covers the startup race window where
+        # the TUI thread hasn't constructed the App yet.
+        self._observed_topics = [
+            ("_core/peer/connected", self._on_peer_event),
+            ("_core/peer/disconnected", self._on_peer_event),
+        ]
+        for topic, cb in self._observed_topics:
+            self.internal_observe(topic, cb)
+
         # Run TUI in its own thread with its own event loop.
         # This prevents PluginCore's blocking tasks (model loading, DB
         # schema creation) from starving Textual's message pump.
@@ -70,6 +85,30 @@ class CLI(Plugin):
             daemon=True,
         )
         self._tui_thread.start()
+
+    # ── Internal-bus observers (loop thread) ───────────────────────────
+    # Callbacks must return quickly (< 1ms per PluginCore.internal_observe
+    # contract). We bridge to the TUI thread via `app.call_from_thread`
+    # so DOM mutations happen on the right loop.
+
+    @log_errors
+    def _on_peer_event(self, topic: str, payload: dict) -> None:
+        """Forward peer-state changes to the Dashboard's TUI thread.
+
+        Shutdown race: the `is_running` check and the `call_from_thread`
+        call are not atomic — `app.exit()` may fire between them. We
+        wrap the dispatch in try/except to swallow the
+        `NoActiveAppError` (or version-equivalent) Textual raises when
+        the app is mid-teardown. The TUI is going away anyway; losing
+        the last few peer events is acceptable.
+        """
+        app = self._app
+        if app is None or not app.is_running:
+            return
+        try:
+            app.call_from_thread(app.on_peer_event_bus, topic, payload)
+        except Exception:
+            pass
 
     def _mute_console(self):
         """Remove the console StreamHandler from QueueListener while TUI active,
@@ -147,6 +186,17 @@ class CLI(Plugin):
     @async_log_errors
     async def on_disable(self):
         self._logger.debug("Dashboard plugin on_disable")
+
+        # Phase 1: unregister internal-bus observers. PluginCore's
+        # `_unobserve_plugin` (called on plugin pop) cleans these up
+        # automatically, but explicit unregister keeps the dicts tidy
+        # under disable/re-enable churn.
+        for topic, cb in getattr(self, "_observed_topics", []):
+            try:
+                self.internal_unobserve(topic, cb)
+            except Exception:
+                pass
+        self._observed_topics = []
 
         # Detach log handler
         root_logger = logging.getLogger()

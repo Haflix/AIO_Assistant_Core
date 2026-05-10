@@ -1,5 +1,5 @@
 description: "AIO Dashboard — Textual TUI for PluginCore management, monitoring, and plugin interaction"
-version: 2.4.2
+version: 2.5.0
 remote: False
 arguments: []
 endpoints: {}

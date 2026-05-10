@@ -92,6 +92,7 @@ MAX_GRAPH_POINTS = 60
 DEFAULT_STATS_INTERVAL = 2.0
 DEFAULT_PLUGIN_INTERVAL = 3.0
 DEFAULT_REQUEST_INTERVAL = 1.0
+DEFAULT_NETWORK_INTERVAL = 3.0  # Phase 1 — peers-table refresh tick
 
 
 # ─── CSS ─────────────────────────────────────────────────────────────
@@ -189,6 +190,31 @@ Footer {
 #plugincore-section { height: auto; }
 .pc-stat-row { height: auto; layout: horizontal; padding: 0 0 1 0; }
 #top-plugins-table { height: auto; max-height: 10; border: round #404040; background: #2d2d2d; }
+
+/* ── Networking ──────────────────────────── */
+#net-scroll { height: 1fr; }
+.net-card {
+    border: round #404040;
+    padding: 1 2;
+    margin: 0 0 1 0;
+    height: auto;
+    background: #2d2d2d;
+}
+.net-card-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
+#net-disabled-banner { padding: 1 2; color: #808080; height: auto; }
+#net-bootstrap-card { border: round #c7a06e; }
+.bootstrap-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
+#net-thisnode-table, #net-discovery-table { height: auto; max-height: 12; }
+#net-peers-table { height: auto; max-height: 16; }
+#net-peer-detail { padding: 1 2; height: auto; color: #d4d4d4; }
+#net-thisnode-status { padding: 0 1; height: auto; }
+#net-bootstrap-fp, #net-bootstrap-instructions {
+    padding: 0 0 1 0; height: auto;
+}
+#net-bootstrap-pem, #net-cert-pem {
+    padding: 1 2; height: auto;
+    background: #1e1e1e; color: #9bb5a0;
+}
 
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
@@ -325,7 +351,8 @@ class DashboardApp(App):
         Binding("2", "tab_plugins", "Plugins"),
         Binding("3", "tab_config", "Config"),
         Binding("4", "tab_logs", "Logs"),
-        Binding("5", "tab_settings", "Settings"),
+        Binding("5", "tab_networking", "Networking"),
+        Binding("6", "tab_settings", "Settings"),
     ]
 
     def __init__(
@@ -362,12 +389,14 @@ class DashboardApp(App):
         self._stats_interval = DEFAULT_STATS_INTERVAL
         self._plugin_interval = DEFAULT_PLUGIN_INTERVAL
         self._request_interval = DEFAULT_REQUEST_INTERVAL
+        self._network_interval = DEFAULT_NETWORK_INTERVAL  # Phase 1
 
         # Timer references for restart on settings change
         self._stats_timer = None
         self._plugin_timer = None
         self._request_timer = None
         self._log_timer = None
+        self._network_timer = None  # Phase 1
 
         # ID registry for dynamic widgets
         self._id_counter = 0
@@ -593,7 +622,68 @@ class DashboardApp(App):
                     yield Static("0/0 records", id="log-record-count", markup=True)
                     yield Static("", id="log-detail", markup=True)
 
-            # ── 5. Settings ──────────────────────────────────────
+            # ── 5. Networking ────────────────────────────────────
+            with TabPane("Networking", id="tab-networking"):
+                with VerticalScroll(id="net-scroll"):
+                    # Banner — visible only when networking disabled.
+                    yield Static(
+                        "Networking is disabled. Set networking.enabled: "
+                        "true in config.yml and Reload to enable.",
+                        id="net-disabled-banner",
+                    )
+
+                    # Bootstrap helper — visible only when applicable.
+                    with Vertical(id="net-bootstrap-card", classes="net-card"):
+                        yield Static("Cluster bootstrap ready",
+                                     classes="bootstrap-title")
+                        yield Static("...", id="net-bootstrap-fp",
+                                     markup=False)
+                        with Collapsible(title="Cert PEM",
+                                         id="net-bootstrap-pem-collapsible",
+                                         collapsed=True):
+                            yield Static("...", id="net-bootstrap-pem",
+                                         markup=False)
+                        yield Static(
+                            "Paste the fingerprint + PEM into another "
+                            "node's networking.peers block. Then add their "
+                            "peer entry to this node's config and click "
+                            "Reload config.yml.",
+                            id="net-bootstrap-instructions",
+                        )
+
+                    # This Node card.
+                    with Vertical(id="net-this-node", classes="net-card"):
+                        yield Static("This Node", classes="net-card-title")
+                        yield DataTable(id="net-thisnode-table",
+                                        cursor_type="none")
+                        with Collapsible(title="Cert PEM",
+                                         id="net-cert-pem-collapsible",
+                                         collapsed=True):
+                            yield Static("...", id="net-cert-pem",
+                                         markup=False)
+                        with Horizontal():
+                            yield Button("Reload config.yml",
+                                         id="btn-net-reload",
+                                         variant="primary")
+                        yield Static("", id="net-thisnode-status",
+                                     markup=True)
+
+                    # Discovery / heartbeat strip.
+                    with Vertical(id="net-discovery", classes="net-card"):
+                        yield Static("Discovery / heartbeat",
+                                     classes="net-card-title")
+                        yield DataTable(id="net-discovery-table",
+                                        cursor_type="none")
+
+                    # Peers table.
+                    with Vertical(id="net-peers", classes="net-card"):
+                        yield Static("Peers", classes="net-card-title")
+                        yield DataTable(id="net-peers-table",
+                                        cursor_type="row")
+                        yield Static("", id="net-peer-detail",
+                                     markup=True)
+
+            # ── 6. Settings ──────────────────────────────────────
             with TabPane("Settings", id="tab-settings"):
                 with VerticalScroll(id="settings-scroll"):
                     # TUI settings
@@ -699,6 +789,27 @@ class DashboardApp(App):
         except NoMatches:
             pass
 
+        # Phase 1 — Networking tab DataTables
+        try:
+            nn = self.query_one("#net-thisnode-table", DataTable)
+            nn.add_columns("Field", "Value")
+        except NoMatches:
+            pass
+        try:
+            nd = self.query_one("#net-discovery-table", DataTable)
+            nd.add_columns("Field", "Value")
+        except NoMatches:
+            pass
+        try:
+            np_t = self.query_one("#net-peers-table", DataTable)
+            np_t.add_columns(
+                "Hostname", "Address", "system_caller", "Alive", "Last HB",
+                "Pool", "In subs", "Out subs", "Inflight", "Bytes (s/r)",
+                "FP",
+            )
+        except NoMatches:
+            pass
+
         # Hide network section if networking disabled
         if not getattr(self.plugin_core, "networking_enabled", False):
             try:
@@ -708,6 +819,12 @@ class DashboardApp(App):
 
         # Populate settings info
         self._populate_settings_info()
+
+        # Phase 1 — populate Networking tab static cards + initial
+        # peers-table render. Visibility (banner vs cards) follows
+        # `pc.networking_enabled`.
+        self._populate_networking_static()
+        self._refresh_peers_table_worker()
 
         # Build config file list
         self._build_config_file_list()
@@ -729,10 +846,15 @@ class DashboardApp(App):
             self._request_timer.stop()
         if self._log_timer:
             self._log_timer.stop()
+        if self._network_timer:  # Phase 1
+            self._network_timer.stop()
         self._stats_timer = self.set_interval(self._stats_interval, self._refresh_stats_worker)
         self._plugin_timer = self.set_interval(self._plugin_interval, self._periodic_plugin_refresh)
         self._request_timer = self.set_interval(self._request_interval, self._refresh_requests_worker)
         self._log_timer = self.set_interval(0.5, self._refresh_log_table)
+        self._network_timer = self.set_interval(  # Phase 1
+            self._network_interval, self._refresh_peers_table_worker,
+        )
 
     def _periodic_plugin_refresh(self) -> None:
         try:
@@ -1194,6 +1316,385 @@ class DashboardApp(App):
             except Exception:
                 pass
         except NoMatches:
+            pass
+
+    # ─── Phase 1 — Networking tab ────────────────────────────────────
+
+    def _populate_networking_static(self) -> None:
+        """One-shot population for the Networking tab's static cards.
+
+        Called on `on_mount` and after every Reload-config click. The
+        peers table is refreshed by the periodic worker, so this method
+        only handles the cards whose contents change rarely (this-node
+        info, discovery/heartbeat strip, bootstrap helper visibility +
+        text). All `query_one` calls are wrapped in `try/except
+        NoMatches` because the Networking tab may not be present yet
+        during an early on-mount race or partial DOM teardown.
+        """
+        pc = self.plugin_core
+        net_enabled = getattr(pc, "networking_enabled", False)
+
+        # Banner vs cards visibility — single switch driven by
+        # networking_enabled. Mounted once at compose, toggled here.
+        try:
+            self.query_one("#net-disabled-banner").display = not net_enabled
+        except NoMatches:
+            pass
+        for cid in ("#net-this-node", "#net-discovery", "#net-peers",
+                    "#net-bootstrap-card"):
+            try:
+                self.query_one(cid).display = net_enabled
+            except NoMatches:
+                pass
+        if not net_enabled:
+            return
+
+        # Bootstrap helper visibility — additional gate on top of
+        # net_enabled. Visible only when `peers=[]` AND the cert PEM
+        # exists on disk. The card is hidden in the loop above already
+        # if net_enabled is False; here we hide it again if the
+        # bootstrap predicate is False even with networking on.
+        bootstrap = self._bootstrap_visible()
+        try:
+            self.query_one("#net-bootstrap-card").display = bootstrap
+        except NoMatches:
+            pass
+
+        nm = getattr(pc, "network", None)
+        if nm is None:
+            # Networking is enabled in config but the NM hasn't been
+            # constructed yet (or is mid-rebuild). Render stub values
+            # so cards don't show stale data from a prior NM.
+            self._populate_thisnode_table(
+                hostname=getattr(pc, "hostname", "?"),
+                port=getattr(pc, "networking_port", "?"),
+                keys_dir="(NM not built)",
+                pool_size="?",
+                discoverable=self._format_discoverable(pc),
+                fingerprint="(NM not built)",
+            )
+            self._populate_discovery_table_pc_only(pc)
+            self._set_cert_pem("(NM not built — cert unavailable)")
+            self._set_bootstrap_card_text(
+                fingerprint="(NM not built)",
+                pem="(NM not built)",
+            )
+            return
+
+        # NM exists — read its live state.
+        self._populate_thisnode_table(
+            hostname=getattr(pc, "hostname", "?"),
+            port=getattr(pc, "networking_port", "?"),
+            keys_dir=str(getattr(nm, "keys_dir", "?")),
+            pool_size=getattr(nm, "pool_size", "?"),
+            discoverable=self._format_discoverable(pc),
+            fingerprint=(getattr(nm, "own_fingerprint", "") or
+                         "(not loaded yet)"),
+        )
+        self._populate_discovery_table(nm, pc)
+        self._set_cert_pem(self._read_cert_pem_safe(nm))
+        self._set_bootstrap_card_text(
+            fingerprint=(getattr(nm, "own_fingerprint", "") or
+                         "(not loaded yet)"),
+            pem=self._read_cert_pem_safe(nm),
+        )
+
+    @staticmethod
+    def _format_discoverable(pc) -> str:
+        auto = getattr(pc, "networking_auto_discoverable", False)
+        direct = getattr(pc, "networking_direct_discoverable", False)
+        return f"auto:{'Y' if auto else 'N'} | direct:{'Y' if direct else 'N'}"
+
+    @staticmethod
+    def _read_cert_pem_safe(nm) -> str:
+        """Read the cert PEM from disk. Defensive against missing file
+        + the rare null `cert_path` (theoretically always-set, but
+        guard anyway per cycle-1 review)."""
+        cert_path = getattr(nm, "cert_path", None)
+        if cert_path is None:
+            return "(cert_path not set)"
+        try:
+            if not cert_path.exists():
+                return "(cert.pem not yet on disk)"
+            return cert_path.read_text(encoding="utf-8")
+        except Exception as e:
+            return f"(read failed: {e})"
+
+    def _populate_thisnode_table(
+        self, *, hostname, port, keys_dir, pool_size, discoverable,
+        fingerprint,
+    ) -> None:
+        try:
+            t = self.query_one("#net-thisnode-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        t.add_row("Hostname", str(hostname))
+        t.add_row("Port", str(port))
+        t.add_row("Keys dir", str(keys_dir))
+        t.add_row("Pool size", str(pool_size))
+        t.add_row("Discoverable", discoverable)
+        t.add_row("Fingerprint", str(fingerprint))
+
+    def _populate_discovery_table(self, nm, pc) -> None:
+        try:
+            t = self.query_one("#net-discovery-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        t.add_row("discover_nodes",
+                  str(getattr(nm, "discover_nodes", "?")))
+        t.add_row("auto_discoverable",
+                  str(getattr(pc, "networking_auto_discoverable", "?")))
+        t.add_row("direct_discoverable",
+                  str(getattr(pc, "networking_direct_discoverable", "?")))
+        t.add_row("heartbeat_interval",
+                  str(getattr(pc, "networking_heartbeat_interval", "?")))
+        t.add_row("lookup_interval",
+                  str(getattr(pc, "networking_lookup_interval", "?")))
+        t.add_row("liveness_timeout",
+                  str(getattr(pc, "networking_liveness_timeout", "?")))
+
+    def _populate_discovery_table_pc_only(self, pc) -> None:
+        """Stub variant when NM is None — only PC-level B-069 attrs
+        are available."""
+        try:
+            t = self.query_one("#net-discovery-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        t.add_row("discover_nodes", "(NM not built)")
+        t.add_row("auto_discoverable",
+                  str(getattr(pc, "networking_auto_discoverable", "?")))
+        t.add_row("direct_discoverable",
+                  str(getattr(pc, "networking_direct_discoverable", "?")))
+        t.add_row("heartbeat_interval",
+                  str(getattr(pc, "networking_heartbeat_interval", "?")))
+        t.add_row("lookup_interval",
+                  str(getattr(pc, "networking_lookup_interval", "?")))
+        t.add_row("liveness_timeout",
+                  str(getattr(pc, "networking_liveness_timeout", "?")))
+
+    def _set_cert_pem(self, pem: str) -> None:
+        try:
+            self.query_one("#net-cert-pem", Static).update(pem)
+        except NoMatches:
+            pass
+
+    def _set_bootstrap_card_text(self, *, fingerprint: str, pem: str) -> None:
+        try:
+            self.query_one("#net-bootstrap-fp", Static).update(
+                f"Fingerprint: {fingerprint}"
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#net-bootstrap-pem", Static).update(pem)
+        except NoMatches:
+            pass
+
+    def _bootstrap_visible(self) -> bool:
+        """Predicate for showing the bootstrap-helper card.
+
+        Visible iff networking is enabled AND no peers are configured
+        AND the cert.pem file exists on disk. The third condition
+        avoids advertising "ready" before identity provisioning has
+        finished writing the cert.
+        """
+        pc = self.plugin_core
+        if not getattr(pc, "networking_enabled", False):
+            return False
+        nm = getattr(pc, "network", None)
+        if nm is None:
+            return False
+        if list(getattr(nm, "peers", []) or []):
+            return False
+        cert_path = getattr(nm, "cert_path", None)
+        if cert_path is None:
+            return False
+        try:
+            return cert_path.exists()
+        except Exception:
+            return False
+
+    @work(thread=False, exclusive=True, group="networking")
+    async def _refresh_peers_table_worker(self) -> None:
+        """Periodic peers-table refresh.
+
+        Snapshots the lock-protected NetworkManager dicts before
+        iterating. Inner `AdvertSub` objects in the snapshot are
+        SHARED references — the peers table only reads scalar fields
+        for display, so eventual consistency is fine. Early-returns
+        when networking is disabled (banner already covers this state).
+        """
+        pc = self.plugin_core
+        if not getattr(pc, "networking_enabled", False):
+            return
+        nm = getattr(pc, "network", None)
+        if nm is None:
+            try:
+                t = self.query_one("#net-peers-table", DataTable)
+            except NoMatches:
+                return
+            t.clear()
+            return
+
+        try:
+            peers = list(getattr(nm, "peers", []) or [])
+            nodes_list = list(getattr(nm, "nodes", []) or [])
+            # Outer-then-inner snapshot pattern. `dict.copy()` /
+            # `set(...)` are C-level atomic in CPython (single GIL
+            # hold), so they survive concurrent structural mutations
+            # of the source. Iterating `.items()` instead would risk
+            # `RuntimeError: dictionary changed size during iteration`
+            # because peer connect/disconnect mutates these outer
+            # dicts under `_advert_locks` / `_adverts_struct_lock`
+            # which the TUI thread does NOT hold.
+            raw_inbound = getattr(nm, "_inbound_adverts", None) or {}
+            raw_outbound = getattr(nm, "_outbound_adverts", None) or {}
+            raw_inflight = getattr(nm, "_inflight_publishes", None) or {}
+            raw_peer_stats = getattr(nm, "peer_stats", None) or {}
+            raw_pools = getattr(nm, "connection_pools", None) or {}
+            inbound_outer = raw_inbound.copy()
+            outbound_outer = raw_outbound.copy()
+            inflight_outer = raw_inflight.copy()
+            peer_stats = raw_peer_stats.copy()
+            connection_pools = raw_pools.copy()
+            # Inner copies — also C-atomic, but if the inner dict
+            # mutates during the outer iteration of our snapshot we'd
+            # still hit RuntimeError. Bail to next tick on race.
+            inbound = {h: d.copy() for h, d in inbound_outer.items()}
+            outbound = {h: d.copy() for h, d in outbound_outer.items()}
+            inflight = {h: set(s) for h, s in inflight_outer.items()}
+            liveness_timeout = getattr(nm, "liveness_timeout", 30)
+        except (RuntimeError, Exception):
+            return
+
+        nodes_by_host = {n.hostname: n for n in nodes_list}
+
+        try:
+            table = self.query_one("#net-peers-table", DataTable)
+        except NoMatches:
+            return
+        table.clear()
+
+        now = time.time()
+        for peer in peers:
+            node = nodes_by_host.get(peer.hostname)
+            alive_str = "?"
+            hb_str = "never"
+            if node is not None:
+                try:
+                    alive_str = "Y" if node.is_alive_sync(
+                        timeout=liveness_timeout) else "N"
+                except Exception:
+                    alive_str = "?"
+                last_hb = getattr(node, "last_heartbeat", None)
+                if last_hb is not None:
+                    hb_str = self._format_relative_hb(now - last_hb)
+
+            pool = connection_pools.get((peer.ip, peer.port))
+            try:
+                # qsize() is GIL-atomic in CPython (returns len(deque));
+                # cross-thread approximate but safe for display.
+                pool_str = str(pool.qsize()) if pool is not None else "0"
+            except Exception:
+                pool_str = "?"
+
+            in_subs = len(inbound.get(peer.hostname, {}))
+            out_subs = len(outbound.get(peer.hostname, {}))
+            inflight_count = len(inflight.get(peer.hostname, set()))
+            stats = peer_stats.get(peer.hostname, {}) or {}
+            bytes_str = (
+                f"{stats.get('bytes_sent', 0)}/"
+                f"{stats.get('bytes_recv', 0)}"
+            )
+            sysc = "Y" if getattr(peer, "system_caller", False) else "N"
+            fp_short = (peer.fingerprint or "")[:12] + (
+                "…" if peer.fingerprint and len(peer.fingerprint) > 12 else ""
+            )
+
+            table.add_row(
+                peer.hostname,
+                f"{peer.ip}:{peer.port}",
+                sysc,
+                alive_str,
+                hb_str,
+                pool_str,
+                str(in_subs),
+                str(out_subs),
+                str(inflight_count),
+                bytes_str,
+                fp_short,
+                key=peer.hostname,
+            )
+
+    @staticmethod
+    def _format_relative_hb(secs: float) -> str:
+        if secs < 0:
+            return "?"
+        if secs < 60:
+            return f"{int(secs)}s ago"
+        if secs < 3600:
+            return f"{int(secs // 60)}m ago"
+        return f"{int(secs // 3600)}h ago"
+
+    @on(Button.Pressed, "#btn-net-reload")
+    def _on_net_reload(self) -> None:  # Phase 1
+        self._dispatch_net_reload()
+
+    @work(thread=False, exclusive=True, group="config-reload")
+    async def _dispatch_net_reload(self) -> None:
+        """Reload `pc.config_path` from disk + re-render Networking-tab
+        cards.
+
+        IMPORTANT: `async_load_config_yaml` swallows networking-config
+        validation errors silently (PluginCore.py:1153-1161 — catches
+        Exception, logs, returns). Only the rare `_rebuild_networking`
+        step-7 failure raises out. So we MUST NOT optimistically claim
+        success — the status message tells the operator to check Logs.
+        """
+        try:
+            await self._run_on_main(
+                self.plugin_core.async_load_config_yaml(
+                    self.plugin_core.config_path
+                )
+            )
+        except Exception as e:
+            self._set_net_status(f"Reload failed: {e}", error=True)
+            return
+
+        self._set_net_status(
+            "Reload requested. Check Logs tab if peers / settings did "
+            "not change."
+        )
+        # Re-render whatever state PluginCore is now in.
+        self._populate_networking_static()
+        self._refresh_peers_table_worker()
+        self._build_config_file_list()
+        self._populate_settings_info()
+
+    def _set_net_status(self, msg: str, error: bool = False) -> None:
+        try:
+            s = self.query_one("#net-thisnode-status", Static)
+            safe = escape(msg)
+            s.update(f"[red]{safe}[/]" if error else f"[green]{safe}[/]")
+        except NoMatches:
+            pass
+
+    def on_peer_event_bus(self, topic: str, payload: dict) -> None:
+        """Bridge target for the CLI plugin's `_on_peer_event` callback.
+
+        Called via `app.call_from_thread` → runs on the TUI loop.
+        Triggers a peers-table refresh on the next worker cycle (no
+        direct DOM mutation here — workers handle that).
+        """
+        # Defensive: if the user is on a different tab, the worker
+        # still updates the table — peers data is small. Tab-visibility
+        # gating not worth the complexity here.
+        try:
+            self._refresh_peers_table_worker()
+        except Exception:
             pass
 
     def _format_peers_display(self) -> str:
@@ -2255,6 +2756,9 @@ class DashboardApp(App):
 
     def action_tab_logs(self) -> None:
         self._switch_tab("tab-logs")
+
+    def action_tab_networking(self) -> None:  # Phase 1
+        self._switch_tab("tab-networking")
 
     def action_tab_settings(self) -> None:
         self._switch_tab("tab-settings")
