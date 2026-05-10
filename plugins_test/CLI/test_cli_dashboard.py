@@ -590,6 +590,10 @@ def mock_pc():
     pc.networking_port = 2510
     pc.networking_auto_discoverable = False
     pc.networking_direct_discoverable = False
+    pc.networking_heartbeat_interval = 10.0
+    pc.networking_lookup_interval = 60.0
+    pc.networking_liveness_timeout = 30.0
+    pc.network = None  # NM only built when networking_enabled=True
     pc.plugin_lock = asyncio.Lock()
     pc.requests = {}
     pc.get_plugin_info = AsyncMock(return_value={
@@ -701,3 +705,116 @@ async def test_log_table_columns(mock_pc):
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         table = app.query_one("#log-table", DataTable)
         assert len(table.columns) == 4
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 0 — Settings tab Networking group: peers display + B-069 rows
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_settings_networking_disabled_shows_placeholder(mock_pc):
+    """When networking_enabled=False, disabled placeholder is visible and
+    data rows are hidden. Mock fixture defaults networking_enabled=False."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(120, 40)) as pilot:
+        await pilot.pause()
+        placeholder = app.query_one("#settings-net-disabled", Static)
+        data = app.query_one("#settings-net-data")
+        assert placeholder.display is True
+        assert data.display is False
+
+
+@pytest.mark.asyncio
+async def test_settings_networking_enabled_shows_peers(mock_pc):
+    """When networking_enabled=True with peers configured, data rows
+    visible, B-069 rows populated, label reads 'Peers:' not 'Node IPs:'."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    # Flip on networking + provide a YAML peers list (network=None still,
+    # so _format_peers_display falls back to the YAML reader path).
+    mock_pc.networking_enabled = True
+    mock_pc.yaml_config = {
+        "plugins": [],
+        "general": {},
+        "networking": {
+            "enabled": True,
+            "peers": [
+                {"hostname": "peer-one", "ip": "10.0.0.1", "port": 2511},
+                {"hostname": "peer-two", "ip": "10.0.0.2", "port": 2511},
+            ],
+        },
+    }
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(120, 40)) as pilot:
+        await pilot.pause()
+        placeholder = app.query_one("#settings-net-disabled", Static)
+        data = app.query_one("#settings-net-data")
+        assert placeholder.display is False
+        assert data.display is True
+
+        # B-069 interval rows populated.
+        assert app.query_one("#info-net-heartbeat", Static).content == "10.0"
+        assert app.query_one("#info-net-lookup", Static).content == "60.0"
+        assert app.query_one("#info-net-liveness", Static).content == "30.0"
+
+        # Peers value renders count + entries.
+        peers_value = app.query_one("#info-net-nodes", Static).content
+        assert peers_value.startswith("2 (")
+        assert "peer-one @ 10.0.0.1:2511" in peers_value
+        assert "peer-two @ 10.0.0.2:2511" in peers_value
+
+
+@pytest.mark.asyncio
+async def test_settings_peers_label_renamed(mock_pc):
+    """The Settings Networking-group label reads 'Peers:' not 'Node IPs:'.
+    Catches a missed PR4 K-3 cleanup if the rename ever regresses."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(120, 40)) as pilot:
+        await pilot.pause()
+        # Find the label paired with #info-net-nodes by walking the
+        # Networking group's setting-row containers.
+        labels = [
+            s.content
+            for s in app.query("#settings-net-data .setting-label").results(Static)
+        ]
+        assert "Peers:" in labels
+        assert "Node IPs:" not in labels
+
+
+@pytest.mark.asyncio
+async def test_settings_peers_display_overflow_elided(mock_pc):
+    """Peers display caps at 4 entries; overflow elided as '+N more'."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    mock_pc.networking_enabled = True
+    mock_pc.yaml_config = {
+        "plugins": [],
+        "general": {},
+        "networking": {
+            "enabled": True,
+            "peers": [
+                {"hostname": f"p{i}", "ip": f"10.0.0.{i}", "port": 2511}
+                for i in range(1, 7)  # 6 peers
+            ],
+        },
+    }
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(120, 40)) as pilot:
+        await pilot.pause()
+        peers_value = app.query_one("#info-net-nodes", Static).content
+        assert peers_value.startswith("6 (")
+        assert "+2 more" in peers_value

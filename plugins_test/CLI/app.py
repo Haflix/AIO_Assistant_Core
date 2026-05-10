@@ -203,6 +203,7 @@ Footer {
 .setting-row { height: auto; layout: horizontal; padding: 0 0 1 0; }
 .setting-label { color: #808080; width: 25; }
 .setting-value { color: #d4d4d4; width: 1fr; }
+.settings-net-disabled { color: #808080; padding: 0 0 1 0; height: auto; }
 
 /* ── Plugin view ─────────────────────────── */
 .plugin-view-container { height: 1fr; padding: 1 2; }
@@ -629,20 +630,38 @@ class DashboardApp(App):
                             )
 
                     # Networking info
-                    with Vertical(classes="settings-group"):
+                    with Vertical(classes="settings-group", id="settings-net-group"):
                         yield Static("Networking", classes="settings-group-title")
-                        with Horizontal(classes="setting-row"):
-                            yield Static("Enabled:", classes="setting-label")
-                            yield Static("...", id="info-net-enabled", classes="setting-value")
-                        with Horizontal(classes="setting-row"):
-                            yield Static("Port:", classes="setting-label")
-                            yield Static("...", id="info-net-port", classes="setting-value")
-                        with Horizontal(classes="setting-row"):
-                            yield Static("Discoverable:", classes="setting-label")
-                            yield Static("...", id="info-net-discoverable", classes="setting-value")
-                        with Horizontal(classes="setting-row"):
-                            yield Static("Node IPs:", classes="setting-label")
-                            yield Static("...", id="info-net-nodes", classes="setting-value")
+                        # Disabled placeholder — visible only when networking off.
+                        yield Static(
+                            "Networking disabled. Set networking.enabled: true "
+                            "in config.yml to enable.",
+                            id="settings-net-disabled",
+                            classes="settings-net-disabled",
+                        )
+                        # Data rows — hidden when networking off.
+                        with Vertical(id="settings-net-data"):
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Enabled:", classes="setting-label")
+                                yield Static("...", id="info-net-enabled", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Port:", classes="setting-label")
+                                yield Static("...", id="info-net-port", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Discoverable:", classes="setting-label")
+                                yield Static("...", id="info-net-discoverable", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Peers:", classes="setting-label")
+                                yield Static("...", id="info-net-nodes", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Heartbeat interval (s):", classes="setting-label")
+                                yield Static("...", id="info-net-heartbeat", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Lookup interval (s):", classes="setting-label")
+                                yield Static("...", id="info-net-lookup", classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Liveness timeout (s):", classes="setting-label")
+                                yield Static("...", id="info-net-liveness", classes="setting-value")
 
         yield Footer()
 
@@ -1121,7 +1140,20 @@ class DashboardApp(App):
             self.query_one("#info-plugin-package", Static).update(
                 getattr(self.plugin_core, "plugin_package", "?")
             )
+
+            # Networking group: hide data rows when networking disabled,
+            # show disabled placeholder. Single source of truth for the
+            # split is `pc.networking_enabled`.
             net_enabled = getattr(self.plugin_core, "networking_enabled", False)
+            try:
+                self.query_one("#settings-net-disabled").display = not net_enabled
+            except NoMatches:
+                pass
+            try:
+                self.query_one("#settings-net-data").display = net_enabled
+            except NoMatches:
+                pass
+
             self.query_one("#info-net-enabled", Static).update("Yes" if net_enabled else "No")
             self.query_one("#info-net-port", Static).update(
                 str(getattr(self.plugin_core, "networking_port", "?"))
@@ -1131,11 +1163,28 @@ class DashboardApp(App):
             self.query_one("#info-net-discoverable", Static).update(
                 f"Auto: {'Y' if auto else 'N'} | Direct: {'Y' if direct else 'N'}"
             )
-            net_cfg = self.plugin_core.yaml_config.get("networking", {})
-            ips = net_cfg.get("node_ips", [])
+
+            # Peers display — sourced from pc.network.peers (PeerSpec list)
+            # when the NetworkManager exists; falls back to YAML
+            # networking.peers count when network is None (e.g. networking
+            # off but config carries entries). PR4 K-3 removed `node_ips`;
+            # reading it raises a hard config error in the framework.
             self.query_one("#info-net-nodes", Static).update(
-                ", ".join(ips) if ips else "none"
+                self._format_peers_display()
             )
+
+            # B-069 runtime intervals — read from PluginCore-level attrs
+            # which mirror the YAML at boot + on async_load_config_yaml.
+            self.query_one("#info-net-heartbeat", Static).update(
+                str(getattr(self.plugin_core, "networking_heartbeat_interval", "?"))
+            )
+            self.query_one("#info-net-lookup", Static).update(
+                str(getattr(self.plugin_core, "networking_lookup_interval", "?"))
+            )
+            self.query_one("#info-net-liveness", Static).update(
+                str(getattr(self.plugin_core, "networking_liveness_timeout", "?"))
+            )
+
             # Set log level select to current
             log_level = self.plugin_core.yaml_config.get("general", {}).get(
                 "console_log_level", "DEBUG"
@@ -1146,6 +1195,50 @@ class DashboardApp(App):
                 pass
         except NoMatches:
             pass
+
+    def _format_peers_display(self) -> str:
+        """Render peers summary for the Settings-tab Networking group.
+
+        Source priority:
+          1. `pc.network.peers` (List[PeerSpec]) when NetworkManager exists.
+          2. YAML `networking.peers` count when network is None (config
+             carries entries but networking has not been started).
+          3. "none" when neither produces entries.
+
+        Output format: `count (host @ ip:port, host2 @ ip:port, ...)` capped
+        at 4 entries; overflow elided as ` +N more`.
+        """
+        nm = getattr(self.plugin_core, "network", None)
+        if nm is not None:
+            peers = list(getattr(nm, "peers", []) or [])
+            if not peers:
+                return "none"
+            entries = [
+                f"{p.hostname} @ {p.ip}:{p.port}" for p in peers[:4]
+            ]
+            count = len(peers)
+            extra = count - len(entries)
+            tail = f" +{extra} more" if extra > 0 else ""
+            return f"{count} ({', '.join(entries)}{tail})"
+        # NM is None — read raw YAML so peers configured but-not-yet-built
+        # still render. Defensive .get() against partial configs.
+        net_cfg = (self.plugin_core.yaml_config or {}).get("networking", {}) or {}
+        raw_peers = net_cfg.get("peers", []) or []
+        if not raw_peers:
+            return "none"
+        entries = []
+        for entry in raw_peers[:4]:
+            if isinstance(entry, dict):
+                host = entry.get("hostname", "?")
+                ip = entry.get("ip", "?")
+                port = entry.get("port", "?")
+                entries.append(f"{host} @ {ip}:{port}")
+            else:
+                entries.append(str(entry))
+        count = len(raw_peers)
+        extra = count - len(entries)
+        tail = f" +{extra} more" if extra > 0 else ""
+        return f"{count} ({', '.join(entries)}{tail})"
 
     # ─── Plugin view generation ──────────────────────────────────────
 
