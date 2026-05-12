@@ -110,6 +110,7 @@ def _make_mock_plugin(
 
 def _make_dashboard_app(plugin_core=None):
     from plugins_test.CLI.app import DashboardApp
+    import collections as _c
     app = object.__new__(DashboardApp)
     app.plugin_core = plugin_core or _make_mock_plugin_core()
     app.plugin_instance = MagicMock(plugin_name="CLI")
@@ -136,6 +137,19 @@ def _make_dashboard_app(plugin_core=None):
     app._plugin_tab_map = {}
     app._plugin_tab_modes = {}
     app._plugin_filter = ""
+    # Phase 2 — cert-expiry cache (bounded FIFO).
+    app._cert_expiry_cache = _c.OrderedDict()
+    app._cert_expiry_cache_cap = 64
+    # Phase 4a — per-peer drill-down state.
+    app._peer_tabs = _c.OrderedDict()
+    app._peer_tabs_cap = 5
+    app._peer_ring_buffers = {}
+    app._peer_drill_timer = None
+    # Phase 4b — per-peer event log baseline.
+    app._peer_log_baselines = {}
+    # Phase 5 — networking uptime tracker.
+    app._networking_started_at = None
+    app._networking_instance_id = None
     return app
 
 def _make_mock_request(plugin="PluginA", method="do_thing", age=0.5,
@@ -1751,8 +1765,13 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
         await app._open_peer_drill_down(host)
-        for _ in range(4):
+        # `_populate_peer_drill_widgets` runs via `call_after_refresh` —
+        # poll for the baseline so the test isn't a timing race against
+        # Textual's refresh cadence.
+        for _ in range(30):
             await pilot.pause()
+            if host in app._peer_log_baselines:
+                break
         # Hydration: the pre-mount event was rendered once. Baseline == 1.
         assert app._peer_log_baselines[host] == 1
 

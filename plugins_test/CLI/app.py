@@ -1039,11 +1039,18 @@ class DashboardApp(App):
                                              classes="setting-value")
                         # Phase 5 — rebuild indicator: visible only when
                         # `pc.networking_enabled AND pc.network is None`.
-                        yield Static(
+                        # Initial `display=False` so the one-frame window
+                        # between compose and the first `on_mount` →
+                        # `_populate_settings_info` call doesn't flash
+                        # the rebuild banner on TUIs that start with
+                        # networking disabled.
+                        rebuild_static = Static(
                             "Networking rebuilding…",
                             id="settings-net-rebuilding",
                             classes="settings-net-warn",
                         )
+                        rebuild_static.display = False
+                        yield rebuild_static
 
         yield Footer()
 
@@ -2273,12 +2280,15 @@ class DashboardApp(App):
           - networking disabled in config: "OFF"
           - enabled but NetworkManager not yet built / mid-rebuild: "ON (N/A)"
           - enabled with live NM: "ON, X/Y peers alive" where X = configured
-            peers (PeerSpec) whose matching Node entry is enabled AND fresh,
+            peers (PeerSpec) whose matching Node entry is enabled AND
+            heartbeated within `heartbeat_interval` (the "alive" band),
             Y = len(nm.peers)
 
-        Configured-but-never-heartbeat peers count toward (Y - X). A peer
-        whose hostname is NOT in nm.peers (e.g. an auto-discovered Node)
-        is excluded entirely.
+        Uses the same heartbeat-age semantics as the Networking-tab
+        cluster summary so a peer in the "degraded" band doesn't read
+        as alive on Home but degraded on Networking. Configured-but-
+        never-heartbeat peers count toward (Y - X). Auto-discovered
+        peers not in `nm.peers` are excluded entirely.
         """
         pc = self.plugin_core
         if not getattr(pc, "networking_enabled", False):
@@ -2289,22 +2299,23 @@ class DashboardApp(App):
         try:
             peers = list(getattr(nm, "peers", []) or [])
             nodes = list(getattr(nm, "nodes", []) or [])
-            timeout = getattr(nm, "liveness_timeout", 30)
+            hb_interval = getattr(nm, "heartbeat_interval", 10)
         except Exception:
             return "ON (N/A)"
         configured_hostnames = {p.hostname for p in peers}
         nodes_by_host = {n.hostname: n for n in nodes
                          if n.hostname in configured_hostnames}
+        now = time.time()
         alive = 0
         for host in configured_hostnames:
             node = nodes_by_host.get(host)
             if node is None or not getattr(node, "enabled", True):
                 continue
-            try:
-                if node.is_alive_sync(timeout=timeout):
-                    alive += 1
-            except Exception:
-                pass
+            last_hb = getattr(node, "last_heartbeat", None)
+            if last_hb is None:
+                continue
+            if now - last_hb < hb_interval:
+                alive += 1
         return f"ON, {alive}/{len(peers)} peers alive"
 
     def on_peer_event_bus(self, topic: str, payload: dict) -> None:
@@ -2745,7 +2756,7 @@ class DashboardApp(App):
         except Exception:
             # Other remove_pane failure: keep dict entries so a retry
             # can clean up later. Log + bail.
-            self._logger.debug(
+            self.log.debug(
                 "remove_pane failed for %s", hostname, exc_info=True,
             )
             return
@@ -2788,7 +2799,7 @@ class DashboardApp(App):
                 # Tab DOM torn down between check and update — skip.
                 continue
             except Exception:
-                self._logger.debug(
+                self.log.debug(
                     "drill-down refresh failed for %s", host, exc_info=True,
                 )
 
