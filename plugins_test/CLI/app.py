@@ -317,6 +317,84 @@ RichLog { background: #1e1e1e; }
 """
 
 
+class CertPEMScreen(ModalScreen[None]):
+    """Modal display of a TLS cert PEM (own or peer).
+
+    Phase 3 — replaces the Cert PEM `Collapsible` widgets that Phase 1
+    dropped. Collapsibles reserve vertical space for their hidden body
+    in Textual 8.2.3, which made the This-Node and Bootstrap cards
+    bloat by ~25 lines per cert. A modal gives the operator the full
+    PEM on demand without permanent layout cost.
+
+    The constructor takes the cert PEM text and its fingerprint
+    explicitly so the same screen renders both the own cert (called
+    with `nm.own_fingerprint`) and any peer cert (called with
+    `peer.fingerprint` from Phase 4a's drill-down View-cert button).
+    """
+
+    DEFAULT_CSS = """
+    CertPEMScreen {
+        align: center middle;
+    }
+    #cert-modal-body {
+        width: 80;
+        height: auto;
+        max-height: 32;
+        border: thick #c7a06e;
+        background: #252525;
+        padding: 1 2;
+    }
+    #cert-modal-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
+    #cert-modal-fp { color: #c7a06e; padding: 0 0 1 0; }
+    #cert-modal-pem {
+        background: #1e1e1e;
+        color: #9bb5a0;
+        padding: 1 2;
+        max-height: 25;
+    }
+    #cert-modal-actions { height: auto; padding: 1 0 0 0; }
+    #cert-modal-actions Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [
+        # `dismiss` resolves to Screen.action_dismiss inherited from
+        # textual.screen — no custom action method needed.
+        Binding("escape", "dismiss", "Close", show=False),
+    ]
+
+    def __init__(self, *, title: str, pem_text: str, fingerprint: str) -> None:
+        super().__init__()
+        self._title = title
+        self._pem = pem_text
+        self._fp = fingerprint
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cert-modal-body"):
+            yield Static(self._title, id="cert-modal-title")
+            # markup=False so a future peer-cert fingerprint that
+            # happens to contain `[` / `]` cannot be misparsed as Rich
+            # markup tags (Phase 4a/c will reuse this modal for peers).
+            yield Static(f"Fingerprint: {self._fp}",
+                         id="cert-modal-fp", markup=False)
+            yield Static(self._pem, id="cert-modal-pem", markup=False)
+            with Horizontal(id="cert-modal-actions"):
+                yield Button("Copy PEM", id="cert-copy")
+                yield Button("Close", id="cert-close")
+
+    @on(Button.Pressed, "#cert-copy")
+    def _on_copy(self) -> None:
+        # OSC 52 clipboard write; no-op on terminals without OSC 52
+        # support (notably macOS Terminal). Best-effort copy.
+        try:
+            self.app.copy_to_clipboard(self._pem)
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#cert-close")
+    def _on_close(self) -> None:
+        self.dismiss()
+
+
 class QuitConfirmScreen(ModalScreen[bool]):
     """Modal confirmation dialog for quitting the dashboard."""
 
@@ -686,6 +764,10 @@ class DashboardApp(App):
                             "peers reference each other, restart both nodes.",
                             id="net-bootstrap-instructions",
                         )
+                        # Phase 3 — modal-backed View PEM. Replaces the
+                        # height-reserving Collapsible deleted in Phase 1.
+                        yield Button("View bootstrap PEM",
+                                     id="btn-net-bootstrap-view-cert")
 
                     # This Node card — label/value rows replace heavy DataTable.
                     with Vertical(id="net-this-node", classes="net-card"):
@@ -712,6 +794,10 @@ class DashboardApp(App):
                         with Horizontal(classes="net-row"):
                             yield Static("Cert expires:", classes="net-row-label")
                             yield Static("...", id="net-cert-expiry", classes="net-row-value")
+                        # Phase 3 — modal-backed View cert. Replaces the
+                        # height-reserving Cert PEM Collapsible.
+                        yield Button("View cert",
+                                     id="btn-net-thisnode-view-cert")
 
                     # Discovery / heartbeat strip — label/value rows.
                     with Vertical(id="net-discovery", classes="net-card"):
@@ -2046,6 +2132,47 @@ class DashboardApp(App):
                     tab.label = host  # drop `(gone)` suffix
                 except Exception:
                     pass
+
+    @on(Button.Pressed, "#btn-net-thisnode-view-cert")
+    def _on_view_thisnode_cert(self) -> None:
+        """Open the cert modal for the own (local-node) cert."""
+        self._open_cert_modal(title="Local node certificate")
+
+    @on(Button.Pressed, "#btn-net-bootstrap-view-cert")
+    def _on_view_bootstrap_cert(self) -> None:
+        """Open the cert modal from the bootstrap card (same own cert).
+
+        Bootstrap PEM is identical to the own cert PEM — the card only
+        exists when `peers=[]` and the operator needs to share their
+        fingerprint + PEM with other nodes.
+        """
+        self._open_cert_modal(title="Bootstrap — local certificate")
+
+    def _open_cert_modal(self, *, title: str) -> None:
+        """Resolve own PEM + fingerprint and push the modal screen.
+
+        Defensive: handles `pc.network is None` (pre-NM / mid-rebuild)
+        with placeholder text instead of letting `_read_cert_pem_safe`
+        crash on a missing `cert_path` attribute. Double-push guarded
+        so a rapid double-click on a `View cert` button cannot stack
+        two modals.
+        """
+        # Double-push guard — a modal is already up; do nothing.
+        if any(isinstance(s, CertPEMScreen) for s in self.screen_stack):
+            return
+        nm = getattr(self.plugin_core, "network", None)
+        if nm is None:
+            self.push_screen(CertPEMScreen(
+                title=title,
+                pem_text="(NetworkManager not built — cert unavailable)",
+                fingerprint="(NM not built)",
+            ))
+            return
+        pem = self._read_cert_pem_safe(nm)
+        fp = (getattr(nm, "own_fingerprint", "") or "(not loaded yet)")
+        self.push_screen(CertPEMScreen(
+            title=title, pem_text=pem, fingerprint=fp,
+        ))
 
     @on(Button.Pressed, "#btn-net-clear-counters")
     def _on_clear_counters(self) -> None:

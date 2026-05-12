@@ -1364,6 +1364,253 @@ async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
         assert "days (own)" in str(widget.content)
 
 
+# ─── Phase 3 — Cert PEM modal ─────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3_view_cert_button_opens_modal(mock_pc, tmp_path):
+    """Pressing the This-Node `View cert` button pushes a CertPEMScreen
+    pre-populated with the own cert PEM + fingerprint."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("MOCK-OWN-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:own-fp-aabb"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # No modal on top of the stack yet.
+        assert not any(isinstance(s, CertPEMScreen) for s in app.screen_stack)
+        # Trigger the handler directly (button hit-test may be off-screen
+        # in headless mode; goal is wiring + modal payload, not pixel hit).
+        app._on_view_thisnode_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        # Modal carries own PEM + own fingerprint.
+        assert modal._pem == "MOCK-OWN-PEM"
+        assert modal._fp == "sha256:own-fp-aabb"
+        # Esc dismisses (via Screen.action_dismiss inherited binding).
+        await modal.action_dismiss()
+        for _ in range(3):
+            await pilot.pause()
+        assert not any(isinstance(s, CertPEMScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_phase3_close_button_dismisses(mock_pc, tmp_path):
+    """The modal's [Close] button calls `dismiss()` and pops the modal."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("CLOSE-TEST-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:close-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        app._on_view_thisnode_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        modal._on_close()
+        for _ in range(3):
+            await pilot.pause()
+        assert not any(isinstance(s, CertPEMScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_phase3_double_push_guard(mock_pc, tmp_path):
+    """Rapid double-press of View cert opens only ONE modal — the
+    second call is a no-op while a modal is already on the stack."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("DUP-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:dup-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        app._on_view_thisnode_cert()
+        app._on_view_thisnode_cert()  # double-press
+        for _ in range(3):
+            await pilot.pause()
+        modal_count = sum(1 for s in app.screen_stack
+                          if isinstance(s, CertPEMScreen))
+        assert modal_count == 1
+
+
+@pytest.mark.asyncio
+async def test_phase3_bootstrap_view_cert_button_opens_modal(mock_pc, tmp_path):
+    """The Bootstrap card's `View bootstrap PEM` button reuses the same
+    modal, populated with the same own cert PEM + fingerprint."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("BOOTSTRAP-OWN-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:boot-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        app._on_view_bootstrap_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        assert modal._pem == "BOOTSTRAP-OWN-PEM"
+        assert modal._title == "Bootstrap — local certificate"
+
+
+@pytest.mark.asyncio
+async def test_phase3_modal_copy_button_invokes_clipboard(mock_pc, tmp_path):
+    """Pressing [Copy PEM] in the modal calls App.copy_to_clipboard
+    with the PEM body."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from unittest.mock import patch
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("COPY-TEST-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:copy-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        app._on_view_thisnode_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        with patch.object(app, "copy_to_clipboard") as mock_copy:
+            modal._on_copy()
+            mock_copy.assert_called_once_with("COPY-TEST-PEM")
+
+
+@pytest.mark.asyncio
+async def test_phase3_view_cert_when_nm_is_none(mock_pc):
+    """If `pc.network` is None (pre-NM / mid-rebuild), the modal opens
+    with placeholder text instead of crashing on missing `cert_path`."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        app._on_view_thisnode_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        assert "NM not built" in modal._fp
+        assert "NetworkManager not built" in modal._pem
+
+
 @pytest.mark.asyncio
 async def test_phase2_disable_hides_all_new_cards(mock_pc):
     """Mid-session networking flip from ON → OFF hides every new card."""
