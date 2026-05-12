@@ -900,9 +900,25 @@ async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_pa
         peers_table = app.query_one("#net-peers-table", DataTable)
         assert peers_table.row_count == 2
 
-        # Cert PEM card reads from disk.
-        pem_widget = app.query_one("#net-cert-pem", Static)
-        assert "FAKE-CERT-BODY" in pem_widget.content
+        # Phase 1 — This-Node + Discovery are now light label/value rows
+        # (Static widgets), not DataTables.
+        fp_row = app.query_one("#info-net-thisnode-fingerprint", Static)
+        assert "self-fp-1234567890ab" in fp_row.content
+        hostname_row = app.query_one("#info-net-thisnode-hostname", Static)
+        assert hostname_row.content == "test-host"
+        # Discovery rows populated with the mock_pc heartbeat_interval.
+        assert app.query_one("#info-net-disc-hb", Static).content == "10.0"
+
+        # The cert PEM Collapsibles are gone; cert content is exposed via
+        # Phase 3 modal, not the DOM.
+        from textual.css.query import NoMatches
+        for stale_id in ("#net-cert-pem", "#net-cert-pem-collapsible",
+                         "#net-bootstrap-pem", "#net-bootstrap-pem-collapsible"):
+            try:
+                app.query_one(stale_id)
+                assert False, f"{stale_id} should be removed in Phase 1"
+            except NoMatches:
+                pass
 
 
 @pytest.mark.asyncio
@@ -940,18 +956,11 @@ async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc,
 
 
 @pytest.mark.asyncio
-async def test_networking_reload_button_dispatches(mock_pc):
-    """Clicking Reload config dispatches `async_load_config_yaml` and
-    sets a non-misleading status message (no 'Config reloaded' claim
-    since that function silently swallows networking-validation
-    errors)."""
+async def test_phase1_home_network_section_removed(mock_pc):
+    """Phase 1: the broken `Network Nodes` section + table are gone."""
     from plugins_test.CLI.app import DashboardApp
-    from textual.widgets import Button, Static
+    from textual.css.query import NoMatches
 
-    mock_pc.async_load_config_yaml = AsyncMock(return_value=None)
-    # Networking ON so the This-Node card (which contains the button)
-    # is visible and the button is hit-testable. NM stays None — we
-    # only care about button → handler → dispatch chain.
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
@@ -959,25 +968,107 @@ async def test_networking_reload_button_dispatches(mock_pc):
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
-        # Switch to Networking tab so the button is rendered.
-        from textual.widgets import TabbedContent
-        app.query_one("#main-tabs", TabbedContent).active = "tab-networking"
-        await pilot.pause()
-        await pilot.click("#btn-net-reload")
-        # Worker is @work(thread=False); pump the loop.
-        for _ in range(5):
-            await pilot.pause()
+        for stale_id in ("#network-section", "#network-table", "#network-empty"):
+            try:
+                app.query_one(stale_id)
+                assert False, f"{stale_id} should be removed in Phase 1"
+            except NoMatches:
+                pass
 
-        # `_run_on_main` short-circuits when the main loop is a
-        # MagicMock auto-attr (returns None without actually awaiting),
-        # so check `assert_called` (coroutine WAS created with the
-        # right config_path) rather than `assert_awaited`. This
-        # validates the button → handler → dispatch chain without
-        # requiring a real cross-loop bridge in the test environment.
-        mock_pc.async_load_config_yaml.assert_called_with(mock_pc.config_path)
-        status = app.query_one("#net-thisnode-status", Static).content
-        assert "Reload" in status  # honest non-claim message
-        assert "Config reloaded" not in status  # no false success
+
+@pytest.mark.asyncio
+async def test_phase1_reload_button_removed(mock_pc):
+    """Phase 1: the Networking-tab Reload button + status Static are gone
+    (Config tab already carries an equivalent reload control)."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.css.query import NoMatches
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for stale_id in ("#btn-net-reload", "#net-thisnode-status",
+                         "#net-thisnode-table", "#net-discovery-table"):
+            try:
+                app.query_one(stale_id)
+                assert False, f"{stale_id} should be removed in Phase 1"
+            except NoMatches:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_phase1_net_stat_card_states(mock_pc):
+    """Home Net stat card renders the right text for each state.
+
+    States covered:
+      - networking disabled → 'OFF'
+      - enabled, network=None (pre-start / mid-rebuild) → 'ON (N/A)'
+      - enabled, alive nodes → 'ON, X/Y peers alive'
+    """
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    # Case 1: networking OFF
+    mock_pc.networking_enabled = False
+    mock_pc.network = None
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):  # let stats worker run
+            await pilot.pause()
+        assert "OFF" in str(app.query_one("#stat-networking", Static).content)
+
+    # Case 2: networking ON but NM is None
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        text = str(app.query_one("#stat-networking", Static).content)
+        assert "N/A" in text
+
+    # Case 3: networking ON with one alive peer out of two
+    class FakePeer:
+        def __init__(self, hostname):
+            self.hostname = hostname
+            self.ip = "10.0.0.1"
+            self.port = 2511
+            self.fingerprint = "fp"
+            self.system_caller = False
+            self.cert_pem = ""
+
+    class FakeNode:
+        def __init__(self, hostname, alive):
+            self.hostname = hostname
+            self.IP = "10.0.0.1"
+            self.enabled = True
+            self._alive = alive
+            self.last_heartbeat = int(time.time()) if alive else None
+        def is_alive_sync(self, timeout=30):
+            return self._alive
+
+    class FakeNM:
+        peers = [FakePeer("peer-a"), FakePeer("peer-b")]
+        nodes = [FakeNode("peer-a", True), FakeNode("peer-b", False)]
+        liveness_timeout = 30
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        text = str(app.query_one("#stat-networking", Static).content)
+        assert "1/2" in text and "peers alive" in text
 
 
 @pytest.mark.asyncio

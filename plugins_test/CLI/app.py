@@ -132,8 +132,6 @@ Footer {
 
 #request-table { height: auto; max-height: 14; border: round #404040; background: #2d2d2d; }
 #request-empty { height: auto; padding: 0 1; }
-#network-empty { height: auto; padding: 0 1; }
-#network-section { height: auto; }
 
 .section-header {
     color: #c7a06e;
@@ -204,17 +202,15 @@ Footer {
 #net-disabled-banner { padding: 1 2; color: #808080; height: auto; }
 #net-bootstrap-card { border: round #c7a06e; }
 .bootstrap-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
-#net-thisnode-table, #net-discovery-table { height: auto; max-height: 12; }
 #net-peers-table { height: auto; max-height: 16; }
 #net-peer-detail { padding: 1 2; height: auto; color: #d4d4d4; }
-#net-thisnode-status { padding: 0 1; height: auto; }
 #net-bootstrap-fp, #net-bootstrap-instructions {
     padding: 0 0 1 0; height: auto;
 }
-#net-bootstrap-pem, #net-cert-pem {
-    padding: 1 2; height: auto;
-    background: #1e1e1e; color: #9bb5a0;
-}
+/* Horizontal widget defaults to horizontal layout — only height + padding needed. */
+.net-row { height: auto; padding: 0 0 1 0; }
+.net-row-label { color: #808080; width: 25; }
+.net-row-value { color: #d4d4d4; width: 1fr; }
 
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
@@ -538,12 +534,6 @@ class DashboardApp(App):
                     yield DataTable(id="request-table", cursor_type="none")
                     yield Static("[dim]No active requests[/dim]", id="request-empty", markup=True)
 
-                    # Network nodes (conditional)
-                    with Vertical(id="network-section"):
-                        yield Static("Network Nodes", classes="section-header")
-                        yield DataTable(id="network-table", cursor_type="none")
-                        yield Static("[dim]No network nodes[/dim]", id="network-empty", markup=True)
-
                     # Graphs
                     yield Static("Graphs", classes="section-header")
                     with Horizontal(id="graph-toggles"):
@@ -638,42 +628,57 @@ class DashboardApp(App):
                                      classes="bootstrap-title")
                         yield Static("...", id="net-bootstrap-fp",
                                      markup=False)
-                        with Collapsible(title="Cert PEM",
-                                         id="net-bootstrap-pem-collapsible",
-                                         collapsed=True):
-                            yield Static("...", id="net-bootstrap-pem",
-                                         markup=False)
                         yield Static(
-                            "Paste the fingerprint + PEM into another "
-                            "node's networking.peers block. Then add their "
-                            "peer entry to this node's config and click "
-                            "Reload config.yml.",
+                            "Paste this node's fingerprint and cert into "
+                            "another node's networking.peers block. Once "
+                            "peers reference each other, restart both nodes.",
                             id="net-bootstrap-instructions",
                         )
 
-                    # This Node card.
+                    # This Node card — label/value rows replace heavy DataTable.
                     with Vertical(id="net-this-node", classes="net-card"):
                         yield Static("This Node", classes="net-card-title")
-                        yield DataTable(id="net-thisnode-table",
-                                        cursor_type="none")
-                        with Collapsible(title="Cert PEM",
-                                         id="net-cert-pem-collapsible",
-                                         collapsed=True):
-                            yield Static("...", id="net-cert-pem",
-                                         markup=False)
-                        with Horizontal():
-                            yield Button("Reload config.yml",
-                                         id="btn-net-reload",
-                                         variant="primary")
-                        yield Static("", id="net-thisnode-status",
-                                     markup=True)
+                        with Horizontal(classes="net-row"):
+                            yield Static("Hostname:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-hostname", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("Port:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-port", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("Keys dir:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-keysdir", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("Pool size:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-pool", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("Discoverable:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-discoverable", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("Fingerprint:", classes="net-row-label")
+                            yield Static("...", id="info-net-thisnode-fingerprint", classes="net-row-value")
 
-                    # Discovery / heartbeat strip.
+                    # Discovery / heartbeat strip — label/value rows.
                     with Vertical(id="net-discovery", classes="net-card"):
                         yield Static("Discovery / heartbeat",
                                      classes="net-card-title")
-                        yield DataTable(id="net-discovery-table",
-                                        cursor_type="none")
+                        with Horizontal(classes="net-row"):
+                            yield Static("discover_nodes:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-discover", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("auto_discoverable:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-auto", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("direct_discoverable:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-direct", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("heartbeat_interval:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-hb", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("lookup_interval:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-lookup", classes="net-row-value")
+                        with Horizontal(classes="net-row"):
+                            yield Static("liveness_timeout:", classes="net-row-label")
+                            yield Static("...", id="info-net-disc-liveness", classes="net-row-value")
 
                     # Peers table.
                     with Vertical(id="net-peers", classes="net-card"):
@@ -779,27 +784,13 @@ class DashboardApp(App):
         except NoMatches:
             pass
         try:
-            nt = self.query_one("#network-table", DataTable)
-            nt.add_columns("Hostname", "IP", "Status")
-        except NoMatches:
-            pass
-        try:
             tpt = self.query_one("#top-plugins-table", DataTable)
             tpt.add_columns("Plugin", "Requests", "Errors", "Avg ms")
         except NoMatches:
             pass
 
-        # Phase 1 — Networking tab DataTables
-        try:
-            nn = self.query_one("#net-thisnode-table", DataTable)
-            nn.add_columns("Field", "Value")
-        except NoMatches:
-            pass
-        try:
-            nd = self.query_one("#net-discovery-table", DataTable)
-            nd.add_columns("Field", "Value")
-        except NoMatches:
-            pass
+        # Networking tab — Peers DataTable columns. This-Node + Discovery
+        # are plain label/value Static rows; no DataTable bootstrap needed.
         try:
             np_t = self.query_one("#net-peers-table", DataTable)
             np_t.add_columns(
@@ -809,13 +800,6 @@ class DashboardApp(App):
             )
         except NoMatches:
             pass
-
-        # Hide network section if networking disabled
-        if not getattr(self.plugin_core, "networking_enabled", False):
-            try:
-                self.query_one("#network-section").display = False
-            except NoMatches:
-                pass
 
         # Populate settings info
         self._populate_settings_info()
@@ -951,9 +935,15 @@ class DashboardApp(App):
             self.query_one("#stat-plugins-enabled", Static).update(str(enabled))
             self.query_one("#stat-plugins-disabled", Static).update(str(disabled))
 
-            # Networking
-            net = "ON" if getattr(self.plugin_core, "networking_enabled", False) else "OFF"
-            self.query_one("#stat-networking", Static).update(net)
+            # Networking — derived from pc.network state.
+            #   "OFF"                    — networking disabled in config
+            #   "ON (N/A)"               — enabled but NetworkManager not yet built
+            #                              (pre-start / mid-rebuild)
+            #   "ON, X/Y peers alive"    — X = configured peers with fresh
+            #                              heartbeat, Y = total configured peers
+            self.query_one("#stat-networking", Static).update(
+                self._format_net_stat_card()
+            )
 
             # CPU & Memory (process / system)
             if HAS_PSUTIL:
@@ -1365,7 +1355,7 @@ class DashboardApp(App):
             # Networking is enabled in config but the NM hasn't been
             # constructed yet (or is mid-rebuild). Render stub values
             # so cards don't show stale data from a prior NM.
-            self._populate_thisnode_table(
+            self._set_thisnode_rows(
                 hostname=getattr(pc, "hostname", "?"),
                 port=getattr(pc, "networking_port", "?"),
                 keys_dir="(NM not built)",
@@ -1373,16 +1363,14 @@ class DashboardApp(App):
                 discoverable=self._format_discoverable(pc),
                 fingerprint="(NM not built)",
             )
-            self._populate_discovery_table_pc_only(pc)
-            self._set_cert_pem("(NM not built — cert unavailable)")
+            self._set_discovery_rows_pc_only(pc)
             self._set_bootstrap_card_text(
                 fingerprint="(NM not built)",
-                pem="(NM not built)",
             )
             return
 
         # NM exists — read its live state.
-        self._populate_thisnode_table(
+        self._set_thisnode_rows(
             hostname=getattr(pc, "hostname", "?"),
             port=getattr(pc, "networking_port", "?"),
             keys_dir=str(getattr(nm, "keys_dir", "?")),
@@ -1391,12 +1379,10 @@ class DashboardApp(App):
             fingerprint=(getattr(nm, "own_fingerprint", "") or
                          "(not loaded yet)"),
         )
-        self._populate_discovery_table(nm, pc)
-        self._set_cert_pem(self._read_cert_pem_safe(nm))
+        self._set_discovery_rows(nm, pc)
         self._set_bootstrap_card_text(
             fingerprint=(getattr(nm, "own_fingerprint", "") or
                          "(not loaded yet)"),
-            pem=self._read_cert_pem_safe(nm),
         )
 
     @staticmethod
@@ -1409,7 +1395,11 @@ class DashboardApp(App):
     def _read_cert_pem_safe(nm) -> str:
         """Read the cert PEM from disk. Defensive against missing file
         + the rare null `cert_path` (theoretically always-set, but
-        guard anyway per cycle-1 review)."""
+        guard anyway per cycle-1 review).
+
+        Retained in Phase 1 for Phase 3's cert modal — modal reads the
+        PEM here on every open instead of caching in the DOM.
+        """
         cert_path = getattr(nm, "cert_path", None)
         if cert_path is None:
             return "(cert_path not set)"
@@ -1420,76 +1410,58 @@ class DashboardApp(App):
         except Exception as e:
             return f"(read failed: {e})"
 
-    def _populate_thisnode_table(
-        self, *, hostname, port, keys_dir, pool_size, discoverable,
-        fingerprint,
-    ) -> None:
+    def _set_row(self, widget_id: str, value: str) -> None:
+        """Defensive Static.update for a #info-net-* label/value row."""
         try:
-            t = self.query_one("#net-thisnode-table", DataTable)
-        except NoMatches:
-            return
-        t.clear()
-        t.add_row("Hostname", str(hostname))
-        t.add_row("Port", str(port))
-        t.add_row("Keys dir", str(keys_dir))
-        t.add_row("Pool size", str(pool_size))
-        t.add_row("Discoverable", discoverable)
-        t.add_row("Fingerprint", str(fingerprint))
-
-    def _populate_discovery_table(self, nm, pc) -> None:
-        try:
-            t = self.query_one("#net-discovery-table", DataTable)
-        except NoMatches:
-            return
-        t.clear()
-        t.add_row("discover_nodes",
-                  str(getattr(nm, "discover_nodes", "?")))
-        t.add_row("auto_discoverable",
-                  str(getattr(pc, "networking_auto_discoverable", "?")))
-        t.add_row("direct_discoverable",
-                  str(getattr(pc, "networking_direct_discoverable", "?")))
-        t.add_row("heartbeat_interval",
-                  str(getattr(pc, "networking_heartbeat_interval", "?")))
-        t.add_row("lookup_interval",
-                  str(getattr(pc, "networking_lookup_interval", "?")))
-        t.add_row("liveness_timeout",
-                  str(getattr(pc, "networking_liveness_timeout", "?")))
-
-    def _populate_discovery_table_pc_only(self, pc) -> None:
-        """Stub variant when NM is None — only PC-level B-069 attrs
-        are available."""
-        try:
-            t = self.query_one("#net-discovery-table", DataTable)
-        except NoMatches:
-            return
-        t.clear()
-        t.add_row("discover_nodes", "(NM not built)")
-        t.add_row("auto_discoverable",
-                  str(getattr(pc, "networking_auto_discoverable", "?")))
-        t.add_row("direct_discoverable",
-                  str(getattr(pc, "networking_direct_discoverable", "?")))
-        t.add_row("heartbeat_interval",
-                  str(getattr(pc, "networking_heartbeat_interval", "?")))
-        t.add_row("lookup_interval",
-                  str(getattr(pc, "networking_lookup_interval", "?")))
-        t.add_row("liveness_timeout",
-                  str(getattr(pc, "networking_liveness_timeout", "?")))
-
-    def _set_cert_pem(self, pem: str) -> None:
-        try:
-            self.query_one("#net-cert-pem", Static).update(pem)
+            self.query_one(widget_id, Static).update(value)
         except NoMatches:
             pass
 
-    def _set_bootstrap_card_text(self, *, fingerprint: str, pem: str) -> None:
+    def _set_thisnode_rows(
+        self, *, hostname, port, keys_dir, pool_size, discoverable,
+        fingerprint,
+    ) -> None:
+        self._set_row("#info-net-thisnode-hostname", str(hostname))
+        self._set_row("#info-net-thisnode-port", str(port))
+        self._set_row("#info-net-thisnode-keysdir", str(keys_dir))
+        self._set_row("#info-net-thisnode-pool", str(pool_size))
+        self._set_row("#info-net-thisnode-discoverable", discoverable)
+        self._set_row("#info-net-thisnode-fingerprint", str(fingerprint))
+
+    def _set_discovery_rows(self, nm, pc) -> None:
+        self._set_row("#info-net-disc-discover",
+                      str(getattr(nm, "discover_nodes", "?")))
+        self._set_row("#info-net-disc-auto",
+                      str(getattr(pc, "networking_auto_discoverable", "?")))
+        self._set_row("#info-net-disc-direct",
+                      str(getattr(pc, "networking_direct_discoverable", "?")))
+        self._set_row("#info-net-disc-hb",
+                      str(getattr(pc, "networking_heartbeat_interval", "?")))
+        self._set_row("#info-net-disc-lookup",
+                      str(getattr(pc, "networking_lookup_interval", "?")))
+        self._set_row("#info-net-disc-liveness",
+                      str(getattr(pc, "networking_liveness_timeout", "?")))
+
+    def _set_discovery_rows_pc_only(self, pc) -> None:
+        """Stub variant when NM is None — only PC-level B-069 attrs are
+        available; discover_nodes lives on NM only."""
+        self._set_row("#info-net-disc-discover", "(NM not built)")
+        self._set_row("#info-net-disc-auto",
+                      str(getattr(pc, "networking_auto_discoverable", "?")))
+        self._set_row("#info-net-disc-direct",
+                      str(getattr(pc, "networking_direct_discoverable", "?")))
+        self._set_row("#info-net-disc-hb",
+                      str(getattr(pc, "networking_heartbeat_interval", "?")))
+        self._set_row("#info-net-disc-lookup",
+                      str(getattr(pc, "networking_lookup_interval", "?")))
+        self._set_row("#info-net-disc-liveness",
+                      str(getattr(pc, "networking_liveness_timeout", "?")))
+
+    def _set_bootstrap_card_text(self, *, fingerprint: str) -> None:
         try:
             self.query_one("#net-bootstrap-fp", Static).update(
                 f"Fingerprint: {fingerprint}"
             )
-        except NoMatches:
-            pass
-        try:
-            self.query_one("#net-bootstrap-pem", Static).update(pem)
         except NoMatches:
             pass
 
@@ -1639,48 +1611,46 @@ class DashboardApp(App):
             return f"{int(secs // 60)}m ago"
         return f"{int(secs // 3600)}h ago"
 
-    @on(Button.Pressed, "#btn-net-reload")
-    def _on_net_reload(self) -> None:  # Phase 1
-        self._dispatch_net_reload()
+    def _format_net_stat_card(self) -> str:
+        """Render the Home tab 'Net' stat card text.
 
-    @work(thread=False, exclusive=True, group="config-reload")
-    async def _dispatch_net_reload(self) -> None:
-        """Reload `pc.config_path` from disk + re-render Networking-tab
-        cards.
+        Three states:
+          - networking disabled in config: "OFF"
+          - enabled but NetworkManager not yet built / mid-rebuild: "ON (N/A)"
+          - enabled with live NM: "ON, X/Y peers alive" where X = configured
+            peers (PeerSpec) whose matching Node entry is enabled AND fresh,
+            Y = len(nm.peers)
 
-        IMPORTANT: `async_load_config_yaml` swallows networking-config
-        validation errors silently (PluginCore.py:1153-1161 — catches
-        Exception, logs, returns). Only the rare `_rebuild_networking`
-        step-7 failure raises out. So we MUST NOT optimistically claim
-        success — the status message tells the operator to check Logs.
+        Configured-but-never-heartbeat peers count toward (Y - X). A peer
+        whose hostname is NOT in nm.peers (e.g. an auto-discovered Node)
+        is excluded entirely.
         """
+        pc = self.plugin_core
+        if not getattr(pc, "networking_enabled", False):
+            return "OFF"
+        nm = getattr(pc, "network", None)
+        if nm is None:
+            return "ON (N/A)"
         try:
-            await self._run_on_main(
-                self.plugin_core.async_load_config_yaml(
-                    self.plugin_core.config_path
-                )
-            )
-        except Exception as e:
-            self._set_net_status(f"Reload failed: {e}", error=True)
-            return
-
-        self._set_net_status(
-            "Reload requested. Check Logs tab if peers / settings did "
-            "not change."
-        )
-        # Re-render whatever state PluginCore is now in.
-        self._populate_networking_static()
-        self._refresh_peers_table_worker()
-        self._build_config_file_list()
-        self._populate_settings_info()
-
-    def _set_net_status(self, msg: str, error: bool = False) -> None:
-        try:
-            s = self.query_one("#net-thisnode-status", Static)
-            safe = escape(msg)
-            s.update(f"[red]{safe}[/]" if error else f"[green]{safe}[/]")
-        except NoMatches:
-            pass
+            peers = list(getattr(nm, "peers", []) or [])
+            nodes = list(getattr(nm, "nodes", []) or [])
+            timeout = getattr(nm, "liveness_timeout", 30)
+        except Exception:
+            return "ON (N/A)"
+        configured_hostnames = {p.hostname for p in peers}
+        nodes_by_host = {n.hostname: n for n in nodes
+                         if n.hostname in configured_hostnames}
+        alive = 0
+        for host in configured_hostnames:
+            node = nodes_by_host.get(host)
+            if node is None or not node.enabled:
+                continue
+            try:
+                if node.is_alive_sync(timeout=timeout):
+                    alive += 1
+            except Exception:
+                pass
+        return f"ON, {alive}/{len(peers)} peers alive"
 
     def on_peer_event_bus(self, topic: str, payload: dict) -> None:
         """Bridge target for the CLI plugin's `_on_peer_event` callback.
