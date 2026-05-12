@@ -299,6 +299,14 @@ Footer {
 .setting-label { color: #808080; width: 25; }
 .setting-value { color: #d4d4d4; width: 1fr; }
 .settings-net-disabled { color: #808080; padding: 0 0 1 0; height: auto; }
+/* Phase 5 — Settings → Networking additions. Without `height: auto` the
+   rebuild Static collapses to zero height in a Vertical, defeating the
+   indicator's purpose. The fingerprint row carries a [View cert] Button
+   alongside a value Static; the explicit width:1fr + left margin on the
+   Button keep the row laid out predictably. */
+.settings-net-warn { color: #cca75a; padding: 0 0 1 0; height: auto; }
+#info-settings-net-fingerprint { width: 1fr; }
+#btn-settings-net-view-cert { margin: 0 0 0 1; }
 
 /* ── Plugin view ─────────────────────────── */
 .plugin-view-container { height: 1fr; padding: 1 2; }
@@ -573,6 +581,15 @@ class DashboardApp(App):
         # the per-peer RichLog by `on_peer_event_bus`; rehydration on
         # mount renders the < baseline entries. Eliminates double-renders.
         self._peer_log_baselines: dict = {}
+
+        # Phase 5 — Settings → Networking group uptime tracker. Captures
+        # `time.time()` on `is_ready` False → True transitions, AND
+        # invalidates on NM instance swap (a hot-reload rebuild swaps
+        # `pc.network` for a fresh NetworkManager whose own `is_ready`
+        # flips independently of the previous one). Keyed by `id(nm)`
+        # so a same-flag/different-instance situation resets cleanly.
+        self._networking_started_at = None
+        self._networking_instance_id = None
         # Phase 4a — per-peer ring buffers feeding the throughput sparklines.
         # Each host's entry is {bytes_sent_delta, bytes_recv_delta,
         # msgs_sent_delta, msgs_recv_delta, last_sample, last_sample_nm_id}.
@@ -987,6 +1004,46 @@ class DashboardApp(App):
                             with Horizontal(classes="setting-row"):
                                 yield Static("Liveness timeout (s):", classes="setting-label")
                                 yield Static("...", id="info-net-liveness", classes="setting-value")
+                            # Phase 5 — identity + uptime + secret status.
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Fingerprint:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-fingerprint",
+                                             classes="setting-value")
+                                yield Button("View cert",
+                                             id="btn-settings-net-view-cert")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Keys dir:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-keysdir",
+                                             classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Cert file:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-certfile",
+                                             classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Pool size:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-poolsize",
+                                             classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Uptime:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-uptime",
+                                             classes="setting-value")
+                            with Horizontal(classes="setting-row"):
+                                yield Static("Secret status:", classes="setting-label")
+                                yield Static("...",
+                                             id="info-settings-net-secret",
+                                             classes="setting-value")
+                        # Phase 5 — rebuild indicator: visible only when
+                        # `pc.networking_enabled AND pc.network is None`.
+                        yield Static(
+                            "Networking rebuilding…",
+                            id="settings-net-rebuilding",
+                            classes="settings-net-warn",
+                        )
 
         yield Footer()
 
@@ -1141,11 +1198,24 @@ class DashboardApp(App):
 
     @work(thread=False, exclusive=True, group="stats")
     async def _refresh_stats_worker(self) -> None:
+        # Phase 5 — uptime tracker runs every stats tick, even before the
+        # `#stat-hostname` widget exists (test harness ordering). Cheap
+        # work, no DOM interaction so the early-guard below can stay.
+        self._tick_networking_uptime()
+
         # Early guard — if key widget missing, DOM not ready / being torn down
         try:
             hostname_w = self.query_one("#stat-hostname", Static)
         except NoMatches:
             return
+
+        # Phase 5 — refresh Settings → Networking group additions each
+        # tick so uptime + rebuild indicator + cert-path-exists stay
+        # current without their own timer.
+        try:
+            self._populate_settings_phase5_rows()
+        except Exception:
+            pass
 
         try:
             hostname_w.update(getattr(self.plugin_core, "hostname", "?") or "?")
@@ -1527,6 +1597,11 @@ class DashboardApp(App):
                 str(getattr(self.plugin_core, "networking_liveness_timeout", "?"))
             )
 
+            # Phase 5 additions — identity paths, uptime, secret status,
+            # rebuild indicator. All driven from `pc.network` when alive
+            # and fall back to placeholder text otherwise.
+            self._populate_settings_phase5_rows()
+
             # Set log level select to current
             log_level = self.plugin_core.yaml_config.get("general", {}).get(
                 "console_log_level", "DEBUG"
@@ -1537,6 +1612,107 @@ class DashboardApp(App):
                 pass
         except NoMatches:
             pass
+
+    # ─── Phase 5 — Settings → Networking group additions ─────────────
+
+    def _populate_settings_phase5_rows(self) -> None:
+        """Refresh the Settings-tab Phase 5 rows.
+
+        Identity paths read from `pc.network` when alive; rebuild
+        indicator visible iff `networking_enabled AND network is None`.
+        Uptime is tracked via `_tick_networking_uptime` from the stats
+        worker — this method just renders the latest value.
+        """
+        pc = self.plugin_core
+        net_enabled = getattr(pc, "networking_enabled", False)
+        nm = getattr(pc, "network", None)
+
+        # Rebuild indicator: enabled + NM missing → mid-rebuild.
+        try:
+            self.query_one("#settings-net-rebuilding").display = (
+                net_enabled and nm is None
+            )
+        except NoMatches:
+            pass
+
+        # Identity paths.
+        if nm is None:
+            self._set_row("#info-settings-net-fingerprint", "(NM not built)")
+            self._set_row("#info-settings-net-keysdir", "(NM not built)")
+            self._set_row("#info-settings-net-certfile", "(NM not built)")
+            self._set_row("#info-settings-net-poolsize", "(NM not built)")
+        else:
+            fp = (getattr(nm, "own_fingerprint", "") or "(not loaded yet)")
+            self._set_row("#info-settings-net-fingerprint", fp)
+            self._set_row("#info-settings-net-keysdir",
+                          str(getattr(nm, "keys_dir", "?")))
+            cert_path = getattr(nm, "cert_path", None)
+            if cert_path is None:
+                cert_display = "(cert_path not set)"
+            else:
+                exists = "exists" if cert_path.exists() else "missing"
+                cert_display = f"{cert_path} ({exists})"
+            self._set_row("#info-settings-net-certfile", cert_display)
+            self._set_row("#info-settings-net-poolsize",
+                          str(getattr(nm, "pool_size", "?")))
+
+        # Uptime.
+        if self._networking_started_at is None:
+            self._set_row("#info-settings-net-uptime", "(not started)")
+        else:
+            elapsed = int(time.time() - self._networking_started_at)
+            h, r = divmod(elapsed, 3600)
+            m, s = divmod(r, 60)
+            self._set_row("#info-settings-net-uptime",
+                          f"{h}:{m:02d}:{s:02d}")
+
+        # Secret status — three possible labels per plan v5.
+        secret_label = self._secret_status_label()
+        self._set_row("#info-settings-net-secret", secret_label)
+
+    def _secret_status_label(self) -> str:
+        """Resolve the secret-status label.
+
+        Priority:
+          1. `pc.networking_secret` truthy → `set via config` (config takes
+             precedence in `networking.py:219` which uses `secret or env`).
+          2. else `os.environ.get("NETWORKING_SECRET")` truthy → `set via env`.
+          3. else → `unset`.
+        """
+        pc_secret = getattr(self.plugin_core, "networking_secret", None)
+        if pc_secret:
+            return "set via config"
+        env_secret = os.environ.get("NETWORKING_SECRET")
+        if env_secret:
+            return "set via env"
+        return "unset"
+
+    def _tick_networking_uptime(self) -> None:
+        """Update `_networking_started_at` based on `nm.is_ready`
+        transitions. Called from `_refresh_stats_worker` once per tick.
+
+        Reset semantics (cycle-3 S-1 fix): `is_ready` toggles within a
+        single NM are tracked, AND an NM instance swap (id change)
+        resets the timestamp to `now` so a hot-reload rebuild does not
+        carry the old uptime.
+        """
+        nm = getattr(self.plugin_core, "network", None)
+        if nm is not None and getattr(nm, "is_ready", False):
+            nm_id = id(nm)
+            if nm_id != self._networking_instance_id:
+                # New NM (or first start) → capture start time.
+                self._networking_instance_id = nm_id
+                self._networking_started_at = time.time()
+        else:
+            # NM gone or not ready → drop the tracker.
+            if self._networking_instance_id is not None:
+                self._networking_instance_id = None
+                self._networking_started_at = None
+
+    @on(Button.Pressed, "#btn-settings-net-view-cert")
+    def _on_settings_view_cert(self) -> None:
+        """Settings-tab View-cert button reuses Phase 3's modal helper."""
+        self._open_cert_modal(title="Local node certificate")
 
     # ─── Phase 1 — Networking tab ────────────────────────────────────
 
@@ -1646,7 +1822,13 @@ class DashboardApp(App):
             return f"(read failed: {e})"
 
     def _set_row(self, widget_id: str, value: str) -> None:
-        """Defensive Static.update for a #info-net-* label/value row."""
+        """Defensive Static.update for any label/value row Static.
+
+        Used by the Networking-tab This-Node + Discovery rows
+        (`#info-net-*`), the Settings → Networking group additions
+        (`#info-settings-net-*`), and the per-peer drill-down identity
+        strip (`#tab-peer-<host>-identity-*`).
+        """
         try:
             self.query_one(widget_id, Static).update(value)
         except NoMatches:

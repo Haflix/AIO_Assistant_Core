@@ -1785,6 +1785,246 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
         assert log_writes == 1  # post-baseline event rendered
 
 
+# ─── Phase 5 — Settings → Networking group additions ─────────────────
+
+@pytest.mark.asyncio
+async def test_phase5_settings_identity_rows_populate(mock_pc, tmp_path):
+    """Identity rows + pool size in the Settings → Networking group
+    render values pulled from `pc.network` when alive."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("X", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:settings-fp"
+        pool_size = 7
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+        is_ready = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        assert "sha256:settings-fp" in app.query_one(
+            "#info-settings-net-fingerprint", Static).content
+        assert str(tmp_path) in app.query_one(
+            "#info-settings-net-keysdir", Static).content
+        assert "exists" in app.query_one(
+            "#info-settings-net-certfile", Static).content
+        assert app.query_one(
+            "#info-settings-net-poolsize", Static).content == "7"
+
+
+@pytest.mark.asyncio
+async def test_phase5_settings_uptime_counts_on_is_ready(mock_pc):
+    """`is_ready` False → True transition captures a start time; the
+    rendered uptime is formatted `h:mm:ss`. An NM instance swap (id
+    change) resets the timer cleanly."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    class FakeNM:
+        is_ready = False
+        peers = []
+        nodes = []
+        keys_dir = "/tmp"
+        cert_path = None
+        own_fingerprint = "fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    nm1 = FakeNM()
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm1
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        # Pre-ready: uptime is "(not started)".
+        app._tick_networking_uptime()
+        assert app._networking_started_at is None
+
+        # Flip to ready — start time captured.
+        nm1.is_ready = True
+        app._tick_networking_uptime()
+        assert app._networking_started_at is not None
+        first_start = app._networking_started_at
+
+        # Same instance, still ready — timestamp unchanged.
+        app._tick_networking_uptime()
+        assert app._networking_started_at == first_start
+
+        # New NM instance — instance_id swaps. The wall-clock timestamp
+        # may be identical when `time.time()` returns the same value
+        # between back-to-back calls, so the instance-id swap is the
+        # authoritative reset signal we test.
+        nm2 = FakeNM()
+        nm2.is_ready = True
+        mock_pc.network = nm2
+        prev_instance_id = app._networking_instance_id
+        app._tick_networking_uptime()
+        assert app._networking_instance_id != prev_instance_id
+        assert app._networking_instance_id == id(nm2)
+        # Render path works.
+        app._populate_settings_phase5_rows()
+        assert ":" in app.query_one(
+            "#info-settings-net-uptime", Static).content
+
+
+@pytest.mark.asyncio
+async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
+    """Secret status renders `set via config` / `set via env` / `unset`
+    per priority order."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    # Case 1: config-set wins.
+    mock_pc.networking_secret = b"from-config"
+    monkeypatch.setenv("NETWORKING_SECRET", "from-env")
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        assert app.query_one("#info-settings-net-secret", Static).content == \
+            "set via config"
+
+    # Case 2: env-set when config is empty.
+    mock_pc.networking_secret = None
+    app2 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app2.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        assert app2.query_one("#info-settings-net-secret", Static).content == \
+            "set via env"
+
+    # Case 3: unset.
+    monkeypatch.delenv("NETWORKING_SECRET", raising=False)
+    mock_pc.networking_secret = None
+    app3 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app3.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        assert app3.query_one("#info-settings-net-secret", Static).content == \
+            "unset"
+
+
+@pytest.mark.asyncio
+async def test_phase5_settings_rebuild_indicator_toggles(mock_pc):
+    """Rebuild indicator visible iff networking enabled AND
+    pc.network is None."""
+    from plugins_test.CLI.app import DashboardApp
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        # Enabled + nm=None → visible.
+        assert app.query_one("#settings-net-rebuilding").display is True
+        # Flip nm in → hidden.
+        class FakeNM:
+            peers = []
+            nodes = []
+            keys_dir = "/tmp"
+            cert_path = None
+            own_fingerprint = "fp"
+            pool_size = 4
+            connection_pools = {}
+            _inbound_adverts = {}
+            _outbound_adverts = {}
+            _inflight_publishes = {}
+            peer_stats = {}
+            liveness_timeout = 30
+            heartbeat_interval = 10
+            discover_nodes = False
+            is_ready = True
+        mock_pc.network = FakeNM()
+        app._populate_settings_phase5_rows()
+        assert app.query_one("#settings-net-rebuilding").display is False
+
+
+@pytest.mark.asyncio
+async def test_phase5_settings_view_cert_button_opens_modal(mock_pc, tmp_path):
+    """The Settings-tab View-cert button reuses Phase 3's modal helper."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("SETTINGS-PEM", encoding="utf-8")
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:settings-modal-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+        is_ready = True
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        app._on_settings_view_cert()
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        assert modal._pem == "SETTINGS-PEM"
+        assert modal._fp == "sha256:settings-modal-fp"
+
+
 # ─── Phase 4c — Drill-down quick actions ─────────────────────────────
 
 @pytest.mark.asyncio
