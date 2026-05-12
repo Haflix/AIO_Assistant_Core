@@ -266,6 +266,22 @@ Footer {
 .peer-actions-row { height: auto; padding: 1 0 0 0; }
 .peer-action-btn { margin: 0 1 0 0; }
 
+/* Phase 4b — drill-down subs tables + in-flight panel + per-peer log. */
+.peer-subs-row { height: auto; padding: 0 0 1 0; }
+.peer-subs-row > DataTable {
+    width: 1fr;
+    height: auto;
+    max-height: 10;
+    margin: 0 1 0 0;
+}
+.peer-inflight { padding: 0 0 1 0; color: #d4d4d4; }
+.peer-eventlog {
+    height: 6;
+    max-height: 10;
+    border: round #404040;
+    background: #252525;
+}
+
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
 .settings-group {
@@ -549,6 +565,11 @@ class DashboardApp(App):
         # Values are the dynamically-created TabPane ids.
         self._peer_tabs: collections.OrderedDict = collections.OrderedDict()
         self._peer_tabs_cap = 5
+        # Phase 4b — per-peer event log baseline (deque length at tab
+        # mount). New events with index >= baseline are streamed into
+        # the per-peer RichLog by `on_peer_event_bus`; rehydration on
+        # mount renders the < baseline entries. Eliminates double-renders.
+        self._peer_log_baselines: dict = {}
         # Phase 4a — per-peer ring buffers feeding the throughput sparklines.
         # Each host's entry is {bytes_sent_delta, bytes_recv_delta,
         # msgs_sent_delta, msgs_recv_delta, last_sample, last_sample_nm_id}.
@@ -2118,39 +2139,42 @@ class DashboardApp(App):
         except Exception:
             pass
 
-        # Phase 2 — event log line.
-        try:
-            log = self.query_one("#net-event-log", RichLog)
-        except NoMatches:
-            log = None
-        if log is not None:
+        # Phase 2 — main event log line. Phase 4b — also stream to the
+        # per-peer log if a drill-down for this host is open AND the
+        # event was appended to the plugin deque AFTER the tab's mount
+        # baseline (otherwise the same event was already rendered via
+        # `_hydrate_peer_log`, and a naive append would double-render).
+        line = self._format_peer_event_line(topic, payload)
+        if line is not None:
+            # Main log first.
             try:
-                ts = time.strftime("%H:%M:%SZ",
-                                   time.gmtime(payload.get("ts", time.time())))
-                host = payload.get("hostname", "?")
-                if topic == "_core/peer/connected":
-                    ip = payload.get("ip", "?")
-                    log.write(f"[#73c991]{ts}  CONNECT     {host} from {ip}[/]")
-                elif topic == "_core/peer/disconnected":
-                    reason = payload.get("reason", "normal")
-                    if reason == "normal":
-                        log.write(f"[dim]{ts}  disconnect  {host} reason=normal[/]")
-                    elif reason == "connection_error":
-                        log.write(
-                            f"[#cca75a]{ts}  DISCONNECT  {host} "
-                            f"reason=connection_error[/]"
-                        )
-                    elif reason == "rce_attempt":
-                        log.write(
-                            f"[#d16969 bold]{ts}  RCE_ATTEMPT {host}[/]"
-                        )
-                    else:  # "error" or unknown reason
-                        log.write(
-                            f"[#d16969]{ts}  DISCONNECT  {host} "
-                            f"reason={reason}[/]"
-                        )
-            except Exception:
+                self.query_one("#net-event-log", RichLog).write(line)
+            except NoMatches:
                 pass
+            # Per-peer log second — baseline-gated dedup.
+            host_for_log = payload.get("hostname")
+            if (
+                host_for_log
+                and host_for_log in self._peer_tabs
+                and host_for_log in self._peer_log_baselines
+            ):
+                baseline = self._peer_log_baselines[host_for_log]
+                # `len()` on a deque is GIL-atomic; safe to read without
+                # the plugin-side `_observer_lock`. Skip if the deque
+                # hasn't grown past the hydration point — the matching
+                # event was already rendered during mount-time hydration.
+                plugin = self.plugin_instance
+                try:
+                    deque_len = len(plugin._recent_peer_events)
+                except Exception:
+                    deque_len = baseline  # forces the skip
+                if deque_len > baseline:
+                    tab_id = self._peer_tabs[host_for_log]
+                    try:
+                        self.query_one(f"#{tab_id}-eventlog",
+                                       RichLog).write(line)
+                    except NoMatches:
+                        pass
 
         # Phase 4a — drill-down tab title flips:
         #   * disconnected → `<host> (gone)`: surfaces the disconnect to
@@ -2312,13 +2336,11 @@ class DashboardApp(App):
         tabs.active = tab_id
 
     def _build_peer_drill_widgets(self, hostname: str, tab_id: str) -> list:
-        """Construct the Phase 4a content widgets for the drill-down pane.
+        """Construct the per-peer drill-down body containers (Phase 4a+4b).
 
-        Identity strip: hostname / IP:port / alive cell / last HB /
-        pool / system_caller / fingerprint short + [View cert] button.
-        Throughput row: 4 Sparklines for bytes_sent / bytes_recv /
-        msgs_sent / msgs_recv deltas (60-sample rolling).
-        Close row: [Close peer tab] button that pops the drill-down.
+        Phase 4a content: identity strip + throughput sparklines + actions
+        row. Phase 4b adds: inbound + outbound subs DataTables, in-flight
+        publishes count Static, and a per-peer filtered event log.
 
         All widgets get IDs scoped under the tab_id prefix so multiple
         open drill-downs cannot collide on shared widget IDs.
@@ -2328,7 +2350,7 @@ class DashboardApp(App):
             Static(f"Peer: {hostname}", classes="net-card-title")
         )
 
-        # Identity strip — 7 label/value rows.
+        # Identity strip — 7 label/value rows (populated post-mount).
         identity = Vertical(id=f"{tab_id}-identity",
                             classes="peer-identity-box")
         widgets.append(identity)
@@ -2337,6 +2359,22 @@ class DashboardApp(App):
         sparks = Horizontal(id=f"{tab_id}-sparklines",
                             classes="peer-sparkline-row")
         widgets.append(sparks)
+
+        # Phase 4b — inbound + outbound subs DataTables side by side.
+        subs_row = Horizontal(id=f"{tab_id}-subs-row",
+                              classes="peer-subs-row")
+        widgets.append(subs_row)
+
+        # Phase 4b — In-flight publishes panel (just a count, not task names).
+        widgets.append(Static("In-flight publishes: 0",
+                              id=f"{tab_id}-inflight",
+                              classes="peer-inflight"))
+
+        # Phase 4b — per-peer event log strip. `markup=True` so we can
+        # color-code by topic/reason like the main event log.
+        widgets.append(RichLog(id=f"{tab_id}-eventlog",
+                               max_lines=50, markup=True,
+                               classes="peer-eventlog"))
 
         # View cert + close buttons row.
         actions = Horizontal(id=f"{tab_id}-actions",
@@ -2354,12 +2392,14 @@ class DashboardApp(App):
         return widgets
 
     def _populate_peer_drill_widgets(self, hostname: str, tab_id: str) -> None:
-        """Mount the identity rows + sparkline panels + action buttons
-        into their already-mounted parent containers. Runs once on tab
-        spawn via `call_after_refresh`."""
+        """Mount the identity rows + sparkline panels + subs tables +
+        in-flight panel + per-peer log + action buttons into their
+        already-mounted parent containers. Runs once on tab spawn via
+        `call_after_refresh`."""
         try:
             identity = self.query_one(f"#{tab_id}-identity", Vertical)
             sparks = self.query_one(f"#{tab_id}-sparklines", Horizontal)
+            subs_row = self.query_one(f"#{tab_id}-subs-row", Horizontal)
             actions = self.query_one(f"#{tab_id}-actions", Horizontal)
         except NoMatches:
             return
@@ -2396,6 +2436,18 @@ class DashboardApp(App):
             box.mount(Static(label, classes="peer-sparkline-title"))
             box.mount(Sparkline([], id=f"{tab_id}-spark-{sub_id}"))
 
+        # Phase 4b — inbound + outbound subs DataTables.
+        inbound_tbl = DataTable(id=f"{tab_id}-subs-in",
+                                cursor_type="none")
+        outbound_tbl = DataTable(id=f"{tab_id}-subs-out",
+                                 cursor_type="none")
+        subs_row.mount(inbound_tbl)
+        subs_row.mount(outbound_tbl)
+        inbound_tbl.add_columns("Topic (in)", "Hosts", "Authors", "Sub UUID")
+        outbound_tbl.add_columns(
+            "Topic (out)", "State", "Sent ago", "Acked ago", "Retries",
+        )
+
         # Phase 4a actions: View cert + Close.
         actions.mount(Button("View cert",
                              id=f"{tab_id}-btn-view-cert",
@@ -2404,6 +2456,21 @@ class DashboardApp(App):
                              id=f"{tab_id}-btn-close",
                              classes="peer-action-btn",
                              variant="error"))
+
+        # Phase 4b — record the baseline AT MOUNT TIME so live events
+        # appended via `on_peer_event_bus` don't duplicate the rehydrated
+        # historical block. Hydrate the log with the filtered history
+        # captured before mount.
+        plugin = self.plugin_instance
+        baseline = 0
+        if plugin is not None and hasattr(plugin, "get_recent_peer_events"):
+            try:
+                history = plugin.get_recent_peer_events()
+                baseline = len(history)
+                self._hydrate_peer_log(tab_id, history, hostname)
+            except Exception:
+                pass
+        self._peer_log_baselines[hostname] = baseline
 
         # Kick a synchronous render so the operator sees data on first
         # paint instead of waiting up to 1s for the shared timer.
@@ -2416,6 +2483,43 @@ class DashboardApp(App):
                 )
             except Exception:
                 pass
+
+    def _hydrate_peer_log(self, tab_id: str, history: list, hostname: str) -> None:
+        """Render the pre-mount filtered-event-history into the per-peer
+        log. Called once at tab mount."""
+        try:
+            log = self.query_one(f"#{tab_id}-eventlog", RichLog)
+        except NoMatches:
+            return
+        for topic, payload in history:
+            if payload.get("hostname") != hostname:
+                continue
+            line = self._format_peer_event_line(topic, payload)
+            if line is not None:
+                log.write(line)
+
+    @staticmethod
+    def _format_peer_event_line(topic: str, payload: dict):
+        """Return a markup-coloured log line for a peer event, or None if
+        the event isn't a peer-lifecycle event. Shared by the per-peer
+        log hydration + live append path."""
+        ts = time.strftime("%H:%M:%SZ",
+                           time.gmtime(payload.get("ts", time.time())))
+        host = payload.get("hostname", "?")
+        if topic == "_core/peer/connected":
+            ip = payload.get("ip", "?")
+            return f"[#73c991]{ts}  CONNECT     {host} from {ip}[/]"
+        if topic == "_core/peer/disconnected":
+            reason = payload.get("reason", "normal")
+            if reason == "normal":
+                return f"[dim]{ts}  disconnect  {host} reason=normal[/]"
+            if reason == "connection_error":
+                return (f"[#cca75a]{ts}  DISCONNECT  {host} "
+                        f"reason=connection_error[/]")
+            if reason == "rce_attempt":
+                return f"[#d16969 bold]{ts}  RCE_ATTEMPT {host}[/]"
+            return f"[#d16969]{ts}  DISCONNECT  {host} reason={reason}[/]"
+        return None
 
     async def _close_peer_drilldown(self, hostname: str) -> None:
         """Pop the drill-down pane + ring buffer for `hostname`.
@@ -2448,6 +2552,9 @@ class DashboardApp(App):
             return
         self._peer_tabs.pop(hostname, None)
         self._peer_ring_buffers.pop(hostname, None)
+        # Phase 4b — drop the per-peer log baseline so a future re-open
+        # of the same host rehydrates cleanly from a fresh deque slice.
+        self._peer_log_baselines.pop(hostname, None)
         if not self._peer_tabs and self._peer_drill_timer is not None:
             try:
                 self._peer_drill_timer.stop()
@@ -2593,6 +2700,67 @@ class DashboardApp(App):
                                Sparkline).data = list(rb[deque_key])
             except NoMatches:
                 continue
+
+        # ── Phase 4b: subs tables + in-flight count ───────────────
+        try:
+            in_raw = dict(getattr(nm, "_inbound_adverts", None) or {})
+            out_raw = dict(getattr(nm, "_outbound_adverts", None) or {})
+            in_subs = dict(in_raw.get(host) or {})
+            out_subs = dict(out_raw.get(host) or {})
+            inflight_map = dict(
+                getattr(nm, "_inflight_publishes", None) or {}
+            )
+            inflight_count = len(set(inflight_map.get(host) or set()))
+        except (RuntimeError, Exception):
+            in_subs, out_subs, inflight_count = {}, {}, 0
+
+        # Inbound DataTable: rebuild on each tick (matches the main
+        # peers-table convention — small data, simple semantics).
+        try:
+            in_tbl = self.query_one(f"#{tab_id}-subs-in", DataTable)
+            in_tbl.clear()
+            for sub_uuid, sub in in_subs.items():
+                topic = getattr(sub, "topic_pattern", "?")
+                hosts_v = getattr(sub, "hosts", None)
+                authors_v = getattr(sub, "authors", None)
+                in_tbl.add_row(
+                    str(topic),
+                    str(hosts_v) if hosts_v is not None else "(any)",
+                    str(authors_v) if authors_v is not None else "(any)",
+                    (sub_uuid[:12] + "…") if len(sub_uuid) > 12 else sub_uuid,
+                )
+        except NoMatches:
+            pass
+
+        # Outbound DataTable: shows ack lifecycle state derived from
+        # sender-side AdvertSub fields (state / sent_at / acked_at /
+        # retry_count) per networking.py:46-49.
+        try:
+            out_tbl = self.query_one(f"#{tab_id}-subs-out", DataTable)
+            out_tbl.clear()
+            for sub_uuid, sub in out_subs.items():
+                topic = getattr(sub, "topic_pattern", "?")
+                state = getattr(sub, "state", "pending")
+                sent_at = getattr(sub, "sent_at", None)
+                acked_at = getattr(sub, "acked_at", None)
+                retry = getattr(sub, "retry_count", 0)
+                sent_str = (self._format_relative_hb(now - sent_at)
+                            if sent_at is not None else "—")
+                acked_str = (self._format_relative_hb(now - acked_at)
+                             if acked_at is not None else "—")
+                out_tbl.add_row(
+                    str(topic), state, sent_str, acked_str, str(retry),
+                )
+        except NoMatches:
+            pass
+
+        # In-flight publishes count (per N-3 nit + plan: count only).
+        try:
+            self.query_one(f"#{tab_id}-inflight", Static).update(
+                f"In-flight publishes: {inflight_count}"
+            )
+        except NoMatches:
+            pass
 
     @on(Button.Pressed)
     def _on_peer_drill_button_pressed(self, event: Button.Pressed) -> None:

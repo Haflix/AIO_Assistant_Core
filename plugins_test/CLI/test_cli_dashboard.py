@@ -1554,6 +1554,240 @@ async def test_phase4a_drill_down_closes_when_networking_disabled(mock_pc, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_phase4b_subs_tables_populate_from_advert_state(mock_pc, tmp_path):
+    """Inbound + outbound subs DataTables render rows from the
+    networking-side advert dicts."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import DataTable
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    host = peers[0].hostname
+
+    # Plant synthetic AdvertSub-like objects in the inbound + outbound
+    # advert dicts.
+    class FakeSub:
+        def __init__(self, topic_pattern, state="pending", retry=0,
+                     sent_at=None, acked_at=None, hosts=None, authors=None):
+            self.topic_pattern = topic_pattern
+            self.state = state
+            self.retry_count = retry
+            self.sent_at = sent_at
+            self.acked_at = acked_at
+            self.hosts = hosts
+            self.authors = authors
+
+    inbound_uuid = "in-1234567890abcdef"
+    outbound_uuid = "out-abcdef1234"
+    nm._inbound_adverts = {host: {inbound_uuid: FakeSub(
+        topic_pattern="llm/response", hosts="any", authors=None,
+    )}}
+    now = time.time()
+    nm._outbound_adverts = {host: {outbound_uuid: FakeSub(
+        topic_pattern="reminder/fire",
+        state="acked",
+        sent_at=now - 2.0,
+        acked_at=now - 1.5,
+        retry=0,
+    )}}
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        # Force a refresh tick so subs are pulled from the synthetic NM.
+        app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
+        await pilot.pause()
+        tab_id = app._peer_tabs[host]
+        in_tbl = app.query_one(f"#{tab_id}-subs-in", DataTable)
+        out_tbl = app.query_one(f"#{tab_id}-subs-out", DataTable)
+        assert in_tbl.row_count == 1
+        assert out_tbl.row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_phase4b_inflight_count_renders(mock_pc, tmp_path):
+    """In-flight publishes count Static reflects the size of
+    `nm._inflight_publishes[host]`."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    host = peers[0].hostname
+    # Synthetic set of 3 in-flight task placeholders (just need a set).
+    nm._inflight_publishes = {host: {object(), object(), object()}}
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
+        await pilot.pause()
+        tab_id = app._peer_tabs[host]
+        text = app.query_one(f"#{tab_id}-inflight", Static).content
+        assert "In-flight publishes: 3" in str(text)
+
+
+@pytest.mark.asyncio
+async def test_phase4b_per_peer_log_filters_to_host(mock_pc, tmp_path):
+    """Per-peer event log gets new lines only for events whose payload
+    hostname matches the drill-down's peer."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import RichLog
+    import collections as _c
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
+    host_a = peers[0].hostname
+    host_b = peers[1].hostname
+
+    # Real-ish plugin so the baseline-gated dedup gate sees a deque and
+    # `len()` works (a MagicMock plugin's `_recent_peer_events` is an
+    # auto-attr that `len()` raises on, forcing the dedup to block).
+    class FakePlugin:
+        plugin_name = "CLI"
+        event_loop = None
+        def __init__(self):
+            import threading as _t
+            self._observer_lock = _t.Lock()
+            self._recent_peer_events: _c.deque = _c.deque(maxlen=500)
+        def get_recent_peer_events(self):
+            return list(self._recent_peer_events)
+        def get_disconnect_reason_counts(self):
+            return {"normal": 0, "connection_error": 0,
+                    "rce_attempt": 0, "error": 0}
+
+    plugin = FakePlugin()
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host_a)
+        for _ in range(3):
+            await pilot.pause()
+        tab_id = app._peer_tabs[host_a]
+
+        # Count writes on the per-peer log via wrapper (avoid private
+        # `_deferred_renders` peek; see Phase 2 event-log test).
+        log = app.query_one(f"#{tab_id}-eventlog", RichLog)
+        log_writes = 0
+        original_write = log.write
+        def _counting_write(*args, **kwargs):
+            nonlocal log_writes
+            log_writes += 1
+            return original_write(*args, **kwargs)
+        log.write = _counting_write  # type: ignore[method-assign]
+
+        # Mimic the observer: append to plugin deque BEFORE the bus call
+        # (real `_on_peer_event` appends then bridges). The dedup gate
+        # compares len(deque) > baseline.
+        # Event for OUR host → log appended.
+        evt_a = {"hostname": host_a, "reason": "rce_attempt",
+                 "ts": time.time()}
+        plugin._recent_peer_events.append(("_core/peer/disconnected", evt_a))
+        app.on_peer_event_bus("_core/peer/disconnected", evt_a)
+        # Event for the OTHER host → log NOT touched.
+        evt_b = {"hostname": host_b, "ip": "10.0.0.2",
+                 "ts": time.time()}
+        plugin._recent_peer_events.append(("_core/peer/connected", evt_b))
+        app.on_peer_event_bus("_core/peer/connected", evt_b)
+        for _ in range(2):
+            await pilot.pause()
+        assert log_writes == 1
+
+
+@pytest.mark.asyncio
+async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
+    """Events captured in the plugin deque BEFORE the drill-down mount
+    are hydrated by `_hydrate_peer_log`; their subsequent arrival via
+    `on_peer_event_bus` MUST NOT re-render them. The baseline-gated
+    dedup blocks the duplicate."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import RichLog
+    import collections as _c
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    host = peers[0].hostname
+
+    # Real-ish plugin with a populated deque so hydration runs end-to-end.
+    class FakePlugin:
+        plugin_name = "CLI"
+        event_loop = None
+        def __init__(self):
+            import threading as _t
+            self._observer_lock = _t.Lock()
+            self._recent_peer_events: _c.deque = _c.deque(maxlen=500)
+        def get_recent_peer_events(self):
+            return list(self._recent_peer_events)
+        def get_disconnect_reason_counts(self):
+            return {"normal": 0, "connection_error": 0,
+                    "rce_attempt": 0, "error": 0}
+
+    plugin = FakePlugin()
+    # Plant a pre-mount disconnect event in the deque — will be hydrated.
+    pre_event = ("_core/peer/disconnected",
+                 {"hostname": host, "reason": "rce_attempt",
+                  "ts": time.time()})
+    plugin._recent_peer_events.append(pre_event)
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host)
+        for _ in range(4):
+            await pilot.pause()
+        # Hydration: the pre-mount event was rendered once. Baseline == 1.
+        assert app._peer_log_baselines[host] == 1
+
+        # Simulate the bus dispatch for the same pre-mount event.
+        # `on_peer_event_bus` must skip this — len(deque) (1) is NOT
+        # greater than baseline (1).
+        tab_id = app._peer_tabs[host]
+        log = app.query_one(f"#{tab_id}-eventlog", RichLog)
+        log_writes = 0
+        original_write = log.write
+        def _counting_write(*args, **kwargs):
+            nonlocal log_writes
+            log_writes += 1
+            return original_write(*args, **kwargs)
+        log.write = _counting_write  # type: ignore[method-assign]
+
+        app.on_peer_event_bus(*pre_event)
+        for _ in range(2):
+            await pilot.pause()
+        assert log_writes == 0  # baseline blocked the dupe
+
+        # Now a NEW event — observer appends + bus dispatches.
+        new_event = ("_core/peer/connected",
+                     {"hostname": host, "ip": "10.0.0.1",
+                      "ts": time.time()})
+        plugin._recent_peer_events.append(new_event[1])  # mimic observer append
+        app.on_peer_event_bus(*new_event)
+        for _ in range(2):
+            await pilot.pause()
+        assert log_writes == 1  # post-baseline event rendered
+
+
+# ─── Phase 4a — Per-peer drill-down tab (continued) ──────────────────
+
+@pytest.mark.asyncio
 async def test_phase4a_drill_down_gone_title_on_disconnect(mock_pc, tmp_path):
     """A `_core/peer/disconnected` event for an open peer flips the tab
     label to `<host> (gone)`; a subsequent reconnect restores it."""
