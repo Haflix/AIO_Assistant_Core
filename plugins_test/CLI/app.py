@@ -13,12 +13,14 @@ Tabs:
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -212,6 +214,36 @@ Footer {
 .net-row-label { color: #808080; width: 25; }
 .net-row-value { color: #d4d4d4; width: 1fr; }
 
+/* Phase 2 — cluster summary line + counters card + event log + cert expiry. */
+#net-cluster-summary { padding: 0 1; margin: 0 0 1 0; color: #c7a06e; }
+#net-counters { padding: 1 2; }
+.net-counter-row {
+    layout: grid;
+    grid-size: 5 1;
+    grid-columns: 1fr 1fr 1fr 1fr 1fr;
+    height: auto;
+    padding: 0 0 1 0;
+}
+.net-counter-card {
+    border: round #404040;
+    background: #2d2d2d;
+    padding: 0 1;
+    margin: 0 1 0 0;
+    height: 3;
+}
+.net-counter-label { color: #808080; }
+.net-counter-value { color: #d4d4d4; text-style: bold; }
+.net-counter-actions { height: auto; }
+.cert-expiry-good { color: #73c991; }
+.cert-expiry-warn { color: #cca75a; }
+.cert-expiry-bad  { color: #d16969; }
+#net-event-log {
+    height: 10;
+    max-height: 14;
+    border: round #404040;
+    background: #252525;
+}
+
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
 .settings-group {
@@ -402,6 +434,20 @@ class DashboardApp(App):
 
         # Plugin search filter
         self._plugin_filter: str = ""
+
+        # Phase 2 — cert-expiry cache. Bounded FIFO: keys are
+        # `own:<path>:<mtime_ns>` or `peer:<hostname>:<sha256-prefix>`;
+        # values are the parsed `cert.not_valid_after_utc` datetime.
+        # `popitem(last=False)` on insert evicts the oldest entry once
+        # the cap is reached. Bounded so a long-running TUI with many
+        # peer-cert rotations cannot leak entries.
+        self._cert_expiry_cache: collections.OrderedDict = collections.OrderedDict()
+        self._cert_expiry_cache_cap = 64
+
+        # Phase 4a precursor — drill-down tab registry. Cheap to declare
+        # here so Phase 2's `on_peer_event_bus` can guard against
+        # missing-attr errors when checking for open peer tabs.
+        self._peer_tabs: collections.OrderedDict = collections.OrderedDict()
 
     # ─── Cross-loop dispatch ────────────────────────────────────────
 
@@ -622,6 +668,12 @@ class DashboardApp(App):
                         id="net-disabled-banner",
                     )
 
+                    # Phase 2 — Cluster summary strip. Single-line glance:
+                    #   `3 peers · 2/3 alive · own_fp:sha256:abc…`
+                    # Updated by `_refresh_peers_table_worker` on each tick.
+                    yield Static("...", id="net-cluster-summary",
+                                 classes="net-card-title")
+
                     # Bootstrap helper — visible only when applicable.
                     with Vertical(id="net-bootstrap-card", classes="net-card"):
                         yield Static("Cluster bootstrap ready",
@@ -656,6 +708,10 @@ class DashboardApp(App):
                         with Horizontal(classes="net-row"):
                             yield Static("Fingerprint:", classes="net-row-label")
                             yield Static("...", id="info-net-thisnode-fingerprint", classes="net-row-value")
+                        # Phase 2 — cert-expiry warning (min across own + peer certs).
+                        with Horizontal(classes="net-row"):
+                            yield Static("Cert expires:", classes="net-row-label")
+                            yield Static("...", id="net-cert-expiry", classes="net-row-value")
 
                     # Discovery / heartbeat strip — label/value rows.
                     with Vertical(id="net-discovery", classes="net-card"):
@@ -680,6 +736,30 @@ class DashboardApp(App):
                             yield Static("liveness_timeout:", classes="net-row-label")
                             yield Static("...", id="info-net-disc-liveness", classes="net-row-value")
 
+                    # Phase 2 — Counters card. Pending-ack badge + 4
+                    # disconnect-reason counters + [Clear counters] button.
+                    with Vertical(id="net-counters", classes="net-card"):
+                        yield Static("Counters", classes="net-card-title")
+                        with Horizontal(classes="net-counter-row"):
+                            with Vertical(classes="net-counter-card"):
+                                yield Static("Pending acks", classes="net-counter-label")
+                                yield Static("0", id="net-counter-pending-acks", classes="net-counter-value")
+                            with Vertical(classes="net-counter-card"):
+                                yield Static("Disconnect: normal", classes="net-counter-label")
+                                yield Static("0", id="net-counter-discon-normal", classes="net-counter-value")
+                            with Vertical(classes="net-counter-card"):
+                                yield Static("Disconnect: conn_error", classes="net-counter-label")
+                                yield Static("0", id="net-counter-discon-conn", classes="net-counter-value")
+                            with Vertical(classes="net-counter-card"):
+                                yield Static("Disconnect: rce_attempt", classes="net-counter-label")
+                                yield Static("0", id="net-counter-discon-rce", classes="net-counter-value")
+                            with Vertical(classes="net-counter-card"):
+                                yield Static("Disconnect: error", classes="net-counter-label")
+                                yield Static("0", id="net-counter-discon-error", classes="net-counter-value")
+                        with Horizontal(classes="net-counter-actions"):
+                            yield Button("Clear counters",
+                                         id="btn-net-clear-counters")
+
                     # Peers table.
                     with Vertical(id="net-peers", classes="net-card"):
                         yield Static("Peers", classes="net-card-title")
@@ -687,6 +767,13 @@ class DashboardApp(App):
                                         cursor_type="row")
                         yield Static("", id="net-peer-detail",
                                      markup=True)
+
+                    # Phase 2 — Network event log strip. Bus-driven, no
+                    # polling. Renders from `self.plugin_instance`'s
+                    # `_recent_peer_events` deque on each new event.
+                    yield RichLog(id="net-event-log",
+                                  max_lines=200, markup=True,
+                                  classes="net-card")
 
             # ── 6. Settings ──────────────────────────────────────
             with TabPane("Settings", id="tab-settings"):
@@ -1326,12 +1413,15 @@ class DashboardApp(App):
 
         # Banner vs cards visibility — single switch driven by
         # networking_enabled. Mounted once at compose, toggled here.
+        # Phase 2 (H6) — new card IDs added so a mid-session
+        # enable/disable flip hides ALL networking widgets uniformly.
         try:
             self.query_one("#net-disabled-banner").display = not net_enabled
         except NoMatches:
             pass
         for cid in ("#net-this-node", "#net-discovery", "#net-peers",
-                    "#net-bootstrap-card"):
+                    "#net-bootstrap-card", "#net-cluster-summary",
+                    "#net-counters", "#net-event-log"):
             try:
                 self.query_one(cid).display = net_enabled
             except NoMatches:
@@ -1384,6 +1474,8 @@ class DashboardApp(App):
             fingerprint=(getattr(nm, "own_fingerprint", "") or
                          "(not loaded yet)"),
         )
+        # Phase 2 — cert-expiry row populated alongside identity.
+        self._set_cert_expiry_row(nm)
 
     @staticmethod
     def _format_discoverable(pc) -> str:
@@ -1465,6 +1557,218 @@ class DashboardApp(App):
         except NoMatches:
             pass
 
+    # ─── Phase 2 — cert expiry, cluster summary, counters ────────────
+
+    def _min_cert_expiry_days(self, nm) -> tuple:
+        """Walk own + per-peer certs and return (min_days, source_label).
+
+        Caches parsed `cert.not_valid_after_utc` per (path, mtime) for the
+        own cert, and per (hostname, sha256-prefix) for peer PEMs. The
+        cache is a bounded FIFO (OrderedDict + popitem(last=False)) so a
+        long-running TUI cannot leak entries across cert rotations.
+
+        Malformed peer certs are silently skipped (PeerSpec construction
+        already validates at config-load — this is defense in depth).
+        Returns (None, "(no certs)") when nothing parses.
+        """
+        from cryptography import x509
+
+        candidates: list = []
+        now_utc = datetime.now(timezone.utc)
+
+        # Own cert
+        try:
+            cert_path = getattr(nm, "cert_path", None)
+            if cert_path is not None and cert_path.exists():
+                mtime_ns = cert_path.stat().st_mtime_ns
+                cache_key = f"own:{cert_path}:{mtime_ns}"
+                cached = self._cert_expiry_cache.get(cache_key)
+                if cached is None:
+                    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+                    cached = cert.not_valid_after_utc
+                    self._cert_expiry_cache[cache_key] = cached
+                    while len(self._cert_expiry_cache) > self._cert_expiry_cache_cap:
+                        self._cert_expiry_cache.popitem(last=False)
+                candidates.append(((cached - now_utc).days, "own"))
+        except Exception:
+            pass  # malformed own cert — skip silently
+
+        # Peer certs
+        for peer in getattr(nm, "peers", []) or []:
+            try:
+                # S-E: empty PEM should never happen post-config-load
+                # (NetworkManager._parse_one_peer validates), but guard
+                # anyway so a future schema change can't silently collapse
+                # all peers into one cache slot via empty-PEM hash collision.
+                if not getattr(peer, "cert_pem", None):
+                    continue
+                pem_hash = hashlib.sha256(peer.cert_pem.encode()).hexdigest()[:16]
+                cache_key = f"peer:{peer.hostname}:{pem_hash}"
+                cached = self._cert_expiry_cache.get(cache_key)
+                if cached is None:
+                    cert = x509.load_pem_x509_certificate(peer.cert_pem.encode())
+                    cached = cert.not_valid_after_utc
+                    self._cert_expiry_cache[cache_key] = cached
+                    while len(self._cert_expiry_cache) > self._cert_expiry_cache_cap:
+                        self._cert_expiry_cache.popitem(last=False)
+                candidates.append(((cached - now_utc).days, f"peer:{peer.hostname}"))
+            except Exception:
+                continue  # malformed peer cert — skip
+
+        if not candidates:
+            return (None, "(no certs)")
+        return min(candidates, key=lambda x: x[0])
+
+    def _set_cert_expiry_row(self, nm) -> None:
+        """Render the cert-expiry warning row in the This-Node card."""
+        try:
+            widget = self.query_one("#net-cert-expiry", Static)
+        except NoMatches:
+            return
+        days, source = self._min_cert_expiry_days(nm)
+        # Reset CSS classes so a recompute can flip colors.
+        for cls in ("cert-expiry-good", "cert-expiry-warn", "cert-expiry-bad"):
+            widget.remove_class(cls)
+        if days is None:
+            widget.update("(no certs to check)")
+            return
+        if days >= 30:
+            widget.add_class("cert-expiry-good")
+        elif days >= 7:
+            widget.add_class("cert-expiry-warn")
+        else:
+            widget.add_class("cert-expiry-bad")
+        widget.update(f"in {days} days ({source})")
+
+    def _format_cluster_summary(self) -> str:
+        """Render the cluster-summary single-line label.
+
+        Format: `N peers · X/N alive · own_fp:sha256:abc…`.
+        Returns the OFF / N/A short-forms when networking isn't fully up.
+
+        Phase 2 cycle-review fix: `alive` here counts nodes whose
+        heartbeat is FRESH within `heartbeat_interval` — matching the
+        peers-table column's "alive" band exactly. The previous
+        implementation used `is_alive_sync(timeout=liveness_timeout)`
+        which counts everything up to liveness_timeout, so the cluster
+        summary would say "2/3 alive" while the peers table marked one
+        of those rows as "degraded" (yellow). Single semantic now.
+        """
+        pc = self.plugin_core
+        if not getattr(pc, "networking_enabled", False):
+            return "Networking OFF"
+        nm = getattr(pc, "network", None)
+        if nm is None:
+            return "Networking ON, NetworkManager not yet built"
+        try:
+            peers = list(getattr(nm, "peers", []) or [])
+            nodes = list(getattr(nm, "nodes", []) or [])
+            hb_interval = getattr(nm, "heartbeat_interval", 10)
+            own_fp = getattr(nm, "own_fingerprint", "") or ""
+        except Exception:
+            return "Networking ON (N/A)"
+        configured = {p.hostname for p in peers}
+        nodes_by_host = {n.hostname: n for n in nodes
+                         if n.hostname in configured}
+        now = time.time()
+        alive = 0
+        for host in configured:
+            node = nodes_by_host.get(host)
+            if node is None or not getattr(node, "enabled", True):
+                continue
+            last_hb = getattr(node, "last_heartbeat", None)
+            if last_hb is None:
+                continue
+            if now - last_hb < hb_interval:
+                alive += 1
+        fp_disp = (own_fp[:24] + "…") if own_fp else "(pending)"
+        return f"{len(peers)} peers · {alive}/{len(peers)} alive · own_fp:{fp_disp}"
+
+    def _refresh_cluster_summary(self) -> None:
+        try:
+            self.query_one("#net-cluster-summary", Static).update(
+                self._format_cluster_summary()
+            )
+        except NoMatches:
+            pass
+
+    def _count_pending_acks(self, nm) -> int:
+        """Count outbound advert entries past one heartbeat without ack."""
+        try:
+            outbound = getattr(nm, "_outbound_adverts", None) or {}
+            hb_interval = getattr(nm, "heartbeat_interval", 10)
+            now = time.time()
+            count = 0
+            # Outer-then-inner copy pattern (peers-table worker convention).
+            outbound_copy = dict(outbound)
+            for host, sub_map in outbound_copy.items():
+                try:
+                    sub_snapshot = dict(sub_map)
+                except (RuntimeError, Exception):
+                    continue
+                for sub in sub_snapshot.values():
+                    if getattr(sub, "state", "") != "pending":
+                        continue
+                    sent_at = getattr(sub, "sent_at", None)
+                    if sent_at is None:
+                        continue
+                    if now - sent_at > hb_interval:
+                        count += 1
+            return count
+        except (RuntimeError, Exception):
+            return 0
+
+    def _refresh_counters(self, nm) -> None:
+        """Populate pending-ack badge + disconnect-reason counters.
+
+        Each widget update is independently guarded so a missing widget
+        (eg. compose race or future ID rename) only skips that one slot
+        — the rest of the counter card still updates.
+        """
+        # Pending acks — independent guard so disconnect-reason loop below
+        # still runs even if this specific widget is absent.
+        try:
+            pa = self.query_one("#net-counter-pending-acks", Static)
+            pending = self._count_pending_acks(nm) if nm is not None else 0
+            pa.update(str(pending))
+            pa.remove_class("stat-val-bad")
+            if pending > 0:
+                pa.add_class("stat-val-bad")
+        except NoMatches:
+            pass
+
+        # Disconnect-reason counts via plugin-side snapshot. Defensive in
+        # case plugin teardown raced this tick (H-B) AND in case the
+        # plugin_instance is a test-time mock that returns non-dict
+        # auto-attrs from `get_disconnect_reason_counts()`.
+        plugin = self.plugin_instance
+        counts: dict
+        try:
+            getter = getattr(plugin, "get_disconnect_reason_counts", None)
+            if callable(getter):
+                raw = getter()
+                counts = raw if isinstance(raw, dict) else {}
+            else:
+                counts = {}
+        except Exception:
+            counts = {}
+        for cid, key in (
+            ("#net-counter-discon-normal", "normal"),
+            ("#net-counter-discon-conn", "connection_error"),
+            ("#net-counter-discon-rce", "rce_attempt"),
+            ("#net-counter-discon-error", "error"),
+        ):
+            try:
+                widget = self.query_one(cid, Static)
+            except NoMatches:
+                continue
+            raw_v = counts.get(key, 0)
+            v = raw_v if isinstance(raw_v, int) else 0
+            widget.update(str(v))
+            widget.remove_class("stat-val-bad")
+            if key == "rce_attempt" and v > 0:
+                widget.add_class("stat-val-bad")
+
     def _bootstrap_visible(self) -> bool:
         """Predicate for showing the bootstrap-helper card.
 
@@ -1498,10 +1802,16 @@ class DashboardApp(App):
         SHARED references — the peers table only reads scalar fields
         for display, so eventual consistency is fine. Early-returns
         when networking is disabled (banner already covers this state).
+
+        Phase 2 — also drives the cluster-summary line + counters card
+        + cert-expiry row so they refresh on every tick alongside the
+        peers table.
         """
         pc = self.plugin_core
         if not getattr(pc, "networking_enabled", False):
             return
+        # Phase 2 — always re-render cluster summary (cheap, derived).
+        self._refresh_cluster_summary()
         nm = getattr(pc, "network", None)
         if nm is None:
             try:
@@ -1509,7 +1819,13 @@ class DashboardApp(App):
             except NoMatches:
                 return
             t.clear()
+            # Counters still useful without an NM (only disconnect-reason
+            # counts will be live; pending-acks defaults to 0).
+            self._refresh_counters(None)
             return
+        # Phase 2 — refresh counters + cert expiry on each tick.
+        self._refresh_counters(nm)
+        self._set_cert_expiry_row(nm)
 
         try:
             peers = list(getattr(nm, "peers", []) or [])
@@ -1551,19 +1867,33 @@ class DashboardApp(App):
         table.clear()
 
         now = time.time()
+        hb_interval = getattr(nm, "heartbeat_interval", 10)
         for peer in peers:
             node = nodes_by_host.get(peer.hostname)
-            alive_str = "?"
+            # Phase 2 — alive column is a colored Text cell whose state
+            # is derived directly from `now - last_heartbeat`, not from
+            # `is_alive_sync` (which is a single-threshold check).
+            #   - alive    (#73c991 green)   = fresh within heartbeat_interval
+            #   - degraded (#cca75a yellow)  = between hb_interval and liveness_timeout
+            #   - down     (#d16969 red)     = beyond liveness_timeout
+            #   - never    (dim)             = no heartbeat ever recorded
+            alive_cell: Text
             hb_str = "never"
-            if node is not None:
-                try:
-                    alive_str = "Y" if node.is_alive_sync(
-                        timeout=liveness_timeout) else "N"
-                except Exception:
-                    alive_str = "?"
+            if node is None:
+                alive_cell = Text("never", style="dim")
+            else:
                 last_hb = getattr(node, "last_heartbeat", None)
-                if last_hb is not None:
-                    hb_str = self._format_relative_hb(now - last_hb)
+                if last_hb is None:
+                    alive_cell = Text("never", style="dim")
+                else:
+                    age = now - last_hb
+                    hb_str = self._format_relative_hb(age)
+                    if age < hb_interval:
+                        alive_cell = Text("alive", style="#73c991")
+                    elif age < liveness_timeout:
+                        alive_cell = Text("degraded", style="#cca75a")
+                    else:
+                        alive_cell = Text("down", style="#d16969")
 
             pool = connection_pools.get((peer.ip, peer.port))
             try:
@@ -1590,7 +1920,7 @@ class DashboardApp(App):
                 peer.hostname,
                 f"{peer.ip}:{peer.port}",
                 sysc,
-                alive_str,
+                alive_cell,
                 hb_str,
                 pool_str,
                 str(in_subs),
@@ -1643,7 +1973,7 @@ class DashboardApp(App):
         alive = 0
         for host in configured_hostnames:
             node = nodes_by_host.get(host)
-            if node is None or not node.enabled:
+            if node is None or not getattr(node, "enabled", True):
                 continue
             try:
                 if node.is_alive_sync(timeout=timeout):
@@ -1656,12 +1986,83 @@ class DashboardApp(App):
         """Bridge target for the CLI plugin's `_on_peer_event` callback.
 
         Called via `app.call_from_thread` → runs on the TUI loop.
-        Triggers a peers-table refresh on the next worker cycle (no
-        direct DOM mutation here — workers handle that).
+
+        Phase 1: triggers a peers-table refresh.
+        Phase 2: writes a colored line to the network event log (RichLog
+            with `markup=True`), color-coded by topic + disconnect reason.
+        Phase 4 (precursor): if a drill-down tab exists for the hostname
+            and shows the `(gone)` suffix from a prior disconnect, restore
+            it on reconnect.
         """
-        # Defensive: if the user is on a different tab, the worker
-        # still updates the table — peers data is small. Tab-visibility
-        # gating not worth the complexity here.
+        try:
+            self._refresh_peers_table_worker()
+        except Exception:
+            pass
+
+        # Phase 2 — event log line.
+        try:
+            log = self.query_one("#net-event-log", RichLog)
+        except NoMatches:
+            log = None
+        if log is not None:
+            try:
+                ts = time.strftime("%H:%M:%SZ",
+                                   time.gmtime(payload.get("ts", time.time())))
+                host = payload.get("hostname", "?")
+                if topic == "_core/peer/connected":
+                    ip = payload.get("ip", "?")
+                    log.write(f"[#73c991]{ts}  CONNECT     {host} from {ip}[/]")
+                elif topic == "_core/peer/disconnected":
+                    reason = payload.get("reason", "normal")
+                    if reason == "normal":
+                        log.write(f"[dim]{ts}  disconnect  {host} reason=normal[/]")
+                    elif reason == "connection_error":
+                        log.write(
+                            f"[#cca75a]{ts}  DISCONNECT  {host} "
+                            f"reason=connection_error[/]"
+                        )
+                    elif reason == "rce_attempt":
+                        log.write(
+                            f"[#d16969 bold]{ts}  RCE_ATTEMPT {host}[/]"
+                        )
+                    else:  # "error" or unknown reason
+                        log.write(
+                            f"[#d16969]{ts}  DISCONNECT  {host} "
+                            f"reason={reason}[/]"
+                        )
+            except Exception:
+                pass
+
+        # Phase 4a precursor — restore `(gone)` tab title on reconnect.
+        # `_peer_tabs` is empty in Phase 2 (no drill-down tabs spawn yet),
+        # so this branch no-ops until Phase 4a lights it up.
+        if topic == "_core/peer/connected":
+            host = payload.get("hostname")
+            if host and host in self._peer_tabs:
+                try:
+                    tab_id = self._peer_tabs[host]
+                    tabbed = self.query_one("#main-tabs", TabbedContent)
+                    tab = tabbed.get_tab(tab_id)
+                    tab.label = host  # drop `(gone)` suffix
+                except Exception:
+                    pass
+
+    @on(Button.Pressed, "#btn-net-clear-counters")
+    def _on_clear_counters(self) -> None:
+        """Reset disconnect-reason counters via plugin-side state.
+
+        H-B (cycle 4) — guard against plugin teardown mid-press: a
+        concurrent `on_disable` could pop attributes between the button
+        press dispatch and this handler. The `getattr` check covers that.
+        """
+        plugin = self.plugin_instance
+        if plugin is None or getattr(plugin, "_observer_lock", None) is None:
+            return
+        try:
+            plugin.clear_disconnect_reason_counts()
+        except AttributeError:
+            return
+        # Trigger immediate counter refresh.
         try:
             self._refresh_peers_table_worker()
         except Exception:

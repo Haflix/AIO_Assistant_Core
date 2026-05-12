@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
@@ -1097,3 +1098,294 @@ async def test_settings_peers_display_overflow_elided(mock_pc):
         peers_value = app.query_one("#info-net-nodes", Static).content
         assert peers_value.startswith("6 (")
         assert "+2 more" in peers_value
+
+
+# ─── Phase 2 — plugin-side observer state + Networking tab additions ──────────
+
+@pytest.mark.asyncio
+async def test_phase2_plugin_observer_state():
+    """The CLI plugin maintains the recent-events deque + disconnect-reason
+    counters under `_observer_lock`. Test the snapshot helpers directly,
+    not through the TUI (cheap + isolates the observer layer)."""
+    from plugins_test.CLI.plugin import CLI
+    import threading
+
+    plugin = CLI.__new__(CLI)
+    plugin._logger = MagicMock()
+    plugin.on_load()  # initialises state
+
+    # Initial state — empty + zeros.
+    assert plugin.get_recent_peer_events() == []
+    assert plugin.get_disconnect_reason_counts() == {
+        "normal": 0, "connection_error": 0, "rce_attempt": 0, "error": 0,
+    }
+    # Lock is a real threading.Lock.
+    assert isinstance(plugin._observer_lock, type(threading.Lock()))
+
+    # Fire a synthetic disconnect — counter increments + deque appends.
+    plugin._app = None  # bridge guard short-circuits cleanly
+    plugin._on_peer_event(
+        "_core/peer/disconnected",
+        {"hostname": "peer-x", "reason": "rce_attempt", "ts": 100.0},
+    )
+    assert plugin.get_disconnect_reason_counts()["rce_attempt"] == 1
+    events = plugin.get_recent_peer_events()
+    assert len(events) == 1
+    assert events[0][0] == "_core/peer/disconnected"
+
+    # Connect event — appended but does not increment any counter.
+    plugin._on_peer_event(
+        "_core/peer/connected",
+        {"hostname": "peer-x", "ip": "10.0.0.1", "ts": 101.0},
+    )
+    assert plugin.get_disconnect_reason_counts()["rce_attempt"] == 1
+    assert len(plugin.get_recent_peer_events()) == 2
+
+    # Unknown reason — counter NOT incremented (defensive).
+    plugin._on_peer_event(
+        "_core/peer/disconnected",
+        {"hostname": "peer-x", "reason": "bogus_reason", "ts": 102.0},
+    )
+    counts = plugin.get_disconnect_reason_counts()
+    assert sum(counts.values()) == 1  # still only the rce_attempt
+
+    # Clear resets all four to 0.
+    plugin.clear_disconnect_reason_counts()
+    assert plugin.get_disconnect_reason_counts() == {
+        "normal": 0, "connection_error": 0, "rce_attempt": 0, "error": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_phase2_cluster_summary_renders(mock_pc):
+    """Cluster summary mounts and renders `N peers · X/Y alive · own_fp:...`."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    class FakePeer:
+        def __init__(self, hostname):
+            self.hostname = hostname
+            self.ip = "10.0.0.1"
+            self.port = 2511
+            self.fingerprint = "fp"
+            self.system_caller = False
+            self.cert_pem = ""
+
+    class FakeNode:
+        def __init__(self, hostname, alive):
+            self.hostname = hostname
+            self.IP = "10.0.0.1"
+            self.enabled = True
+            self._alive = alive
+            self.last_heartbeat = int(time.time()) if alive else None
+        def is_alive_sync(self, timeout=30):
+            return self._alive
+
+    class FakeNM:
+        peers = [FakePeer("peer-a"), FakePeer("peer-b"), FakePeer("peer-c")]
+        nodes = [FakeNode("peer-a", True), FakeNode("peer-b", True),
+                 FakeNode("peer-c", False)]
+        own_fingerprint = "sha256:abcdef0123456789aabbccdd"
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        _outbound_adverts = {}
+        _inbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        connection_pools = {}
+        keys_dir = Path("/tmp")
+        cert_path = Path("/tmp/cert.pem")
+        pool_size = 4
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        text = app.query_one("#net-cluster-summary", Static).content
+        assert "3 peers" in text
+        assert "2/3 alive" in text
+        assert "sha256:abcdef" in text
+
+
+@pytest.mark.asyncio
+async def test_phase2_counter_card_and_clear_button(mock_pc):
+    """Counter mini-cards render disconnect-reason snapshots and the
+    [Clear counters] button resets them via plugin-side state."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+
+    # Build a real-ish plugin_instance — not MagicMock — so the observer
+    # state + clear method actually work.
+    class FakePlugin:
+        def __init__(self):
+            import threading as _t
+            self._observer_lock = _t.Lock()
+            self._counts = {"normal": 0, "connection_error": 0,
+                            "rce_attempt": 2, "error": 0}
+        def get_disconnect_reason_counts(self):
+            with self._observer_lock:
+                return dict(self._counts)
+        def clear_disconnect_reason_counts(self):
+            with self._observer_lock:
+                for k in self._counts:
+                    self._counts[k] = 0
+        # Minimum surface DashboardApp accesses during init.
+        plugin_name = "CLI"
+        event_loop = None
+
+    plugin = FakePlugin()
+    mock_pc.networking_enabled = True
+    mock_pc.network = None  # peers worker still runs, counters still updated
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        # Initial render reflects starting counters.
+        assert app.query_one("#net-counter-discon-rce", Static).content == "2"
+        # Invoke handler directly (the Networking tab + button may be
+        # off-screen in headless mode; the goal is wiring, not pixel hit).
+        app._on_clear_counters()
+        for _ in range(3):
+            await pilot.pause()
+        assert plugin._counts["rce_attempt"] == 0
+        assert app.query_one("#net-counter-discon-rce", Static).content == "0"
+
+
+@pytest.mark.asyncio
+async def test_phase2_event_log_writes_colored_lines(mock_pc):
+    """Bus event → RichLog gets a colored line. Verify via
+    `on_peer_event_bus` directly (which is the TUI-thread bridge target)."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import RichLog
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        log = app.query_one("#net-event-log", RichLog)
+
+        # Count writes via a wrapper around the public `write` method so
+        # the test doesn't peek at private `_deferred_renders` (RichLog
+        # defers writes until the widget knows its size — a private detail
+        # that may change between Textual versions).
+        write_count = 0
+        original_write = log.write
+        def _counting_write(*args, **kwargs):
+            nonlocal write_count
+            write_count += 1
+            return original_write(*args, **kwargs)
+        log.write = _counting_write  # type: ignore[method-assign]
+
+        # Synthetic connected event.
+        app.on_peer_event_bus("_core/peer/connected",
+                              {"hostname": "peer-x", "ip": "10.0.0.1",
+                               "ts": 100.0})
+        for _ in range(2):
+            await pilot.pause()
+        # Synthetic disconnect with rce_attempt reason.
+        app.on_peer_event_bus("_core/peer/disconnected",
+                              {"hostname": "peer-x",
+                               "reason": "rce_attempt", "ts": 101.0})
+        for _ in range(2):
+            await pilot.pause()
+        # Two writes called on the public RichLog.write API.
+        assert write_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
+    """Cert-expiry row renders 'in N days (...)' for a synthetic cert,
+    with color class matching the days-remaining band."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import Static
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from datetime import datetime, timezone, timedelta
+
+    # Build a self-signed cert that expires in 45 days (green band).
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "test-host")]
+    )
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=45))
+        .sign(key, hashes.SHA256())
+    )
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+    class FakeNM:
+        peers = []
+        nodes = []
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "fp-aabbcc"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = FakeNM()
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        widget = app.query_one("#net-cert-expiry", Static)
+        # 45 days in the future → green class.
+        assert widget.has_class("cert-expiry-good")
+        assert "days (own)" in str(widget.content)
+
+
+@pytest.mark.asyncio
+async def test_phase2_disable_hides_all_new_cards(mock_pc):
+    """Mid-session networking flip from ON → OFF hides every new card."""
+    from plugins_test.CLI.app import DashboardApp
+
+    mock_pc.networking_enabled = True
+    mock_pc.network = None
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Confirm cards visible when enabled.
+        assert app.query_one("#net-cluster-summary").display is True
+        assert app.query_one("#net-counters").display is True
+        assert app.query_one("#net-event-log").display is True
+
+        # Flip to disabled and re-run populate.
+        mock_pc.networking_enabled = False
+        app._populate_networking_static()
+        await pilot.pause()
+        assert app.query_one("#net-cluster-summary").display is False
+        assert app.query_one("#net-counters").display is False
+        assert app.query_one("#net-event-log").display is False
+        assert app.query_one("#net-disabled-banner").display is True

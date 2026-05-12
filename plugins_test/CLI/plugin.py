@@ -7,6 +7,7 @@ Plugins can register custom TUI panels by implementing either:
 """
 
 import asyncio
+import collections
 import importlib.util
 import logging
 import os
@@ -50,6 +51,23 @@ class CLI(Plugin):
         self._main_loop = None
         self._observed_topics: list = []
 
+        # Phase 2 — plugin-side observer state.
+        #
+        # The Networking-tab cluster summary, disconnect-reason counters,
+        # event log strip, and per-peer drill-down event log all read from
+        # state mutated by `_on_peer_event`. The observer runs on the
+        # PluginCore event loop thread; the TUI reads from its own thread.
+        # `_observer_lock` (threading.Lock) keeps the two dicts coherent
+        # under concurrent read + observer-fire. The deque + dict live
+        # here (NOT on DashboardApp) so events arriving BEFORE the TUI
+        # thread mounts the App are captured — the TUI hydrates from the
+        # deque on tab mount.
+        self._recent_peer_events: collections.deque = collections.deque(maxlen=500)
+        self._disconnect_reason_counts: dict = {
+            "normal": 0, "connection_error": 0, "rce_attempt": 0, "error": 0,
+        }
+        self._observer_lock = threading.Lock()
+
     @async_log_errors
     async def on_enable(self):
         self._logger.debug("Dashboard plugin on_enable")
@@ -62,11 +80,20 @@ class CLI(Plugin):
         self._log_handler.setLevel(logging.DEBUG)
         root_logger.addHandler(self._log_handler)
 
+        # Phase 2 — clear plugin-side state before re-subscribing so a
+        # disable -> re-enable cycle starts with a fresh deque + zeroed
+        # counters. Events arriving during the disable window are lost
+        # regardless (observer was unregistered); mixing pre-disable and
+        # post-enable events in the same deque has no useful semantic.
+        with self._observer_lock:
+            self._recent_peer_events.clear()
+            for k in self._disconnect_reason_counts:
+                self._disconnect_reason_counts[k] = 0
+
         # Phase 1: subscribe to internal-bus topics for live-update of
         # the Networking tab. Registration happens on the loop thread
         # (this method's caller); callbacks bridge to the TUI thread
-        # via `app.call_from_thread`. Phase 2 / 3 will extend this
-        # list with event/state topics. The `app and app.is_running`
+        # via `app.call_from_thread`. The `app and app.is_running`
         # guard in each callback covers the startup race window where
         # the TUI thread hasn't constructed the App yet.
         self._observed_topics = [
@@ -101,7 +128,24 @@ class CLI(Plugin):
         `NoActiveAppError` (or version-equivalent) Textual raises when
         the app is mid-teardown. The TUI is going away anyway; losing
         the last few peer events is acceptable.
+
+        Phase 2 — record state under `_observer_lock` BEFORE the TUI
+        bridge so the TUI's snapshot reads (which take the same lock)
+        see consistent state. NO `await` may be added under this lock —
+        we run on the asyncio loop thread, and re-entering would let
+        another observer fire mid-mutation.
         """
+        with self._observer_lock:
+            # Payload is appended by reference. ALL CONSUMERS MUST TREAT
+            # IT AS READ-ONLY — the framework's emit site does not share
+            # the dict between observers today, so mutating here would
+            # also break those future observers if they ever land.
+            self._recent_peer_events.append((topic, payload))
+            if topic == "_core/peer/disconnected":
+                reason = payload.get("reason", "normal")
+                if reason in self._disconnect_reason_counts:
+                    self._disconnect_reason_counts[reason] += 1
+
         app = self._app
         if app is None or not app.is_running:
             return
@@ -109,6 +153,36 @@ class CLI(Plugin):
             app.call_from_thread(app.on_peer_event_bus, topic, payload)
         except Exception:
             pass
+
+    # ── Plugin-side state snapshot helpers (TUI thread → plugin) ───────
+    # All three methods are safe to call from any thread. They take
+    # `_observer_lock` briefly; no `await` happens under the lock so
+    # they cannot deadlock the asyncio loop. The returned values are
+    # FRESH copies; the caller may mutate them freely. Payload dicts
+    # inside `get_recent_peer_events()` are shared references — TUI
+    # readers MUST treat them as read-only.
+
+    def get_recent_peer_events(self) -> list:
+        """Snapshot the recent-peer-event deque.
+
+        Returns a fresh list whose elements are the SAME (topic, payload)
+        tuples held by the deque. Payload dicts are NOT copied — treat
+        them as read-only.
+        """
+        with self._observer_lock:
+            return list(self._recent_peer_events)
+
+    def get_disconnect_reason_counts(self) -> dict:
+        """Snapshot disconnect-reason counts. Returns a fresh dict; caller
+        may mutate freely."""
+        with self._observer_lock:
+            return dict(self._disconnect_reason_counts)
+
+    def clear_disconnect_reason_counts(self) -> None:
+        """Reset disconnect-reason counts to zero. Thread-safe."""
+        with self._observer_lock:
+            for k in self._disconnect_reason_counts:
+                self._disconnect_reason_counts[k] = 0
 
     def _mute_console(self):
         """Remove the console StreamHandler from QueueListener while TUI active,
