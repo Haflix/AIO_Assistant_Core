@@ -282,6 +282,9 @@ Footer {
     background: #252525;
 }
 
+/* Phase 4c — drill-down quick-action feedback Static. */
+.peer-action-status { color: #73c991; padding: 0 1; }
+
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
 .settings-group {
@@ -2448,14 +2451,28 @@ class DashboardApp(App):
             "Topic (out)", "State", "Sent ago", "Acked ago", "Retries",
         )
 
-        # Phase 4a actions: View cert + Close.
+        # Phase 4a actions: View cert.
         actions.mount(Button("View cert",
                              id=f"{tab_id}-btn-view-cert",
+                             classes="peer-action-btn"))
+        # Phase 4c quick actions.
+        actions.mount(Button("Copy fingerprint",
+                             id=f"{tab_id}-btn-copy-fp",
+                             classes="peer-action-btn"))
+        actions.mount(Button("Copy PEM",
+                             id=f"{tab_id}-btn-copy-pem",
+                             classes="peer-action-btn"))
+        actions.mount(Button("Jump to config",
+                             id=f"{tab_id}-btn-jump-config",
                              classes="peer-action-btn"))
         actions.mount(Button("Close peer tab",
                              id=f"{tab_id}-btn-close",
                              classes="peer-action-btn",
                              variant="error"))
+        # Phase 4c — status feedback Static (cleared after 2s via timer).
+        actions.mount(Static("",
+                             id=f"{tab_id}-action-status",
+                             classes="peer-action-status"))
 
         # Phase 4b — record the baseline AT MOUNT TIME so live events
         # appended via `on_peer_event_bus` don't duplicate the rehydrated
@@ -2766,31 +2783,173 @@ class DashboardApp(App):
     def _on_peer_drill_button_pressed(self, event: Button.Pressed) -> None:
         """Catch-all handler for drill-down per-peer buttons.
 
-        Routes `tab-peer-<sanitised>-btn-view-cert` to the peer-cert
-        modal and `tab-peer-<sanitised>-btn-close` to the close worker.
+        Routes every `tab-peer-<sanitised>-btn-*` button to its handler.
+        Each branch resolves the hostname via `_host_for_tab(tab_id)`.
+        Phase 4a buttons: View cert, Close peer tab.
+        Phase 4c buttons: Copy fingerprint, Copy PEM, Jump to config.
         """
         btn_id = event.button.id
         if not btn_id or not btn_id.startswith("tab-peer-"):
             return
-        # tab_id = btn_id minus trailing -btn-view-cert / -btn-close.
-        if btn_id.endswith("-btn-view-cert"):
-            tab_id = btn_id[: -len("-btn-view-cert")]
+
+        for suffix, action in (
+            ("-btn-view-cert", "view_cert"),
+            ("-btn-copy-fp", "copy_fp"),
+            ("-btn-copy-pem", "copy_pem"),
+            ("-btn-jump-config", "jump_config"),
+            ("-btn-close", "close"),
+        ):
+            if not btn_id.endswith(suffix):
+                continue
+            tab_id = btn_id[: -len(suffix)]
             host = self._host_for_tab(tab_id)
-            if host is not None:
+            if host is None:
+                return
+            if action == "view_cert":
                 self._open_peer_cert_modal(host)
-        elif btn_id.endswith("-btn-close"):
-            tab_id = btn_id[: -len("-btn-close")]
-            host = self._host_for_tab(tab_id)
-            if host is not None:
-                # `_close_peer_drilldown` is async; schedule as a worker.
-                # `exit_on_error=False` so a future regression in the
-                # close path logs instead of tearing the whole TUI down.
+            elif action == "copy_fp":
+                self._peer_copy_fingerprint(host, tab_id)
+            elif action == "copy_pem":
+                self._peer_copy_pem(host, tab_id)
+            elif action == "jump_config":
+                self.run_worker(
+                    self._peer_jump_to_config(host, tab_id),
+                    name=f"peer-jump-config:{host}",
+                    exclusive=False,
+                    exit_on_error=False,
+                )
+            elif action == "close":
                 self.run_worker(
                     self._close_peer_drilldown(host),
                     name=f"close-peer-tab:{host}",
                     exclusive=False,
                     exit_on_error=False,
                 )
+            return
+
+    # ─── Phase 4c — Drill-down quick actions ─────────────────────────
+
+    def _set_peer_action_status(self, tab_id: str, msg: str) -> None:
+        """Update the per-tab status Static and clear it after 2s."""
+        try:
+            widget = self.query_one(f"#{tab_id}-action-status", Static)
+        except NoMatches:
+            return
+        widget.update(msg)
+        # Schedule a clear; safe to chain repeated calls — only the
+        # latest timer's clear matters for visible state.
+        self.set_timer(2.0, lambda: self._clear_peer_action_status(tab_id))
+
+    def _clear_peer_action_status(self, tab_id: str) -> None:
+        try:
+            self.query_one(f"#{tab_id}-action-status", Static).update("")
+        except NoMatches:
+            pass
+
+    def _peer_copy_fingerprint(self, host: str, tab_id: str) -> None:
+        peer = self._lookup_peer(host)
+        if peer is None:
+            self._set_peer_action_status(tab_id, "Peer not found")
+            return
+        fp = getattr(peer, "fingerprint", "") or ""
+        try:
+            self.copy_to_clipboard(fp)
+        except Exception:
+            pass
+        self._set_peer_action_status(tab_id, "Copied fingerprint")
+
+    def _peer_copy_pem(self, host: str, tab_id: str) -> None:
+        peer = self._lookup_peer(host)
+        if peer is None:
+            self._set_peer_action_status(tab_id, "Peer not found")
+            return
+        pem = getattr(peer, "cert_pem", "") or ""
+        try:
+            self.copy_to_clipboard(pem)
+        except Exception:
+            pass
+        self._set_peer_action_status(tab_id, "Copied PEM")
+
+    def _lookup_peer(self, host: str):
+        """Resolve a PeerSpec-like object from `nm.peers` by hostname."""
+        nm = getattr(self.plugin_core, "network", None)
+        if nm is None:
+            return None
+        for peer in getattr(nm, "peers", []) or []:
+            if getattr(peer, "hostname", None) == host:
+                return peer
+        return None
+
+    async def _peer_jump_to_config(self, host: str, tab_id: str) -> None:
+        """Best-effort jump to the peer's entry in `config.yml`.
+
+        Switches to the Config tab, selects `config.yml (main)`, loads
+        the file, scans the text for the first `hostname: <peer>` line,
+        and moves the cursor there (with `center=True` so the viewport
+        scrolls). False-match on a commented `# hostname: peer-x` is
+        acceptable v1.
+        """
+        try:
+            tabs = self.query_one("#main-tabs", TabbedContent)
+            tabs.active = "tab-config"
+        except NoMatches:
+            self._set_peer_action_status(tab_id, "Config tab missing")
+            return
+
+        # Set the Select to the main config and trigger load.
+        try:
+            sel = self.query_one("#config-select", Select)
+            sel.value = "config.yml (main)"
+        except NoMatches:
+            pass
+
+        # `_load_config_file` is a Textual @work coroutine; await its
+        # completion via run_worker -> wait_for. We invoke the underlying
+        # method directly to keep the flow synchronous-ish.
+        try:
+            label = "config.yml (main)"
+            path = self._config_files.get(label)
+            if path:
+                content = Path(path).read_text(encoding="utf-8")
+                self.query_one("#config-editor", TextArea).load_text(content)
+                self._current_config_file = path
+                self._config_clean_hash = hashlib.md5(
+                    content.encode()
+                ).hexdigest()
+            else:
+                self._set_peer_action_status(tab_id, "Main config not found")
+                return
+        except Exception:
+            self._set_peer_action_status(tab_id, "Config load failed")
+            return
+
+        # Scan + jump.
+        try:
+            ta = self.query_one("#config-editor", TextArea)
+            # YAML peer entries are written as list items like
+            # `- hostname: peer-foo`; the leading `-` is optional so we
+            # also match a bare `hostname: peer-foo` form.
+            pattern = re.compile(
+                rf"^\s*-?\s*hostname:\s*['\"]?{re.escape(host)}['\"]?\s*$"
+            )
+            line_idx = None
+            for idx, raw_line in enumerate(ta.text.splitlines()):
+                if pattern.match(raw_line):
+                    line_idx = idx
+                    break
+            if line_idx is not None:
+                # center=True triggers scroll_cursor_visible so the
+                # cursor jumps INTO view (per `_text_area.py:1925-1956`).
+                ta.move_cursor((line_idx, 0), center=True)
+                self._set_peer_action_status(
+                    tab_id, f"Jumped to line {line_idx + 1}",
+                )
+            else:
+                self._set_peer_action_status(
+                    tab_id, f"hostname: {host} not found",
+                )
+        except NoMatches:
+            self._set_peer_action_status(tab_id, "Config editor missing")
 
     def _host_for_tab(self, tab_id: str) -> Optional[str]:
         for host, tid in self._peer_tabs.items():

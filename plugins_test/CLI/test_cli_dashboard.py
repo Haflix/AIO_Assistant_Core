@@ -1785,6 +1785,109 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
         assert log_writes == 1  # post-baseline event rendered
 
 
+# ─── Phase 4c — Drill-down quick actions ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase4c_copy_fingerprint_invokes_clipboard(mock_pc, tmp_path):
+    """`[Copy fingerprint]` calls `App.copy_to_clipboard` with the
+    peer's fingerprint string."""
+    from plugins_test.CLI.app import DashboardApp
+    from unittest.mock import patch
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    host = peers[0].hostname
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        tab_id = app._peer_tabs[host]
+        with patch.object(app, "copy_to_clipboard") as mock_copy:
+            app._peer_copy_fingerprint(host, tab_id)
+            mock_copy.assert_called_once_with(f"sha256:fp-{host}")
+
+
+@pytest.mark.asyncio
+async def test_phase4c_copy_pem_invokes_clipboard(mock_pc, tmp_path):
+    """`[Copy PEM]` calls `App.copy_to_clipboard` with the peer's PEM."""
+    from plugins_test.CLI.app import DashboardApp
+    from unittest.mock import patch
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    host = peers[0].hostname
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        tab_id = app._peer_tabs[host]
+        with patch.object(app, "copy_to_clipboard") as mock_copy:
+            app._peer_copy_pem(host, tab_id)
+            mock_copy.assert_called_once_with(f"PEER-PEM-{host}")
+
+
+@pytest.mark.asyncio
+async def test_phase4c_jump_to_config_finds_hostname_line(mock_pc, tmp_path):
+    """`[Jump to config]` switches to the Config tab, loads main config,
+    and moves the cursor to the line containing `hostname: <peer>`."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import TabbedContent, TextArea
+
+    config_file = tmp_path / "config.yml"
+    config_text = (
+        "general:\n"
+        "  hostname: my-node\n"
+        "networking:\n"
+        "  enabled: true\n"
+        "  peers:\n"
+        "    - hostname: peer-0\n"
+        "      address: 10.0.0.1:2511\n"
+        "    - hostname: peer-1\n"
+        "      address: 10.0.0.2:2511\n"
+    )
+    config_file.write_text(config_text, encoding="utf-8")
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
+    host = "peer-1"
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+    # Override config_path so _build_config_file_list picks up our fixture.
+    mock_pc.config_path = str(config_file)
+    mock_pc.yaml_config = {"plugins": [], "general": {},
+                           "networking": {"enabled": True}}
+    mock_pc.plugin_package = "plugins_test"
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(180, 60)) as pilot:
+        await pilot.pause()
+        # Ensure _config_files is populated from on_mount.
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        tab_id = app._peer_tabs[host]
+        await app._peer_jump_to_config(host, tab_id)
+        for _ in range(2):
+            await pilot.pause()
+        # Tab switched to config.
+        assert app.query_one("#main-tabs", TabbedContent).active == "tab-config"
+        # Cursor placed on the line containing `hostname: peer-1` (line 7,
+        # zero-indexed = 6).
+        ta = app.query_one("#config-editor", TextArea)
+        row, _col = ta.cursor_location
+        assert config_text.splitlines()[row].strip() == "- hostname: peer-1"
+
+
 # ─── Phase 4a — Per-peer drill-down tab (continued) ──────────────────
 
 @pytest.mark.asyncio
