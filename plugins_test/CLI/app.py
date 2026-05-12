@@ -244,6 +244,28 @@ Footer {
     background: #252525;
 }
 
+/* Phase 4a — per-peer drill-down tab. */
+.peer-tab-body { height: 1fr; padding: 1 2; }
+.peer-identity-box {
+    border: round #404040;
+    background: #2d2d2d;
+    padding: 1 2;
+    margin: 0 0 1 0;
+    height: auto;
+}
+.peer-sparkline-row { height: 6; padding: 0 0 1 0; }
+.peer-sparkline-box {
+    border: round #404040;
+    background: #2d2d2d;
+    padding: 0 1;
+    margin: 0 1 0 0;
+    height: 4;
+    width: 1fr;
+}
+.peer-sparkline-title { color: #9bb5a0; height: 1; }
+.peer-actions-row { height: auto; padding: 1 0 0 0; }
+.peer-action-btn { margin: 0 1 0 0; }
+
 /* ── Settings ────────────────────────────── */
 #settings-scroll { height: 1fr; }
 .settings-group {
@@ -522,10 +544,21 @@ class DashboardApp(App):
         self._cert_expiry_cache: collections.OrderedDict = collections.OrderedDict()
         self._cert_expiry_cache_cap = 64
 
-        # Phase 4a precursor — drill-down tab registry. Cheap to declare
-        # here so Phase 2's `on_peer_event_bus` can guard against
-        # missing-attr errors when checking for open peer tabs.
+        # Phase 4a — drill-down tab registry. OrderedDict so FIFO
+        # eviction at the 5-tab cap drops the oldest-opened tab.
+        # Values are the dynamically-created TabPane ids.
         self._peer_tabs: collections.OrderedDict = collections.OrderedDict()
+        self._peer_tabs_cap = 5
+        # Phase 4a — per-peer ring buffers feeding the throughput sparklines.
+        # Each host's entry is {bytes_sent_delta, bytes_recv_delta,
+        # msgs_sent_delta, msgs_recv_delta, last_sample, last_sample_nm_id}.
+        # last_sample_nm_id captures id(pc.network) at last sample so a
+        # mid-session NM rebuild invalidates the prior cumulative counters
+        # (peer_stats is recreated on the new NM and starts at 0).
+        self._peer_ring_buffers: dict = {}
+        # Single app-level 1s timer drives all open drill-down refreshes.
+        # Created lazily on first open; stopped when last tab closes.
+        self._peer_drill_timer = None
 
     # ─── Cross-loop dispatch ────────────────────────────────────────
 
@@ -2119,19 +2152,24 @@ class DashboardApp(App):
             except Exception:
                 pass
 
-        # Phase 4a precursor — restore `(gone)` tab title on reconnect.
-        # `_peer_tabs` is empty in Phase 2 (no drill-down tabs spawn yet),
-        # so this branch no-ops until Phase 4a lights it up.
-        if topic == "_core/peer/connected":
-            host = payload.get("hostname")
-            if host and host in self._peer_tabs:
-                try:
-                    tab_id = self._peer_tabs[host]
-                    tabbed = self.query_one("#main-tabs", TabbedContent)
-                    tab = tabbed.get_tab(tab_id)
-                    tab.label = host  # drop `(gone)` suffix
-                except Exception:
-                    pass
+        # Phase 4a — drill-down tab title flips:
+        #   * disconnected → `<host> (gone)`: surfaces the disconnect to
+        #     a user staring at an open drill-down without auto-closing
+        #     the tab (operator may want to study the last state).
+        #   * connected → `<host>`: restores the title if the same peer
+        #     reconnects, so a flap doesn't leave a stale "(gone)" label.
+        host = payload.get("hostname")
+        if host and host in self._peer_tabs:
+            try:
+                tab_id = self._peer_tabs[host]
+                tabbed = self.query_one("#main-tabs", TabbedContent)
+                tab = tabbed.get_tab(tab_id)
+                if topic == "_core/peer/connected":
+                    tab.label = host
+                elif topic == "_core/peer/disconnected":
+                    tab.label = f"{host} (gone)"
+            except Exception:
+                pass
 
     @on(Button.Pressed, "#btn-net-thisnode-view-cert")
     def _on_view_thisnode_cert(self) -> None:
@@ -2194,6 +2232,427 @@ class DashboardApp(App):
             self._refresh_peers_table_worker()
         except Exception:
             pass
+
+    # ─── Phase 4a — per-peer drill-down tab ──────────────────────────
+
+    @on(DataTable.RowSelected, "#net-peers-table")
+    async def _on_peers_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the per-peer drill-down on Enter / row-activate."""
+        if event.row_key is None:
+            return
+        host = str(event.row_key.value)
+        await self._open_peer_drill_down(host)
+
+    async def _open_peer_drill_down(self, hostname: str) -> None:
+        """Spawn (or focus) a per-peer drill-down TabPane.
+
+        Phase 4a layout: identity strip + 4 throughput sparklines + Close
+        button. Phase 4b will append subs tables + in-flight panel +
+        filtered event log; Phase 4c adds quick-action buttons.
+
+        - Gated on `pc.networking_enabled` (no-op when off).
+        - Cap at `_peer_tabs_cap` (5) open tabs: FIFO eviction of oldest.
+        - Single app-level 1s timer drives all refreshes; created lazily
+          on first open, stopped on last close.
+        """
+        if not getattr(self.plugin_core, "networking_enabled", False):
+            return
+        # Already open — just switch to it.
+        if hostname in self._peer_tabs:
+            try:
+                self.query_one("#main-tabs", TabbedContent).active = (
+                    self._peer_tabs[hostname]
+                )
+            except NoMatches:
+                pass
+            return
+
+        # Cap enforcement — FIFO evict the oldest before opening.
+        if len(self._peer_tabs) >= self._peer_tabs_cap:
+            oldest_host = next(iter(self._peer_tabs))
+            await self._close_peer_drilldown(oldest_host)
+
+        tab_id = f"tab-peer-{self._sanitize_id(hostname)}"
+        try:
+            tabs = self.query_one("#main-tabs", TabbedContent)
+        except NoMatches:
+            return
+
+        pane = TabPane(hostname, id=tab_id)
+        await tabs.add_pane(pane)
+
+        try:
+            self.query_one(f"#{tab_id}", TabPane)
+        except NoMatches:
+            return
+
+        # Build pane body via Phase 4a helper; appended via mount().
+        scroll = VerticalScroll(classes="peer-tab-body",
+                                id=f"{tab_id}-scroll")
+        await pane.mount(scroll)
+        for w in self._build_peer_drill_widgets(hostname, tab_id):
+            await scroll.mount(w)
+
+        self._peer_tabs[hostname] = tab_id
+        # Initialise ring buffer for this peer.
+        self._peer_ring_buffers[hostname] = {
+            "bytes_sent_delta": collections.deque(maxlen=60),
+            "bytes_recv_delta": collections.deque(maxlen=60),
+            "msgs_sent_delta":  collections.deque(maxlen=60),
+            "msgs_recv_delta":  collections.deque(maxlen=60),
+            "last_sample": None,
+            "last_sample_nm_id": None,
+        }
+        # Start the shared 1s timer on first drill-down open.
+        if self._peer_drill_timer is None:
+            self._peer_drill_timer = self.set_interval(
+                1.0, self._refresh_peer_drilldowns,
+            )
+
+        tabs.active = tab_id
+
+    def _build_peer_drill_widgets(self, hostname: str, tab_id: str) -> list:
+        """Construct the Phase 4a content widgets for the drill-down pane.
+
+        Identity strip: hostname / IP:port / alive cell / last HB /
+        pool / system_caller / fingerprint short + [View cert] button.
+        Throughput row: 4 Sparklines for bytes_sent / bytes_recv /
+        msgs_sent / msgs_recv deltas (60-sample rolling).
+        Close row: [Close peer tab] button that pops the drill-down.
+
+        All widgets get IDs scoped under the tab_id prefix so multiple
+        open drill-downs cannot collide on shared widget IDs.
+        """
+        widgets: list = []
+        widgets.append(
+            Static(f"Peer: {hostname}", classes="net-card-title")
+        )
+
+        # Identity strip — 7 label/value rows.
+        identity = Vertical(id=f"{tab_id}-identity",
+                            classes="peer-identity-box")
+        widgets.append(identity)
+
+        # Throughput sparklines — 4 panels in a Horizontal grid.
+        sparks = Horizontal(id=f"{tab_id}-sparklines",
+                            classes="peer-sparkline-row")
+        widgets.append(sparks)
+
+        # View cert + close buttons row.
+        actions = Horizontal(id=f"{tab_id}-actions",
+                             classes="peer-actions-row")
+        widgets.append(actions)
+
+        # Schedule child mounting on the next tick — `compose` returns
+        # the top-level containers; their internals get filled by the
+        # post-mount initialiser. This lets `add_pane`'s mount cycle
+        # complete before we add nested widgets.
+        self.call_after_refresh(
+            self._populate_peer_drill_widgets,
+            hostname, tab_id,
+        )
+        return widgets
+
+    def _populate_peer_drill_widgets(self, hostname: str, tab_id: str) -> None:
+        """Mount the identity rows + sparkline panels + action buttons
+        into their already-mounted parent containers. Runs once on tab
+        spawn via `call_after_refresh`."""
+        try:
+            identity = self.query_one(f"#{tab_id}-identity", Vertical)
+            sparks = self.query_one(f"#{tab_id}-sparklines", Horizontal)
+            actions = self.query_one(f"#{tab_id}-actions", Horizontal)
+        except NoMatches:
+            return
+
+        # Identity rows.
+        for label, sub_id in (
+            ("Host:", "host"),
+            ("Address:", "addr"),
+            ("Alive:", "alive"),
+            ("Last HB:", "hb"),
+            ("Pool:", "pool"),
+            ("system_caller:", "sysc"),
+            ("Fingerprint:", "fp"),
+        ):
+            row = Horizontal(classes="net-row")
+            identity.mount(row)
+            row.mount(Static(label, classes="net-row-label"))
+            row.mount(Static(
+                "...",
+                id=f"{tab_id}-identity-{sub_id}",
+                classes="net-row-value",
+            ))
+
+        # Sparkline panels — 4 sided-by-side boxes, each with title +
+        # current rate label + the Sparkline itself.
+        for label, sub_id in (
+            ("Bytes sent / s", "bsent"),
+            ("Bytes recv / s", "brecv"),
+            ("Msgs sent / s", "msent"),
+            ("Msgs recv / s", "mrecv"),
+        ):
+            box = Vertical(classes="peer-sparkline-box")
+            sparks.mount(box)
+            box.mount(Static(label, classes="peer-sparkline-title"))
+            box.mount(Sparkline([], id=f"{tab_id}-spark-{sub_id}"))
+
+        # Phase 4a actions: View cert + Close.
+        actions.mount(Button("View cert",
+                             id=f"{tab_id}-btn-view-cert",
+                             classes="peer-action-btn"))
+        actions.mount(Button("Close peer tab",
+                             id=f"{tab_id}-btn-close",
+                             classes="peer-action-btn",
+                             variant="error"))
+
+        # Kick a synchronous render so the operator sees data on first
+        # paint instead of waiting up to 1s for the shared timer.
+        pc = self.plugin_core
+        nm = getattr(pc, "network", None)
+        if nm is not None:
+            try:
+                self._refresh_one_peer_drilldown(
+                    hostname, nm, id(nm), time.time(),
+                )
+            except Exception:
+                pass
+
+    async def _close_peer_drilldown(self, hostname: str) -> None:
+        """Pop the drill-down pane + ring buffer for `hostname`.
+
+        Also stops the shared 1s refresh timer when no drill-down tabs
+        remain so an idle TUI does not tick uselessly.
+
+        Pane removal runs BEFORE the dict pops so a failed `remove_pane`
+        does not orphan the DOM entry: if remove fails, the entry stays
+        in `_peer_tabs` and a subsequent `_close_peer_drilldown` retry
+        can reattempt the remove. The dict pops only happen after a
+        successful remove.
+        """
+        tab_id = self._peer_tabs.get(hostname)
+        if tab_id is None:
+            return
+        try:
+            tabs = self.query_one("#main-tabs", TabbedContent)
+            await tabs.remove_pane(tab_id)
+        except NoMatches:
+            # TabbedContent itself is gone (TUI tearing down) — treat
+            # the pane as already removed.
+            pass
+        except Exception:
+            # Other remove_pane failure: keep dict entries so a retry
+            # can clean up later. Log + bail.
+            self._logger.debug(
+                "remove_pane failed for %s", hostname, exc_info=True,
+            )
+            return
+        self._peer_tabs.pop(hostname, None)
+        self._peer_ring_buffers.pop(hostname, None)
+        if not self._peer_tabs and self._peer_drill_timer is not None:
+            try:
+                self._peer_drill_timer.stop()
+            except Exception:
+                pass
+            self._peer_drill_timer = None
+
+    async def _refresh_peer_drilldowns(self) -> None:
+        """1s tick across all open drill-down tabs.
+
+        Survives one-tick-after-shutdown via `is_running` guard. When
+        networking is mid-rebuild (`pc.network is None`) or fully
+        disabled, every open drill-down tab is closed — there is no
+        useful data left to render.
+        """
+        if not self.is_running:
+            return
+        if not self._peer_tabs:
+            return
+        pc = self.plugin_core
+        nm = pc.network  # snapshot ONCE per tick (avoid mid-tick rebuild race)
+        if not getattr(pc, "networking_enabled", False) or nm is None:
+            for host in list(self._peer_tabs.keys()):
+                await self._close_peer_drilldown(host)
+            return
+        nm_id = id(nm)
+        now = time.time()
+        for host in list(self._peer_tabs.keys()):
+            try:
+                self._refresh_one_peer_drilldown(host, nm, nm_id, now)
+            except NoMatches:
+                # Tab DOM torn down between check and update — skip.
+                continue
+            except Exception:
+                self._logger.debug(
+                    "drill-down refresh failed for %s", host, exc_info=True,
+                )
+
+    def _refresh_one_peer_drilldown(self, host: str, nm, nm_id: int,
+                                     now: float) -> None:
+        """Identity + sparkline update for one peer's drill-down."""
+        tab_id = self._peer_tabs.get(host)
+        if tab_id is None:
+            return
+
+        # Snapshot peer state — outer-then-inner dict-copy + bail-on-race
+        # matches the established peers-table worker convention.
+        try:
+            peers = list(getattr(nm, "peers", []) or [])
+            nodes_list = list(getattr(nm, "nodes", []) or [])
+            stats_snapshot = dict(getattr(nm, "peer_stats", None) or {})
+            stats = (stats_snapshot.get(host) or {}).copy()
+            pool_map = dict(getattr(nm, "connection_pools", None) or {})
+            hb_interval = getattr(nm, "heartbeat_interval", 10)
+            liveness = getattr(nm, "liveness_timeout", 30)
+        except (RuntimeError, Exception):
+            return
+
+        peer = next((p for p in peers if p.hostname == host), None)
+        node = next((n for n in nodes_list if n.hostname == host), None)
+
+        # ── Identity rows ──────────────────────────────────────────
+        ip_port = (f"{peer.ip}:{peer.port}" if peer is not None
+                   else "(not in peers config)")
+        sysc = "Y" if (peer and getattr(peer, "system_caller", False)) else "N"
+        fp = getattr(peer, "fingerprint", "") if peer else ""
+        fp_short = (fp[:24] + "…") if len(fp) > 24 else (fp or "(none)")
+
+        # Alive cell mirrors the peers-table semantics exactly.
+        if node is None:
+            alive_text = "never"
+            hb_str = "never"
+        else:
+            last_hb = getattr(node, "last_heartbeat", None)
+            if last_hb is None:
+                alive_text = "never"
+                hb_str = "never"
+            else:
+                age = now - last_hb
+                hb_str = self._format_relative_hb(age)
+                if age < hb_interval:
+                    alive_text = "alive"
+                elif age < liveness:
+                    alive_text = "degraded"
+                else:
+                    alive_text = "down"
+
+        pool = pool_map.get((getattr(peer, "ip", None),
+                             getattr(peer, "port", None)))
+        try:
+            pool_str = (f"{pool.qsize()}/{getattr(nm, 'pool_size', '?')}"
+                        if pool is not None
+                        else f"0/{getattr(nm, 'pool_size', '?')}")
+        except Exception:
+            pool_str = "?"
+
+        self._set_row(f"#{tab_id}-identity-host", host)
+        self._set_row(f"#{tab_id}-identity-addr", ip_port)
+        self._set_row(f"#{tab_id}-identity-alive", alive_text)
+        self._set_row(f"#{tab_id}-identity-hb", hb_str)
+        self._set_row(f"#{tab_id}-identity-pool", pool_str)
+        self._set_row(f"#{tab_id}-identity-sysc", sysc)
+        self._set_row(f"#{tab_id}-identity-fp", fp_short)
+
+        # ── Sparkline updates ─────────────────────────────────────
+        rb = self._peer_ring_buffers.get(host)
+        if rb is None:
+            return
+        # S-1: NM rebuild invalidates cumulative-counter delta math.
+        # Reset last_sample on instance swap.
+        if rb["last_sample_nm_id"] != nm_id:
+            rb["last_sample"] = None
+            rb["last_sample_nm_id"] = nm_id
+
+        last = rb["last_sample"]
+        if last is None or not stats:
+            # First tick on this NM (or peer has no stats yet): push 0s
+            # so the sparkline has data but doesn't lie about throughput.
+            for k in ("bytes_sent_delta", "bytes_recv_delta",
+                      "msgs_sent_delta", "msgs_recv_delta"):
+                rb[k].append(0.0)
+            if stats:
+                rb["last_sample"] = stats
+        else:
+            for raw, k in (
+                ("bytes_sent", "bytes_sent_delta"),
+                ("bytes_recv", "bytes_recv_delta"),
+                ("msgs_sent",  "msgs_sent_delta"),
+                ("msgs_recv",  "msgs_recv_delta"),
+            ):
+                delta = max(0, stats.get(raw, 0) - last.get(raw, 0))
+                rb[k].append(float(delta))
+            rb["last_sample"] = stats
+
+        for sub_id, deque_key in (
+            ("bsent", "bytes_sent_delta"),
+            ("brecv", "bytes_recv_delta"),
+            ("msent", "msgs_sent_delta"),
+            ("mrecv", "msgs_recv_delta"),
+        ):
+            try:
+                self.query_one(f"#{tab_id}-spark-{sub_id}",
+                               Sparkline).data = list(rb[deque_key])
+            except NoMatches:
+                continue
+
+    @on(Button.Pressed)
+    def _on_peer_drill_button_pressed(self, event: Button.Pressed) -> None:
+        """Catch-all handler for drill-down per-peer buttons.
+
+        Routes `tab-peer-<sanitised>-btn-view-cert` to the peer-cert
+        modal and `tab-peer-<sanitised>-btn-close` to the close worker.
+        """
+        btn_id = event.button.id
+        if not btn_id or not btn_id.startswith("tab-peer-"):
+            return
+        # tab_id = btn_id minus trailing -btn-view-cert / -btn-close.
+        if btn_id.endswith("-btn-view-cert"):
+            tab_id = btn_id[: -len("-btn-view-cert")]
+            host = self._host_for_tab(tab_id)
+            if host is not None:
+                self._open_peer_cert_modal(host)
+        elif btn_id.endswith("-btn-close"):
+            tab_id = btn_id[: -len("-btn-close")]
+            host = self._host_for_tab(tab_id)
+            if host is not None:
+                # `_close_peer_drilldown` is async; schedule as a worker.
+                # `exit_on_error=False` so a future regression in the
+                # close path logs instead of tearing the whole TUI down.
+                self.run_worker(
+                    self._close_peer_drilldown(host),
+                    name=f"close-peer-tab:{host}",
+                    exclusive=False,
+                    exit_on_error=False,
+                )
+
+    def _host_for_tab(self, tab_id: str) -> Optional[str]:
+        for host, tid in self._peer_tabs.items():
+            if tid == tab_id:
+                return host
+        return None
+
+    def _open_peer_cert_modal(self, host: str) -> None:
+        """Push the CertPEMScreen with this peer's cert PEM + fingerprint.
+
+        Shares the double-push guard with `_open_cert_modal`: at most ONE
+        cert modal is on the stack at any time. If an own-cert modal is
+        already open, the peer-cert button silently no-ops — user must
+        close the existing modal first. Accepted UX trade-off: a noisy
+        feedback toast adds plumbing for a vanishingly rare case.
+        """
+        if any(isinstance(s, CertPEMScreen) for s in self.screen_stack):
+            return
+        nm = getattr(self.plugin_core, "network", None)
+        if nm is None:
+            return
+        peer = next((p for p in getattr(nm, "peers", []) or []
+                     if p.hostname == host), None)
+        if peer is None:
+            return
+        self.push_screen(CertPEMScreen(
+            title=f"Peer certificate — {host}",
+            pem_text=getattr(peer, "cert_pem", "") or "(no PEM)",
+            fingerprint=getattr(peer, "fingerprint", "") or "(no fingerprint)",
+        ))
 
     def _format_peers_display(self) -> str:
         """Render peers summary for the Settings-tab Networking group.

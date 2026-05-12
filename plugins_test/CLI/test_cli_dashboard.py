@@ -1364,6 +1364,262 @@ async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
         assert "days (own)" in str(widget.content)
 
 
+# ─── Phase 4a — Per-peer drill-down tab ──────────────────────────────
+
+def _make_phase4_fake_nm(tmp_path, *, host_count: int = 2):
+    """Build a stand-in for `pc.network` sufficient for Phase 4a tests.
+
+    Returns (FakeNM_instance, peers_list).
+    """
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("OWN-CERT", encoding="utf-8")
+
+    class FakePeer:
+        def __init__(self, hostname):
+            self.hostname = hostname
+            self.ip = f"10.0.0.{hash(hostname) % 200 + 1}"
+            self.port = 2511
+            self.fingerprint = f"sha256:fp-{hostname}"
+            self.cert_pem = f"PEER-PEM-{hostname}"
+            self.system_caller = False
+
+    class FakeNode:
+        def __init__(self, hostname):
+            self.hostname = hostname
+            self.IP = f"10.0.0.{hash(hostname) % 200 + 1}"
+            self.enabled = True
+            self.last_heartbeat = int(time.time())
+        def is_alive_sync(self, timeout=30):
+            return True
+
+    peer_list = [FakePeer(f"peer-{i}") for i in range(host_count)]
+    node_list = [FakeNode(p.hostname) for p in peer_list]
+
+    class FakeNM:
+        peers = peer_list
+        nodes = node_list
+        keys_dir = tmp_path
+        cert_path = cert_file
+        own_fingerprint = "sha256:own-fp"
+        pool_size = 4
+        connection_pools = {}
+        _inbound_adverts = {}
+        _outbound_adverts = {}
+        _inflight_publishes = {}
+        peer_stats = {p.hostname: {
+            "bytes_sent": 100, "bytes_recv": 200,
+            "msgs_sent": 5, "msgs_recv": 8,
+        } for p in peer_list}
+        liveness_timeout = 30
+        heartbeat_interval = 10
+        discover_nodes = False
+
+    return FakeNM(), peer_list
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_opens_on_row_select(mock_pc, tmp_path):
+    """Selecting a peers-table row spawns a drill-down TabPane keyed by
+    hostname. Re-selecting the same row focuses the existing pane
+    instead of stacking duplicates."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import TabbedContent, TabPane
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        host = peers[0].hostname
+        # Open via the same code path the RowSelected handler uses.
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        assert host in app._peer_tabs
+        tab_id = app._peer_tabs[host]
+        # TabPane mounted.
+        assert app.query_one(f"#{tab_id}", TabPane) is not None
+        # Re-select — should be a no-op (no second pane).
+        await app._open_peer_drill_down(host)
+        await pilot.pause()
+        assert len(app._peer_tabs) == 1
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_cap_evicts_oldest(mock_pc, tmp_path):
+    """The 6th distinct peer drill-down evicts the oldest open tab."""
+    from plugins_test.CLI.app import DashboardApp
+
+    nm, _ = _make_phase4_fake_nm(tmp_path, host_count=6)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.pause()
+        hosts = [p.hostname for p in nm.peers]
+        # Open 5 — all fit in cap.
+        for h in hosts[:5]:
+            await app._open_peer_drill_down(h)
+        await pilot.pause()
+        assert len(app._peer_tabs) == 5
+        # 6th evicts the FIRST opened.
+        await app._open_peer_drill_down(hosts[5])
+        await pilot.pause()
+        assert len(app._peer_tabs) == 5
+        assert hosts[0] not in app._peer_tabs
+        assert hosts[5] in app._peer_tabs
+        # Ring buffer for the evicted host is cleaned up.
+        assert hosts[0] not in app._peer_ring_buffers
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_sparkline_data_grows(mock_pc, tmp_path):
+    """Each refresh tick appends a delta to the 4 throughput sparklines.
+    Verify the deque length grows under repeated calls and stays
+    capped at 60."""
+    from plugins_test.CLI.app import DashboardApp
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        host = peers[0].hostname
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+
+        rb = app._peer_ring_buffers[host]
+        # Reset the ring buffer to a known starting state so the test is
+        # deterministic regardless of whether `call_after_refresh` already
+        # fired an initial tick under the test harness's pacing.
+        for k in ("bytes_sent_delta", "bytes_recv_delta",
+                  "msgs_sent_delta", "msgs_recv_delta"):
+            rb[k].clear()
+        rb["last_sample"] = None
+        rb["last_sample_nm_id"] = None
+
+        # First tick — last_sample is None → seeds zero-delta sample.
+        app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
+        assert len(rb["bytes_sent_delta"]) == 1
+        assert rb["bytes_sent_delta"][0] == 0.0
+
+        # Bump cumulative counters and tick again — delta appended.
+        nm.peer_stats[host]["bytes_sent"] += 50
+        app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
+        assert len(rb["bytes_sent_delta"]) == 2
+        assert rb["bytes_sent_delta"][-1] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_closes_when_networking_disabled(mock_pc, tmp_path):
+    """When networking flips off mid-session, all open drill-down tabs
+    are closed by the shared refresh worker."""
+    from plugins_test.CLI.app import DashboardApp
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        await app._open_peer_drill_down(peers[0].hostname)
+        await app._open_peer_drill_down(peers[1].hostname)
+        for _ in range(3):
+            await pilot.pause()
+        assert len(app._peer_tabs) == 2
+
+        # Flip networking off — refresh worker closes all peer tabs.
+        mock_pc.networking_enabled = False
+        await app._refresh_peer_drilldowns()
+        for _ in range(3):
+            await pilot.pause()
+        assert app._peer_tabs == {}
+        # Shared timer also stopped.
+        assert app._peer_drill_timer is None
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_gone_title_on_disconnect(mock_pc, tmp_path):
+    """A `_core/peer/disconnected` event for an open peer flips the tab
+    label to `<host> (gone)`; a subsequent reconnect restores it."""
+    from plugins_test.CLI.app import DashboardApp
+    from textual.widgets import TabbedContent
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        host = peers[0].hostname
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        tabs = app.query_one("#main-tabs", TabbedContent)
+        tab_id = app._peer_tabs[host]
+        # Baseline: label is just the hostname.
+        assert str(tabs.get_tab(tab_id).label) == host
+        # Disconnect → title gains the `(gone)` suffix.
+        app.on_peer_event_bus("_core/peer/disconnected",
+                              {"hostname": host, "reason": "normal",
+                               "ts": time.time()})
+        for _ in range(2):
+            await pilot.pause()
+        assert "(gone)" in str(tabs.get_tab(tab_id).label)
+        # Reconnect → label restored.
+        app.on_peer_event_bus("_core/peer/connected",
+                              {"hostname": host, "ip": "10.0.0.1",
+                               "ts": time.time()})
+        for _ in range(2):
+            await pilot.pause()
+        assert str(tabs.get_tab(tab_id).label) == host
+
+
+@pytest.mark.asyncio
+async def test_phase4a_drill_down_view_cert_opens_peer_modal(mock_pc, tmp_path):
+    """The drill-down `View cert` button opens a CertPEMScreen carrying
+    the PEER's cert PEM + fingerprint (not the own cert)."""
+    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+
+    nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
+    mock_pc.networking_enabled = True
+    mock_pc.network = nm
+
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+                       log_handler=TUILogHandler())
+    async with app.run_test(headless=True, size=(160, 60)) as pilot:
+        await pilot.pause()
+        host = peers[0].hostname
+        await app._open_peer_drill_down(host)
+        for _ in range(3):
+            await pilot.pause()
+        app._open_peer_cert_modal(host)
+        for _ in range(3):
+            await pilot.pause()
+        modal = next((s for s in app.screen_stack
+                      if isinstance(s, CertPEMScreen)), None)
+        assert modal is not None
+        assert modal._pem == f"PEER-PEM-{host}"
+        assert modal._fp == f"sha256:fp-{host}"
+
+
 # ─── Phase 3 — Cert PEM modal ─────────────────────────────────────────
 
 @pytest.mark.asyncio
