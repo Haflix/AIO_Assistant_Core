@@ -85,9 +85,9 @@ plugins:
     enabled: false
     path: ./plugins_test/TestRemoteVictim
 
-  - name: CLI
+  - name: TUI
     enabled: true
-    path: ./plugins_test/CLI
+    path: ./plugins_test/TUI
 
   # ── Private plugins (in the separate _private/ repo) ──────────────
   # Disabled by default in the example — enable per-deployment after

@@ -1,0 +1,36 @@
+# Node B (subscriber side) config for `tui_smoke_pair.py`. Spawned by
+# `tui_smoke_node.py` as a subprocess with its own console + dashboard.
+#
+# Subscribes to events published by Node A's TUIDemoTimer + TUIDemoPub
+# so the cross-node event flow is visible in this node's Logs +
+# Networking tabs (inbound advert detail).
+#
+# Networking section overridden at runtime: port / keys_dir / peers
+# all come from `tui_smoke_node.py` flags supplied by the launcher.
+general:
+  hostname: tui-pair-b
+  plugin_package: plugins_test
+  console_log_level: WARNING
+  asyncio_debug: false
+
+networking:
+  enabled: true
+  discover_nodes: true
+  direct_discoverable: true
+  auto_discoverable: true
+  heartbeat_interval: 5
+  lookup_interval: 30
+  liveness_timeout: 15
+
+plugins:
+  # TUI dashboard — same plugin both sides load.
+  - name: TUI
+    enabled: true
+  # Subscriber — handles demo.greeted + demo.ticked from Node A's
+  # TUIDemoPub. Each event tick increments its counter.
+  - name: TUIDemoSub
+    enabled: true
+  # Orchestrator — handles Node A's TUIDemoTimer heartbeats / bursts
+  # AND has a cross-plugin sub that re-routes heartbeats to TUIDemoSub.
+  - name: TUIDemoOrch
+    enabled: true

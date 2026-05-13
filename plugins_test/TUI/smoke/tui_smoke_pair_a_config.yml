@@ -1,0 +1,37 @@
+# Node A (publisher side) config for `tui_smoke_pair.py`. Spawned by
+# `tui_smoke_node.py` as a subprocess with its own console + dashboard.
+#
+# Generates the cross-node event traffic: TUIDemoTimer fires demo
+# heartbeat / burst events every 3s, and TUIDemoPub exposes
+# `fire_events` as a manual trigger. Both topics are subscribed to by
+# Node B's TUIDemoSub + TUIDemoOrch.
+#
+# Networking section overridden at runtime: port / keys_dir / peers
+# all come from `tui_smoke_node.py` flags supplied by the launcher.
+general:
+  hostname: tui-pair-a
+  plugin_package: plugins_test
+  console_log_level: WARNING
+  asyncio_debug: false
+
+networking:
+  enabled: true
+  discover_nodes: true
+  direct_discoverable: true
+  auto_discoverable: true
+  heartbeat_interval: 5
+  lookup_interval: 30
+  liveness_timeout: 15
+
+plugins:
+  # TUI dashboard — same plugin both sides load.
+  - name: TUI
+    enabled: true
+  # Auto-fires heartbeat + burst events every 3s. Drives the visible
+  # event flow Node B reacts to.
+  - name: TUIDemoTimer
+    enabled: true
+  # Manual publisher — Open Tab in the Plugins panel, Call `fire_events`
+  # to trigger a small burst on demand.
+  - name: TUIDemoPub
+    enabled: true

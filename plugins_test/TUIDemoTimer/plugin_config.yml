@@ -1,0 +1,41 @@
+description: TUI smoke demo — fires demo events every few seconds so Live-stream is always populated without manual interaction.
+version: 0.1.0
+remote: false
+verbose_notifier: true
+arguments:
+
+events:
+  heartbeat:
+    topic: "demo.timer.heartbeat"
+    hosts: "any"
+  burst:
+    topic: "demo.timer.burst"
+    hosts: "any"
+
+endpoints:
+  status:
+    internal_name: status
+    remote: false
+    accessible_by_other_plugins: true
+    description: Report current tick count and interval
+    tags: ["demo", "timer"]
+    arguments: []
+
+  set_interval:
+    internal_name: set_interval
+    remote: false
+    accessible_by_other_plugins: true
+    description: Change the tick interval at runtime
+    tags: ["demo", "timer", "control"]
+    arguments:
+      - name: seconds
+        type: float
+        description: New interval in seconds (e.g. 1.0 for very fast)
+
+  pause:
+    internal_name: pause
+    remote: false
+    accessible_by_other_plugins: true
+    description: Pause / unpause the heartbeat (toggle)
+    tags: ["demo", "timer", "control"]
+    arguments: []

@@ -64,24 +64,24 @@ from textual.widgets import (
 # ── Import siblings ──────────────────────────────────────────────────
 import sys as _sys
 
-if "cli_dashboard.log_handler" in _sys.modules:
-    TUILogHandler = _sys.modules["cli_dashboard.log_handler"].TUILogHandler
+if "tui_dashboard.log_handler" in _sys.modules:
+    TUILogHandler = _sys.modules["tui_dashboard.log_handler"].TUILogHandler
 else:
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location(
-        "cli_dashboard.log_handler",
+        "tui_dashboard.log_handler",
         os.path.join(os.path.dirname(__file__), "log_handler.py"),
     )
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     TUILogHandler = _mod.TUILogHandler
 
-if "cli_dashboard.request_tracker" in _sys.modules:
-    RequestTracker = _sys.modules["cli_dashboard.request_tracker"].RequestTracker
+if "tui_dashboard.request_tracker" in _sys.modules:
+    RequestTracker = _sys.modules["tui_dashboard.request_tracker"].RequestTracker
 else:
     import importlib.util as _ilu2
     _spec2 = _ilu2.spec_from_file_location(
-        "cli_dashboard.request_tracker",
+        "tui_dashboard.request_tracker",
         os.path.join(os.path.dirname(__file__), "request_tracker.py"),
     )
     _mod2 = _ilu2.module_from_spec(_spec2)
@@ -167,7 +167,7 @@ Footer {
 }
 
 /* ── Config ──────────────────────────────── */
-#config-scroll { height: 1fr; }
+#config-container { height: 1fr; }
 #config-selector { height: auto; layout: horizontal; padding: 0 0 1 0; }
 #config-editor { height: 1fr; }
 #config-actions { height: auto; layout: horizontal; padding: 1 0 0 0; }
@@ -175,7 +175,7 @@ Footer {
 #config-status { padding: 0 1; }
 
 /* ── Logs ────────────────────────────────── */
-#logs-scroll { height: 1fr; }
+#logs-container { height: 1fr; }
 #log-filters { height: auto; layout: horizontal; padding: 0 0 1 0; }
 #log-search { width: 1fr; }
 #log-table { height: 1fr; border: round #404040; background: #252525; }
@@ -188,7 +188,6 @@ Footer {
 
 /* ── PluginCore stats ───────────────────── */
 #plugincore-section { height: auto; }
-.pc-stat-row { height: auto; layout: horizontal; padding: 0 0 1 0; }
 #top-plugins-table { height: auto; max-height: 10; border: round #404040; background: #2d2d2d; }
 
 /* ── Networking ──────────────────────────── */
@@ -216,7 +215,6 @@ Footer {
 
 /* Phase 2 — cluster summary line + counters card + event log + cert expiry. */
 #net-cluster-summary { padding: 0 1; margin: 0 0 1 0; color: #c7a06e; }
-#net-counters { padding: 1 2; }
 .net-counter-row {
     layout: grid;
     grid-size: 5 1;
@@ -253,13 +251,13 @@ Footer {
     margin: 0 0 1 0;
     height: auto;
 }
-.peer-sparkline-row { height: 6; padding: 0 0 1 0; }
+.peer-sparkline-row { height: 8; padding: 0 0 1 0; }
 .peer-sparkline-box {
     border: round #404040;
     background: #2d2d2d;
     padding: 0 1;
     margin: 0 1 0 0;
-    height: 4;
+    height: 6;
     width: 1fr;
 }
 .peer-sparkline-title { color: #9bb5a0; height: 1; }
@@ -581,6 +579,17 @@ class DashboardApp(App):
         # the per-peer RichLog by `on_peer_event_bus`; rehydration on
         # mount renders the < baseline entries. Eliminates double-renders.
         self._peer_log_baselines: dict = {}
+        # Hostnames whose per-peer log has been hydrated. The retry
+        # path of `_populate_peer_drill_widgets` re-fetches a fresh
+        # history snapshot; without this flag, events that arrived
+        # between the first (bailed) call and the retry would be
+        # written twice — once by `on_peer_event_bus` (the baseline
+        # was set on the first call so the gate passed), once by the
+        # retry's hydration.
+        self._peer_log_hydrated: set = set()
+        # Retry counter for `_populate_peer_drill_widgets` when the
+        # parent containers aren't yet queryable. Capped per-tab.
+        self._peer_drill_populate_attempts: dict = {}
 
         # Phase 5 — Settings → Networking group uptime tracker. Captures
         # `time.time()` on `is_ready` False → True transitions, AND
@@ -612,10 +621,14 @@ class DashboardApp(App):
         locks, tasks, and futures. This helper dispatches correctly.
 
         Returns None (instead of crashing) if the main loop is
-        closed/stopped — this happens during shutdown and must not
-        take down the TUI.
+        missing / closed / stopped — this happens during shutdown
+        and must not take down the TUI. Also: tests using a hand-
+        written FakePlugin pass `event_loop=None`, which makes
+        `_main_loop` None; without the explicit None guard, the
+        `.is_closed()` call would raise AttributeError and the
+        outer try/except in callers would mask a silent no-op.
         """
-        if self._main_loop.is_closed():
+        if self._main_loop is None or self._main_loop.is_closed():
             coro.close()  # prevent "coroutine never awaited" warning
             return None
         future = asyncio.run_coroutine_threadsafe(coro, self._main_loop)
@@ -781,7 +794,7 @@ class DashboardApp(App):
 
             # ── 3. Config ────────────────────────────────────────
             with TabPane("Config", id="tab-config"):
-                with Vertical(id="config-scroll"):
+                with Vertical(id="config-container"):
                     with Horizontal(id="config-selector"):
                         yield Select([], id="config-select", prompt="Select config file...")
                         yield Button("Load", id="btn-config-load", variant="primary")
@@ -794,7 +807,7 @@ class DashboardApp(App):
 
             # ── 4. Logs ──────────────────────────────────────────
             with TabPane("Logs", id="tab-logs"):
-                with Vertical(id="logs-scroll"):
+                with Vertical(id="logs-container"):
                     with Horizontal(id="log-filters"):
                         yield Select(
                             [("All Levels", "ALL"), ("DEBUG", "DEBUG"),
@@ -2004,9 +2017,13 @@ class DashboardApp(App):
                          if n.hostname in configured}
         now = time.time()
         alive = 0
+        # `node.enabled` is intentionally NOT checked here — the peers
+        # table's alive-cell logic ignores it too, and consistency
+        # between the two surfaces matters more than the philosophical
+        # question of whether a disabled-but-heartbeating peer counts.
         for host in configured:
             node = nodes_by_host.get(host)
-            if node is None or not getattr(node, "enabled", True):
+            if node is None:
                 continue
             last_hb = getattr(node, "last_heartbeat", None)
             if last_hb is None:
@@ -2307,9 +2324,12 @@ class DashboardApp(App):
                          if n.hostname in configured_hostnames}
         now = time.time()
         alive = 0
+        # Aligned with the peers-table alive-cell logic (which doesn't
+        # check `node.enabled`) — see `_format_cluster_summary` for the
+        # rationale.
         for host in configured_hostnames:
             node = nodes_by_host.get(host)
-            if node is None or not getattr(node, "enabled", True):
+            if node is None:
                 continue
             last_hb = getattr(node, "last_heartbeat", None)
             if last_hb is None:
@@ -2319,7 +2339,7 @@ class DashboardApp(App):
         return f"ON, {alive}/{len(peers)} peers alive"
 
     def on_peer_event_bus(self, topic: str, payload: dict) -> None:
-        """Bridge target for the CLI plugin's `_on_peer_event` callback.
+        """Bridge target for the TUI plugin's `_on_peer_event` callback.
 
         Called via `app.call_from_thread` → runs on the TUI loop.
 
@@ -2347,7 +2367,12 @@ class DashboardApp(App):
                 self.query_one("#net-event-log", RichLog).write(line)
             except NoMatches:
                 pass
-            # Per-peer log second — baseline-gated dedup.
+            # Per-peer log second — baseline-gated dedup. Baseline is a
+            # snapshot of the plugin's monotonic `_event_seq` taken at
+            # tab-mount time. We gate on `current_seq > baseline_seq` so
+            # the dedup keeps working after the bounded deque saturates
+            # (where the old `len()`-based check would silently lock the
+            # log permanently once `len()` plateaued at maxlen).
             host_for_log = payload.get("hostname")
             if (
                 host_for_log
@@ -2355,16 +2380,25 @@ class DashboardApp(App):
                 and host_for_log in self._peer_log_baselines
             ):
                 baseline = self._peer_log_baselines[host_for_log]
-                # `len()` on a deque is GIL-atomic; safe to read without
-                # the plugin-side `_observer_lock`. Skip if the deque
-                # hasn't grown past the hydration point — the matching
-                # event was already rendered during mount-time hydration.
                 plugin = self.plugin_instance
+                current_seq = baseline  # forces the skip on plugin error
                 try:
-                    deque_len = len(plugin._recent_peer_events)
+                    if plugin is not None and hasattr(plugin, "get_event_seq"):
+                        candidate = plugin.get_event_seq()
+                        if isinstance(candidate, int):
+                            current_seq = candidate
+                        else:
+                            # MagicMock or other non-int: fall back to len.
+                            current_seq = len(plugin._recent_peer_events)
+                    else:
+                        current_seq = len(plugin._recent_peer_events)
                 except Exception:
-                    deque_len = baseline  # forces the skip
-                if deque_len > baseline:
+                    current_seq = baseline
+                if (
+                    isinstance(current_seq, int)
+                    and isinstance(baseline, int)
+                    and current_seq > baseline
+                ):
                     tab_id = self._peer_tabs[host_for_log]
                     try:
                         self.query_one(f"#{tab_id}-eventlog",
@@ -2445,7 +2479,13 @@ class DashboardApp(App):
             return
         try:
             plugin.clear_disconnect_reason_counts()
-        except AttributeError:
+        except Exception:
+            # Broad catch — teardown races may raise more than just
+            # AttributeError (lock contention, RuntimeError if the
+            # plugin's loop was just stopped). The button is one-shot
+            # and idempotent on success, so silently dropping on
+            # error is safer than letting it crash out of a Textual
+            # event handler.
             return
         # Trigger immediate counter refresh.
         try:
@@ -2488,9 +2528,20 @@ class DashboardApp(App):
             return
 
         # Cap enforcement — FIFO evict the oldest before opening.
+        # `_close_peer_drilldown` keeps the dict entry intact when
+        # `remove_pane` fails (non-NoMatches), so re-check the cap
+        # after the await: if eviction silently bailed, refuse to
+        # open the new tab — proceeding would orphan the failed
+        # remove's pane AND push len(_peer_tabs) past the cap.
         if len(self._peer_tabs) >= self._peer_tabs_cap:
             oldest_host = next(iter(self._peer_tabs))
             await self._close_peer_drilldown(oldest_host)
+            if len(self._peer_tabs) >= self._peer_tabs_cap:
+                self.log.warning(
+                    "Peer drill-down cap reached and eviction failed; "
+                    "refusing to open drill-down for %s", hostname,
+                )
+                return
 
         tab_id = f"tab-peer-{self._sanitize_id(hostname)}"
         try:
@@ -2591,14 +2642,51 @@ class DashboardApp(App):
         """Mount the identity rows + sparkline panels + subs tables +
         in-flight panel + per-peer log + action buttons into their
         already-mounted parent containers. Runs once on tab spawn via
-        `call_after_refresh`."""
+        `call_after_refresh`.
+
+        Idempotent: re-entering after a successful populate is a no-op
+        (every mount call would otherwise hit `DuplicateIds`). Detect
+        via the identity-host row presence — that's the first child
+        mounted by populate.
+
+        Baseline + hydration are deferred to the END of the success
+        path so `_peer_log_baselines[hostname]` becomes visible only
+        AFTER hydration has finished. Test code (and `on_peer_event_bus`'s
+        baseline-dedup gate) can therefore treat that key as "the per-peer
+        log is hydrated + ready for live appends". If the parent-container
+        query bails and we retry, baseline stays unset until the retry
+        succeeds — bus events during the in-flight window simply route
+        through the main log only, not the per-peer log.
+        """
+        # Idempotency check — if the identity-host row already exists,
+        # populate already ran for this tab. Avoid DuplicateIds on a
+        # second invocation. Also clear the retry counter on this exit
+        # path for symmetry with the success path (housekeeping only —
+        # the counter is also cleaned in `_close_peer_drilldown`).
+        try:
+            self.query_one(f"#{tab_id}-identity-host", Static)
+            self._peer_drill_populate_attempts.pop(tab_id, None)
+            return
+        except NoMatches:
+            pass
+
         try:
             identity = self.query_one(f"#{tab_id}-identity", Vertical)
             sparks = self.query_one(f"#{tab_id}-sparklines", Horizontal)
             subs_row = self.query_one(f"#{tab_id}-subs-row", Horizontal)
             actions = self.query_one(f"#{tab_id}-actions", Horizontal)
         except NoMatches:
+            # Parent containers not queryable yet — retry on next
+            # refresh. Cap the retry count via a per-tab counter so a
+            # genuinely dead tab can't spin forever.
+            attempts = self._peer_drill_populate_attempts.get(tab_id, 0)
+            if attempts < 5:
+                self._peer_drill_populate_attempts[tab_id] = attempts + 1
+                self.call_after_refresh(
+                    self._populate_peer_drill_widgets, hostname, tab_id,
+                )
             return
+        self._peer_drill_populate_attempts.pop(tab_id, None)
 
         # Identity rows.
         for label, sub_id in (
@@ -2619,8 +2707,9 @@ class DashboardApp(App):
                 classes="net-row-value",
             ))
 
-        # Sparkline panels — 4 sided-by-side boxes, each with title +
-        # current rate label + the Sparkline itself.
+        # Sparkline panels — 4 side-by-side boxes, each with a title
+        # Static label + the Sparkline itself. The 60-sample rolling
+        # delta is fed in via `_refresh_one_peer_drilldown`.
         for label, sub_id in (
             ("Bytes sent / s", "bsent"),
             ("Bytes recv / s", "brecv"),
@@ -2667,20 +2756,35 @@ class DashboardApp(App):
                              id=f"{tab_id}-action-status",
                              classes="peer-action-status"))
 
-        # Phase 4b — record the baseline AT MOUNT TIME so live events
-        # appended via `on_peer_event_bus` don't duplicate the rehydrated
-        # historical block. Hydrate the log with the filtered history
-        # captured before mount.
+        # Snapshot deque + seq, hydrate, then publish the baseline.
+        # The baseline write is the LAST observable side-effect — once
+        # `_peer_log_baselines[hostname]` exists, the per-peer log is
+        # both rendered (hydration done) and ready to accept live
+        # appends from `on_peer_event_bus`. Seq is the monotonic event
+        # counter (not `len()`) so the dedup gate keeps working after
+        # the bounded deque saturates.
         plugin = self.plugin_instance
-        baseline = 0
+        history: list = []
         if plugin is not None and hasattr(plugin, "get_recent_peer_events"):
             try:
                 history = plugin.get_recent_peer_events()
-                baseline = len(history)
+            except Exception:
+                history = []
+        baseline_seq = len(history)
+        if plugin is not None and hasattr(plugin, "get_event_seq"):
+            try:
+                candidate = plugin.get_event_seq()
+                if isinstance(candidate, int):
+                    baseline_seq = candidate
+            except Exception:
+                pass
+        if hostname not in self._peer_log_hydrated:
+            try:
                 self._hydrate_peer_log(tab_id, history, hostname)
             except Exception:
                 pass
-        self._peer_log_baselines[hostname] = baseline
+            self._peer_log_hydrated.add(hostname)
+        self._peer_log_baselines[hostname] = baseline_seq
 
         # Kick a synchronous render so the operator sees data on first
         # paint instead of waiting up to 1s for the shared timer.
@@ -2760,11 +2864,15 @@ class DashboardApp(App):
                 "remove_pane failed for %s", hostname, exc_info=True,
             )
             return
-        self._peer_tabs.pop(hostname, None)
+        tab_id = self._peer_tabs.pop(hostname, None)
         self._peer_ring_buffers.pop(hostname, None)
-        # Phase 4b — drop the per-peer log baseline so a future re-open
-        # of the same host rehydrates cleanly from a fresh deque slice.
+        # Phase 4b — drop the per-peer log baseline + hydration flag so
+        # a future re-open of the same host rehydrates cleanly from a
+        # fresh deque slice.
         self._peer_log_baselines.pop(hostname, None)
+        self._peer_log_hydrated.discard(hostname)
+        if tab_id is not None:
+            self._peer_drill_populate_attempts.pop(tab_id, None)
         if not self._peer_tabs and self._peer_drill_timer is not None:
             try:
                 self._peer_drill_timer.stop()
@@ -3045,6 +3153,9 @@ class DashboardApp(App):
             self._set_peer_action_status(tab_id, "Peer not found")
             return
         fp = getattr(peer, "fingerprint", "") or ""
+        if not fp:
+            self._set_peer_action_status(tab_id, "Fingerprint unavailable")
+            return
         try:
             self.copy_to_clipboard(fp)
         except Exception:
@@ -3057,6 +3168,9 @@ class DashboardApp(App):
             self._set_peer_action_status(tab_id, "Peer not found")
             return
         pem = getattr(peer, "cert_pem", "") or ""
+        if not pem:
+            self._set_peer_action_status(tab_id, "PEM unavailable")
+            return
         try:
             self.copy_to_clipboard(pem)
         except Exception:
@@ -3103,7 +3217,11 @@ class DashboardApp(App):
             label = "config.yml (main)"
             path = self._config_files.get(label)
             if path:
-                content = Path(path).read_text(encoding="utf-8")
+                # `read_text` is blocking; off-thread it so a slow disk
+                # doesn't freeze Textual's message pump.
+                content = await asyncio.to_thread(
+                    Path(path).read_text, encoding="utf-8",
+                )
                 self.query_one("#config-editor", TextArea).load_text(content)
                 self._current_config_file = path
                 self._config_clean_hash = hashlib.md5(
@@ -3233,7 +3351,7 @@ class DashboardApp(App):
             has_bar: True when a view-mode-bar exists above the scroll
                 container (close button already in bar — skip duplicates).
         """
-        _log = logging.getLogger("CLI.TabBuilder")
+        _log = logging.getLogger("TUI.TabBuilder")
         if plugin is None:
             plugin = self.plugin_core.plugins.get(plugin_name)
         if not plugin:
@@ -3518,7 +3636,7 @@ class DashboardApp(App):
         The module is cached in sys.modules after first load; subsequent
         calls reuse the cached module and only create a fresh widget.
         """
-        _log = logging.getLogger("CLI.TabBuilder")
+        _log = logging.getLogger("TUI.TabBuilder")
         tui_path = info.get("path", "")
         class_name = info.get("class_name", "")
         if not tui_path or not class_name:
@@ -3842,7 +3960,7 @@ class DashboardApp(App):
         error = getattr(worker, "error", None)
         error_msg = str(error) if error else "Unknown error"
         worker_name = getattr(worker, "name", "?")
-        logging.getLogger("CLI.TabBuilder").error(
+        logging.getLogger("TUI.TabBuilder").error(
             "[%s] Worker '%s' crashed: %s", plugin_name, worker_name,
             error_msg, exc_info=error,
         )

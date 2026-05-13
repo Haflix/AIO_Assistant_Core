@@ -1,0 +1,74 @@
+description: TUI smoke demo orchestrator — subscribes to TUIDemoTimer events + cross-plugin to TUIDemoPub. Adds variety to the Subscriptions / Plugins-detail panes.
+version: 0.1.0
+remote: false
+verbose_notifier: true
+arguments:
+
+subscriptions:
+  on_heartbeat:
+    topic: "demo.timer.heartbeat"
+    target_access_name: handle_heartbeat
+    hosts: "any"
+  on_burst:
+    topic: "demo.timer.burst"
+    target_access_name: handle_burst
+    hosts: "any"
+  on_greeted_via_orch:
+    topic: "demo.greeted"
+    target_access_name: handle_greeted_via_orch
+    hosts: "any"
+  # Cross-plugin sub: orchestrator OWNS this sub but routes dispatches
+  # to TUIDemoSub.handle_ticked. Demonstrates the cross-plugin sub
+  # pattern in the Subs panel "Target" column.
+  cross_to_subhandler:
+    topic: "demo.timer.heartbeat"
+    target_plugin: TUIDemoSub
+    target_access_name: handle_ticked
+    hosts: "any"
+
+endpoints:
+  handle_heartbeat:
+    internal_name: handle_heartbeat
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.timer.heartbeat
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_burst:
+    internal_name: handle_burst
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.timer.burst
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  handle_greeted_via_orch:
+    internal_name: handle_greeted_via_orch
+    remote: false
+    accessible_by_other_plugins: true
+    description: Handler for demo.greeted (via orchestrator)
+    tags: ["demo", "sub", "orch"]
+    arguments:
+      - name: event
+
+  stats:
+    internal_name: stats
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns received-event counts by topic
+    tags: ["demo", "orch"]
+    arguments: []
+
+  count_stream:
+    internal_name: count_stream
+    remote: false
+    accessible_by_other_plugins: true
+    description: Streaming endpoint — yields integers 1..N as a demo
+    tags: ["demo", "orch", "stream"]
+    arguments:
+      - name: n
+        type: int
+        description: Upper bound (default 5)

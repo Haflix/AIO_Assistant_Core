@@ -1,0 +1,44 @@
+description: TUI smoke demo — declares subscriptions to TUIDemoPub events so the Subs / Catalogue / Live-stream panels show realistic dispatch metadata.
+version: 0.1.0
+remote: false
+verbose_notifier: true
+arguments:
+
+subscriptions:
+  on_greeted:
+    topic: "demo.greeted"
+    target_access_name: handle_greeted
+    hosts: "any"
+  on_ticked:
+    topic: "demo.ticked"
+    target_access_name: handle_ticked
+    hosts: "any"
+
+endpoints:
+  handle_greeted:
+    internal_name: handle_greeted
+    remote: false
+    accessible_by_other_plugins: true
+    description: Subscription handler for demo.greeted
+    tags: ["demo", "sub"]
+    arguments:
+      - name: event
+        description: The event payload from publish_event
+
+  handle_ticked:
+    internal_name: handle_ticked
+    remote: false
+    accessible_by_other_plugins: true
+    description: Subscription handler for demo.ticked
+    tags: ["demo", "sub"]
+    arguments:
+      - name: event
+        description: The event payload from publish_event
+
+  count:
+    internal_name: count
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns how many events have been received so far
+    tags: ["demo"]
+    arguments: []

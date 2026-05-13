@@ -1,4 +1,4 @@
-# Custom Plugin Tabs in the CLI Dashboard
+# Custom Plugin Tabs in the TUI Dashboard
 
 Plugins can register custom TUI panels that appear as dedicated tabs in the Dashboard.
 Two approaches are available, depending on UI complexity.

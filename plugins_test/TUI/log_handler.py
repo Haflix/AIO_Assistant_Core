@@ -42,9 +42,10 @@ class TUILogHandler(logging.Handler):
     - `display_level` filters which records are shown in the widget
       (records below this level are silently skipped in display, but stored).
 
-    Thread-aware: if emit() is called from the same thread as Textual's
-    event loop, it writes directly. From other threads, it uses
-    call_from_thread for safety.
+    Thread-safe: emit() may be called from any thread; the lock
+    protects the `_store` / `_buffer` deques and the `_dirty` flag.
+    Cross-thread Textual DOM mutations happen via the TUI thread's
+    own refresh timer reading from `_store`.
     """
 
     MAX_STORE = 5000
@@ -54,7 +55,6 @@ class TUILogHandler(logging.Handler):
         self._widget = None       # DataTable
         self._detail_widget = None  # Static for expanded detail
         self._app = None
-        self._app_thread_id = None
         self._lock = threading.Lock()
         self._buffer: deque = deque(maxlen=max_buffer)
 
@@ -83,20 +83,24 @@ class TUILogHandler(logging.Handler):
         self._displayed_seqs: list = []
 
     def attach(self, data_table_widget, detail_widget=None, app=None):
-        """Attach to a DataTable widget and flush buffered records."""
+        """Attach to a DataTable widget and flush buffered records.
+
+        Buffer-drain happens UNDER the lock so a concurrent `emit()`
+        on the logging thread cannot interleave its new-record append
+        with the buffered-record replay — that would land the new
+        record in `_store` before older buffered ones, breaking
+        timestamp/seq ordering for downstream filtering.
+        """
         with self._lock:
             self._widget = data_table_widget
             self._detail_widget = detail_widget
             self._app = app or data_table_widget.app
-            self._app_thread_id = threading.get_ident()
-            # Move buffer into store
             pending = list(self._buffer)
             self._buffer.clear()
-
-        for rec in pending:
-            self._store.append(rec)
-        self._dirty = True
-        self._needs_rebuild = True
+            for rec in pending:
+                self._store.append(rec)
+            self._dirty = True
+            self._needs_rebuild = True
 
     def detach(self):
         """Detach from the widget, re-enable buffering."""
@@ -104,7 +108,6 @@ class TUILogHandler(logging.Handler):
             self._widget = None
             self._detail_widget = None
             self._app = None
-            self._app_thread_id = None
 
     @property
     def display_level(self) -> int:

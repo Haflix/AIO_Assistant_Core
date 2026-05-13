@@ -23,7 +23,7 @@ _plugin_dir = os.path.dirname(os.path.abspath(__file__))
 def _import_sibling(module_name: str):
     path = os.path.join(_plugin_dir, f"{module_name}.py")
     spec = importlib.util.spec_from_file_location(
-        f"cli_dashboard.{module_name}", path
+        f"tui_dashboard.{module_name}", path
     )
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -38,7 +38,7 @@ TUILogHandler = _log_handler_mod.TUILogHandler
 DashboardApp = _app_mod.DashboardApp
 
 
-class CLI(Plugin):
+class TUI(Plugin):
     """Dashboard TUI plugin for the PluginCore."""
 
     @log_errors
@@ -63,6 +63,12 @@ class CLI(Plugin):
         # thread mounts the App are captured — the TUI hydrates from the
         # deque on tab mount.
         self._recent_peer_events: collections.deque = collections.deque(maxlen=500)
+        # Monotonic counter incremented on every peer event ever observed
+        # (NOT bounded by deque maxlen). The TUI's baseline-dedup gate
+        # uses this to detect "is there a new event since I snapshotted"
+        # because `len(deque)` plateaus at maxlen and stops being a
+        # reliable signal once the ring buffer wraps.
+        self._event_seq: int = 0
         self._disconnect_reason_counts: dict = {
             "normal": 0, "connection_error": 0, "rce_attempt": 0, "error": 0,
         }
@@ -87,6 +93,7 @@ class CLI(Plugin):
         # post-enable events in the same deque has no useful semantic.
         with self._observer_lock:
             self._recent_peer_events.clear()
+            self._event_seq = 0
             for k in self._disconnect_reason_counts:
                 self._disconnect_reason_counts[k] = 0
 
@@ -141,6 +148,7 @@ class CLI(Plugin):
             # the dict between observers today, so mutating here would
             # also break those future observers if they ever land.
             self._recent_peer_events.append((topic, payload))
+            self._event_seq += 1
             if topic == "_core/peer/disconnected":
                 reason = payload.get("reason", "normal")
                 if reason in self._disconnect_reason_counts:
@@ -171,6 +179,16 @@ class CLI(Plugin):
         """
         with self._observer_lock:
             return list(self._recent_peer_events)
+
+    def get_event_seq(self) -> int:
+        """Snapshot the monotonic peer-event counter.
+
+        Used by the TUI's baseline-dedup gate to detect "did a new event
+        arrive since the snapshot" — `len(_recent_peer_events)` is an
+        unreliable signal once the deque reaches its maxlen and wraps.
+        """
+        with self._observer_lock:
+            return self._event_seq
 
     def get_disconnect_reason_counts(self) -> dict:
         """Snapshot disconnect-reason counts. Returns a fresh dict; caller
@@ -248,14 +266,26 @@ class CLI(Plugin):
         finally:
             self._unmute_console()
             self._logger.info("Dashboard TUI exited")
-            # Signal shutdown on the main event loop
+            # Signal shutdown on the main event loop.
+            # `asyncio.Event.set` is not thread-safe; if the main loop
+            # is running we hop onto it. If it has already stopped,
+            # the sync fallback may raise on a closed loop — swallow
+            # since the framework is shutting down anyway and losing
+            # the signal in that narrow window is preferable to a
+            # crash on the TUI thread.
             if hasattr(self._plugin_core, "_shutdown_event"):
                 if self._main_loop and self._main_loop.is_running():
-                    self._main_loop.call_soon_threadsafe(
-                        self._plugin_core._shutdown_event.set
-                    )
+                    try:
+                        self._main_loop.call_soon_threadsafe(
+                            self._plugin_core._shutdown_event.set
+                        )
+                    except RuntimeError:
+                        pass
                 else:
-                    self._plugin_core._shutdown_event.set()
+                    try:
+                        self._plugin_core._shutdown_event.set()
+                    except RuntimeError:
+                        pass
 
     @async_log_errors
     async def on_disable(self):

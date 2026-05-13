@@ -1,0 +1,45 @@
+description: TUI smoke demo — publishes events on demand for the Live-stream tab + carries tagged endpoints for the tag-search demo.
+version: 0.1.0
+remote: false
+verbose_notifier: true
+arguments:
+
+events:
+  greeted:
+    topic: "demo.greeted"
+    hosts: "any"
+  ticked:
+    topic: "demo.ticked"
+    hosts: "any"
+  disabled_demo:
+    topic: "demo.disabled"
+    hosts: "any"
+    enabled: false
+
+endpoints:
+  fire_events:
+    internal_name: fire_events
+    remote: false
+    accessible_by_other_plugins: true
+    description: Publish a small burst of demo events into Live-stream
+    tags: ["demo", "fire"]
+    arguments: []
+
+  ping:
+    internal_name: ping
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns pong — used to demo a tagged endpoint
+    tags: ["demo", "ping"]
+    arguments: []
+
+  echo:
+    internal_name: echo
+    remote: false
+    accessible_by_other_plugins: true
+    description: Echoes the supplied message back
+    tags: ["demo"]
+    arguments:
+      - name: message
+        type: str
+        description: The message to echo

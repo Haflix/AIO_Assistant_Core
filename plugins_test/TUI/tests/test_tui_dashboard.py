@@ -1,5 +1,5 @@
 """
-Unit tests for the CLI Dashboard plugin.
+Unit tests for the TUI Dashboard plugin.
 
 Tests cover:
 - TUILogHandler: buffering, attach/detach, emit routing, thread safety, display_level,
@@ -20,12 +20,12 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
-_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from plugins_test.CLI.log_handler import TUILogHandler, LogRecord
-from plugins_test.CLI.request_tracker import RequestTracker, ActiveRequest
+from plugins_test.TUI.log_handler import TUILogHandler, LogRecord
+from plugins_test.TUI.request_tracker import RequestTracker, ActiveRequest
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -109,11 +109,11 @@ def _make_mock_plugin(
     return p
 
 def _make_dashboard_app(plugin_core=None):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     import collections as _c
     app = object.__new__(DashboardApp)
     app.plugin_core = plugin_core or _make_mock_plugin_core()
-    app.plugin_instance = MagicMock(plugin_name="CLI")
+    app.plugin_instance = MagicMock(plugin_name="TUI")
     app.log_handler = TUILogHandler()
     app._start_time = 1000000.0
     app._tracker = RequestTracker()
@@ -517,12 +517,12 @@ class TestIdRegistry:
 
 class TestSanitizeId:
     def test_special_chars_removed(self):
-        from plugins_test.CLI.app import DashboardApp
+        from plugins_test.TUI.app import DashboardApp
         result = DashboardApp._sanitize_id("AI:Plugin.v2")
         assert ":" not in result and "." not in result
 
     def test_different_names_unique(self):
-        from plugins_test.CLI.app import DashboardApp
+        from plugins_test.TUI.app import DashboardApp
         assert DashboardApp._sanitize_id("AI:Plugin") != DashboardApp._sanitize_id("AI-Plugin")
 
 class TestPluginViewGeneration:
@@ -623,10 +623,10 @@ def mock_pc():
 
 @pytest.mark.asyncio
 async def test_compose_all_tabs(mock_pc):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static, TabbedContent, DataTable, TextArea
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -657,10 +657,10 @@ async def test_compose_all_tabs(mock_pc):
 
 @pytest.mark.asyncio
 async def test_tab_switching(mock_pc):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -673,10 +673,10 @@ async def test_tab_switching(mock_pc):
 
 @pytest.mark.asyncio
 async def test_keyboard_shortcuts(mock_pc):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -690,10 +690,10 @@ async def test_keyboard_shortcuts(mock_pc):
 
 @pytest.mark.asyncio
 async def test_plugin_table_populates(mock_pc):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import DataTable
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -703,10 +703,10 @@ async def test_plugin_table_populates(mock_pc):
 
 @pytest.mark.asyncio
 async def test_log_handler_attaches(mock_pc):
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     handler = TUILogHandler()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=handler)
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         assert handler._widget is not None
@@ -715,11 +715,11 @@ async def test_log_handler_attaches(mock_pc):
 @pytest.mark.asyncio
 async def test_log_table_columns(mock_pc):
     """Log DataTable should have Time, Level, Source, Message columns."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import DataTable
 
     handler = TUILogHandler()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=handler)
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         table = app.query_one("#log-table", DataTable)
@@ -734,10 +734,10 @@ async def test_log_table_columns(mock_pc):
 async def test_settings_networking_disabled_shows_placeholder(mock_pc):
     """When networking_enabled=False, disabled placeholder is visible and
     data rows are hidden. Mock fixture defaults networking_enabled=False."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -751,7 +751,7 @@ async def test_settings_networking_disabled_shows_placeholder(mock_pc):
 async def test_settings_networking_enabled_shows_peers(mock_pc):
     """When networking_enabled=True with peers configured, data rows
     visible, B-069 rows populated, label reads 'Peers:' not 'Node IPs:'."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     # Flip on networking + provide a YAML peers list (network=None still,
@@ -769,7 +769,7 @@ async def test_settings_networking_enabled_shows_peers(mock_pc):
         },
     }
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -794,10 +794,10 @@ async def test_settings_networking_enabled_shows_peers(mock_pc):
 async def test_settings_peers_label_renamed(mock_pc):
     """The Settings Networking-group label reads 'Peers:' not 'Node IPs:'.
     Catches a missed PR4 K-3 cleanup if the rename ever regresses."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -819,10 +819,10 @@ async def test_settings_peers_label_renamed(mock_pc):
 async def test_networking_tab_disabled_shows_banner(mock_pc):
     """When networking_enabled=False, Networking tab shows the disabled
     banner and all data cards are hidden."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -837,7 +837,7 @@ async def test_networking_tab_disabled_shows_banner(mock_pc):
 async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_path):
     """Networking on + NM present: This-Node table populated, banner
     hidden, peers table renders peer rows."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static, DataTable
 
     # Build a fake NetworkManager-like object exposing only the attrs
@@ -898,7 +898,7 @@ async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_pa
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -940,7 +940,7 @@ async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_pa
 async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc, tmp_path):
     """Bootstrap card visible iff networking on + peers=[] + cert.pem
     exists on disk."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("BOOTSTRAP-CERT", encoding="utf-8")
@@ -963,7 +963,7 @@ async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc,
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -973,13 +973,13 @@ async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc,
 @pytest.mark.asyncio
 async def test_phase1_home_network_section_removed(mock_pc):
     """Phase 1: the broken `Network Nodes` section + table are gone."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.css.query import NoMatches
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -995,13 +995,13 @@ async def test_phase1_home_network_section_removed(mock_pc):
 async def test_phase1_reload_button_removed(mock_pc):
     """Phase 1: the Networking-tab Reload button + status Static are gone
     (Config tab already carries an equivalent reload control)."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.css.query import NoMatches
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1023,13 +1023,13 @@ async def test_phase1_net_stat_card_states(mock_pc):
       - enabled, network=None (pre-start / mid-rebuild) → 'ON (N/A)'
       - enabled, alive nodes → 'ON, X/Y peers alive'
     """
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     # Case 1: networking OFF
     mock_pc.networking_enabled = False
     mock_pc.network = None
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1040,7 +1040,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
     # Case 2: networking ON but NM is None
     mock_pc.networking_enabled = True
     mock_pc.network = None
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1076,7 +1076,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
 
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1089,7 +1089,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
 @pytest.mark.asyncio
 async def test_settings_peers_display_overflow_elided(mock_pc):
     """Peers display caps at 4 entries; overflow elided as '+N more'."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     mock_pc.networking_enabled = True
@@ -1105,7 +1105,7 @@ async def test_settings_peers_display_overflow_elided(mock_pc):
         },
     }
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -1118,13 +1118,13 @@ async def test_settings_peers_display_overflow_elided(mock_pc):
 
 @pytest.mark.asyncio
 async def test_phase2_plugin_observer_state():
-    """The CLI plugin maintains the recent-events deque + disconnect-reason
+    """The TUI plugin maintains the recent-events deque + disconnect-reason
     counters under `_observer_lock`. Test the snapshot helpers directly,
     not through the TUI (cheap + isolates the observer layer)."""
-    from plugins_test.CLI.plugin import CLI
+    from plugins_test.TUI.plugin import TUI
     import threading
 
-    plugin = CLI.__new__(CLI)
+    plugin = TUI.__new__(TUI)
     plugin._logger = MagicMock()
     plugin.on_load()  # initialises state
 
@@ -1170,10 +1170,58 @@ async def test_phase2_plugin_observer_state():
     }
 
 
+def test_phase2_event_seq_monotonic_past_deque_cap():
+    """Regression test for the deque-saturation bug:
+
+    `_recent_peer_events` is a bounded deque (`maxlen=500`). Once it
+    saturates, `len()` plateaus at 500 forever and stops being a
+    reliable "did a new event arrive" signal. The TUI's per-peer log
+    dedup gate uses `_event_seq` (a monotonic counter incremented on
+    every `_on_peer_event` call) for exactly this reason — `seq` keeps
+    growing past `maxlen` so subsequent bus events are still detected
+    as "new" and rendered into the per-peer log.
+
+    Without this regression test, a future refactor could reintroduce
+    a `len()`-based gate and silently break the per-peer log after
+    long-running clusters with frequent peer churn.
+    """
+    from plugins_test.TUI.plugin import TUI
+
+    plugin = TUI.__new__(TUI)
+    plugin._logger = MagicMock()
+    plugin.on_load()
+    plugin._app = None  # bridge guard short-circuits
+
+    # Saturate the deque past maxlen.
+    deque_cap = plugin._recent_peer_events.maxlen
+    assert deque_cap == 500
+    for i in range(deque_cap + 50):
+        plugin._on_peer_event(
+            "_core/peer/connected",
+            {"hostname": f"peer-{i}", "ip": "10.0.0.1", "ts": float(i)},
+        )
+
+    # deque len plateaus at maxlen, but the seq counts ALL events.
+    assert len(plugin.get_recent_peer_events()) == deque_cap
+    assert plugin.get_event_seq() == deque_cap + 50
+
+    # Snapshot baseline AFTER saturation. A subsequent event increments
+    # the seq, so the dedup gate (`current_seq > baseline`) still fires
+    # — len()-based gating would not.
+    baseline_seq = plugin.get_event_seq()
+    plugin._on_peer_event(
+        "_core/peer/connected",
+        {"hostname": "peer-new", "ip": "10.0.0.1", "ts": 999.0},
+    )
+    assert plugin.get_event_seq() == baseline_seq + 1
+    # len() did NOT change — proves the bug exists in a `len()`-based gate.
+    assert len(plugin.get_recent_peer_events()) == deque_cap
+
+
 @pytest.mark.asyncio
 async def test_phase2_cluster_summary_renders(mock_pc):
     """Cluster summary mounts and renders `N peers · X/Y alive · own_fp:...`."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     class FakePeer:
@@ -1214,7 +1262,7 @@ async def test_phase2_cluster_summary_renders(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1230,7 +1278,7 @@ async def test_phase2_cluster_summary_renders(mock_pc):
 async def test_phase2_counter_card_and_clear_button(mock_pc):
     """Counter mini-cards render disconnect-reason snapshots and the
     [Clear counters] button resets them via plugin-side state."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     # Build a real-ish plugin_instance — not MagicMock — so the observer
@@ -1249,7 +1297,7 @@ async def test_phase2_counter_card_and_clear_button(mock_pc):
                 for k in self._counts:
                     self._counts[k] = 0
         # Minimum surface DashboardApp accesses during init.
-        plugin_name = "CLI"
+        plugin_name = "TUI"
         event_loop = None
 
     plugin = FakePlugin()
@@ -1277,13 +1325,13 @@ async def test_phase2_counter_card_and_clear_button(mock_pc):
 async def test_phase2_event_log_writes_colored_lines(mock_pc):
     """Bus event → RichLog gets a colored line. Verify via
     `on_peer_event_bus` directly (which is the TUI-thread bridge target)."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import RichLog
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1321,7 +1369,7 @@ async def test_phase2_event_log_writes_colored_lines(mock_pc):
 async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
     """Cert-expiry row renders 'in N days (...)' for a synthetic cert,
     with color class matching the days-remaining band."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -1366,7 +1414,7 @@ async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1436,14 +1484,14 @@ async def test_phase4a_drill_down_opens_on_row_select(mock_pc, tmp_path):
     """Selecting a peers-table row spawns a drill-down TabPane keyed by
     hostname. Re-selecting the same row focuses the existing pane
     instead of stacking duplicates."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent, TabPane
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1467,13 +1515,13 @@ async def test_phase4a_drill_down_opens_on_row_select(mock_pc, tmp_path):
 @pytest.mark.asyncio
 async def test_phase4a_drill_down_cap_evicts_oldest(mock_pc, tmp_path):
     """The 6th distinct peer drill-down evicts the oldest open tab."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     nm, _ = _make_phase4_fake_nm(tmp_path, host_count=6)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1500,13 +1548,13 @@ async def test_phase4a_drill_down_sparkline_data_grows(mock_pc, tmp_path):
     """Each refresh tick appends a delta to the 4 throughput sparklines.
     Verify the deque length grows under repeated calls and stays
     capped at 60."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1541,13 +1589,13 @@ async def test_phase4a_drill_down_sparkline_data_grows(mock_pc, tmp_path):
 async def test_phase4a_drill_down_closes_when_networking_disabled(mock_pc, tmp_path):
     """When networking flips off mid-session, all open drill-down tabs
     are closed by the shared refresh worker."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=2)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1571,7 +1619,7 @@ async def test_phase4a_drill_down_closes_when_networking_disabled(mock_pc, tmp_p
 async def test_phase4b_subs_tables_populate_from_advert_state(mock_pc, tmp_path):
     """Inbound + outbound subs DataTables render rows from the
     networking-side advert dicts."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import DataTable
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
@@ -1607,13 +1655,17 @@ async def test_phase4b_subs_tables_populate_from_advert_state(mock_pc, tmp_path)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
         await app._open_peer_drill_down(host)
-        for _ in range(3):
+        # Poll for populate completion — `call_after_refresh` deferral
+        # under suite load can exceed 3 ticks easily.
+        for _ in range(100):
             await pilot.pause()
+            if host in app._peer_log_baselines:
+                break
         # Force a refresh tick so subs are pulled from the synthetic NM.
         app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
         await pilot.pause()
@@ -1628,7 +1680,7 @@ async def test_phase4b_subs_tables_populate_from_advert_state(mock_pc, tmp_path)
 async def test_phase4b_inflight_count_renders(mock_pc, tmp_path):
     """In-flight publishes count Static reflects the size of
     `nm._inflight_publishes[host]`."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
@@ -1639,13 +1691,16 @@ async def test_phase4b_inflight_count_renders(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
         await app._open_peer_drill_down(host)
-        for _ in range(3):
+        # Poll for populate completion under suite load.
+        for _ in range(100):
             await pilot.pause()
+            if host in app._peer_log_baselines:
+                break
         app._refresh_one_peer_drilldown(host, nm, id(nm), time.time())
         await pilot.pause()
         tab_id = app._peer_tabs[host]
@@ -1657,7 +1712,7 @@ async def test_phase4b_inflight_count_renders(mock_pc, tmp_path):
 async def test_phase4b_per_peer_log_filters_to_host(mock_pc, tmp_path):
     """Per-peer event log gets new lines only for events whose payload
     hostname matches the drill-down's peer."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import RichLog
     import collections as _c
 
@@ -1669,7 +1724,7 @@ async def test_phase4b_per_peer_log_filters_to_host(mock_pc, tmp_path):
     # `len()` works (a MagicMock plugin's `_recent_peer_events` is an
     # auto-attr that `len()` raises on, forcing the dedup to block).
     class FakePlugin:
-        plugin_name = "CLI"
+        plugin_name = "TUI"
         event_loop = None
         def __init__(self):
             import threading as _t
@@ -1690,8 +1745,12 @@ async def test_phase4b_per_peer_log_filters_to_host(mock_pc, tmp_path):
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
         await app._open_peer_drill_down(host_a)
-        for _ in range(3):
+        # Poll for populate — `call_after_refresh` under suite load can
+        # exceed even 30 ticks; using 100 to be safe.
+        for _ in range(100):
             await pilot.pause()
+            if host_a in app._peer_log_baselines:
+                break
         tab_id = app._peer_tabs[host_a]
 
         # Count writes on the per-peer log via wrapper (avoid private
@@ -1729,7 +1788,7 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
     are hydrated by `_hydrate_peer_log`; their subsequent arrival via
     `on_peer_event_bus` MUST NOT re-render them. The baseline-gated
     dedup blocks the duplicate."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import RichLog
     import collections as _c
 
@@ -1738,7 +1797,7 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
 
     # Real-ish plugin with a populated deque so hydration runs end-to-end.
     class FakePlugin:
-        plugin_name = "CLI"
+        plugin_name = "TUI"
         event_loop = None
         def __init__(self):
             import threading as _t
@@ -1765,10 +1824,9 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
         await app._open_peer_drill_down(host)
-        # `_populate_peer_drill_widgets` runs via `call_after_refresh` —
-        # poll for the baseline so the test isn't a timing race against
-        # Textual's refresh cadence.
-        for _ in range(30):
+        # Poll for populate completion (the baseline is the last write
+        # in `_populate_peer_drill_widgets`, so it's a reliable marker).
+        for _ in range(100):
             await pilot.pause()
             if host in app._peer_log_baselines:
                 break
@@ -1810,7 +1868,7 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
 async def test_phase5_settings_identity_rows_populate(mock_pc, tmp_path):
     """Identity rows + pool size in the Settings → Networking group
     render values pulled from `pc.network` when alive."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     cert_file = tmp_path / "cert.pem"
@@ -1836,7 +1894,7 @@ async def test_phase5_settings_identity_rows_populate(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1857,7 +1915,7 @@ async def test_phase5_settings_uptime_counts_on_is_ready(mock_pc):
     """`is_ready` False → True transition captures a start time; the
     rendered uptime is formatted `h:mm:ss`. An NM instance swap (id
     change) resets the timer cleanly."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     class FakeNM:
@@ -1881,7 +1939,7 @@ async def test_phase5_settings_uptime_counts_on_is_ready(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = nm1
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1920,7 +1978,7 @@ async def test_phase5_settings_uptime_counts_on_is_ready(mock_pc):
 async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
     """Secret status renders `set via config` / `set via env` / `unset`
     per priority order."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
     mock_pc.networking_enabled = True
@@ -1930,7 +1988,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
     mock_pc.networking_secret = b"from-config"
     monkeypatch.setenv("NETWORKING_SECRET", "from-env")
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1941,7 +1999,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
 
     # Case 2: env-set when config is empty.
     mock_pc.networking_secret = None
-    app2 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app2 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app2.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1953,7 +2011,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
     # Case 3: unset.
     monkeypatch.delenv("NETWORKING_SECRET", raising=False)
     mock_pc.networking_secret = None
-    app3 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app3 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app3.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1967,12 +2025,12 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
 async def test_phase5_settings_rebuild_indicator_toggles(mock_pc):
     """Rebuild indicator visible iff networking enabled AND
     pc.network is None."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2005,7 +2063,7 @@ async def test_phase5_settings_rebuild_indicator_toggles(mock_pc):
 @pytest.mark.asyncio
 async def test_phase5_settings_view_cert_button_opens_modal(mock_pc, tmp_path):
     """The Settings-tab View-cert button reuses Phase 3's modal helper."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("SETTINGS-PEM", encoding="utf-8")
@@ -2030,7 +2088,7 @@ async def test_phase5_settings_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2050,7 +2108,7 @@ async def test_phase5_settings_view_cert_button_opens_modal(mock_pc, tmp_path):
 async def test_phase4c_copy_fingerprint_invokes_clipboard(mock_pc, tmp_path):
     """`[Copy fingerprint]` calls `App.copy_to_clipboard` with the
     peer's fingerprint string."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from unittest.mock import patch
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
@@ -2058,7 +2116,7 @@ async def test_phase4c_copy_fingerprint_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2074,7 +2132,7 @@ async def test_phase4c_copy_fingerprint_invokes_clipboard(mock_pc, tmp_path):
 @pytest.mark.asyncio
 async def test_phase4c_copy_pem_invokes_clipboard(mock_pc, tmp_path):
     """`[Copy PEM]` calls `App.copy_to_clipboard` with the peer's PEM."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from unittest.mock import patch
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
@@ -2082,7 +2140,7 @@ async def test_phase4c_copy_pem_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2099,7 +2157,7 @@ async def test_phase4c_copy_pem_invokes_clipboard(mock_pc, tmp_path):
 async def test_phase4c_jump_to_config_finds_hostname_line(mock_pc, tmp_path):
     """`[Jump to config]` switches to the Config tab, loads main config,
     and moves the cursor to the line containing `hostname: <peer>`."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent, TextArea
 
     config_file = tmp_path / "config.yml"
@@ -2126,7 +2184,7 @@ async def test_phase4c_jump_to_config_finds_hostname_line(mock_pc, tmp_path):
                            "networking": {"enabled": True}}
     mock_pc.plugin_package = "plugins_test"
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2153,14 +2211,14 @@ async def test_phase4c_jump_to_config_finds_hostname_line(mock_pc, tmp_path):
 async def test_phase4a_drill_down_gone_title_on_disconnect(mock_pc, tmp_path):
     """A `_core/peer/disconnected` event for an open peer flips the tab
     label to `<host> (gone)`; a subsequent reconnect restores it."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2192,13 +2250,13 @@ async def test_phase4a_drill_down_gone_title_on_disconnect(mock_pc, tmp_path):
 async def test_phase4a_drill_down_view_cert_opens_peer_modal(mock_pc, tmp_path):
     """The drill-down `View cert` button opens a CertPEMScreen carrying
     the PEER's cert PEM + fingerprint (not the own cert)."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     nm, peers = _make_phase4_fake_nm(tmp_path, host_count=1)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2222,7 +2280,7 @@ async def test_phase4a_drill_down_view_cert_opens_peer_modal(mock_pc, tmp_path):
 async def test_phase3_view_cert_button_opens_modal(mock_pc, tmp_path):
     """Pressing the This-Node `View cert` button pushes a CertPEMScreen
     pre-populated with the own cert PEM + fingerprint."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("MOCK-OWN-PEM", encoding="utf-8")
@@ -2246,7 +2304,7 @@ async def test_phase3_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2273,7 +2331,7 @@ async def test_phase3_view_cert_button_opens_modal(mock_pc, tmp_path):
 @pytest.mark.asyncio
 async def test_phase3_close_button_dismisses(mock_pc, tmp_path):
     """The modal's [Close] button calls `dismiss()` and pops the modal."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("CLOSE-TEST-PEM", encoding="utf-8")
@@ -2297,7 +2355,7 @@ async def test_phase3_close_button_dismisses(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2317,7 +2375,7 @@ async def test_phase3_close_button_dismisses(mock_pc, tmp_path):
 async def test_phase3_double_push_guard(mock_pc, tmp_path):
     """Rapid double-press of View cert opens only ONE modal — the
     second call is a no-op while a modal is already on the stack."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("DUP-PEM", encoding="utf-8")
@@ -2341,7 +2399,7 @@ async def test_phase3_double_push_guard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2358,7 +2416,7 @@ async def test_phase3_double_push_guard(mock_pc, tmp_path):
 async def test_phase3_bootstrap_view_cert_button_opens_modal(mock_pc, tmp_path):
     """The Bootstrap card's `View bootstrap PEM` button reuses the same
     modal, populated with the same own cert PEM + fingerprint."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     cert_file = tmp_path / "cert.pem"
     cert_file.write_text("BOOTSTRAP-OWN-PEM", encoding="utf-8")
@@ -2382,7 +2440,7 @@ async def test_phase3_bootstrap_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2400,7 +2458,7 @@ async def test_phase3_bootstrap_view_cert_button_opens_modal(mock_pc, tmp_path):
 async def test_phase3_modal_copy_button_invokes_clipboard(mock_pc, tmp_path):
     """Pressing [Copy PEM] in the modal calls App.copy_to_clipboard
     with the PEM body."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
     from unittest.mock import patch
 
     cert_file = tmp_path / "cert.pem"
@@ -2425,7 +2483,7 @@ async def test_phase3_modal_copy_button_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2444,12 +2502,12 @@ async def test_phase3_modal_copy_button_invokes_clipboard(mock_pc, tmp_path):
 async def test_phase3_view_cert_when_nm_is_none(mock_pc):
     """If `pc.network` is None (pre-NM / mid-rebuild), the modal opens
     with placeholder text instead of crashing on missing `cert_path`."""
-    from plugins_test.CLI.app import DashboardApp, CertPEMScreen
+    from plugins_test.TUI.app import DashboardApp, CertPEMScreen
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2466,12 +2524,12 @@ async def test_phase3_view_cert_when_nm_is_none(mock_pc):
 @pytest.mark.asyncio
 async def test_phase2_disable_hides_all_new_cards(mock_pc):
     """Mid-session networking flip from ON → OFF hides every new card."""
-    from plugins_test.CLI.app import DashboardApp
+    from plugins_test.TUI.app import DashboardApp
 
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="CLI"),
+    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
