@@ -213,3 +213,14 @@ backups/
 
 # Config files — local user copy. Copy config.example.yml to config.yml and edit.
 config.yml
+
+# Vendored Textual source — pulled locally for API verification during
+# reviewer cycles; production runtime uses `pip install textual`.
+plugins_test/TUI/textual/
+
+# TUI smoke-harness generated identity (cert.pem / key.pem). The harness
+# auto-creates these on first run via the same `_load_or_generate_identity`
+# path the production NetworkManager uses, so a fresh clone bootstraps
+# cleanly. Tracking would commit private-key material + pin per-machine
+# fingerprints into peer configs.
+_keys_tui_smoke/

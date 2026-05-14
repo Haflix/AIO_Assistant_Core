@@ -1,0 +1,13 @@
+description: TUI smoke demo — minimal "spare" plugin loaded but disabled. Shows the DISABLED phase in the Plugins table; click Enable to flip it READY live (demonstrates the _core/plugin/state_changed bus subscription).
+version: 0.1.0
+remote: false
+arguments:
+
+endpoints:
+  hello:
+    internal_name: hello
+    remote: false
+    accessible_by_other_plugins: true
+    description: Returns a greeting string
+    tags: ["demo", "spare"]
+    arguments: []
