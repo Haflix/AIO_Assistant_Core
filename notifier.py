@@ -17,7 +17,7 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 from uuid import uuid4
 
 
@@ -359,6 +359,45 @@ class TopicRegistry:
         """Look up a subscription by sub_uuid."""
         async with self._lock:
             return self._subs.get(sub_uuid)
+
+    async def set_subscription_enabled(
+        self, sub_uuid: str, enabled: bool
+    ) -> Tuple[Optional[Subscription], bool]:
+        """Toggle a subscription's enabled flag atomically inside the
+        registry lock. Returns ``(sub_or_None, changed)``:
+
+        * ``sub=None`` when ``sub_uuid`` is unknown (popped or never existed)
+        * ``changed=False`` when current state already matched (no-op)
+        * ``changed=True`` when the flag was flipped
+
+        Caller is responsible for any post-mutation broadcast / emit; this
+        method does NOT release the lock to call network code (per the
+        framework's lock-ordering rule that disallows network I/O inside
+        registry locks — see ``_get_lifecycle_lock`` in PluginCore).
+
+        The returned ``Subscription`` reference is the live registry entry;
+        callers that need to broadcast to peers can read its fields after
+        the lock has released — the dataclass is mutable, but field reads
+        are atomic at the Python attribute level, so a concurrent
+        unsubscribe between this return and the broadcast call leaves the
+        reference valid (peer just learns about an enabled state for a
+        sub that no longer exists locally; eventual consistency via
+        peer heartbeat resolves it).
+        """
+        # Coerce to bool so callers passing truthy/falsy non-bool values
+        # (e.g. 1 from a JSON deserializer) don't silently corrupt
+        # ``Subscription.enabled`` to a non-bool type. find_all's
+        # ``if not sub.enabled`` check tolerates truthy/falsy values, but
+        # downstream readers (advert protocol, TUI rendering) expect bool.
+        coerced = bool(enabled)
+        async with self._lock:
+            sub = self._subs.get(sub_uuid)
+            if sub is None:
+                return None, False
+            if sub.enabled == coerced:
+                return sub, False
+            sub.enabled = coerced
+            return sub, True
 
     async def list_local_subs(self) -> List[Subscription]:
         """Snapshot all local subs in insertion order. Used by Stage C

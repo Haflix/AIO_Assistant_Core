@@ -239,6 +239,7 @@ async def run_tests() -> int:
                     "TestBugSuite",
                     "TestHotReloadNetworkingSuite",
                     "TestInternalEventBusSuite",
+                    "TestRuntimeToggleSuite",
                 ],
                 "category": None,        # both basic and edge
                 # Don't filter by host — let matrix-expanded `.remote`

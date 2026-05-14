@@ -3909,12 +3909,18 @@ class PluginCore:
             function_name = request.target_method
 
             # B-073 Step 8 emit: request started.
+            # Phase 2a (B-080-adjacent): ``kind`` carries request.kind so
+            # observers can distinguish execute / publish_event fan-out /
+            # request_event fan-out children without correlating against
+            # _core/event/* topics. Backward-compatible — observers ignore
+            # unknown keys per the (topic, payload) contract.
             self._internal_emit(
                 "_core/request/started",
                 request_id=request.id,
                 plugin=plugin_name,
                 method=function_name,
                 author=request.author,
+                kind=request.kind,
                 ts=time.time(),
             )
 
@@ -4069,11 +4075,13 @@ class PluginCore:
                 else:
                     errored = request._future.cancelled()
                 now = time.time()
+                # Phase 2a: kind=request.kind for symmetry with /started.
                 self._internal_emit(
                     "_core/request/completed",
                     request_id=request.id,
                     latency=max(0.0, now - request.created_at),
                     error=errored,
+                    kind=request.kind,
                     ts=now,
                 )
 
@@ -6638,3 +6646,163 @@ class PluginCore:
                 except ValueError:
                     pass
         return ok
+
+    # ── Phase 2a: runtime sub/event enable-toggle API ─────────────────
+    # Twin async methods for flipping enabled flags on existing subs or
+    # events at runtime. Both emit a ``_core/<noun>/state_changed`` topic
+    # so the TUI Events tab + future tooling can react. See
+    # ``_private/tui_phase2_events_plan.md`` sections 4.2-4.4 for the
+    # detailed design + the lock-ordering rationale for splitting
+    # subscription toggle across notifier (atomic mutation under registry
+    # lock) and PluginCore (broadcast + emit outside the lock).
+
+    async def set_subscription_enabled(
+        self, sub_uuid: str, enabled: bool
+    ) -> bool:
+        """Toggle a subscription's enabled flag at runtime.
+
+        Mutation happens atomically inside ``topic_registry._lock`` via
+        ``TopicRegistry.set_subscription_enabled`` (notifier.py) which
+        returns ``(sub_or_None, changed)``. When networking is enabled
+        and ready, this method then broadcasts an add-delta to peers
+        on a True transition (peer starts advertising the sub) or a
+        remove-delta on a False transition (peer stops). Broadcasts
+        happen OUTSIDE the registry lock, per the framework's
+        lock-ordering rule (mirrored from the
+        ``subscribe_event``/``unsubscribe_event`` patterns at
+        ``PluginCore.py:6595`` + ``6626`` — see the lock-ordering
+        comment block at ``_get_lifecycle_lock`` for the
+        "no-network-I/O-under-registry-lock" invariant).
+
+        After mutation + broadcast attempt, emits
+        ``_core/subscription/state_changed`` so the Subscriptions
+        browser + Live-stream can react. Emit fires ONLY when the flag
+        actually changed (idempotent no-op call returns True without
+        emitting — observers cannot distinguish "no-op-True" from
+        "toggled-True" via the boolean return alone, but the absence of
+        an emit on no-op lets them tell).
+
+        Emit depth (per ``_internal_emit``'s ``_EMIT_DEPTH`` context
+        var, ``_MAX_EMIT_DEPTH=5``): a single toggle call adds depth=1
+        for the single ``_core/subscription/state_changed`` emit. If an
+        observer of that topic chains back into this method, the
+        nested emit observes depth=2. Any future fan-out that extends
+        this chain MUST stay clear of the depth-5 cap (see Section 12
+        stop condition in ``_private/tui_phase2_events_plan.md``).
+
+        Returns:
+            True if ``sub_uuid`` was found in the registry — covers both
+                the "toggled successfully" path and the "no-op (already
+                at target value)" path.
+            False if ``sub_uuid`` was not in the registry (pop_plugin
+                race or invalid uuid).
+
+        Broadcast failure is logged at DEBUG and NOT propagated; local
+        state mutated successfully, peer eventual-consistency via
+        heartbeat handles any peer-side drift. Mirrors existing
+        ``subscribe_event`` / ``unsubscribe_event`` semantics.
+        """
+        sub, changed = await self.topic_registry.set_subscription_enabled(
+            sub_uuid, enabled
+        )
+        if sub is None:
+            return False
+        if not changed:
+            return True  # no-op — no broadcast, no emit
+        self._logger.info(
+            "Subscription %s enabled=%s",
+            sub_uuid, enabled,
+        )
+        # Snapshot nm once. Mid-call hot-reload would otherwise leak the
+        # broadcast onto a stopped NM; consistent with the pattern used
+        # by subscribe_event / unsubscribe_event for the same reason.
+        nm = self.network
+        if (
+            getattr(self, "networking_enabled", False)
+            and nm is not None
+            and getattr(nm, "is_ready", False)
+        ):
+            try:
+                if enabled:
+                    await nm.broadcast_local_sub_added(sub)
+                else:
+                    await nm.broadcast_local_sub_removed(sub)
+            except Exception:
+                self._logger.debug(
+                    "set_subscription_enabled: broadcast failed",
+                    exc_info=True,
+                )
+        self._internal_emit(
+            "_core/subscription/state_changed",
+            sub_uuid=sub_uuid,
+            enabled=enabled,
+            ts=time.time(),
+        )
+        return True
+
+    async def set_event_enabled(
+        self, plugin_name: str, event_id: str, enabled: bool
+    ) -> bool:
+        """Toggle an event's ``enabled`` flag at runtime. Local-only —
+        events are not advertised to peers (publishers don't advertise;
+        only subscribers do).
+
+        Async despite no awaited I/O: required so the ``_internal_emit``
+        call runs on the loop thread per the observer contract
+        (sync observers must NOT be dispatched from non-loop threads —
+        ``internal_observe`` docstring at line 764 of this file). TUI
+        callers bridge via ``_run_on_main`` like for set_subscription_enabled.
+
+        Emits ``_core/event/state_changed`` so the Events catalogue +
+        Live-stream can react. Emit fires only on actual state change
+        (idempotent no-op returns True without emitting).
+
+        Idempotency caveat — UNDER CONCURRENT TOGGLE: the
+        read-modify-write sequence ``entry.get("enabled") != bool(enabled)``
+        → ``entry["enabled"] = bool(enabled)`` is NOT atomic. Two
+        concurrent calls with the same target value can both observe
+        "needs change" between each other's writes and both emit. For
+        the intended TUI single-actor use case this race is
+        unobservable; high-concurrency callers should serialize.
+
+        TOCTOU note: a concurrent ``_pop_plugin_under_lock`` between
+        ``self.plugins.get`` and the mutation orphans the events dict.
+        The mutation succeeds on the orphan but is invisible to future
+        dispatch (``publish_event`` / ``request_event`` won't find the
+        entry — the plugin's events dict has been GC'd from the
+        framework's perspective). The emit fires correctly to other
+        observers, but the popped plugin's own observers were already
+        cleared by ``_unobserve_plugin`` at pop time, so they won't see
+        the emit either. Accepted because: (a) operator clicked toggle
+        on an event they could see — pop is rare in normal use,
+        (b) guarding with plugin_lock would over-serialize a debug-only
+        path.
+
+        Returns:
+            True if the ``(plugin, event_id)`` pair exists at call time
+                (covers toggled + no-op paths).
+            False if either the plugin is not loaded or the event_id is
+                not declared on it.
+        """
+        plugin = self.plugins.get(plugin_name)
+        if plugin is None:
+            return False
+        events = getattr(plugin, "events", None) or {}
+        entry = events.get(event_id)
+        if entry is None:
+            return False
+        if bool(entry.get("enabled", True)) == bool(enabled):
+            return True  # no-op — no emit
+        entry["enabled"] = bool(enabled)
+        self._logger.info(
+            "Event %s/%s enabled=%s",
+            plugin_name, event_id, bool(enabled),
+        )
+        self._internal_emit(
+            "_core/event/state_changed",
+            plugin_name=plugin_name,
+            event_id=event_id,
+            enabled=bool(enabled),
+            ts=time.time(),
+        )
+        return True

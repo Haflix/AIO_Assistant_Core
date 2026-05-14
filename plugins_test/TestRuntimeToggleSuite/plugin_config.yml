@@ -1,0 +1,36 @@
+description: Phase 2a — TestRuntimeToggleSuite covering runtime sub/event enable-toggle API + kind field on _core/request/*
+version: "0.1.0"
+remote: false
+arguments:
+events:
+  runtime_toggle_event:
+    topic: "trts/runtime_toggle"
+    hosts: "local"
+subscriptions:
+  runtime_toggle_dispatch_sub:
+    topic: "trts/runtime_toggle"
+    target_access_name: handle_runtime_toggle_event
+    hosts: "local"
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run the runtime-toggle suite
+    arguments:
+      - name: category
+        description: 'basic | edge | null'
+      - name: host
+        description: 'local | remote | null'
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive
+
+  handle_runtime_toggle_event:
+    internal_name: handle_runtime_toggle_event
+    remote: false
+    accessible_by_other_plugins: true
+    description: No-op handler used as YAML-declared sub target for dispatch tests
+    arguments:
+      - name: event

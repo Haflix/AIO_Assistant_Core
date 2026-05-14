@@ -102,6 +102,11 @@ plugins:
     enabled: true
     path: ./plugins_test/TestInternalEventBusSuite
 
+  # Phase 2a runtime sub/event toggle API regression suite + kind= field guard
+  - name: TestRuntimeToggleSuite
+    enabled: true
+    path: ./plugins_test/TestRuntimeToggleSuite
+
   # PR2 fixture plugins — loaded on-demand by TestPR2Suite (§5.4 idiom).
   # enabled:false so they don't auto-start at test framework boot.
   - name: TestPR2Fixture
