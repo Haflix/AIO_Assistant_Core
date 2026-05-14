@@ -682,7 +682,8 @@ async def test_keyboard_shortcuts(mock_pc):
         tabs = app.query_one("#main-tabs", TabbedContent)
         for key, expected in [("2", "tab-plugins"), ("3", "tab-config"),
                               ("4", "tab-logs"), ("5", "tab-networking"),
-                              ("6", "tab-settings"), ("1", "tab-home")]:
+                              ("6", "tab-events"),  # Phase 2b
+                              ("7", "tab-settings"), ("1", "tab-home")]:
             await pilot.press(key)
             await pilot.pause()
             assert tabs.active == expected
@@ -2546,3 +2547,1525 @@ async def test_phase2_disable_hides_all_new_cards(mock_pc):
         assert app.query_one("#net-counters").display is False
         assert app.query_one("#net-event-log").display is False
         assert app.query_one("#net-disabled-banner").display is True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2b — Events tab (Subs / Catalogue / Live-stream)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Test structure mirrors plan Section 6 — 37 cases covering:
+#   #1     compose
+#   #2-12  Subs browser
+#   #13-16 Events catalogue
+#   #17-22 Live-stream observer pipeline (assert against plugin buffer,
+#          NOT the rendered DataTable — see plan cycle 4 H2)
+#   #23-30 Live-stream UI (filters, debounce, clear, gating, burst, atomic)
+#   #31    Observer cleanup on disable
+#   #32-33 Outer-tab scoping + filter persistence
+#   #34    _run_on_main None-return toast
+#   #52    _run_on_main False-return toast
+#   #53    _outer_is_events flips back on Home activation
+#   #57    No-op toggle behavior (no toast — emit-fires-on-change locks
+#          this via #56 in test_application.py; the TUI side just
+#          relies on the wrapper returning True without crashing)
+
+
+from unittest.mock import patch as _phase2b_patch
+
+
+def _make_phase2b_subscription(
+    *,
+    sub_uuid: str,
+    topic_pattern: str,
+    plugin_name: str,
+    plugin_uuid: str = "",
+    target_plugin: str = None,
+    target_access_name: str = "handler",
+    target_plugin_uuid: str = None,
+    hosts="any",
+    blocked_hosts=None,
+    authors=None,
+    blocked_authors=None,
+    enabled: bool = True,
+    declared_id: str = None,
+):
+    """Build a Subscription-shaped MagicMock for `list_local_subs` mock."""
+    sub = MagicMock()
+    sub.sub_uuid = sub_uuid
+    sub.topic_pattern = topic_pattern
+    sub.plugin_name = plugin_name
+    sub.plugin_uuid = plugin_uuid or f"{plugin_name}-uuid"
+    sub.target_plugin = target_plugin or plugin_name
+    sub.target_access_name = target_access_name
+    sub.target_plugin_uuid = target_plugin_uuid
+    sub.hosts = hosts
+    sub.blocked_hosts = blocked_hosts
+    sub.authors = authors
+    sub.blocked_authors = blocked_authors
+    sub.enabled = enabled
+    sub.declared_id = declared_id
+    return sub
+
+
+def _install_phase2b_pc(mock_pc, *, subs=None, events_by_plugin=None,
+                       set_sub_result=True, set_evt_result=True):
+    """Patch a `mock_pc` with the Phase 2b API surface — topic_registry +
+    set_subscription_enabled + set_event_enabled. `events_by_plugin` is
+    a {plugin_name: {event_id: {topic, hosts, blocked_hosts, enabled}}}
+    map injected onto the plugin objects' `events` attribute.
+    """
+    subs = list(subs or [])
+
+    async def _list_local_subs():
+        return list(subs)
+
+    mock_pc.topic_registry = MagicMock()
+    mock_pc.topic_registry.list_local_subs = _list_local_subs
+    mock_pc.set_subscription_enabled = AsyncMock(return_value=set_sub_result)
+    mock_pc.set_event_enabled = AsyncMock(return_value=set_evt_result)
+    mock_pc.internal_observe = MagicMock()
+    mock_pc.internal_unobserve = MagicMock(return_value=True)
+    if events_by_plugin:
+        for pname, events_map in events_by_plugin.items():
+            p = mock_pc.plugins.get(pname)
+            if p is not None:
+                p.events = events_map
+
+
+def _make_phase2b_plugin_instance(name="TUI"):
+    """A plugin_instance that satisfies DashboardApp + survives
+    `_run_on_main`'s `is_closed()` guard. We patch `_run_on_main` to
+    await directly in tests that need real coroutine resolution.
+    """
+    plugin = MagicMock(plugin_name=name)
+    plugin.plugin_uuid = "tui-uuid"
+    plugin.event_loop = MagicMock()
+    return plugin
+
+
+async def _patch_run_on_main_passthrough(app):
+    """Replace `_run_on_main` with a direct-await passthrough for tests
+    where we WANT the registry call to succeed inside the test loop.
+    """
+    async def _passthrough(coro, timeout=30.0):
+        return await coro
+    app._run_on_main = _passthrough  # type: ignore[method-assign]
+
+
+# ── #1 — compose ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_events_tab_renders(mock_pc):
+    """Events tab + 3 inner sub-tabs compose."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable, Static
+
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Outer Events tab.
+        outer_tabs = app.query_one("#main-tabs", TabbedContent)
+        outer_tabs.active = "tab-events"
+        await pilot.pause()
+        assert outer_tabs.active == "tab-events"
+
+        # Inner TabbedContent.
+        inner = app.query_one("#events-tabs", TabbedContent)
+        for inner_id in ("events-tab-subs", "events-tab-cat", "events-tab-live"):
+            inner.active = inner_id
+            await pilot.pause()
+            assert inner.active == inner_id
+
+        # Three tables present.
+        app.query_one("#events-subs-table", DataTable)
+        app.query_one("#events-cat-table", DataTable)
+        app.query_one("#events-live-table", DataTable)
+
+        # Counter widgets present.
+        app.query_one("#events-subs-counter", Static)
+        app.query_one("#events-cat-counter", Static)
+        app.query_one("#events-live-counter", Static)
+
+
+# ── #2-12 — Subs browser ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_populates_from_registry(mock_pc):
+    """list_local_subs returns 3 subs, all 3 land in the table with
+    correct Type column (YAML vs runtime)."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import DataTable, TabbedContent
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="uuid-A", topic_pattern="msgs/foo",
+            plugin_name="PluginA", declared_id="declared-a",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="uuid-B", topic_pattern="msgs/bar",
+            plugin_name="PluginB", declared_id="declared-b",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="uuid-C", topic_pattern="runtime/baz",
+            plugin_name="PluginA", declared_id=None,
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        await pilot.pause()
+        await pilot.pause()
+        # Worker has now run via the activation handler.
+        table = app.query_one("#events-subs-table", DataTable)
+        # Wait a couple ticks for the worker.
+        for _ in range(5):
+            if table.row_count == 3:
+                break
+            await pilot.pause()
+        assert table.row_count == 3
+        # Type column index = 6 (Topic / Owner / Target / Hosts /
+        # Authors / Enabled / Type / sub_uuid).
+        rendered = app._subs_rendered_rows
+        types = [r["declared_kind"] for r in rendered]
+        assert types.count("YAML") == 2
+        assert types.count("runtime") == 1
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_filter_by_plugin(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Select, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="u1", topic_pattern="a/b",
+            plugin_name="PluginA", declared_id="x",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u2", topic_pattern="c/d",
+            plugin_name="PluginB", declared_id="y",
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 2:
+                break
+        sel = app.query_one("#events-subs-filter-plugin", Select)
+        sel.value = "PluginA"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        assert app.query_one("#events-subs-table", DataTable).row_count == 1
+        # Only PluginA visible.
+        assert all(r["plugin_name"] == "PluginA" for r in app._subs_rendered_rows)
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_filter_by_topic_substring(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="u1", topic_pattern="msgs/foo", plugin_name="A",
+            declared_id="x",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u2", topic_pattern="msgs/bar", plugin_name="A",
+            declared_id="y",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u3", topic_pattern="other/baz", plugin_name="A",
+            declared_id="z",
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 3:
+                break
+        topic_inp = app.query_one("#events-subs-filter-topic", Input)
+        topic_inp.value = "msgs"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 2:
+                break
+        assert app.query_one("#events-subs-table", DataTable).row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_filter_by_hostname(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="u1", topic_pattern="a", plugin_name="A",
+            declared_id="x", hosts="peer-one",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u2", topic_pattern="b", plugin_name="A",
+            declared_id="y", hosts="peer-two",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u3", topic_pattern="c", plugin_name="A",
+            declared_id="z", hosts="any",
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        host_inp = app.query_one("#events-subs-filter-hostname", Input)
+        host_inp.value = "peer-one"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        assert app.query_one("#events-subs-table", DataTable).row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_filter_by_sub_uuid_substring(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="abc12345", topic_pattern="a", plugin_name="A",
+            declared_id="x",
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="def67890", topic_pattern="b", plugin_name="A",
+            declared_id="y",
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        uuid_inp = app.query_one("#events-subs-filter-uuid", Input)
+        uuid_inp.value = "def"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        assert app.query_one("#events-subs-table", DataTable).row_count == 1
+        assert app._subs_rendered_rows[0]["sub_uuid"].startswith("def")
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_enabled_only(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Checkbox, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid="u1", topic_pattern="a", plugin_name="A",
+            declared_id="x", enabled=True,
+        ),
+        _make_phase2b_subscription(
+            sub_uuid="u2", topic_pattern="b", plugin_name="A",
+            declared_id="y", enabled=False,
+        ),
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        cb = app.query_one("#events-subs-filter-enabled-only", Checkbox)
+        cb.value = True
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        assert app.query_one("#events-subs-table", DataTable).row_count == 1
+        assert app._subs_rendered_rows[0]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_counter_updates(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, Static, TabbedContent, DataTable
+
+    subs = [
+        _make_phase2b_subscription(
+            sub_uuid=f"u{i}", topic_pattern=f"t/{i}", plugin_name="A",
+            declared_id=f"d{i}",
+        ) for i in range(4)
+    ]
+    _install_phase2b_pc(mock_pc, subs=subs)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 4:
+                break
+        counter = app.query_one("#events-subs-counter", Static).content
+        assert "4 / 4" in counter
+        inp = app.query_one("#events-subs-filter-topic", Input)
+        inp.value = "t/1"
+        for _ in range(5):
+            await pilot.pause()
+            if "1 / 4" in app.query_one("#events-subs-counter", Static).content:
+                break
+        assert "1 / 4" in app.query_one("#events-subs-counter", Static).content
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_toggle_via_e_key(mock_pc):
+    """Press `e` with focus on the subs table → wrapper called with
+    flipped value; row re-renders with new state on bus refresh."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="uuid-X", topic_pattern="t", plugin_name="A",
+        declared_id="x", enabled=True,
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub])
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        await pilot.press("e")
+        for _ in range(5):
+            await pilot.pause()
+        mock_pc.set_subscription_enabled.assert_awaited()
+        called_args = mock_pc.set_subscription_enabled.await_args.args
+        assert called_args[0] == "uuid-X"
+        assert called_args[1] is False  # flipped from True
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_copy_uuid_via_c_key(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="uuid-COPY-ME", topic_pattern="t", plugin_name="A",
+        declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub])
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        with _phase2b_patch.object(app, "copy_to_clipboard") as mock_copy:
+            await pilot.press("c")
+            await pilot.pause()
+            mock_copy.assert_called_once_with("uuid-COPY-ME")
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_detail_modal_opens_on_enter(mock_pc):
+    from plugins_test.TUI.app import DashboardApp, SubscriptionDetailScreen
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="uuid-DETAIL", topic_pattern="t", plugin_name="A",
+        declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub])
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        for _ in range(5):
+            await pilot.pause()
+        modal = next(
+            (s for s in app.screen_stack
+             if isinstance(s, SubscriptionDetailScreen)),
+            None,
+        )
+        assert modal is not None
+        assert modal._sub["sub_uuid"] == "uuid-DETAIL"
+
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_toggle_on_popped_plugin_uuid(mock_pc):
+    """Wrapper returns False (uuid not in registry) → warning toast,
+    set_subscription_enabled returned False as the mock."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="uuid-GONE", topic_pattern="t", plugin_name="A",
+        declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=False)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    notified = []
+
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        with _phase2b_patch.object(app, "notify",
+                                  side_effect=lambda *a, **k: notified.append((a, k))):
+            await pilot.press("e")
+            for _ in range(5):
+                await pilot.pause()
+        assert any("no longer exists" in str(c[0]) for c in notified)
+
+
+# ── #13-16 — Events catalogue ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_events_catalogue_populates(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    _install_phase2b_pc(
+        mock_pc,
+        events_by_plugin={
+            "PluginA": {
+                "evt1": {
+                    "topic": "msgs/foo", "hosts": "local",
+                    "blocked_hosts": None, "enabled": True,
+                },
+                "evt2": {
+                    "topic": "msgs/bar", "hosts": "local",
+                    "blocked_hosts": None, "enabled": False,
+                },
+            },
+        },
+    )
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-cat"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-cat-table", DataTable).row_count == 2:
+                break
+        assert app.query_one("#events-cat-table", DataTable).row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_phase2b_events_catalogue_runtime_placeholder_highlight(mock_pc):
+    """Topic with `{user_id}` renders with yellow markup applied AFTER
+    escape. A topic containing `[red]inject[/]` cannot inject formatting.
+    """
+    from plugins_test.TUI.app import DashboardApp
+
+    rendered = DashboardApp._render_topic_with_placeholders("msgs/{user_id}/x")
+    assert "[yellow]{user_id}[/]" in rendered
+
+    injected = DashboardApp._render_topic_with_placeholders(
+        "msgs/[red]inject[/]/{var}"
+    )
+    # `[red]inject[/]` becomes `\[red]inject\[/]` after rich escape so
+    # it can never render as red. `{var}` survives the escape pass
+    # since it contains no `[`/`]`, then gets wrapped in yellow tags.
+    assert "\\[red]inject\\[/]" in injected
+    assert "[yellow]{var}[/]" in injected
+
+
+@pytest.mark.asyncio
+async def test_phase2b_events_catalogue_toggle_via_e_key(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    _install_phase2b_pc(
+        mock_pc,
+        events_by_plugin={
+            "PluginA": {
+                "evt1": {
+                    "topic": "msgs/foo", "hosts": "local",
+                    "blocked_hosts": None, "enabled": True,
+                },
+            },
+        },
+    )
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-cat"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-cat-table", DataTable).row_count == 1:
+                break
+        table = app.query_one("#events-cat-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        await pilot.press("e")
+        for _ in range(5):
+            await pilot.pause()
+        mock_pc.set_event_enabled.assert_awaited()
+        args = mock_pc.set_event_enabled.await_args.args
+        assert args[0] == "PluginA"
+        assert args[1] == "evt1"
+        assert args[2] is False  # flipped from True
+
+
+@pytest.mark.asyncio
+async def test_phase2b_events_catalogue_idempotent_toggle(mock_pc):
+    """set_event_enabled returns True for both toggle and no-op. The
+    wrapper distinguishes them via the row's `enabled` flag — repeated
+    presses produce repeated calls (the wrapper does not pre-coalesce);
+    framework-side dedup is what enforces no extra emit."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    _install_phase2b_pc(
+        mock_pc,
+        events_by_plugin={
+            "PluginA": {
+                "evt1": {
+                    "topic": "msgs/foo", "hosts": "local",
+                    "blocked_hosts": None, "enabled": True,
+                },
+            },
+        },
+    )
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-cat"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-cat-table", DataTable).row_count == 1:
+                break
+        table = app.query_one("#events-cat-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        # First press: True → False. Second press without refresh:
+        # the row's `enabled` is still True locally (no bus emit
+        # because mock_pc.set_event_enabled doesn't fire one). So
+        # second press would re-send `False`. We assert both calls
+        # were sent.
+        await pilot.press("e")
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+        assert mock_pc.set_event_enabled.await_count == 2
+
+
+# ── #17-22 — Live-stream observer pipeline ──────────────────────────────
+
+def _make_phase2b_real_plugin():
+    """Build a real-ish TUI plugin instance for observer tests.
+    Bypasses on_enable + threading + log handler attach by calling
+    `__new__` + manual state init (mirrors how the existing Phase 2
+    plugin tests build one).
+
+    `event_loop` is set to None so DashboardApp's `_run_on_main`
+    safely short-circuits — tests calling `_flush_live_events`
+    directly don't need cross-loop dispatch. Also stamp
+    `plugin_uuid` so the app's observer-registration loop in
+    `on_mount` has a uuid to bind against.
+    """
+    from plugins_test.TUI.plugin import TUI
+    plugin = TUI.__new__(TUI)
+    plugin._logger = MagicMock()
+    plugin.on_load()
+    plugin._app = None
+    plugin.event_loop = None
+    plugin.plugin_name = "TUI"
+    plugin.plugin_uuid = "tui-uuid"
+    return plugin
+
+
+def test_phase2b_live_stream_observes_published():
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/event/published", {
+        "publisher": "PluginA", "topic": "msgs/foo",
+        "target_count": 3, "ts": 100.0,
+    })
+    rows, seq = plugin.get_live_events_since(0)
+    assert seq == 1
+    assert len(rows) == 1
+    assert "▶ pub" in rows[0]["type_label"]
+    assert rows[0]["topic"] == "msgs/foo"
+    assert rows[0]["publisher"] == "PluginA"
+    assert "target_count=3" in rows[0]["detail"]
+
+
+def test_phase2b_live_stream_observes_requested():
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/event/requested", {
+        "publisher": "PluginB", "topic": "ask/me",
+        "target_count": 1, "ts": 200.0,
+    })
+    rows, _ = plugin.get_live_events_since(0)
+    assert len(rows) == 1
+    assert "? req" in rows[0]["type_label"]
+
+
+def test_phase2b_live_stream_observes_stream_lifecycle():
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/event/streamed", {
+        "publisher": "X", "topic": "s/t",
+        "phase": "first_chunk", "ts": 300.0,
+    })
+    plugin._on_bus_event("_core/event/streamed", {
+        "publisher": "X", "topic": "s/t",
+        "phase": "ended", "ts": 301.0,
+    })
+    rows, _ = plugin.get_live_events_since(0)
+    assert len(rows) == 2
+    labels = [r["type_label"] for r in rows]
+    assert any("» first" in l for l in labels)
+    assert any("« end" in l for l in labels)
+
+
+def test_phase2b_live_stream_observes_sub_toggle():
+    """sub-toggle row appears with enabled flag visible in Detail."""
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/subscription/state_changed", {
+        "sub_uuid": "uuid-abc123def", "enabled": False, "ts": 400.0,
+    })
+    plugin._on_bus_event("_core/subscription/state_changed", {
+        "sub_uuid": "uuid-abc123def", "enabled": True, "ts": 401.0,
+    })
+    rows, _ = plugin.get_live_events_since(0)
+    assert len(rows) == 2
+    assert all("~ sub" in r["type_label"] for r in rows)
+    assert "enabled=False" in rows[0]["detail"]
+    assert "enabled=True" in rows[1]["detail"]
+
+
+def test_phase2b_live_stream_observes_event_toggle():
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/event/state_changed", {
+        "plugin_name": "PluginA", "event_id": "evt1",
+        "enabled": False, "ts": 500.0,
+    })
+    plugin._on_bus_event("_core/event/state_changed", {
+        "plugin_name": "PluginA", "event_id": "evt1",
+        "enabled": True, "ts": 501.0,
+    })
+    rows, _ = plugin.get_live_events_since(0)
+    assert len(rows) == 2
+    assert all("~ evt" in r["type_label"] for r in rows)
+    assert "PluginA/evt1" in rows[0]["detail"]
+
+
+def test_phase2b_live_stream_unknown_phase_falls_through():
+    """Future phase value lands as `stream:unknown` rather than
+    silently dropping (plan cycle 1 L1)."""
+    plugin = _make_phase2b_real_plugin()
+    plugin._on_bus_event("_core/event/streamed", {
+        "publisher": "X", "topic": "s/t",
+        "phase": "future_value", "ts": 600.0,
+    })
+    rows, _ = plugin.get_live_events_since(0)
+    assert len(rows) == 1
+    assert rows[0]["type_label"] == "stream:unknown"
+
+
+# ── #23-30 — Live-stream UI ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_live_stream_filter_topic(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, TabbedContent, DataTable
+
+    _install_phase2b_pc(mock_pc)
+    # Real plugin instance so `get_live_events_since` returns the
+    # expected `(list, int)` tuple — MagicMock returns a MagicMock
+    # which trips the flush's defensive `except Exception: return`.
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_real_plugin(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        # Activate Live-stream tab.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-live"
+        await pilot.pause()
+        # Programmatic `.active=` doesn't deterministically dispatch
+        # the TabActivated message inside the same `pause()` window.
+        # Force the visibility flags directly so the flush actually
+        # renders — the activation handler logic is tested separately
+        # by test_phase2b_outer_is_events_clears_on_home_activation.
+        app._outer_is_events = True
+        app._inner_is_live = True
+        # Inject events directly into the rendered-rows cache so the
+        # test doesn't depend on the plugin instance.
+        app._live_rendered_rows = [
+            {"ts": 100.0, "topic_raw": "_core/event/published",
+             "type_label": "[green]▶ pub[/]",
+             "topic": "msgs/foo", "publisher": "X", "detail": "target_count=1",
+             "_seq": 1},
+            {"ts": 101.0, "topic_raw": "_core/event/published",
+             "type_label": "[green]▶ pub[/]",
+             "topic": "other/bar", "publisher": "X", "detail": "target_count=1",
+             "_seq": 2},
+        ]
+        app._live_filter_dirty = True
+        app._flush_live_events()
+        await pilot.pause()
+        assert app.query_one("#events-live-table", DataTable).row_count == 2
+        inp = app.query_one("#events-live-filter-topic", Input)
+        inp.value = "msgs"
+        # Same as the type-checkbox test: set dirty flag explicitly
+        # so we don't depend on Input.Changed message-queue timing.
+        app._live_filter_dirty = True
+        app._flush_live_events()
+        await pilot.pause()
+        assert app.query_one("#events-live-table", DataTable).row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_phase2b_live_stream_filter_type_checkboxes(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Checkbox, TabbedContent, DataTable
+
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_real_plugin(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-live"
+        await pilot.pause()
+        app._outer_is_events = True
+        app._inner_is_live = True
+        app._live_rendered_rows = [
+            {"ts": 100.0, "topic_raw": "_core/event/published",
+             "type_label": "[green]▶ pub[/]",
+             "topic": "a", "publisher": "X", "detail": "",
+             "_seq": 1},
+            {"ts": 101.0, "topic_raw": "_core/event/requested",
+             "type_label": "[yellow]? req[/]",
+             "topic": "b", "publisher": "X", "detail": "",
+             "_seq": 2},
+        ]
+        app._live_filter_dirty = True
+        app._flush_live_events()
+        await pilot.pause()
+        assert app.query_one("#events-live-table", DataTable).row_count == 2
+        # Untick `pub` checkbox. The Checkbox.Changed handler posts an
+        # async message; we set the dirty flag explicitly to avoid
+        # depending on Textual's message-queue timing in tests.
+        cb = app.query_one("#events-live-type-pub", Checkbox)
+        cb.value = False
+        app._live_filter_dirty = True
+        app._flush_live_events()
+        await pilot.pause()
+        assert app.query_one("#events-live-table", DataTable).row_count == 1
+
+
+@pytest.mark.asyncio
+async def test_phase2b_live_stream_filter_debounce(mock_pc):
+    """Rapid filter changes only produce ONE re-render per flush tick.
+
+    Cycle 6 fresh-eyes fix: previously this test only asserted that
+    `_live_filter_dirty` cleared, which would pass for a one-line
+    `_live_filter_dirty = False` body with no actual render. The
+    strengthened version counts `table.clear()` calls across multiple
+    dirty-flag toggles per single flush, falsifying the claim that
+    rapid changes don't multiply renders.
+    """
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import DataTable, TabbedContent
+
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_real_plugin(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-live"
+        await pilot.pause()
+        app._outer_is_events = True
+        app._inner_is_live = True
+        # Populate one row in the rendered cache so the flush has work.
+        app._live_rendered_rows = [
+            {"ts": 100.0, "topic_raw": "_core/event/published",
+             "type_label": "[green]▶ pub[/]",
+             "topic": "t", "publisher": "X", "detail": "",
+             "_seq": 1},
+        ]
+        # Wrap `table.clear` so we can count invocations.
+        table = app.query_one("#events-live-table", DataTable)
+        clear_calls = []
+        original_clear = table.clear
+        def _counting_clear(*a, **kw):
+            clear_calls.append(time.time())
+            return original_clear(*a, **kw)
+        table.clear = _counting_clear  # type: ignore[method-assign]
+        # Simulate rapid filter changes: set dirty 5 times, then ONE flush.
+        for _ in range(5):
+            app._live_filter_dirty = True
+        app._flush_live_events()
+        assert app._live_filter_dirty is False
+        # Exactly one render — the multiple dirty-sets coalesced.
+        assert len(clear_calls) == 1, (
+            f"expected 1 re-render, got {len(clear_calls)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_phase2b_live_stream_clear_button(mock_pc):
+    """Clear button wipes the table + resets `_live_last_seen_seq`."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    plugin = _make_phase2b_real_plugin()
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=plugin,
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Push a couple events into the plugin's buffer.
+        plugin._on_bus_event("_core/event/published", {
+            "publisher": "X", "topic": "t",
+            "target_count": 1, "ts": 100.0,
+        })
+        plugin._on_bus_event("_core/event/published", {
+            "publisher": "X", "topic": "t",
+            "target_count": 1, "ts": 101.0,
+        })
+        # Activate the live-stream sub-tab + force flush.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-live"
+        await pilot.pause()
+        app._outer_is_events = True
+        app._inner_is_live = True
+        # Invoke the Clear button's handler directly (pilot.click can
+        # raise OutOfBounds when the button isn't in the rendered
+        # viewport at the headless test size).
+        app._on_live_clear_pressed(None)
+        for _ in range(3):
+            await pilot.pause()
+        # `clear_live_events` returns the seq; app applies it.
+        assert app._live_last_seen_seq == 2
+        assert app._live_rendered_rows == []
+        assert app.query_one("#events-live-table", DataTable).row_count == 0
+
+
+@pytest.mark.asyncio
+async def test_phase2b_live_visible_gates_flush(mock_pc):
+    """Flush is a no-op when outer or inner is not Events/Live."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import DataTable
+
+    plugin = _make_phase2b_real_plugin()
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=plugin,
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Stay on Home (outer != events). Push an event.
+        plugin._on_bus_event("_core/event/published", {
+            "publisher": "X", "topic": "t",
+            "target_count": 1, "ts": 100.0,
+        })
+        # Force flush — it should observe `_outer_is_events=False`
+        # and bail without rendering.
+        app._flush_live_events()
+        await pilot.pause()
+        assert app.query_one("#events-live-table", DataTable).row_count == 0
+
+
+@pytest.mark.asyncio
+async def test_phase2b_live_visible_catchup_flush_on_reenter(mock_pc):
+    """Switch outer/inner away then back → catch-up flush renders
+    queued events."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    plugin = _make_phase2b_real_plugin()
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=plugin,
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Activate Events → Live initially (so subscribers are wired).
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-live"
+        await pilot.pause()
+        # Switch to Home.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-home"
+        await pilot.pause()
+        # Push events while hidden.
+        plugin._on_bus_event("_core/event/published", {
+            "publisher": "X", "topic": "t",
+            "target_count": 1, "ts": 100.0,
+        })
+        # Re-enter Events.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(3):
+            await pilot.pause()
+        # The catch-up flush fired on the outer-edge handler.
+        assert app.query_one("#events-live-table", DataTable).row_count >= 1
+
+
+def test_phase2b_live_stream_burst_load_caps_at_1000():
+    """Plugin deque caps at 1000."""
+    plugin = _make_phase2b_real_plugin()
+    for i in range(2000):
+        plugin._on_bus_event("_core/event/published", {
+            "publisher": "X", "topic": "t",
+            "target_count": 1, "ts": float(i),
+        })
+    rows, seq = plugin.get_live_events_since(0)
+    assert seq == 2000
+    assert len(rows) == 1000  # deque maxlen
+
+
+def test_phase2b_live_stream_get_events_since_atomic():
+    """Concurrent `_on_bus_event` from another thread + main-thread
+    `get_live_events_since` — no `RuntimeError`, no torn read.
+
+    Cycle 6 fresh-eyes fix: half the reads use a non-zero `last_seq`
+    cursor so the O(new_events) right-iteration path is also
+    exercised under contention. Previously the test always called
+    `get_live_events_since(0)`, which only walks the full deque
+    (also exercises the path consumers actually use, but not the
+    cursor-advance behaviour). Both paths share the same lock so
+    a torn read in either would surface as `RuntimeError` or a
+    `KeyError`/`TypeError` from a partially-built row dict.
+    """
+    plugin = _make_phase2b_real_plugin()
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            plugin._on_bus_event("_core/event/published", {
+                "publisher": "X", "topic": "t",
+                "target_count": 1, "ts": float(i),
+            })
+            i += 1
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    try:
+        last_seen = 0
+        for i in range(200):
+            # Alternate between full-deque reads (`last_seq=0`) and
+            # cursor-advance reads (`last_seq=last_seen`). The
+            # cursor-advance path returns rows whose `_seq` > last_seen
+            # by walking the deque from the right; verify every row
+            # respects the bound and that the returned `current_seq`
+            # monotonically increases.
+            if i % 2 == 0:
+                rows, current_seq = plugin.get_live_events_since(0)
+            else:
+                rows, current_seq = plugin.get_live_events_since(last_seen)
+                for r in rows:
+                    assert r["_seq"] > last_seen, (
+                        f"cursor breach: row _seq={r['_seq']} "
+                        f"<= last_seen={last_seen}"
+                    )
+            # `_seq` field present on every row (no torn read).
+            for r in rows:
+                assert isinstance(r["_seq"], int)
+            assert isinstance(current_seq, int)
+            assert current_seq >= last_seen
+            last_seen = current_seq
+    finally:
+        stop.set()
+        t.join(timeout=2.0)
+
+
+# ── #31 — Observer cleanup on disable ──────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_observer_cleanup_on_disable():
+    """`plugin.on_disable()` removes every observed topic from
+    `internal_observers`. Re-enable + re-disable produce the same
+    final state.
+
+    Cycle 1 review fix: this test now calls the real `on_disable`
+    coroutine (with stubbed dependencies) instead of manually
+    simulating the unregister loop. Without this, a future refactor
+    of `on_disable` that uses a different variable name (e.g.
+    `_subscribed_topics` instead of `_observed_topics`) would leave
+    a real observer leak undetected.
+    """
+    from plugins_test.TUI.plugin import TUI
+
+    # Synthetic plugin_core stub that mirrors `internal_observe`
+    # / `internal_unobserve` semantics on a plain dict so we can
+    # inspect. Also satisfies the surface `on_disable` reaches into
+    # (log handler removal happens against root logger; the TUI
+    # plugin's `_app` is None so the `app.exit()` path is skipped).
+    class StubPC:
+        def __init__(self):
+            self.main_event_loop = None
+            self.plugins_by_uuid = {}
+            self._internal_observers = {}
+        def internal_observe(self, plugin_uuid, topic, cb):
+            self._internal_observers.setdefault(topic, []).append(cb)
+        def internal_unobserve(self, plugin_uuid, topic, cb):
+            lst = self._internal_observers.get(topic, [])
+            if cb in lst:
+                lst.remove(cb)
+            if not lst:
+                self._internal_observers.pop(topic, None)
+            return True
+
+    plugin = TUI.__new__(TUI)
+    plugin._logger = MagicMock()
+    plugin._plugin_core = StubPC()
+    plugin.plugin_uuid = "tui-uuid"
+    plugin.on_load()
+    # Mirror the registration loop from `on_enable` — observer pairs
+    # the real on_enable would set up. The `internal_observe` method
+    # on the real Plugin base auto-fills the plugin_uuid, but here we
+    # bypass it by calling our stub directly. This is the
+    # registration path equivalent.
+    plugin._observed_topics = [
+        ("_core/peer/connected", plugin._on_peer_event),
+        ("_core/peer/disconnected", plugin._on_peer_event),
+        ("_core/event/published", plugin._on_bus_event),
+        ("_core/event/requested", plugin._on_bus_event),
+        ("_core/event/streamed", plugin._on_bus_event),
+        ("_core/subscription/state_changed", plugin._on_bus_event),
+        ("_core/event/state_changed", plugin._on_bus_event),
+    ]
+    for topic, cb in plugin._observed_topics:
+        plugin._plugin_core.internal_observe(
+            plugin.plugin_uuid, topic, cb,
+        )
+
+    expected = {
+        "_core/peer/connected",
+        "_core/peer/disconnected",
+        "_core/event/published",
+        "_core/event/requested",
+        "_core/event/streamed",
+        "_core/subscription/state_changed",
+        "_core/event/state_changed",
+    }
+    assert expected.issubset(
+        set(plugin._plugin_core._internal_observers.keys())
+    )
+
+    # Set up the minimal state on_disable touches before running it.
+    plugin._app = None
+    plugin._tui_thread = None
+    plugin._muted_handler = None
+    plugin._log_handler = MagicMock()
+    plugin._log_handler.detach = MagicMock()
+
+    # Patch `internal_unobserve` on the plugin instance to delegate
+    # to our stub PC's unobserve (the Plugin base's `internal_unobserve`
+    # auto-fills plugin_uuid; our stub PC has its own signature).
+    def _plugin_unobserve(topic, cb):
+        return plugin._plugin_core.internal_unobserve(
+            plugin.plugin_uuid, topic, cb,
+        )
+    plugin.internal_unobserve = _plugin_unobserve
+
+    # Call the REAL on_disable coroutine.
+    await plugin.on_disable()
+
+    # All 7 observer registrations should be cleaned up.
+    for topic in expected:
+        assert topic not in plugin._plugin_core._internal_observers, (
+            f"on_disable left observer for {topic!r} registered"
+        )
+    # And the plugin's own bookkeeping list should be empty.
+    assert plugin._observed_topics == []
+
+
+# ── #32-33 — Outer-tab scoping + filter persistence ────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_outer_tab_handler_scoping_against_nested_event(mock_pc):
+    """Switching inner tabs (events-tabs) does NOT touch the catch-all
+    config-dirty banner via the outer activation handler."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent
+
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        # Activate Events.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        await pilot.pause()
+        assert app._outer_is_events is True
+        # Switch inner tab — outer flag must stay True.
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-cat"
+        await pilot.pause()
+        assert app._outer_is_events is True
+        # Switch back to subs.
+        app.query_one("#events-tabs", TabbedContent).active = "events-tab-subs"
+        await pilot.pause()
+        assert app._outer_is_events is True
+
+
+@pytest.mark.asyncio
+async def test_phase2b_filter_persistence_across_tab_switch(mock_pc):
+    """Topic filter on Subs browser survives outer-tab roundtrip."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import Input, TabbedContent
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="u1", topic_pattern="t", plugin_name="A", declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub])
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(3):
+            await pilot.pause()
+        inp = app.query_one("#events-subs-filter-topic", Input)
+        inp.value = "marker-value"
+        await pilot.pause()
+        # Switch to Home + back.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-home"
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        await pilot.pause()
+        inp_after = app.query_one("#events-subs-filter-topic", Input)
+        assert inp_after.value == "marker-value"
+
+
+# ── #34 — _run_on_main None-return toast ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_run_on_main_none_return_shows_toast(mock_pc):
+    """When `_run_on_main` returns None (main loop missing), the toggle
+    wrapper notifies with a warning toast instead of silently no-opping."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="u1", topic_pattern="t", plugin_name="A", declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub])
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    notified = []
+
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        # Activate Events FIRST so the worker has a chance to run
+        # against the unmocked `_run_on_main`. Then patch + pre-populate
+        # AFTER, so the worker's clear doesn't wipe our row.
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(3):
+            await pilot.pause()
+        app._outer_is_events = True
+        # Now stub `_run_on_main` to return None for the toggle path.
+        async def _none_passthrough(coro, timeout=30.0):
+            coro.close()
+            return None
+        app._run_on_main = _none_passthrough  # type: ignore[method-assign]
+        # Pre-populate the rendered rows + table so the toggle has a
+        # cursor target.
+        app._subs_rendered_rows = [{
+            "topic_pattern": "t", "plugin_name": "A", "plugin_uuid": "x",
+            "target_plugin": "A", "target_access_name": "h",
+            "target_plugin_uuid": None, "target_render": ".h",
+            "hosts": None, "blocked_hosts": None, "authors": None,
+            "blocked_authors": None, "enabled": True,
+            "declared_id": "x", "declared_kind": "YAML", "sub_uuid": "u1",
+        }]
+        table = app.query_one("#events-subs-table", DataTable)
+        if table.row_count == 0:
+            table.add_row("t", "A", ".h", "", "*", "on", "YAML", "u1...")
+        # Move cursor to the first row so `_selected_sub_row` resolves.
+        table.move_cursor(row=0)
+        table.focus()
+        await pilot.pause()
+        # Call the toggle helper directly with an explicit row dict —
+        # bypasses any test-ordering / cursor-state issues with
+        # `_selected_sub_row()`. The helper's body is identical to
+        # what the @work path runs.
+        row = {
+            "topic_pattern": "t", "plugin_name": "A", "plugin_uuid": "x",
+            "target_plugin": "A", "target_access_name": "h",
+            "target_plugin_uuid": None, "target_render": ".h",
+            "hosts": None, "blocked_hosts": None, "authors": None,
+            "blocked_authors": None, "enabled": True,
+            "declared_id": "x", "declared_kind": "YAML", "sub_uuid": "u1",
+        }
+        with _phase2b_patch.object(
+            app, "notify",
+            side_effect=lambda *a, **k: notified.append((a, k)),
+        ):
+            await app._apply_subscription_toggle(row)
+        msgs = [str(c[0][0]) if c[0] else "" for c in notified]
+        assert any("main loop unavailable" in m for m in msgs), \
+            f"notified={notified!r}"
+
+
+# ── #52 — _run_on_main False-return toast ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_run_on_main_false_return_shows_toast(mock_pc):
+    """Wrapper returns False (sub_uuid not in registry) → distinct
+    toast from #34. Already validated by #12 — but plan #52 calls out
+    the explicit distinction between None (infrastructure) and False
+    (data state changed under us)."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="u-gone", topic_pattern="t", plugin_name="A",
+        declared_id="x",
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=False)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    notified = []
+
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        with _phase2b_patch.object(
+            app, "notify",
+            side_effect=lambda *a, **k: notified.append((a, k)),
+        ):
+            await pilot.press("e")
+            for _ in range(5):
+                await pilot.pause()
+        # Must be the "no longer exists" toast, NOT the "main loop
+        # unavailable" one.
+        msgs = [str(c[0]) for c in notified]
+        assert any("no longer exists" in m for m in msgs)
+        assert not any("main loop unavailable" in m for m in msgs)
+
+
+# ── #53 — _outer_is_events flips back on Home activation ───────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_outer_is_events_clears_on_home_activation(mock_pc):
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    _install_phase2b_pc(mock_pc)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        await pilot.pause()
+        assert app._outer_is_events is True
+        app.query_one("#main-tabs", TabbedContent).active = "tab-home"
+        await pilot.pause()
+        assert app._outer_is_events is False
+        # Flush is no-op while not on Events.
+        app._live_rendered_rows = [
+            {"ts": 100.0, "topic_raw": "_core/event/published",
+             "type_label": "[green]▶ pub[/]",
+             "topic": "t", "publisher": "X", "detail": "",
+             "_seq": 1},
+        ]
+        app._live_filter_dirty = True
+        app._flush_live_events()
+        await pilot.pause()
+        # Table count unchanged from 0 (Live-stream not visible).
+        # Plus we never rendered in the first place.
+        assert app.query_one("#events-live-table", DataTable).row_count == 0
+
+
+# ── #57 — No-op toggle wrapper-side behavior ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase2b_subs_browser_noop_toggle_no_crash(mock_pc):
+    """The TUI wrapper returns cleanly when the framework reports a
+    no-op (same value already set). No toast asserted here — the
+    wrapper relies on the bus emit ONLY firing on actual state change,
+    locked in framework test #56."""
+    from plugins_test.TUI.app import DashboardApp
+    from textual.widgets import TabbedContent, DataTable
+
+    sub = _make_phase2b_subscription(
+        sub_uuid="u1", topic_pattern="t", plugin_name="A", declared_id="x",
+        enabled=True,
+    )
+    _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=True)
+    app = DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+    async with app.run_test(headless=True, size=(140, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        app.query_one("#main-tabs", TabbedContent).active = "tab-events"
+        for _ in range(5):
+            await pilot.pause()
+            if app.query_one("#events-subs-table", DataTable).row_count == 1:
+                break
+        table = app.query_one("#events-subs-table", DataTable)
+        table.focus()
+        await pilot.pause()
+        await pilot.press("e")
+        for _ in range(5):
+            await pilot.pause()
+        # Wrapper was called with the flipped value (True → False).
+        called_args = mock_pc.set_subscription_enabled.await_args.args
+        assert called_args[0] == "u1"
+        assert called_args[1] is False

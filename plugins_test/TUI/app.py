@@ -361,6 +361,52 @@ Collapsible { background: transparent; padding: 0; }
 CollapsibleTitle { background: #2d2d2d; color: #9bb5a0; padding: 0 1; }
 
 RichLog { background: #1e1e1e; }
+
+/* ── Phase 2b — Events tab ───────────────────────── */
+#events-outer { height: 1fr; }
+/* TabbedContent itself fills the outer TabPane; inner TabPanes use 1fr
+   per the CLAUDE.md "no height:100% in TabPane" rule. */
+#events-tabs { height: 1fr; }
+#events-subs-body, #events-cat-body, #events-live-body { height: 1fr; }
+#events-subs-filters, #events-cat-filters, #events-live-filters,
+#events-live-types {
+    height: auto;
+    padding: 0 0 1 0;
+}
+.events-filter {
+    margin: 0 1 0 0;
+    width: auto;
+}
+#events-subs-filter-topic, #events-subs-filter-hostname,
+#events-subs-filter-uuid,
+#events-cat-filter-topic,
+#events-live-filter-topic, #events-live-filter-publisher {
+    width: 1fr;
+    min-width: 12;
+}
+#events-subs-filter-plugin, #events-cat-filter-plugin { min-width: 18; }
+.events-counter {
+    color: #808080;
+    padding: 1 0 0 1;
+    width: auto;
+}
+.events-hint { color: #808080; padding: 0 0 0 0; height: auto; }
+.events-types-label { color: #c7a06e; padding: 1 1 0 0; }
+#events-live-types Checkbox { margin: 0 1 0 0; }
+#events-live-clear-btn { margin: 0 0 0 2; }
+#events-subs-table, #events-cat-table {
+    height: 1fr;
+    min-height: 6;
+    border: round #404040;
+    background: #252525;
+}
+#events-live-table {
+    height: 1fr;
+    min-height: 6;
+    border: round #404040;
+    background: #1e1e1e;
+}
+.sub-disabled { color: #606060; }
 """
 
 
@@ -442,6 +488,165 @@ class CertPEMScreen(ModalScreen[None]):
         self.dismiss()
 
 
+class SubscriptionDetailScreen(ModalScreen[None]):
+    """Phase 2b — read-only modal showing every field of a Subscription.
+
+    The Subs browser table truncates long values; this modal renders
+    them in full. `sub_uuid` + `plugin_uuid` + `target_plugin_uuid` are
+    shown explicitly so an operator pasting from logs can verify the
+    full identity. A dedicated [c] binding copies the sub_uuid via
+    OSC 52 (same approach as `CertPEMScreen._on_copy`).
+    """
+
+    DEFAULT_CSS = """
+    SubscriptionDetailScreen {
+        align: center middle;
+    }
+    #sub-modal-body {
+        width: 96;
+        height: auto;
+        max-height: 36;
+        border: thick #c7a06e;
+        background: #252525;
+        padding: 1 2;
+    }
+    #sub-modal-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
+    .sub-modal-row { height: auto; padding: 0 0 0 0; layout: horizontal; }
+    .sub-modal-key { color: #808080; width: 22; }
+    .sub-modal-val { color: #d4d4d4; width: 1fr; }
+    #sub-modal-actions { height: auto; padding: 1 0 0 0; }
+    #sub-modal-actions Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("c", "copy_uuid", "Copy UUID", show=True),
+    ]
+
+    def __init__(self, *, sub_dict: dict) -> None:
+        super().__init__()
+        # Plain dict (NOT live Subscription) so a concurrent pop_plugin
+        # between modal-open and modal-close can't yank fields out
+        # underneath the rendered view.
+        self._sub = dict(sub_dict)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sub-modal-body"):
+            yield Static("Subscription", id="sub-modal-title")
+            for label, key in (
+                ("Topic:", "topic_pattern"),
+                ("Owner:", "plugin_name"),
+                ("Owner UUID:", "plugin_uuid"),
+                ("Target plugin:", "target_plugin"),
+                ("Target endpoint:", "target_access_name"),
+                ("Target UUID:", "target_plugin_uuid"),
+                ("Hosts:", "hosts"),
+                ("Blocked hosts:", "blocked_hosts"),
+                ("Authors:", "authors"),
+                ("Blocked authors:", "blocked_authors"),
+                ("Enabled:", "enabled"),
+                ("Type:", "declared_kind"),
+                ("Declared id:", "declared_id"),
+                ("sub_uuid:", "sub_uuid"),
+            ):
+                with Horizontal(classes="sub-modal-row"):
+                    yield Static(label, classes="sub-modal-key")
+                    yield Static(
+                        str(self._sub.get(key, "")),
+                        classes="sub-modal-val",
+                        markup=False,
+                    )
+            with Horizontal(id="sub-modal-actions"):
+                yield Button("Copy UUID", id="sub-copy")
+                yield Button("Close", id="sub-close")
+
+    @on(Button.Pressed, "#sub-copy")
+    def _on_copy(self) -> None:
+        self.action_copy_uuid()
+
+    @on(Button.Pressed, "#sub-close")
+    def _on_close(self) -> None:
+        self.dismiss()
+
+    def action_copy_uuid(self) -> None:
+        try:
+            self.app.copy_to_clipboard(str(self._sub.get("sub_uuid", "")))
+        except Exception:
+            pass
+
+
+class EventDetailScreen(ModalScreen[None]):
+    """Phase 2b — read-only modal showing every field of a declared event.
+
+    Topic is rendered with `[yellow]{var}[/]` markup highlighting on
+    runtime placeholders (same renderer the Events catalogue uses).
+    Markup escape is applied to the topic body BEFORE the yellow tags
+    so a topic accidentally containing `[red]inject[/]` cannot break
+    formatting.
+    """
+
+    DEFAULT_CSS = """
+    EventDetailScreen {
+        align: center middle;
+    }
+    #event-modal-body {
+        width: 96;
+        height: auto;
+        max-height: 28;
+        border: thick #c7a06e;
+        background: #252525;
+        padding: 1 2;
+    }
+    #event-modal-title { color: #c7a06e; text-style: bold; padding: 0 0 1 0; }
+    .event-modal-row { height: auto; padding: 0 0 0 0; layout: horizontal; }
+    .event-modal-key { color: #808080; width: 22; }
+    .event-modal-val { color: #d4d4d4; width: 1fr; }
+    #event-modal-actions { height: auto; padding: 1 0 0 0; }
+    #event-modal-actions Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=False),
+    ]
+
+    def __init__(self, *, event_dict: dict) -> None:
+        super().__init__()
+        self._event = dict(event_dict)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="event-modal-body"):
+            yield Static("Event", id="event-modal-title")
+            for label, key, plain in (
+                ("Plugin:", "plugin", True),
+                ("Event ID:", "event_id", True),
+                ("Topic:", "topic_rendered", False),
+                ("Hosts:", "hosts", True),
+                ("Blocked hosts:", "blocked_hosts", True),
+                ("Enabled:", "enabled", True),
+                ("Description:", "description", True),
+            ):
+                with Horizontal(classes="event-modal-row"):
+                    yield Static(label, classes="event-modal-key")
+                    if plain:
+                        yield Static(
+                            str(self._event.get(key, "")),
+                            classes="event-modal-val",
+                            markup=False,
+                        )
+                    else:
+                        yield Static(
+                            str(self._event.get(key, "")),
+                            classes="event-modal-val",
+                            markup=True,
+                        )
+            with Horizontal(id="event-modal-actions"):
+                yield Button("Close", id="event-close")
+
+    @on(Button.Pressed, "#event-close")
+    def _on_close(self) -> None:
+        self.dismiss()
+
+
 class QuitConfirmScreen(ModalScreen[bool]):
     """Modal confirmation dialog for quitting the dashboard."""
 
@@ -505,7 +710,8 @@ class DashboardApp(App):
         Binding("3", "tab_config", "Config"),
         Binding("4", "tab_logs", "Logs"),
         Binding("5", "tab_networking", "Networking"),
-        Binding("6", "tab_settings", "Settings"),
+        Binding("6", "tab_events", "Events"),
+        Binding("7", "tab_settings", "Settings"),
     ]
 
     def __init__(
@@ -609,6 +815,44 @@ class DashboardApp(App):
         # Single app-level 1s timer drives all open drill-down refreshes.
         # Created lazily on first open; stopped when last tab closes.
         self._peer_drill_timer = None
+
+        # ── Phase 2b — Events tab state ─────────────────────────────
+        # Outer/inner visibility flags drive Live-stream `_live_visible`.
+        # Both False by default — Home is the active tab on mount and the
+        # outer/inner handlers haven't fired yet, so a Subs/Catalogue
+        # refresh worker that fires off `on_mount` doesn't try to render
+        # against a tab that isn't visible.
+        self._outer_is_events: bool = False
+        self._inner_is_live: bool = False
+        # Cursor into the plugin-side live deque — `get_live_events_since`
+        # returns rows whose `_seq > self._live_last_seen_seq`.
+        self._live_last_seen_seq: int = 0
+        # 100ms flush timer ref — created in `on_mount`, no stop until
+        # app shutdown (cheap no-op when `_live_visible` is False or
+        # the deque is empty).
+        self._live_flush_timer = None
+        # 250ms debounce-tick timer (cycle 1 review fix — was leaked
+        # as orphan on `_start_timers` re-entry from settings-apply).
+        self._debounce_timer = None
+        # Refresh-debounce flags — set by bus observers, cleared by the
+        # debounce timer / immediate-refresh on tab activation.
+        self._subs_refresh_pending: bool = False
+        self._cat_refresh_pending: bool = False
+        # Filter-dirty flag for Live-stream: any Input/Checkbox change
+        # in the Live-stream filters sets this; the flush timer reads
+        # AND clears under no lock (same-thread mutation).
+        self._live_filter_dirty: bool = False
+        # Cached rendered rows for Live-stream so the same render isn't
+        # recomputed unless `_live_filter_dirty` or new events arrived.
+        # Stores the raw row dicts produced by `_classify_and_normalize`
+        # (each carries its own `_seq` key — no extra tuple wrapper).
+        self._live_rendered_rows: list = []
+        # Phase 2b — internal-event-bus observers registered by the app
+        # for refresh-debounce on the Subs / Catalogue tables. Mirrors
+        # the pattern in plugin.py's on_enable — register on app mount,
+        # unregister on app shutdown. Plugin uuid filled at register
+        # time so `_unobserve_plugin` cleans up if the plugin pops.
+        self._app_bus_observers: list = []
 
     # ─── Cross-loop dispatch ────────────────────────────────────────
 
@@ -948,7 +1192,164 @@ class DashboardApp(App):
                                   max_lines=200, markup=True,
                                   classes="net-card")
 
-            # ── 6. Settings ──────────────────────────────────────
+            # ── 6. Events (Phase 2b) ─────────────────────────────
+            with TabPane("Events", id="tab-events"):
+                with Vertical(id="events-outer"):
+                    with TabbedContent(id="events-tabs"):
+                        # ── Subscriptions browser ──────────────────
+                        with TabPane("Subscriptions", id="events-tab-subs"):
+                            with Vertical(id="events-subs-body"):
+                                with Horizontal(id="events-subs-filters"):
+                                    yield Select(
+                                        [("All plugins", "__all__")],
+                                        id="events-subs-filter-plugin",
+                                        value="__all__",
+                                        prompt="Plugin...",
+                                        classes="events-filter",
+                                    )
+                                    yield Input(
+                                        placeholder="Topic substring...",
+                                        id="events-subs-filter-topic",
+                                        classes="events-filter",
+                                    )
+                                    yield Input(
+                                        placeholder="Hostname substring...",
+                                        id="events-subs-filter-hostname",
+                                        classes="events-filter",
+                                    )
+                                    yield Input(
+                                        placeholder="sub_uuid substring...",
+                                        id="events-subs-filter-uuid",
+                                        classes="events-filter",
+                                    )
+                                    yield Checkbox(
+                                        "Enabled only",
+                                        value=False,
+                                        id="events-subs-filter-enabled-only",
+                                        classes="events-filter",
+                                    )
+                                    yield Static(
+                                        "Showing 0 / 0",
+                                        id="events-subs-counter",
+                                        classes="events-counter",
+                                    )
+                                yield DataTable(
+                                    id="events-subs-table",
+                                    cursor_type="row",
+                                )
+                                yield Static(
+                                    "[dim][e] Toggle  [c] Copy UUID  "
+                                    "[t] Copy topic  [Enter] Details[/dim]",
+                                    id="events-subs-hint",
+                                    classes="events-hint",
+                                    markup=True,
+                                )
+
+                        # ── Events catalogue ───────────────────────
+                        with TabPane("Catalogue", id="events-tab-cat"):
+                            with Vertical(id="events-cat-body"):
+                                with Horizontal(id="events-cat-filters"):
+                                    yield Select(
+                                        [("All plugins", "__all__")],
+                                        id="events-cat-filter-plugin",
+                                        value="__all__",
+                                        prompt="Plugin...",
+                                        classes="events-filter",
+                                    )
+                                    yield Input(
+                                        placeholder="Topic substring...",
+                                        id="events-cat-filter-topic",
+                                        classes="events-filter",
+                                    )
+                                    yield Checkbox(
+                                        "Enabled only",
+                                        value=False,
+                                        id="events-cat-filter-enabled-only",
+                                        classes="events-filter",
+                                    )
+                                    yield Static(
+                                        "Showing 0 / 0",
+                                        id="events-cat-counter",
+                                        classes="events-counter",
+                                    )
+                                yield Static(
+                                    "[dim]Yellow segments are runtime "
+                                    "placeholders (resolved at publish "
+                                    "time via topic_vars)[/dim]",
+                                    id="events-cat-legend",
+                                    classes="events-hint",
+                                    markup=True,
+                                )
+                                yield DataTable(
+                                    id="events-cat-table",
+                                    cursor_type="row",
+                                )
+                                yield Static(
+                                    "[dim][e] Toggle  [c] Copy topic  "
+                                    "[Enter] Details[/dim]",
+                                    id="events-cat-hint",
+                                    classes="events-hint",
+                                    markup=True,
+                                )
+
+                        # ── Live-stream ────────────────────────────
+                        with TabPane("Live-stream", id="events-tab-live"):
+                            with Vertical(id="events-live-body"):
+                                with Horizontal(id="events-live-filters"):
+                                    yield Input(
+                                        placeholder="Topic substring...",
+                                        id="events-live-filter-topic",
+                                        classes="events-filter",
+                                    )
+                                    yield Input(
+                                        placeholder="Publisher substring...",
+                                        id="events-live-filter-publisher",
+                                        classes="events-filter",
+                                    )
+                                    yield Static(
+                                        "Showing 0 / 0 events",
+                                        id="events-live-counter",
+                                        classes="events-counter",
+                                    )
+                                with Horizontal(id="events-live-types"):
+                                    yield Static(
+                                        "Types:",
+                                        classes="events-types-label",
+                                    )
+                                    yield Checkbox(
+                                        "pub", value=True,
+                                        id="events-live-type-pub",
+                                    )
+                                    yield Checkbox(
+                                        "req", value=True,
+                                        id="events-live-type-req",
+                                    )
+                                    yield Checkbox(
+                                        "first", value=True,
+                                        id="events-live-type-first",
+                                    )
+                                    yield Checkbox(
+                                        "end", value=True,
+                                        id="events-live-type-end",
+                                    )
+                                    yield Checkbox(
+                                        "sub", value=True,
+                                        id="events-live-type-sub",
+                                    )
+                                    yield Checkbox(
+                                        "evt", value=True,
+                                        id="events-live-type-evt",
+                                    )
+                                    yield Button(
+                                        "Clear",
+                                        id="events-live-clear-btn",
+                                    )
+                                yield DataTable(
+                                    id="events-live-table",
+                                    cursor_type="row",
+                                )
+
+            # ── 7. Settings ──────────────────────────────────────
             with TabPane("Settings", id="tab-settings"):
                 with VerticalScroll(id="settings-scroll"):
                     # TUI settings
@@ -1108,6 +1509,57 @@ class DashboardApp(App):
         except NoMatches:
             pass
 
+        # Phase 2b — Events tab columns. Eight Subs columns, five
+        # Catalogue columns, five Live-stream columns. We set the
+        # column counts here so workers can do `add_row` directly
+        # without re-defining columns each refresh.
+        try:
+            subs_t = self.query_one("#events-subs-table", DataTable)
+            subs_t.add_columns(
+                "Topic", "Owner", "Target", "Hosts", "Authors",
+                "Enabled", "Type", "sub_uuid",
+            )
+        except NoMatches:
+            pass
+        try:
+            cat_t = self.query_one("#events-cat-table", DataTable)
+            cat_t.add_columns(
+                "Plugin", "Event ID", "Topic", "Hosts", "Enabled",
+            )
+        except NoMatches:
+            pass
+        try:
+            live_t = self.query_one("#events-live-table", DataTable)
+            live_t.add_columns(
+                "Time", "Type", "Topic", "Publisher", "Detail",
+            )
+        except NoMatches:
+            pass
+
+        # Phase 2b — register the app-side bus observers (debounce flags
+        # for Subs / Catalogue refresh). The plugin owns the 5 live-stream
+        # observers; the app owns the refresh-debounce observers because
+        # the trigger is "rebuild the table" which is TUI-side state.
+        # We register them on the plugin's uuid so framework auto-cleanup
+        # via `_unobserve_plugin` fires on plugin pop.
+        try:
+            plugin_uuid = self.plugin_instance.plugin_uuid
+        except AttributeError:
+            plugin_uuid = None
+        if plugin_uuid is not None:
+            pc = self.plugin_core
+            self._app_bus_observers = [
+                ("_core/subscription/state_changed", self._on_subs_refresh_signal),
+                ("_core/event/state_changed", self._on_cat_refresh_signal),
+                ("_core/plugin/state_changed", self._on_subs_refresh_signal),
+                ("_core/plugin/state_changed", self._on_cat_refresh_signal),
+            ]
+            for topic, cb in self._app_bus_observers:
+                try:
+                    pc.internal_observe(plugin_uuid, topic, cb)
+                except Exception:
+                    pass
+
         # Populate settings info
         self._populate_settings_info()
 
@@ -1139,6 +1591,10 @@ class DashboardApp(App):
             self._log_timer.stop()
         if self._network_timer:  # Phase 1
             self._network_timer.stop()
+        if self._live_flush_timer:  # Phase 2b
+            self._live_flush_timer.stop()
+        if self._debounce_timer:  # Phase 2b
+            self._debounce_timer.stop()
         self._stats_timer = self.set_interval(self._stats_interval, self._refresh_stats_worker)
         self._plugin_timer = self.set_interval(self._plugin_interval, self._periodic_plugin_refresh)
         self._request_timer = self.set_interval(self._request_interval, self._refresh_requests_worker)
@@ -1146,6 +1602,11 @@ class DashboardApp(App):
         self._network_timer = self.set_interval(  # Phase 1
             self._network_interval, self._refresh_peers_table_worker,
         )
+        # Phase 2b — 100ms Live-stream flush + 250ms Subs/Catalogue
+        # debounce. Both are cheap no-ops when nothing changed
+        # (`_live_visible` False, or no `_*_refresh_pending` flag set).
+        self._live_flush_timer = self.set_interval(0.1, self._flush_live_events)
+        self._debounce_timer = self.set_interval(0.25, self._debounce_refresh_tick)
 
     def _periodic_plugin_refresh(self) -> None:
         try:
@@ -1212,6 +1673,25 @@ class DashboardApp(App):
 
     async def _shutdown(self) -> None:
         self.log_handler.detach()
+        # Phase 2b — explicitly unregister the app-side bus observers
+        # registered in `on_mount`. PluginCore's `_unobserve_plugin`
+        # auto-cleans on plugin pop, but app exit (e.g. user presses
+        # `q`) is independent of plugin pop. Without explicit
+        # cleanup, these observers stay registered in
+        # `pc._internal_observers` until the plugin is later popped
+        # — a leak on the app-exits-but-plugin-keeps-running path.
+        try:
+            plugin_uuid = self.plugin_instance.plugin_uuid
+        except AttributeError:
+            plugin_uuid = None
+        if plugin_uuid is not None:
+            pc = self.plugin_core
+            for topic, cb in getattr(self, "_app_bus_observers", []):
+                try:
+                    pc.internal_unobserve(plugin_uuid, topic, cb)
+                except Exception:
+                    pass
+            self._app_bus_observers = []
         await super()._shutdown()
 
     # ─── Stats refresh ───────────────────────────────────────────────
@@ -2424,6 +2904,957 @@ class DashboardApp(App):
                     tab.label = f"{host} (gone)"
             except Exception:
                 pass
+
+    # ───────────────────────────────────────────────────────────────────
+    # Phase 2b — Events tab logic (Subs / Catalogue / Live-stream)
+    # ───────────────────────────────────────────────────────────────────
+    # Layout note:
+    #   * Bus-driven debounce signals + the 250ms tick that consumes them
+    #   * Three workers: `_refresh_subs_browser_worker`,
+    #     `_refresh_events_catalogue_worker`, `_flush_live_events`
+    #   * Key bindings (`e`/`c`/`t`/Enter) routed via DataTable focus
+    #   * Helpers: `_render_topic_with_placeholders` (markup escape),
+    #     `_truncate_cell`, filter functions
+    # Implementation order in this block mirrors plan Section 10:
+    #   subs first, catalogue second, live-stream third.
+
+    # ── Phase 2b helpers — shared by Subs + Catalogue + Live-stream ────
+
+    # Template-var regex defined locally (NOT imported from PluginCore)
+    # so the TUI plugin doesn't take a hard dependency on framework
+    # internals — see plan Section 5.3 cycle 2 M10 fix.
+    _TEMPLATE_VAR_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+    @staticmethod
+    def _truncate_cell(value, max_len: int) -> str:
+        """Truncate a stringified value to `max_len` chars; append '...'
+        when truncated. Always returns a `str` even when `value` is None
+        or a list. Modal opens with `Enter` for the full uncapped value.
+        """
+        s = str(value) if value is not None else ""
+        if len(s) > max_len:
+            return s[: max(1, max_len - 3)] + "..."
+        return s
+
+    @classmethod
+    def _render_topic_with_placeholders(cls, topic: str) -> str:
+        """Return a Rich-markup string highlighting `{var}` placeholders
+        in yellow. The full topic is escaped FIRST so a topic containing
+        `[red]inject[/]` cannot inject formatting.
+
+        Per plan Section 5.3 — yellow color picked over italic+dim
+        because italic+dim is invisible on many terminal emulators.
+        Markup escape inside the substitution lambda's match group too,
+        defensively, in case future variable names introduce special
+        characters (currently the regex restricts to identifier-style).
+        """
+        escaped = escape(topic)
+        return cls._TEMPLATE_VAR_RE.sub(
+            lambda m: f"[yellow]{escape(m.group(0))}[/]", escaped,
+        )
+
+    def _on_subs_refresh_signal(self, topic: str, payload: dict) -> None:
+        """Bus observer: set the debounce flag for the Subs browser.
+
+        Runs on the loop thread. Setting a bool is GIL-atomic so no
+        lock is required; the 250ms `_debounce_refresh_tick` runs on
+        the TUI thread which clears the flag + spawns the worker.
+
+        Observer callback contract: must return < 1ms and must not
+        raise — Exception subclasses are swallowed by `_internal_emit`,
+        but we still keep this method side-effect-free to avoid cascading
+        errors into other observers in the same emit.
+        """
+        self._subs_refresh_pending = True
+
+    def _on_cat_refresh_signal(self, topic: str, payload: dict) -> None:
+        """Bus observer: set the debounce flag for the Events catalogue.
+
+        Same shape as `_on_subs_refresh_signal`.
+        """
+        self._cat_refresh_pending = True
+
+    def _debounce_refresh_tick(self) -> None:
+        """Read-and-clear the debounce flags; spawn workers when set.
+
+        Runs on the TUI thread at 250ms (the timer registered in
+        `_start_timers`). Skips refresh entirely when the Events tab
+        isn't the active outer tab — the next outer-activation handler
+        re-triggers the refresh as part of the immediate-on-enter path.
+        """
+        if not self._outer_is_events:
+            return
+        if self._subs_refresh_pending:
+            self._subs_refresh_pending = False
+            self._refresh_subs_browser_worker()
+        if self._cat_refresh_pending:
+            self._cat_refresh_pending = False
+            self._refresh_events_catalogue_worker()
+
+    def _get_subs_filter_state(self) -> dict:
+        """Snapshot the Subs browser filter widget values. Returns a
+        dict the worker uses to filter rows. Missing widgets default
+        to permissive values so the worker can run before `on_mount`
+        finishes (test-harness ordering).
+        """
+        state = {
+            "plugin": "__all__",
+            "topic": "",
+            "hostname": "",
+            "uuid": "",
+            "enabled_only": False,
+        }
+        try:
+            state["plugin"] = str(self.query_one(
+                "#events-subs-filter-plugin", Select,
+            ).value or "__all__")
+        except (NoMatches, Exception):
+            pass
+        try:
+            state["topic"] = self.query_one(
+                "#events-subs-filter-topic", Input,
+            ).value
+        except NoMatches:
+            pass
+        try:
+            state["hostname"] = self.query_one(
+                "#events-subs-filter-hostname", Input,
+            ).value
+        except NoMatches:
+            pass
+        try:
+            state["uuid"] = self.query_one(
+                "#events-subs-filter-uuid", Input,
+            ).value
+        except NoMatches:
+            pass
+        try:
+            state["enabled_only"] = self.query_one(
+                "#events-subs-filter-enabled-only", Checkbox,
+            ).value
+        except NoMatches:
+            pass
+        return state
+
+    def _sub_passes_filter(self, sub_row: dict, flt: dict) -> bool:
+        """Apply the filter state to a Subs row dict. Substring matches
+        are case-insensitive; the Plugin select uses a `__all__`
+        sentinel so the empty default doesn't accidentally hide everything.
+
+        Cycle 2 fresh-eyes fix: hostname filter renders ``None`` as
+        the empty string (NOT the literal `"None"`) before substring
+        matching. Without this, typing `"one"` in the hostname filter
+        unexpectedly matched every sub with `hosts=None` because
+        ``str(None) == "None"`` contains the substring `"one"`.
+        """
+        if flt["enabled_only"] and not sub_row["enabled"]:
+            return False
+        if flt["plugin"] != "__all__" and sub_row["plugin_name"] != flt["plugin"]:
+            return False
+        if flt["topic"]:
+            needle = flt["topic"].lower()
+            if needle not in str(sub_row["topic_pattern"]).lower():
+                return False
+        if flt["hostname"]:
+            needle = flt["hostname"].lower()
+            hosts_val = sub_row.get("hosts")
+            hosts_str = "" if hosts_val is None else str(hosts_val)
+            if needle not in hosts_str.lower():
+                return False
+        if flt["uuid"]:
+            needle = flt["uuid"].lower()
+            if needle not in str(sub_row["sub_uuid"]).lower():
+                return False
+        return True
+
+    def _populate_subs_plugin_filter_options(self, sub_rows: list) -> None:
+        """Refresh the Plugin select's options from the current snapshot.
+
+        Adds an `All plugins` sentinel + every distinct plugin_name in
+        sub_rows. Preserves the current selection when it survives the
+        rebuild; otherwise reverts to `__all__`.
+
+        Cycle 1 review fix: suppress `Select.Changed` events for the
+        duration of the rebuild via `self.prevent(...)` so the
+        post-rebuild value re-assignment doesn't loop back into the
+        worker through `_on_subs_filter_plugin_changed`. The worker
+        is `exclusive=True` in its group so a self-trigger would
+        cancel the in-flight render mid-row and produce a visible
+        flicker (counter snapping to `M / M` for one frame).
+        """
+        try:
+            sel = self.query_one("#events-subs-filter-plugin", Select)
+        except NoMatches:
+            return
+        plugin_names = sorted({r["plugin_name"] for r in sub_rows})
+        options = [("All plugins", "__all__")] + [
+            (n, n) for n in plugin_names
+        ]
+        current = str(sel.value or "__all__")
+        with self.prevent(Select.Changed):
+            try:
+                sel.set_options(options)
+            except Exception:
+                return
+            if current == "__all__" or current in plugin_names:
+                sel.value = current
+            else:
+                sel.value = "__all__"
+
+    @work(thread=False, exclusive=True, group="events-subs")
+    async def _refresh_subs_browser_worker(self) -> None:
+        """Rebuild the Subs browser table from a `list_local_subs` snapshot.
+
+        Runs on the TUI loop via Textual's worker. The PluginCore call
+        is async and acquires `topic_registry._lock`, so we bridge via
+        `_run_on_main` (it runs on the main loop, where the registry
+        lock lives).
+        """
+        pc = self.plugin_core
+        try:
+            subs = await self._run_on_main(
+                pc.topic_registry.list_local_subs()
+            )
+        except Exception:
+            subs = None
+        if subs is None:
+            subs = []
+
+        rows = []
+        for s in subs:
+            target_plugin = getattr(s, "target_plugin", "") or getattr(
+                s, "plugin_name", ""
+            )
+            target_access = getattr(s, "target_access_name", "") or ""
+            if target_plugin == getattr(s, "plugin_name", ""):
+                target_render = f".{target_access}"
+            else:
+                target_render = f"{target_plugin}.{target_access}"
+            rows.append({
+                "topic_pattern": getattr(s, "topic_pattern", ""),
+                "plugin_name": getattr(s, "plugin_name", ""),
+                "plugin_uuid": getattr(s, "plugin_uuid", ""),
+                "target_plugin": target_plugin,
+                "target_access_name": target_access,
+                "target_plugin_uuid": getattr(s, "target_plugin_uuid", None),
+                "target_render": target_render,
+                "hosts": getattr(s, "hosts", None),
+                "blocked_hosts": getattr(s, "blocked_hosts", None),
+                "authors": getattr(s, "authors", None),
+                "blocked_authors": getattr(s, "blocked_authors", None),
+                "enabled": bool(getattr(s, "enabled", True)),
+                "declared_id": getattr(s, "declared_id", None),
+                "declared_kind": (
+                    "YAML" if getattr(s, "declared_id", None) is not None
+                    else "runtime"
+                ),
+                "sub_uuid": getattr(s, "sub_uuid", ""),
+            })
+
+        # Plugin filter dropdown options reflect the current snapshot —
+        # do this BEFORE applying the filter so a newly-loaded plugin
+        # shows up in the select.
+        self._populate_subs_plugin_filter_options(rows)
+
+        flt = self._get_subs_filter_state()
+        visible = [r for r in rows if self._sub_passes_filter(r, flt)]
+
+        try:
+            table = self.query_one("#events-subs-table", DataTable)
+        except NoMatches:
+            return
+        table.clear()
+        # Cache the row dicts onto the app so toggle / detail handlers
+        # can look up the full Subscription state by row index without
+        # re-querying the registry.
+        self._subs_rendered_rows = visible
+        for r in visible:
+            # Enabled cell carries our own static markup — plain string
+            # passed through `default_cell_formatter`'s `Text.from_markup`
+            # path renders the green/dim correctly.
+            #
+            # User-controlled fields (`topic_pattern`, `hosts`,
+            # `authors_cell`) come from registry data that plugin
+            # authors write — wrap in `Text(...)` so accidental
+            # `[`/`]` in the values renders literally rather than
+            # attempting markup interpretation. Validated-identifier
+            # and framework-controlled fields skip the wrap (they
+            # can't contain markup chars by construction).
+            enabled_cell = (
+                "[green]on[/]" if r["enabled"] else "[dim]off[/]"
+            )
+            authors_cell = (
+                "*" if r["authors"] is None
+                else self._truncate_cell(r["authors"], 12)
+            )
+            sub_uuid = r["sub_uuid"] or ""
+            uuid_cell = (
+                sub_uuid[:8] + "..." if len(sub_uuid) > 8 else sub_uuid
+            )
+            table.add_row(
+                Text(self._truncate_cell(r["topic_pattern"], 20)),
+                self._truncate_cell(r["plugin_name"], 16),
+                self._truncate_cell(r["target_render"], 20),
+                Text(self._truncate_cell(r["hosts"], 12)),
+                Text(authors_cell),
+                enabled_cell,
+                r["declared_kind"],
+                uuid_cell,
+            )
+
+        # Counter update.
+        try:
+            self.query_one("#events-subs-counter", Static).update(
+                f"Showing {len(visible)} / {len(rows)}"
+            )
+        except NoMatches:
+            pass
+
+    # ── Subs browser interactions ──────────────────────────────────────
+
+    @on(Input.Changed, "#events-subs-filter-topic")
+    @on(Input.Changed, "#events-subs-filter-hostname")
+    @on(Input.Changed, "#events-subs-filter-uuid")
+    def _on_subs_filter_input_changed(self, event: Input.Changed) -> None:
+        # Inline re-render of the existing snapshot via the worker —
+        # avoids hitting the registry repeatedly while typing.
+        self._refresh_subs_browser_worker()
+
+    @on(Select.Changed, "#events-subs-filter-plugin")
+    def _on_subs_filter_plugin_changed(self, event: Select.Changed) -> None:
+        self._refresh_subs_browser_worker()
+
+    @on(Checkbox.Changed, "#events-subs-filter-enabled-only")
+    def _on_subs_filter_enabled_only_changed(self, event: Checkbox.Changed) -> None:
+        self._refresh_subs_browser_worker()
+
+    @on(DataTable.RowSelected, "#events-subs-table")
+    def _on_subs_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._open_sub_detail_modal()
+
+    def _selected_sub_row(self) -> Optional[dict]:
+        """Return the cached row dict for the current cursor row, or
+        None if there is no rendered selection. Called by the e/c/t
+        key handlers + the Enter→modal handler.
+        """
+        rows = getattr(self, "_subs_rendered_rows", []) or []
+        try:
+            table = self.query_one("#events-subs-table", DataTable)
+        except NoMatches:
+            return None
+        idx = table.cursor_row
+        if idx is None or idx < 0 or idx >= len(rows):
+            return None
+        return rows[idx]
+
+    def _open_sub_detail_modal(self) -> None:
+        row = self._selected_sub_row()
+        if row is None:
+            return
+        # Double-push guard mirroring `_open_cert_modal`.
+        if any(isinstance(s, SubscriptionDetailScreen) for s in self.screen_stack):
+            return
+        self.push_screen(SubscriptionDetailScreen(sub_dict=row))
+
+    @work(thread=False, exclusive=True, group="events-subs-toggle")
+    async def _toggle_selected_sub(self) -> None:
+        row = self._selected_sub_row()
+        if row is None:
+            return
+        await self._apply_subscription_toggle(row)
+
+    async def _apply_subscription_toggle(self, row: dict) -> None:
+        """Body of the subscription-toggle action. Extracted from the
+        @work wrapper so tests can drive it directly without depending
+        on Textual's worker scheduling semantics.
+        """
+        sub_uuid = row["sub_uuid"]
+        current = bool(row["enabled"])
+        new_value = not current
+        try:
+            result = await self._run_on_main(
+                self.plugin_core.set_subscription_enabled(sub_uuid, new_value)
+            )
+        except asyncio.TimeoutError:
+            self.notify("Toggle timed out (30s)", severity="warning")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.notify(f"Toggle failed: {e}", severity="error")
+            return
+        if result is None:
+            self.notify(
+                "Cannot toggle — main loop unavailable",
+                severity="warning",
+            )
+            return
+        if result is False:
+            self.notify(
+                "Subscription no longer exists",
+                severity="warning",
+            )
+            return
+        # `set_subscription_enabled` returns True for both "toggled
+        # successfully" AND "no-op (already at target value)". The
+        # bus emit only fires on actual change, so the refresh hook
+        # only triggers when state moved. Operator's view reconciles
+        # via the next emit-driven refresh.
+
+    def _copy_to_clipboard_safe(self, text: str, label: str) -> None:
+        """OSC 52 clipboard write with status-line toast. Best-effort:
+        terminals without OSC 52 silently no-op (notably macOS Terminal);
+        the toast still fires so the operator gets feedback that the
+        keystroke was acknowledged.
+        """
+        try:
+            self.copy_to_clipboard(str(text))
+            self.notify(f"Copied {label}", timeout=2.0)
+        except Exception:
+            self.notify(f"Copy failed: {label}", severity="warning")
+
+    @on(DataTable.HeaderSelected, "#events-subs-table")
+    def _on_subs_header_selected(self, event) -> None:
+        # No sorting in Phase 2b; header click is a no-op so the cell
+        # selection doesn't accidentally trigger toggle. Future phase
+        # could implement column sort here.
+        pass
+
+    # Key bindings on the DataTable — Textual's `Binding` on App level
+    # would intercept globally. Instead, we add bindings to the
+    # DataTable widget by overriding `on_key` for the relevant table.
+    # Simpler approach used here: action methods on the App with
+    # priority key bindings constrained to focused widget via custom
+    # routing. Textual idiomatic path: `key_e` / `key_c` / `key_t` on
+    # the DataTable subclass, but we don't subclass DataTable to keep
+    # the changeset focused.
+
+    def on_key(self, event) -> None:
+        """Key router: e/c/t/Enter actions on Events tab tables.
+
+        Only fires when one of the Events tables is focused. Returning
+        early without consuming the event lets Textual dispatch the
+        keystroke to default handlers — important so global bindings
+        (q/r/1-7) still work when an Events table is focused.
+        """
+        if not self._outer_is_events:
+            return
+        focused = self.focused
+        if focused is None:
+            return
+        fid = getattr(focused, "id", "") or ""
+        if fid == "events-subs-table":
+            if event.key == "e":
+                event.stop()
+                self._toggle_selected_sub()
+            elif event.key == "c":
+                event.stop()
+                row = self._selected_sub_row()
+                if row is not None:
+                    self._copy_to_clipboard_safe(
+                        row["sub_uuid"], "sub_uuid",
+                    )
+            elif event.key == "t":
+                event.stop()
+                row = self._selected_sub_row()
+                if row is not None:
+                    self._copy_to_clipboard_safe(
+                        row["topic_pattern"], "topic",
+                    )
+        elif fid == "events-cat-table":
+            if event.key == "e":
+                event.stop()
+                self._toggle_selected_event()
+            elif event.key == "c":
+                event.stop()
+                row = self._selected_event_row()
+                if row is not None:
+                    self._copy_to_clipboard_safe(row["topic"], "topic")
+
+    # ── Events catalogue ────────────────────────────────────────────
+
+    def _get_cat_filter_state(self) -> dict:
+        state = {"plugin": "__all__", "topic": "", "enabled_only": False}
+        try:
+            state["plugin"] = str(self.query_one(
+                "#events-cat-filter-plugin", Select,
+            ).value or "__all__")
+        except (NoMatches, Exception):
+            pass
+        try:
+            state["topic"] = self.query_one(
+                "#events-cat-filter-topic", Input,
+            ).value
+        except NoMatches:
+            pass
+        try:
+            state["enabled_only"] = self.query_one(
+                "#events-cat-filter-enabled-only", Checkbox,
+            ).value
+        except NoMatches:
+            pass
+        return state
+
+    def _event_passes_filter(self, row: dict, flt: dict) -> bool:
+        if flt["enabled_only"] and not row["enabled"]:
+            return False
+        if flt["plugin"] != "__all__" and row["plugin"] != flt["plugin"]:
+            return False
+        if flt["topic"]:
+            needle = flt["topic"].lower()
+            if needle not in str(row["topic"]).lower():
+                return False
+        return True
+
+    def _populate_cat_plugin_filter_options(self, rows: list) -> None:
+        """Refresh the catalogue's Plugin select options. Same
+        `prevent(Select.Changed)` rebuild pattern as the Subs browser —
+        see `_populate_subs_plugin_filter_options` for rationale.
+        """
+        try:
+            sel = self.query_one("#events-cat-filter-plugin", Select)
+        except NoMatches:
+            return
+        plugin_names = sorted({r["plugin"] for r in rows})
+        options = [("All plugins", "__all__")] + [
+            (n, n) for n in plugin_names
+        ]
+        current = str(sel.value or "__all__")
+        with self.prevent(Select.Changed):
+            try:
+                sel.set_options(options)
+            except Exception:
+                return
+            if current == "__all__" or current in plugin_names:
+                sel.value = current
+            else:
+                sel.value = "__all__"
+
+    @work(thread=False, exclusive=True, group="events-cat")
+    async def _refresh_events_catalogue_worker(self) -> None:
+        """Rebuild the Events catalogue table from `plugin.events`.
+
+        Iterates `dict(pc.plugins).items()` — snapshot to avoid
+        cross-thread RuntimeError if plugins mutate during iteration.
+        Only enabled plugins are surfaced (matches the dispatch path —
+        events on a disabled plugin can never fire anyway).
+        """
+        pc = self.plugin_core
+        try:
+            plugins_snapshot = list(pc.plugins.items())
+        except RuntimeError:
+            plugins_snapshot = []
+
+        rows = []
+        for name, plugin in plugins_snapshot:
+            if not getattr(plugin, "enabled", False):
+                continue
+            events_dict = getattr(plugin, "events", None) or {}
+            if not isinstance(events_dict, dict):
+                continue
+            description = getattr(plugin, "description", "") or ""
+            for event_id, entry in events_dict.items():
+                if not isinstance(entry, dict):
+                    continue
+                rows.append({
+                    "plugin": name,
+                    "event_id": event_id,
+                    "topic": entry.get("topic", ""),
+                    "hosts": entry.get("hosts"),
+                    "blocked_hosts": entry.get("blocked_hosts"),
+                    "enabled": bool(entry.get("enabled", True)),
+                    "description": description,
+                })
+
+        self._populate_cat_plugin_filter_options(rows)
+        flt = self._get_cat_filter_state()
+        visible = [r for r in rows if self._event_passes_filter(r, flt)]
+
+        try:
+            table = self.query_one("#events-cat-table", DataTable)
+        except NoMatches:
+            return
+        table.clear()
+        self._cat_rendered_rows = visible
+        for r in visible:
+            # Topic cell: `_render_topic_with_placeholders` already
+            # applies `rich.markup.escape` to the topic body before
+            # wrapping `{var}` placeholders in yellow tags — so the
+            # output is safe to interpret as markup via
+            # `Text.from_markup`.
+            topic_render = self._render_topic_with_placeholders(
+                self._truncate_cell(r["topic"], 24)
+            )
+            hosts_display = (
+                "default" if r["hosts"] is None
+                else self._truncate_cell(r["hosts"], 12)
+            )
+            enabled_cell = (
+                "[green]on[/]" if r["enabled"] else "[dim]off[/]"
+            )
+            topic_text = Text.from_markup(topic_render)
+            enabled_text = Text.from_markup(enabled_cell)
+            # `hosts_display` comes from user-controlled plugin config —
+            # wrap to defuse accidental `[`/`]`. Plugin name + event ID
+            # are validated identifiers so they're safe as plain strings
+            # (default_cell_formatter wraps them itself).
+            table.add_row(
+                self._truncate_cell(r["plugin"], 16),
+                self._truncate_cell(r["event_id"], 16),
+                topic_text,
+                Text(hosts_display),
+                enabled_text,
+            )
+        try:
+            self.query_one("#events-cat-counter", Static).update(
+                f"Showing {len(visible)} / {len(rows)}"
+            )
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#events-cat-filter-topic")
+    def _on_cat_filter_topic_changed(self, event: Input.Changed) -> None:
+        self._refresh_events_catalogue_worker()
+
+    @on(Select.Changed, "#events-cat-filter-plugin")
+    def _on_cat_filter_plugin_changed(self, event: Select.Changed) -> None:
+        self._refresh_events_catalogue_worker()
+
+    @on(Checkbox.Changed, "#events-cat-filter-enabled-only")
+    def _on_cat_filter_enabled_only_changed(self, event: Checkbox.Changed) -> None:
+        self._refresh_events_catalogue_worker()
+
+    @on(DataTable.RowSelected, "#events-cat-table")
+    def _on_cat_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._open_event_detail_modal()
+
+    def _selected_event_row(self) -> Optional[dict]:
+        rows = getattr(self, "_cat_rendered_rows", []) or []
+        try:
+            table = self.query_one("#events-cat-table", DataTable)
+        except NoMatches:
+            return None
+        idx = table.cursor_row
+        if idx is None or idx < 0 or idx >= len(rows):
+            return None
+        return rows[idx]
+
+    def _open_event_detail_modal(self) -> None:
+        row = self._selected_event_row()
+        if row is None:
+            return
+        if any(isinstance(s, EventDetailScreen) for s in self.screen_stack):
+            return
+        # Pre-render the topic with placeholders so the modal's
+        # `topic_rendered` field carries the markup; the rest of the
+        # fields are plain strings (markup escape applied by the modal).
+        modal_row = dict(row)
+        modal_row["topic_rendered"] = self._render_topic_with_placeholders(
+            row["topic"]
+        )
+        self.push_screen(EventDetailScreen(event_dict=modal_row))
+
+    @work(thread=False, exclusive=True, group="events-cat-toggle")
+    async def _toggle_selected_event(self) -> None:
+        row = self._selected_event_row()
+        if row is None:
+            return
+        plugin_name = row["plugin"]
+        event_id = row["event_id"]
+        current = bool(row["enabled"])
+        new_value = not current
+        try:
+            result = await self._run_on_main(
+                self.plugin_core.set_event_enabled(
+                    plugin_name, event_id, new_value,
+                )
+            )
+        except asyncio.TimeoutError:
+            self.notify("Toggle timed out (30s)", severity="warning")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.notify(f"Toggle failed: {e}", severity="error")
+            return
+        if result is None:
+            self.notify(
+                "Cannot toggle — main loop unavailable",
+                severity="warning",
+            )
+            return
+        if result is False:
+            self.notify(
+                f"Event {plugin_name}/{event_id} no longer exists",
+                severity="warning",
+            )
+            return
+        # True → either toggled (emit fires + observer triggers refresh)
+        # or no-op. Local view + new_value should differ; nothing else
+        # to do here.
+
+    # ── Live-stream ─────────────────────────────────────────────────
+
+    # Topic-raw → checkbox-id mapping used by the live filter. The
+    # 6 visible labels collapse to 5 source topics because
+    # `_core/event/streamed` discriminates on `phase` between
+    # `» first` (cyan) and `« end` (dim cyan). Both checkboxes
+    # share the same source topic but apply different phase filters.
+    _LIVE_TYPE_FILTERS = {
+        "_core/event/published": ("events-live-type-pub", None),
+        "_core/event/requested": ("events-live-type-req", None),
+        "_core/event/streamed:first_chunk": (
+            "events-live-type-first", None,
+        ),
+        "_core/event/streamed:ended": ("events-live-type-end", None),
+        "_core/subscription/state_changed": (
+            "events-live-type-sub", None,
+        ),
+        "_core/event/state_changed": (
+            "events-live-type-evt", None,
+        ),
+        # `stream:unknown` (defensive fallback for future stream
+        # phases — plan cycle 1 L1) deliberately has no checkbox.
+        # Cycle 1 review HIGH-2 fix: was mapped to the `first_chunk`
+        # key which caused unknown rows to be hidden when the operator
+        # unticked `first`, defeating the diagnostic visibility of
+        # the fallback. Keyed to a checkbox-less id so `.get(key,
+        # (None, None))[0]` returns None and the row stays visible
+        # regardless of checkbox state.
+        "_core/event/streamed:unknown": ("_no_checkbox_", None),
+    }
+
+    def _get_live_filter_state(self) -> dict:
+        state = {
+            "topic": "",
+            "publisher": "",
+            "types": {
+                "events-live-type-pub": True,
+                "events-live-type-req": True,
+                "events-live-type-first": True,
+                "events-live-type-end": True,
+                "events-live-type-sub": True,
+                "events-live-type-evt": True,
+            },
+        }
+        try:
+            state["topic"] = self.query_one(
+                "#events-live-filter-topic", Input,
+            ).value
+        except NoMatches:
+            pass
+        try:
+            state["publisher"] = self.query_one(
+                "#events-live-filter-publisher", Input,
+            ).value
+        except NoMatches:
+            pass
+        for cid in state["types"]:
+            try:
+                state["types"][cid] = self.query_one(
+                    f"#{cid}", Checkbox,
+                ).value
+            except NoMatches:
+                pass
+        return state
+
+    @staticmethod
+    def _live_row_type_filter_key(row: dict) -> str:
+        """Convert a row's `topic_raw` (+ phase if streamed) into the
+        filter-key used by `_LIVE_TYPE_FILTERS`. Keeps the dispatch
+        keyed on the same string the type-label was derived from.
+
+        Cycle 2 fresh-eyes fix: discriminates on the raw ``phase``
+        field carried in the row dict (set by
+        `plugin._classify_and_normalize`) instead of substring-
+        matching the Rich-markup `type_label`. The label is a UI
+        string (`"[cyan]» first[/]"` etc.) and substring matches
+        like `"first" in label` happen to work today but would
+        silently misclassify if the markup glyphs ever change.
+
+        Cycle 1 review HIGH-2 fix: the unknown-phase fallback
+        returns ``stream:unknown`` (which has no checkbox in
+        ``_LIVE_TYPE_FILTERS``) instead of being silently grouped
+        with ``first_chunk``. Operator unchecking ``first`` no
+        longer hides ``stream:unknown`` diagnostic rows.
+        """
+        topic_raw = row.get("topic_raw", "")
+        if topic_raw == "_core/event/streamed":
+            phase = row.get("phase")
+            if phase == "first_chunk":
+                return "_core/event/streamed:first_chunk"
+            if phase == "ended":
+                return "_core/event/streamed:ended"
+            return "_core/event/streamed:unknown"
+        return topic_raw
+
+    def _live_row_passes_filter(self, row: dict, flt: dict) -> bool:
+        # Type checkbox.
+        key = self._live_row_type_filter_key(row)
+        type_id = self._LIVE_TYPE_FILTERS.get(key, (None, None))[0]
+        if type_id is not None and not flt["types"].get(type_id, True):
+            return False
+        if flt["topic"]:
+            needle = flt["topic"].lower()
+            if needle not in str(row.get("topic", "")).lower():
+                return False
+        if flt["publisher"]:
+            needle = flt["publisher"].lower()
+            if needle not in str(row.get("publisher", "")).lower():
+                return False
+        return True
+
+    def _flush_live_events(self) -> None:
+        """100ms tick: pull new rows from the plugin, append filtered
+        ones to the table.
+
+        Gated on `_live_visible` so events queued in the plugin deque
+        DON'T render against an inactive tab — when the outer/inner
+        edge flips back to True, the catch-up flush fires immediately
+        (handled by the activation handlers, not by this method).
+
+        Filter-dirty flag triggers a FULL re-render against the entire
+        cached row list — without this, changing a Type checkbox
+        wouldn't hide already-rendered rows.
+        """
+        live_visible = self._outer_is_events and self._inner_is_live
+        if not live_visible:
+            # Skip render while Live-stream is hidden. We deliberately
+            # do NOT advance `_live_last_seen_seq` here — the
+            # tab-activation handlers fire `_flush_live_events()`
+            # directly on the False→True visibility edge as a
+            # catch-up flush, which re-fetches all events since the
+            # cursor was last advanced. Advancing here would cause
+            # those accumulated events to be silently dropped.
+            return
+
+        plugin = self.plugin_instance
+        if plugin is None or not hasattr(plugin, "get_live_events_since"):
+            return
+
+        try:
+            new_rows, current_seq = plugin.get_live_events_since(
+                self._live_last_seen_seq
+            )
+        except Exception:
+            return
+        self._live_last_seen_seq = current_seq
+
+        if not new_rows and not self._live_filter_dirty:
+            return
+
+        # Append new rows to the cached list; trim to deque maxlen so
+        # the cached list doesn't grow unbounded vs the plugin's deque.
+        if new_rows:
+            self._live_rendered_rows.extend(new_rows)
+            # Plugin deque cap is 1000; mirror here.
+            if len(self._live_rendered_rows) > 1000:
+                self._live_rendered_rows = self._live_rendered_rows[-1000:]
+
+        flt = self._get_live_filter_state()
+        if self._live_filter_dirty or new_rows:
+            try:
+                table = self.query_one("#events-live-table", DataTable)
+            except NoMatches:
+                return
+            visible = [
+                r for r in self._live_rendered_rows
+                if self._live_row_passes_filter(r, flt)
+            ]
+            table.clear()
+            for r in visible:
+                ts = float(r.get("ts", 0.0) or 0.0)
+                time_cell = ""
+                if ts > 0:
+                    try:
+                        time_cell = datetime.fromtimestamp(ts).strftime(
+                            "%H:%M:%S.%f"
+                        )[:-3]
+                    except (OSError, ValueError):
+                        time_cell = "?"
+                # Type cell renders Rich markup (color glyphs) — those
+                # strings come from the plugin's own static dispatch
+                # table so markup is intentional.
+                type_text = Text.from_markup(r.get("type_label", ""))
+                # `topic` can be plugin-author-written and the topic
+                # validator doesn't reject `[`/`]` characters — wrap in
+                # plain `Text(...)` so the literal text renders instead
+                # of attempting markup interpretation. `publisher` is
+                # always a validated plugin_name (identifier-only) and
+                # `detail` is locally formatted by `_detail_for` — both
+                # safe as plain strings.
+                topic_text = Text(
+                    self._truncate_cell(r.get("topic", ""), 24)
+                )
+                publisher_cell = self._truncate_cell(
+                    r.get("publisher", ""), 16,
+                )
+                detail_cell = self._truncate_cell(r.get("detail", ""), 40)
+                table.add_row(
+                    time_cell,
+                    type_text,
+                    topic_text,
+                    publisher_cell,
+                    detail_cell,
+                )
+            try:
+                self.query_one("#events-live-counter", Static).update(
+                    f"Showing {len(visible)} / "
+                    f"{len(self._live_rendered_rows)} events"
+                )
+            except NoMatches:
+                pass
+            self._live_filter_dirty = False
+
+    @on(Input.Changed, "#events-live-filter-topic")
+    @on(Input.Changed, "#events-live-filter-publisher")
+    def _on_live_filter_input_changed(self, event: Input.Changed) -> None:
+        # Same-thread mutation; no lock needed. Next 100ms tick reads +
+        # clears the flag.
+        self._live_filter_dirty = True
+
+    @on(Checkbox.Changed, "#events-live-type-pub")
+    @on(Checkbox.Changed, "#events-live-type-req")
+    @on(Checkbox.Changed, "#events-live-type-first")
+    @on(Checkbox.Changed, "#events-live-type-end")
+    @on(Checkbox.Changed, "#events-live-type-sub")
+    @on(Checkbox.Changed, "#events-live-type-evt")
+    def _on_live_type_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        self._live_filter_dirty = True
+
+    @on(Button.Pressed, "#events-live-clear-btn")
+    def _on_live_clear_pressed(self, event: Button.Pressed) -> None:
+        """Atomic clear: wipe the plugin deque AND advance our cursor
+        to the new high-water mark in ONE plugin-side lock acquisition.
+
+        Without the cursor-resync under the same lock, a concurrent
+        `_on_bus_event` between `clear_live_events()` and a separate
+        seq read would leave the new event in the deque with a seq
+        equal to our resync value — the next flush would skip it
+        forever. The plugin method returns the post-clear seq so we
+        can resync atomically.
+        """
+        plugin = self.plugin_instance
+        if plugin is None or not hasattr(plugin, "clear_live_events"):
+            return
+        try:
+            new_cursor = plugin.clear_live_events()
+        except Exception:
+            return
+        if isinstance(new_cursor, int):
+            self._live_last_seen_seq = new_cursor
+        self._live_rendered_rows = []
+        try:
+            table = self.query_one("#events-live-table", DataTable)
+            table.clear()
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#events-live-counter", Static).update(
+                "Showing 0 / 0 events"
+            )
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-net-thisnode-view-cert")
     def _on_view_thisnode_cert(self) -> None:
@@ -4134,6 +5565,61 @@ class DashboardApp(App):
         if entry and entry.get("type") == "menu-toggle":
             self._execute_toggle(entry, event.value)
 
+    # ── Phase 2b — Events tab activation handlers ─────────────────
+    # The existing undecorated `on_tabbed_content_tab_activated` below
+    # stays as a catch-all for the config-dirty banner. These two
+    # decorated handlers fire IN ADDITION (selector-filtered to specific
+    # `TabbedContent` instances) so the outer-vs-inner activation logic
+    # for the Events tab doesn't pollute the catch-all body.
+    #
+    # Defensive `event.tabbed_content.id` check inside each handler:
+    # Textual's `@on(..., "#id")` decorator selector should already
+    # filter, but the Phase 4b regression (where nested TabbedContent
+    # events bubbled up to an outer handler) is the precedent for the
+    # belt-and-suspenders guard.
+
+    @on(TabbedContent.TabActivated, "#main-tabs")
+    def _on_main_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if event.tabbed_content.id != "main-tabs":
+            return
+        pane_id = event.pane.id or ""
+        was_events = self._outer_is_events
+        self._outer_is_events = pane_id == "tab-events"
+        if self._outer_is_events:
+            # Immediate refresh of whichever Events sub-tab is active so
+            # the operator sees fresh data instead of stale rows on
+            # tab-enter. Live-stream catch-up flush handled by
+            # `_flush_live_events` via the (False -> True) edge below.
+            self._refresh_subs_browser_worker()
+            self._refresh_events_catalogue_worker()
+        if not was_events and self._outer_is_events:
+            # Edge False -> True: trigger one immediate Live-stream flush
+            # if Live-stream is the active inner tab (so the operator
+            # doesn't see a stale table waiting on the next 100ms tick).
+            if self._inner_is_live:
+                self._flush_live_events()
+
+    @on(TabbedContent.TabActivated, "#events-tabs")
+    def _on_events_inner_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        if event.tabbed_content.id != "events-tabs":
+            return
+        pane_id = event.pane.id or ""
+        was_live = self._inner_is_live
+        self._inner_is_live = pane_id == "events-tab-live"
+        # Immediate refresh of the just-activated inner tab.
+        if pane_id == "events-tab-subs":
+            self._refresh_subs_browser_worker()
+        elif pane_id == "events-tab-cat":
+            self._refresh_events_catalogue_worker()
+        if not was_live and self._inner_is_live:
+            # Edge False -> True for Live-stream — immediate catch-up
+            # flush. Mirrors the outer-tab edge handler above.
+            self._flush_live_events()
+
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         """Warn in config status when leaving config tab with unsaved edits."""
         # When switching away from config, show persistent dirty warning
@@ -4354,6 +5840,9 @@ class DashboardApp(App):
 
     def action_tab_networking(self) -> None:  # Phase 1
         self._switch_tab("tab-networking")
+
+    def action_tab_events(self) -> None:  # Phase 2b
+        self._switch_tab("tab-events")
 
     def action_tab_settings(self) -> None:
         self._switch_tab("tab-settings")

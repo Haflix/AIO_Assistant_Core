@@ -74,6 +74,19 @@ class TUI(Plugin):
         }
         self._observer_lock = threading.Lock()
 
+        # Phase 2b — Live-stream observer state. Five bus topics fan in
+        # here on the loop thread; the TUI thread polls via
+        # `get_live_events_since` every 100ms. Buffer is bounded to 1000
+        # entries — bursts beyond that drop oldest from the deque front;
+        # the TUI's `_live_last_seen_seq` advances past dropped events
+        # without re-rendering them. seq is monotonic across the buffer
+        # lifetime; `_clear_live_events` returns the current value so
+        # the TUI can resync its consumer cursor without observing
+        # already-published events as new.
+        self._live_event_buffer: collections.deque = collections.deque(maxlen=1000)
+        self._live_event_seq: int = 0
+        self._live_event_lock = threading.Lock()
+
     @async_log_errors
     async def on_enable(self):
         self._logger.debug("Dashboard plugin on_enable")
@@ -97,15 +110,30 @@ class TUI(Plugin):
             for k in self._disconnect_reason_counts:
                 self._disconnect_reason_counts[k] = 0
 
+        # Phase 2b — symmetric clear for the Live-stream buffer.
+        with self._live_event_lock:
+            self._live_event_buffer.clear()
+            self._live_event_seq = 0
+
         # Phase 1: subscribe to internal-bus topics for live-update of
         # the Networking tab. Registration happens on the loop thread
         # (this method's caller); callbacks bridge to the TUI thread
         # via `app.call_from_thread`. The `app and app.is_running`
         # guard in each callback covers the startup race window where
         # the TUI thread hasn't constructed the App yet.
+        #
+        # Phase 2b adds 5 bus topics for the Live-stream sub-tab. All
+        # 5 fan in to `_on_bus_event` which only mutates the plugin-side
+        # buffer + lock; the TUI thread polls via `get_live_events_since`
+        # on a 100ms timer (pull model, no `call_from_thread` bridge).
         self._observed_topics = [
             ("_core/peer/connected", self._on_peer_event),
             ("_core/peer/disconnected", self._on_peer_event),
+            ("_core/event/published", self._on_bus_event),
+            ("_core/event/requested", self._on_bus_event),
+            ("_core/event/streamed", self._on_bus_event),
+            ("_core/subscription/state_changed", self._on_bus_event),
+            ("_core/event/state_changed", self._on_bus_event),
         ]
         for topic, cb in self._observed_topics:
             self.internal_observe(topic, cb)
@@ -201,6 +229,174 @@ class TUI(Plugin):
         with self._observer_lock:
             for k in self._disconnect_reason_counts:
                 self._disconnect_reason_counts[k] = 0
+
+    # ── Phase 2b — Live-stream bus observer + getters ─────────────────
+    # The 5 bus topics from on_enable fan in here. This runs on the
+    # loop thread (sync observer contract). MUST return quickly (< 1ms);
+    # appending a small dict under a short-held lock satisfies that.
+    # No `call_from_thread` here — the TUI side uses a 100ms pull timer
+    # via `get_live_events_since`. Symmetric with how the registry
+    # dispatches the original framework topics.
+
+    # Static dispatch table — single source of truth for the four
+    # phase-less topic labels. `_core/event/streamed` discriminates on
+    # `phase` inside `_type_label_for` (NOT inline in `_on_bus_event`)
+    # so this method stays a thin shim and future label changes have
+    # one edit point.
+    _TYPE_LABELS = {
+        "_core/event/published":          "▶ pub",
+        "_core/event/requested":          "? req",
+        "_core/subscription/state_changed": "~ sub",
+        "_core/event/state_changed":      "~ evt",
+    }
+
+    _TYPE_LABEL_COLORS = {
+        "▶ pub": "green",
+        "? req": "yellow",
+        "~ sub": "magenta",
+        "~ evt": "magenta",
+    }
+
+    @log_errors
+    def _on_bus_event(self, topic: str, payload: dict) -> None:
+        """Loop-thread bus observer for the 5 Live-stream topics.
+
+        The `_internal_emit` payload dict is shared across every observer
+        receiving the same emit (within one call). `_classify_and_normalize`
+        produces a FRESH dict — must not mutate `payload`. Without this
+        guarantee, a sibling observer reading the same emit could see
+        keys we injected (e.g. `_seq` from the lock section below).
+        """
+        row = self._classify_and_normalize(topic, payload)
+        with self._live_event_lock:
+            self._live_event_seq += 1
+            row["_seq"] = self._live_event_seq
+            self._live_event_buffer.append(row)
+
+    def _classify_and_normalize(self, topic: str, payload: dict) -> dict:
+        """Produce a fresh row dict from a bus emit payload. MUST NOT
+        mutate the input payload — within one `_internal_emit` call the
+        payload dict reference is shared with every other observer
+        receiving the same emit.
+
+        Returns the partial row; `_on_bus_event` adds `_seq` under the
+        lock so the caller can keep the lock-hold time minimal.
+
+        Cycle 2 fresh-eyes fix: also carries the raw `phase` field
+        (for stream events) so the consumer-side type-filter doesn't
+        have to substring-match the Rich-markup `type_label` to
+        discriminate first/end/unknown — that coupling was fragile
+        (`"end" in "[dim cyan]« end[/]"` works today but would break
+        if the markup format ever changes).
+        """
+        return {
+            "ts": payload.get("ts", 0.0),
+            "topic_raw": topic,
+            "phase": payload.get("phase"),  # None for non-stream topics
+            "type_label": self._type_label_for(topic, payload),
+            "topic": payload.get("topic", ""),
+            "publisher": payload.get("publisher", ""),
+            "detail": self._detail_for(topic, payload),
+        }
+
+    def _type_label_for(self, topic: str, payload: dict) -> str:
+        """Return the colored Rich-markup Type-column label for one emit.
+
+        Phase discrimination for `_core/event/streamed` happens here so
+        `_on_bus_event` stays a thin shim. Unknown phase falls through to
+        `stream:unknown` rather than dropping silently — operator can
+        spot a future framework phase addition before it gets dispatched
+        as the wrong label.
+        """
+        if topic == "_core/event/streamed":
+            phase = payload.get("phase")
+            if phase == "first_chunk":
+                return "[cyan]» first[/]"
+            if phase == "ended":
+                return "[dim cyan]« end[/]"
+            # Plan cycle 1 L1 fallback for unknown phase. Reachable
+            # if the framework ever adds a new `phase` value without
+            # updating this dispatch.
+            return "stream:unknown"
+        base = self._TYPE_LABELS.get(topic)
+        if base is None:
+            # Defensive — only reachable if a new framework topic
+            # registers without a corresponding label entry. The
+            # plugin only registers `_on_bus_event` for the 5 topics
+            # in `on_enable`, all of which are mapped above, so this
+            # branch is structurally unreachable today.
+            return f"?{topic}"
+        color = self._TYPE_LABEL_COLORS[base]
+        return f"[{color}]{base}[/]"
+
+    def _detail_for(self, topic: str, payload: dict) -> str:
+        """Type-dependent renderer for the Detail column (per plan 5.4)."""
+        if topic in ("_core/event/published", "_core/event/requested"):
+            return f"target_count={payload.get('target_count', 0)}"
+        if topic == "_core/event/streamed":
+            return ""
+        if topic == "_core/subscription/state_changed":
+            sub_uuid = payload.get("sub_uuid", "")
+            short = sub_uuid[:8] + "..." if len(sub_uuid) > 8 else sub_uuid
+            return f"sub_uuid={short} enabled={payload.get('enabled', '?')}"
+        if topic == "_core/event/state_changed":
+            return (
+                f"{payload.get('plugin_name', '?')}/"
+                f"{payload.get('event_id', '?')} "
+                f"enabled={payload.get('enabled', '?')}"
+            )
+        return ""
+
+    def get_live_events_since(self, last_seq: int) -> tuple:
+        """Returns (rows_newer_than_last_seq, current_max_seq) atomically.
+
+        Called from the TUI thread by the 100ms flush timer. Iterates
+        the deque from the right (newest) until reaching an entry with
+        `seq <= last_seq`, then stops — O(new_events) not O(deque_size).
+        Critical because the observer fires on the loop thread under
+        the same lock; keeping the consumer's lock-hold time proportional
+        to actual new work avoids regressing bus dispatch latency under
+        heavy publish load.
+
+        Returns a fresh list (not the deque itself) so the consumer's
+        iteration is decoupled from any later producer append after
+        lock release.
+        """
+        new_rows: list = []
+        with self._live_event_lock:
+            for r in reversed(self._live_event_buffer):
+                if r["_seq"] <= last_seq:
+                    break
+                new_rows.append(r)
+            current_seq = self._live_event_seq
+        new_rows.reverse()  # restore chronological order for consumer
+        return new_rows, current_seq
+
+    def get_live_event_seq(self) -> int:
+        """Snapshot the live-event monotonic counter.
+
+        Symmetric with `get_event_seq` — used by tests and any future
+        polling-style consumer that wants to detect "is there new
+        activity since the snapshot" without dragging rows back.
+        """
+        with self._live_event_lock:
+            return self._live_event_seq
+
+    def clear_live_events(self) -> int:
+        """Atomically clear the live-event deque and return the current
+        seq. The TUI thread uses the returned value as the new
+        `_live_last_seen_seq` so a concurrent `_on_bus_event` between
+        clear-and-resync cannot leave events stranded behind the cursor.
+
+        Returning the seq under the SAME lock acquisition as the clear
+        is the whole point — separate calls would let a concurrent
+        append slip between clear and seq-read, then the consumer's
+        `last_seen_seq` would still match that appended event's `_seq`
+        and the row would be skipped forever.
+        """
+        with self._live_event_lock:
+            self._live_event_buffer.clear()
+            return self._live_event_seq
 
     def _mute_console(self):
         """Remove the console StreamHandler from QueueListener while TUI active,
