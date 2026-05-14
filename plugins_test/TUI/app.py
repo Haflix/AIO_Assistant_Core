@@ -105,6 +105,23 @@ DEFAULT_PLUGIN_INTERVAL = 3.0
 DEFAULT_REQUEST_INTERVAL = 1.0
 DEFAULT_NETWORK_INTERVAL = 3.0  # Phase 1 — peers-table refresh tick
 
+# Phase 3b — Logger-level Select options for the per-plugin tab Logger
+# overrides section. `__keep__` is a string sentinel for "(none) — don't
+# change this side" so the Select can use `allow_blank=False` (the
+# Select.NULL singleton is reserved for the prepended allow_blank=True
+# row, which would create a confusing dual-blank UX when an explicit
+# "no change" option is also needed). Apply handler maps `__keep__` →
+# Python None before calling PluginCore.set_logger_level.
+_LOGGER_LEVEL_OPTIONS = [
+    ("(none) — don't change", "__keep__"),
+    ("DEBUG", "DEBUG"),
+    ("INFO", "INFO"),
+    ("WARNING", "WARNING"),
+    ("ERROR", "ERROR"),
+    ("CRITICAL", "CRITICAL"),
+    ("MUTE", "MUTE"),
+]
+
 
 # ─── CSS ─────────────────────────────────────────────────────────────
 APP_CSS = """
@@ -423,6 +440,65 @@ RichLog { background: #1e1e1e; }
     background: #1e1e1e;
 }
 .sub-disabled { color: #606060; }
+
+/* ── Phase 3b — Per-plugin tab additions ─────────────────────────── */
+.lifecycle-strip {
+    height: auto;
+    layout: horizontal;
+    padding: 0 0 1 0;
+}
+.lifecycle-strip .stat-card { min-width: 16; height: 3; }
+.per-plugin-section {
+    height: auto;
+    padding: 1 0 0 0;
+}
+.per-plugin-section-title {
+    color: #c7a06e;
+    text-style: bold;
+    height: auto;
+    padding: 0 0 0 0;
+}
+.per-plugin-section-hint {
+    color: #808080;
+    height: auto;
+    padding: 0 0 1 0;
+}
+.per-plugin-empty { color: #808080; height: auto; padding: 0 1; }
+.per-plugin-table {
+    height: auto;
+    max-height: 8;
+    border: round #404040;
+    background: #2d2d2d;
+    margin: 0 0 1 0;
+}
+.per-plugin-logger-add-row {
+    height: auto;
+    layout: horizontal;
+    padding: 0 0 1 0;
+}
+.per-plugin-logger-add-row Input,
+.per-plugin-logger-add-row Select {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+.per-plugin-logger-add-row Button { width: auto; min-width: 8; }
+.per-plugin-logger-header {
+    height: auto;
+    layout: horizontal;
+}
+.per-plugin-logger-header Static { width: 1fr; }
+.per-plugin-logger-header Button { width: auto; min-width: 8; }
+.per-plugin-logger-list { height: auto; }
+.per-plugin-logger-row {
+    height: auto;
+    layout: horizontal;
+    padding: 0 0 0 0;
+}
+.per-plugin-logger-row Static { width: 1fr; }
+.per-plugin-logger-row Button { width: auto; min-width: 8; }
+.per-plugin-jump-button { margin: 0 1 1 0; min-width: 24; }
+.per-plugin-copy-uuid { width: auto; min-width: 6; }
+.per-plugin-verbose-switch { width: auto; }
 """
 
 
@@ -5104,6 +5180,24 @@ class DashboardApp(App):
         if plugin is None:
             plugin = self.plugin_core.plugins.get(plugin_name)
         if not plugin:
+            # Phase 3b — UNLOADED / FAILED_LOAD plugins lack a live
+            # instance in `pc.plugins` (per `PluginCore.py:2466-2474`,
+            # the assignment only runs on the success path). When the
+            # plugin still has a `plugin_states` entry, fall through
+            # to the generated view with `plugin=None` so the per-plugin
+            # Lifecycle / Events / Subs / Logger sections render their
+            # "(plugin not loaded)" placeholders. The endpoint loop
+            # also tolerates `plugin=None` (defaults to `{}`).
+            plugin_states = getattr(self.plugin_core, "plugin_states", None)
+            if isinstance(plugin_states, dict) and plugin_name in plugin_states:
+                _log.debug(
+                    "[%s] plugin instance missing — rendering Phase 3b "
+                    "placeholders via generated view (state-only)",
+                    plugin_name,
+                )
+                return self._auto_generate_plugin_view(
+                    plugin_name, None, has_bar=has_bar,
+                )
             return [Static(f"Plugin '{escape(plugin_name)}' not found.")]
 
         if force_mode == "generated":
@@ -5188,6 +5282,20 @@ class DashboardApp(App):
             + (f"  [dim]{escape(desc)}[/dim]" if desc else ""),
             markup=True,
         ))
+
+        # ── Phase 3b — four new sections between title Static and Rule
+        # (plan Section 4.4 insertion order: Lifecycle strip → Events →
+        # Subs → Logger overrides → Rule → endpoints).
+        widgets.append(self._build_lifecycle_strip(plugin_name, plugin))
+        widgets.append(self._build_per_plugin_events_section(plugin_name, plugin))
+        widgets.append(self._build_per_plugin_subs_section(plugin_name, plugin))
+        widgets.append(self._build_per_plugin_logger_section(plugin_name, plugin))
+        # Runtime-subs + logger-list population are scheduled by
+        # `_finalize_per_plugin_phase3b_sections` from `open_plugin_tab`
+        # / `_do_switch_view_mode` AFTER the mount loop completes —
+        # call_after_refresh inside the builder fired too early
+        # (callback ran before trailing widgets mounted).
+
         widgets.append(Rule())
 
         endpoints = getattr(plugin, "endpoints", {})
@@ -5507,6 +5615,13 @@ class DashboardApp(App):
         self._plugin_tab_modes[tab_id] = mode
         tabs.active = tab_id
 
+        # Phase 3b — populate the runtime subs DataTable + logger
+        # overrides list AFTER the mount loop completes. Builders
+        # can't reliably schedule this themselves; call_after_refresh
+        # from inside the builder fires before trailing widgets mount.
+        if mode == "generated":
+            self._finalize_per_plugin_phase3b_sections(plugin_name)
+
     async def _close_plugin_tab(self, plugin_name: str) -> None:
         tab_id = f"tab-plugin-{self._sanitize_id(plugin_name)}"
         tabs = self.query_one("#main-tabs", TabbedContent)
@@ -5671,6 +5786,21 @@ class DashboardApp(App):
                 self.load_plugin_config(entry["plugin"])
             elif t in ("view-mode-custom", "view-mode-generated"):
                 self._switch_plugin_view_mode(entry["plugin"], t)
+            # ── Phase 3b — per-plugin tab button routing ──────────────
+            elif t == "per-plugin-copy-uuid":
+                self._handle_per_plugin_copy_uuid(entry["plugin"])
+            elif t == "per-plugin-jump-events":
+                self._jump_to_events_catalogue_for_plugin(entry["plugin"])
+            elif t == "per-plugin-jump-subs":
+                self._jump_to_subs_browser_for_plugin(entry["plugin"])
+            elif t == "per-plugin-logger-apply":
+                self._handle_per_plugin_logger_apply(entry["plugin"])
+            elif t == "per-plugin-logger-clear":
+                self._handle_per_plugin_logger_clear(
+                    entry["plugin"], entry.get("endpoint", ""),
+                )
+            elif t == "per-plugin-logger-refresh":
+                self._handle_per_plugin_logger_refresh(entry["plugin"])
         except Exception:
             pass
 
@@ -5803,6 +5933,11 @@ class DashboardApp(App):
         for w in content:
             await scroll.mount(w)
 
+        # Phase 3b — populate the post-mount Phase 3b sections only
+        # when we're switching INTO the generated view.
+        if new_mode == "generated":
+            self._finalize_per_plugin_phase3b_sections(plugin_name)
+
         # Update toggle button styles
         bar_id = f"{tab_id}-view-bar"
         try:
@@ -5880,8 +6015,22 @@ class DashboardApp(App):
     def on_switch_changed(self, event: Switch.Changed) -> None:
         sw_id = event.switch.id or ""
         entry = self._lookup_id(sw_id)
-        if entry and entry.get("type") == "menu-toggle":
+        if not entry:
+            return
+        t = entry.get("type")
+        if t == "menu-toggle":
             self._execute_toggle(entry, event.value)
+        elif t == "per-plugin-verbose":
+            # Phase 3b — direct attr write on the loop-bound Plugin
+            # instance (plan Section 4.4 cycle-1 LOW fix #6: no lock
+            # needed; GIL-safe; faster than `_run_on_main` bridge).
+            plugin_name = entry.get("plugin", "")
+            target = self.plugin_core.plugins.get(plugin_name)
+            if target is not None:
+                try:
+                    target.verbose_notifier = bool(event.value)
+                except Exception:
+                    pass
 
     # ── Phase 2b — Events tab activation handlers ─────────────────
     # The existing undecorated `on_tabbed_content_tab_activated` below
@@ -6544,6 +6693,1003 @@ class DashboardApp(App):
             id=self._DETAIL_SECTION_ARGS,
             classes="plugin-detail-section-body",
         )
+
+    # ── Phase 3b — Per-plugin tab section builders ────────────────────
+
+    def _per_plugin_widget_id(self, kind: str, plugin_name: str) -> str:
+        """Deterministic widget ID for Phase 3b per-plugin tab widgets.
+
+        Same plugin name yields the same suffix across re-renders so
+        tests can locate widgets without inspecting the counter-driven
+        `_id_registry`. Combines a fixed `kind` prefix with the
+        sanitized plugin name (md5-suffixed, see `_sanitize_id`).
+        """
+        return f"{kind}-{self._sanitize_id(plugin_name)}"
+
+    def _finalize_per_plugin_phase3b_sections(self, plugin_name: str) -> None:
+        """Phase 3b — kick off post-mount population for the per-plugin
+        tab's Phase 3b sections.
+
+        Called from `open_plugin_tab` / `_do_switch_view_mode` AFTER the
+        widget mount loop completes (call_after_refresh inside the
+        builders fires too early when the trailing widgets are still
+        being mounted). Triggers:
+
+          * `_refresh_per_plugin_logger_list_for(plugin_name)` — sync;
+            mounts per-prefix Horizontal rows or the empty Static
+            placeholder into the overrides Vertical container.
+          * `_populate_per_plugin_runtime_subs(plugin_name, uuid)` —
+            sync wrapper around the async worker body
+            (`_do_populate_per_plugin_runtime_subs`). Schedules the
+            worker with a plugin-scoped exclusive group so cross-plugin
+            invocations don't cancel each other. Worker awaits
+            `list_local_subs()`, filters by plugin_uuid + declared_id,
+            populates the runtime DataTable.
+
+        Both helpers are no-ops when the section widgets aren't found
+        (e.g. plugin is UNLOADED/FAILED_LOAD and the Logger Add row
+        wasn't built, or the operator closed the tab between trigger
+        and execute).
+        """
+        # Logger list — sync helper that mounts rows into the Vertical.
+        try:
+            self._refresh_per_plugin_logger_list_for(plugin_name)
+        except Exception:
+            pass
+
+        # Runtime subs worker — skip for plugins without a live instance
+        # (UNLOADED/FAILED_LOAD have no plugin_uuid to filter by).
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        if plugin is None:
+            return
+        plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
+        if not plugin_uuid:
+            return
+        try:
+            self._populate_per_plugin_runtime_subs(plugin_name, plugin_uuid)
+        except Exception:
+            pass
+
+    def _build_lifecycle_strip(self, plugin_name: str, plugin) -> Horizontal:
+        """Phase 3b — Lifecycle strip at the top of the per-plugin tab.
+
+        Six cells in a Horizontal `.lifecycle-strip` container:
+        Phase pill, UUID short + Copy button, _lifecycle_ready ✓/✗,
+        ready ✓/✗, verbose_notifier Switch, version.
+
+        For UNLOADED / FAILED_LOAD plugins (plugin is None per the
+        framework — `PluginCore.py:2466-2474` only assigns to
+        `pc.plugins` on the success path), the strip renders best-effort
+        cells: phase + version from state/on-disk-cfg fallback,
+        readiness/uuid cells render `?`, no Copy / Switch widgets.
+        """
+        phase_label, phase_class = self._plugin_phase(plugin_name, plugin)
+        phase_id = self._per_plugin_widget_id("per-plugin-phase", plugin_name)
+
+        # UUID — first 8 hex chars + Copy button. For unloaded plugins,
+        # plugin is None so render `?` without a Copy button.
+        uuid_str = "?"
+        version_str = "?"
+        lifecycle_marker = "?"
+        ready_marker = "?"
+        verbose_value = False
+        if plugin is not None:
+            uuid_full = str(getattr(plugin, "plugin_uuid", "") or "")
+            uuid_str = (uuid_full[:8] + "…") if len(uuid_full) > 8 else uuid_full or "?"
+            version_str = str(getattr(plugin, "version", "?"))
+            lcr = getattr(plugin, "_lifecycle_ready", None)
+            rdy = getattr(plugin, "ready", None)
+            if lcr is not None and hasattr(lcr, "is_set"):
+                lifecycle_marker = "✓" if lcr.is_set() else "✗"
+            if rdy is not None and hasattr(rdy, "is_set"):
+                ready_marker = "✓" if rdy.is_set() else "✗"
+            verbose_value = bool(getattr(plugin, "verbose_notifier", False))
+
+        # Phase cell.
+        phase_cell = Vertical(
+            Static("[dim]Phase[/dim]", markup=True, classes="stat-key"),
+            Static(phase_label, classes=phase_class, id=phase_id),
+            classes="stat-card",
+        )
+
+        # UUID cell with Copy button.
+        if plugin is not None:
+            copy_id = self._make_id(
+                "copy-uuid", plugin_name, "", "per-plugin-copy-uuid",
+            )
+            uuid_cell = Vertical(
+                Static("[dim]UUID[/dim]", markup=True, classes="stat-key"),
+                Horizontal(
+                    Static(uuid_str, classes="stat-val"),
+                    Button("Copy", id=copy_id, classes="per-plugin-copy-uuid"),
+                ),
+                classes="stat-card",
+            )
+        else:
+            uuid_cell = Vertical(
+                Static("[dim]UUID[/dim]", markup=True, classes="stat-key"),
+                Static(uuid_str, classes="stat-val"),
+                classes="stat-card",
+            )
+
+        # _lifecycle_ready cell.
+        lcr_color = "green" if lifecycle_marker == "✓" else ("red" if lifecycle_marker == "✗" else "yellow")
+        lcr_cell = Vertical(
+            Static("[dim]lifecycle_ready[/dim]", markup=True, classes="stat-key"),
+            Static(
+                f"[{lcr_color}]{lifecycle_marker}[/{lcr_color}]",
+                markup=True, classes="stat-val",
+                id=self._per_plugin_widget_id("per-plugin-lifecycle-ready", plugin_name),
+            ),
+            classes="stat-card",
+        )
+
+        # ready cell.
+        rdy_color = "green" if ready_marker == "✓" else ("red" if ready_marker == "✗" else "yellow")
+        rdy_cell = Vertical(
+            Static("[dim]ready[/dim]", markup=True, classes="stat-key"),
+            Static(
+                f"[{rdy_color}]{ready_marker}[/{rdy_color}]",
+                markup=True, classes="stat-val",
+                id=self._per_plugin_widget_id("per-plugin-ready", plugin_name),
+            ),
+            classes="stat-card",
+        )
+
+        # verbose_notifier Switch cell — only for loaded plugins (need
+        # a target instance for the toggle handler to write to). The
+        # Switch's `id` is the deterministic per-plugin widget id;
+        # on_switch_changed looks up routing metadata via the id (not
+        # the `name`), so we register the routing entry directly under
+        # the deterministic id and skip `_make_id` for this widget
+        # (would otherwise leave a dead registry entry that inflates
+        # `_id_counter` without a resolvable widget — review fix).
+        if plugin is not None:
+            verbose_widget_id = self._per_plugin_widget_id(
+                "per-plugin-verbose", plugin_name,
+            )
+            verbose_cell = Vertical(
+                Static("[dim]verbose_notifier[/dim]", markup=True, classes="stat-key"),
+                Switch(
+                    value=verbose_value,
+                    id=verbose_widget_id,
+                    classes="per-plugin-verbose-switch",
+                ),
+                classes="stat-card",
+            )
+            self._id_registry[verbose_widget_id] = {
+                "plugin": plugin_name,
+                "endpoint": "",
+                "type": "per-plugin-verbose",
+            }
+        else:
+            verbose_cell = Vertical(
+                Static("[dim]verbose_notifier[/dim]", markup=True, classes="stat-key"),
+                Static("?", classes="stat-val"),
+                classes="stat-card",
+            )
+
+        # Version cell. `version_str` comes from plugin_config.yml which
+        # is free-form — escape against accidental markup syntax in the
+        # config (Cycle 2 fresh-eyes LOW finding; matches the existing
+        # pattern at `_auto_generate_plugin_view`'s title Static).
+        ver_cell = Vertical(
+            Static("[dim]Version[/dim]", markup=True, classes="stat-key"),
+            Static(escape(version_str), classes="stat-val"),
+            classes="stat-card",
+        )
+
+        return Horizontal(
+            phase_cell, uuid_cell, lcr_cell, rdy_cell, verbose_cell, ver_cell,
+            classes="lifecycle-strip",
+            id=self._per_plugin_widget_id("lifecycle-strip", plugin_name),
+        )
+
+    def _build_per_plugin_events_section(
+        self, plugin_name: str, plugin,
+    ) -> Vertical:
+        """Phase 3b — Events section on the per-plugin tab.
+
+        Static title + DataTable (cursor_type="none", max-height 8 per
+        plan Section 4.5 + plan-cycle 1 fix #36 — non-interactive
+        regression target) + cross-link button. Empty `plugin.events` →
+        `(no events declared)` placeholder.
+        """
+        title_static = Static(
+            "[bold]Events[/bold]", markup=True,
+            classes="per-plugin-section-title",
+        )
+
+        events_dict = None
+        if plugin is not None:
+            cand = getattr(plugin, "events", None)
+            if isinstance(cand, dict):
+                events_dict = cand
+
+        body = [title_static]
+
+        if plugin is None:
+            body.append(Static(
+                "[dim](plugin not loaded)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-events-empty", plugin_name,
+                ),
+            ))
+        elif not events_dict:
+            body.append(Static(
+                "[dim](no events declared)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-events-empty", plugin_name,
+                ),
+            ))
+        else:
+            table = DataTable(
+                cursor_type="none",  # plan Section 4.5 — non-interactive
+                classes="per-plugin-table",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-events-table", plugin_name,
+                ),
+            )
+            table.add_columns("Event ID", "Topic", "Hosts", "Enabled")
+            for evt_id, entry in events_dict.items():
+                if not isinstance(entry, dict):
+                    continue
+                topic = str(entry.get("topic", ""))
+                hosts = entry.get("hosts")
+                enabled = entry.get("enabled", True)
+                # `hosts` can be user-config-controlled (list/str/None);
+                # wrap defensively so a stray markup char in a config
+                # value doesn't break rendering.
+                hosts_text = Text("" if hosts is None else str(hosts))
+                enabled_text = Text(
+                    "✓" if enabled else "✗",
+                    style="green" if enabled else "red",
+                )
+                table.add_row(
+                    str(evt_id),
+                    Text(topic),
+                    hosts_text,
+                    enabled_text,
+                )
+            body.append(table)
+
+        # Cross-link button — only when plugin is loaded (jump target
+        # only makes sense for a plugin the catalogue knows about).
+        if plugin is not None:
+            jump_id = self._make_id(
+                "jump-events", plugin_name, "", "per-plugin-jump-events",
+            )
+            body.append(Button(
+                "Open in Events catalogue",
+                id=jump_id,
+                classes="per-plugin-jump-button",
+                variant="primary",
+            ))
+
+        return Vertical(
+            *body, classes="per-plugin-section",
+            id=self._per_plugin_widget_id(
+                "per-plugin-events-section", plugin_name,
+            ),
+        )
+
+    def _build_per_plugin_subs_section(
+        self, plugin_name: str, plugin,
+    ) -> Vertical:
+        """Phase 3b — Subscriptions section on the per-plugin tab.
+
+        Two sub-tables: declared (from `plugin.subscriptions`) and
+        runtime (populated post-mount via
+        `_populate_per_plugin_runtime_subs` worker using a single
+        `topic_registry.list_local_subs()` snapshot + client-side
+        filter `s.plugin_uuid == plugin.plugin_uuid AND s.declared_id
+        is None`).
+
+        Cross-link button switches to Events tab → Subs browser inner
+        tab + injects the plugin name into the filter Select.
+
+        For UNLOADED / FAILED_LOAD plugins (plugin is None): render
+        `(plugin not loaded)` placeholders, no cross-link button.
+        """
+        body = [
+            Static(
+                "[bold]Subscriptions[/bold]", markup=True,
+                classes="per-plugin-section-title",
+            ),
+        ]
+
+        if plugin is None:
+            body.append(Static(
+                "[dim](plugin not loaded)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-subs-declared-empty", plugin_name,
+                ),
+            ))
+            body.append(Static(
+                "[dim](plugin not loaded)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-subs-runtime-empty", plugin_name,
+                ),
+            ))
+            return Vertical(
+                *body, classes="per-plugin-section",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-subs-section", plugin_name,
+                ),
+            )
+
+        # Declared subs table — sync read from plugin.subscriptions.
+        declared_dict = getattr(plugin, "subscriptions", None) or {}
+        if not isinstance(declared_dict, dict):
+            declared_dict = {}
+
+        body.append(Static(
+            "[dim]Declared (YAML):[/dim]", markup=True,
+            classes="per-plugin-section-hint",
+        ))
+        if not declared_dict:
+            body.append(Static(
+                "[dim](no declared subs)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-subs-declared-empty", plugin_name,
+                ),
+            ))
+        else:
+            d_table = DataTable(
+                cursor_type="none",
+                classes="per-plugin-table",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-subs-declared-table", plugin_name,
+                ),
+            )
+            d_table.add_columns(
+                "Declared ID", "Topic", "Target", "Hosts",
+                "Authors", "Enabled",
+            )
+            for dec_id, entry in declared_dict.items():
+                if not isinstance(entry, dict):
+                    continue
+                target_plugin = entry.get("target_plugin") or plugin_name
+                target_access = entry.get("target_access_name") or "?"
+                hosts = entry.get("hosts")
+                authors = entry.get("authors")
+                enabled = entry.get("enabled", True)
+                enabled_text = Text(
+                    "✓" if enabled else "✗",
+                    style="green" if enabled else "red",
+                )
+                d_table.add_row(
+                    str(dec_id),
+                    Text(str(entry.get("topic", ""))),
+                    Text(f"{target_plugin}.{target_access}"),
+                    Text("" if hosts is None else str(hosts)),
+                    Text("" if authors is None else str(authors)),
+                    enabled_text,
+                )
+            body.append(d_table)
+
+        # Runtime subs table — populated by worker after mount. Default
+        # to the empty placeholder VISIBLE; worker swaps display states
+        # based on the snapshot filter result. Both widgets mounted so
+        # the worker can flip `.display` without re-mounting.
+        body.append(Static(
+            "[dim]Runtime:[/dim]", markup=True,
+            classes="per-plugin-section-hint",
+        ))
+        runtime_empty = Static(
+            "[dim](no runtime subs)[/dim]",
+            markup=True, classes="per-plugin-empty",
+            id=self._per_plugin_widget_id(
+                "per-plugin-subs-runtime-empty", plugin_name,
+            ),
+        )
+        runtime_table = DataTable(
+            cursor_type="none",
+            classes="per-plugin-table",
+            id=self._per_plugin_widget_id(
+                "per-plugin-subs-runtime-table", plugin_name,
+            ),
+        )
+        # Defer add_columns until the worker runs — DataTable.add_columns
+        # requires `self.app.console` for width measurement, which only
+        # exists inside an active Textual app context. Sync-construction
+        # callers (the legacy
+        # `TestPluginViewGeneration.test_auto_generate_no_endpoints`
+        # invokes `_auto_generate_plugin_view` without a running app)
+        # would otherwise raise `NoActiveAppError`.
+        runtime_table.display = False  # hidden until worker confirms rows
+        body.append(runtime_empty)
+        body.append(runtime_table)
+
+        # Cross-link button.
+        jump_id = self._make_id(
+            "jump-subs", plugin_name, "", "per-plugin-jump-subs",
+        )
+        body.append(Button(
+            "Open in Subscriptions browser",
+            id=jump_id,
+            classes="per-plugin-jump-button",
+            variant="primary",
+        ))
+
+        return Vertical(
+            *body, classes="per-plugin-section",
+            id=self._per_plugin_widget_id(
+                "per-plugin-subs-section", plugin_name,
+            ),
+        )
+
+    def _build_per_plugin_logger_section(
+        self, plugin_name: str, plugin,
+    ) -> Vertical:
+        """Phase 3b — Logger-level overrides section on the per-plugin tab.
+
+        Header (title + Refresh button), hint, Current Overrides list
+        (rows owned by THIS plugin — Vertical container of per-prefix
+        Horizontal rows so each row can host an actual Clear Button;
+        Textual 8.2.3's DataTable can't embed widgets in cells), Add
+        row (Input + 2 Selects + Apply button).
+
+        For UNLOADED / FAILED_LOAD plugins (plugin is None or no
+        plugin_uuid): render placeholder without Add row — per plan
+        Section 4.7 edge case + plan-cycle 2 resolution (option A:
+        treat both states identically since `pc.plugins.get(name)` is
+        None for both per `PluginCore.py:2466-2474`).
+
+        `pc.list_logger_levels()`, `set_logger_level`, `clear_logger_level`
+        are sync (per plan Section 4.7 cycle-2 fix referencing
+        `PluginCore.py:1737-1763`). Direct-call from the handler is
+        correct — wrapping in `_run_on_main` would raise TypeError
+        ("a coroutine was expected") because run_coroutine_threadsafe
+        expects a coroutine.
+        """
+        plugin_uuid = (
+            str(getattr(plugin, "plugin_uuid", "") or "") if plugin is not None else ""
+        )
+        renderable_section = (plugin is not None and bool(plugin_uuid))
+
+        if not renderable_section:
+            # No Add row for UNLOADED / FAILED_LOAD (per Option A
+            # resolution — plugin not actionable).
+            title_only = Horizontal(
+                Static(
+                    "[bold]Logger-level overrides[/bold]", markup=True,
+                    classes="per-plugin-section-title",
+                ),
+                classes="per-plugin-logger-header",
+            )
+            return Vertical(
+                title_only,
+                Static(
+                    "[dim](plugin not loaded)[/dim]",
+                    markup=True, classes="per-plugin-empty",
+                    id=self._per_plugin_widget_id(
+                        "per-plugin-logger-empty", plugin_name,
+                    ),
+                ),
+                classes="per-plugin-section",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-logger-section", plugin_name,
+                ),
+            )
+
+        # Refresh button — re-renders the Current Overrides list only
+        # (no bus topic for logger-level changes, per plan Section 4.7).
+        refresh_id = self._make_id(
+            "logger-refresh", plugin_name, "", "per-plugin-logger-refresh",
+        )
+        title_row = Horizontal(
+            Static(
+                "[bold]Logger-level overrides[/bold]", markup=True,
+                classes="per-plugin-section-title",
+            ),
+            Button("Refresh", id=refresh_id, variant="default"),
+            classes="per-plugin-logger-header",
+        )
+
+        body: list = [title_row]
+        body.append(Static(
+            "[dim]Per-logger thresholds owned by this plugin. "
+            "Plugin source wins over config source.[/dim]",
+            markup=True, classes="per-plugin-section-hint",
+        ))
+
+        # Current overrides list (Vertical of per-prefix rows).
+        owners_filter = (plugin_name, plugin_uuid)
+        overrides_list = Vertical(
+            id=self._per_plugin_widget_id(
+                "per-plugin-logger-list", plugin_name,
+            ),
+            classes="per-plugin-logger-list",
+        )
+        body.append(overrides_list)
+
+        # Add row: prefix Input + console Select + file Select + Apply.
+        prefix_id = self._per_plugin_widget_id(
+            "per-plugin-logger-prefix", plugin_name,
+        )
+        console_id = self._per_plugin_widget_id(
+            "per-plugin-logger-console", plugin_name,
+        )
+        file_id = self._per_plugin_widget_id(
+            "per-plugin-logger-file", plugin_name,
+        )
+        apply_id = self._make_id(
+            "logger-apply", plugin_name, "", "per-plugin-logger-apply",
+        )
+        body.append(Horizontal(
+            Input(placeholder="logger prefix (e.g. asyncio)", id=prefix_id),
+            Select(
+                _LOGGER_LEVEL_OPTIONS, value="__keep__",
+                allow_blank=False, id=console_id,
+            ),
+            Select(
+                _LOGGER_LEVEL_OPTIONS, value="__keep__",
+                allow_blank=False, id=file_id,
+            ),
+            Button("Apply", id=apply_id, variant="primary"),
+            classes="per-plugin-logger-add-row",
+            id=self._per_plugin_widget_id(
+                "per-plugin-logger-add-row", plugin_name,
+            ),
+        ))
+
+        # Initial population is triggered by `open_plugin_tab` /
+        # `_do_switch_view_mode` AFTER the mount loop completes via
+        # `_finalize_per_plugin_phase3b_sections`. Builders cannot
+        # reliably schedule it themselves because call_after_refresh
+        # may fire before mount finishes on the trailing widgets.
+
+        return Vertical(
+            *body, classes="per-plugin-section",
+            id=self._per_plugin_widget_id(
+                "per-plugin-logger-section", plugin_name,
+            ),
+        )
+
+    def _refresh_per_plugin_logger_list_for(self, plugin_name: str) -> None:
+        """Phase 3b — schedule the per-plugin Logger overrides list
+        re-render via a plugin-scoped worker group.
+
+        Cycle 3 fresh-eyes MEDIUM fix: a static @work group string
+        (`"per-plugin-logger-list"`) with `exclusive=True` would
+        cancel ANOTHER plugin's in-flight worker the moment THIS
+        plugin's tab triggered a re-render — leaving that other
+        plugin's overrides list half-rendered. Use `run_worker(...)`
+        with a dynamic per-plugin group so only same-plugin invocations
+        cancel each other.
+
+        Callers: initial mount from `_finalize_per_plugin_phase3b_sections`;
+        Apply/Clear/Refresh handlers from `on_button_pressed`.
+        """
+        self.run_worker(
+            self._do_refresh_per_plugin_logger_list(plugin_name),
+            group=f"per-plugin-logger-list-{plugin_name}",
+            exclusive=True,
+            thread=False,
+        )
+
+    async def _do_refresh_per_plugin_logger_list(
+        self, plugin_name: str,
+    ) -> None:
+        """Worker body — fetch snapshot, await-clear the overrides
+        Vertical, mount per-prefix rows or the empty placeholder.
+
+        Scheduled by `_refresh_per_plugin_logger_list_for` with a
+        plugin-scoped exclusive group. Same-plugin rapid re-renders
+        (Apply / Clear / Refresh) cancel the prior mid-await; cross-
+        plugin invocations run in parallel.
+        """
+        try:
+            list_id = self._per_plugin_widget_id(
+                "per-plugin-logger-list", plugin_name,
+            )
+            overrides_list = self.query_one(f"#{list_id}", Vertical)
+        except NoMatches:
+            return
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        if plugin is None:
+            return
+        plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
+        if not plugin_uuid:
+            return
+        try:
+            snapshot = self.plugin_core.list_logger_levels()
+        except Exception:
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+
+        # Prune the `_id_registry` entries the prior render produced for
+        # this plugin's per-row Clear buttons. Without this, repeated
+        # Apply/Clear/Refresh on a long-lived tab accumulates dead
+        # registry rows pointing at unmounted widgets — bounded by
+        # interaction count, cleaned only on tab close otherwise
+        # (Cycle 2 fresh-eyes LOW finding).
+        to_drop = [
+            wid for wid, e in self._id_registry.items()
+            if e.get("plugin") == plugin_name
+            and e.get("type") == "per-plugin-logger-clear"
+        ]
+        for wid in to_drop:
+            self._id_registry.pop(wid, None)
+
+        # Await-clear so child.remove() completes before the next mount.
+        try:
+            await overrides_list.remove_children()
+        except Exception:
+            return  # widget tree torn down mid-refresh — bail
+
+        owners_filter = (plugin_name, plugin_uuid)
+        matching = []
+        for prefix, info in snapshot.items():
+            if not isinstance(info, dict):
+                continue
+            owners = info.get("owners") or []
+            if owners_filter not in owners:
+                continue
+            matching.append((prefix, info))
+
+        if not matching:
+            await overrides_list.mount(Static(
+                "[dim](no overrides owned by this plugin)[/dim]",
+                markup=True, classes="per-plugin-empty",
+                id=self._per_plugin_widget_id(
+                    "per-plugin-logger-empty", plugin_name,
+                ),
+            ))
+            return
+
+        for prefix, info in matching:
+            effective = info.get("effective", {}) or {}
+            config = info.get("config", {}) or {}
+            eff_console = effective.get("console")
+            eff_file = effective.get("file")
+            cfg_console = config.get("console")
+            cfg_file = config.get("file")
+            console_cell = "" if eff_console is None else str(eff_console)
+            if cfg_console is not None and cfg_console != eff_console:
+                console_cell += f" (was: {cfg_console})"
+            file_cell = "" if eff_file is None else str(eff_file)
+            if cfg_file is not None and cfg_file != eff_file:
+                file_cell += f" (was: {cfg_file})"
+
+            # Per-row Clear button — registered with prefix in the
+            # `endpoint` slot so the on_button_pressed catch-all can
+            # route to the clear handler.
+            clear_id = self._make_id(
+                "logger-clear", plugin_name, prefix,
+                "per-plugin-logger-clear",
+            )
+            row = Horizontal(
+                Static(
+                    f"[bold]{escape(prefix)}[/bold]", markup=True,
+                    classes="per-plugin-logger-prefix-cell",
+                ),
+                # `Static` defaults to `markup=True`. Level strings
+                # are validated (DEBUG/INFO/etc.) but `cfg_*` values
+                # come straight from the LogUtil snapshot dict; an
+                # unbracketed value-replace future could surface user
+                # text. Disable markup parsing for these cells —
+                # consistent with the LOW review fix.
+                Static(
+                    console_cell, markup=False,
+                    classes="per-plugin-logger-console-cell",
+                ),
+                Static(
+                    file_cell, markup=False,
+                    classes="per-plugin-logger-file-cell",
+                ),
+                Button("Clear", id=clear_id, variant="warning"),
+                classes="per-plugin-logger-row",
+            )
+            await overrides_list.mount(row)
+
+    def _populate_per_plugin_runtime_subs(
+        self, plugin_name: str, plugin_uuid: str,
+    ) -> None:
+        """Sync wrapper — schedules the runtime-subs worker with a
+        plugin-scoped exclusive group. Cycle 3 fresh-eyes MEDIUM fix —
+        see `_refresh_per_plugin_logger_list_for` for the same dynamic-
+        group rationale.
+        """
+        self.run_worker(
+            self._do_populate_per_plugin_runtime_subs(plugin_name, plugin_uuid),
+            group=f"per-plugin-runtime-subs-{plugin_name}",
+            exclusive=True,
+            thread=False,
+        )
+
+    async def _do_populate_per_plugin_runtime_subs(
+        self, plugin_name: str, plugin_uuid: str,
+    ) -> None:
+        """Worker body — populate the runtime subs table for `plugin_name`
+        from a single `pc.topic_registry.list_local_subs()` snapshot.
+
+        Filter: `sub.plugin_uuid == plugin_uuid AND sub.declared_id is
+        None` (runtime subs only; YAML-declared subs are shown in the
+        declared table). Plan Section 4.6 cycle-1 fix — single snapshot
+        call avoids the N-await per-sub lookup AND closes the mid-iter
+        pop window (concurrent `_pop_plugin_under_lock` can remove a
+        sub between awaits).
+        """
+        try:
+            table_id = self._per_plugin_widget_id(
+                "per-plugin-subs-runtime-table", plugin_name,
+            )
+            empty_id = self._per_plugin_widget_id(
+                "per-plugin-subs-runtime-empty", plugin_name,
+            )
+            table = self.query_one(f"#{table_id}", DataTable)
+            empty = self.query_one(f"#{empty_id}", Static)
+        except NoMatches:
+            return  # tab unmounted between schedule and execute
+
+        # Snapshot via _run_on_main — list_local_subs is async + holds
+        # topic_registry._lock on the main loop.
+        try:
+            subs = await self._run_on_main(
+                self.plugin_core.topic_registry.list_local_subs()
+            )
+        except Exception:
+            subs = None
+        if subs is None:
+            subs = []
+
+        rows = []
+        for s in subs:
+            if getattr(s, "plugin_uuid", None) != plugin_uuid:
+                continue
+            if getattr(s, "declared_id", None) is not None:
+                continue
+            rows.append(s)
+
+        try:
+            table.clear()
+        except Exception:
+            pass
+        # Add columns lazily — first run after the widget is mounted
+        # inside an active app context. `column_count` is 0 until
+        # `add_columns` runs, so this is idempotent on subsequent worker
+        # invocations.
+        if not table.columns:
+            try:
+                table.add_columns(
+                    "Sub UUID", "Topic", "Target", "Hosts", "Authors",
+                )
+            except Exception:
+                # Defensive — if the active app context is unexpectedly
+                # absent, leave the table empty rather than raising.
+                return
+        for s in rows:
+            sub_uuid_short = str(getattr(s, "sub_uuid", "") or "")[:8] + "…"
+            topic = str(getattr(s, "topic_pattern", "") or "")
+            target_plugin = (
+                getattr(s, "target_plugin", None)
+                or getattr(s, "plugin_name", "")
+            )
+            target_access = getattr(s, "target_access_name", "") or ""
+            hosts = getattr(s, "hosts", None)
+            authors = getattr(s, "authors", None)
+            table.add_row(
+                Text(sub_uuid_short),
+                Text(topic),
+                Text(f"{target_plugin}.{target_access}"),
+                Text("" if hosts is None else str(hosts)),
+                Text("" if authors is None else str(authors)),
+            )
+
+        # Toggle display: show table when we have rows, otherwise show
+        # the empty placeholder.
+        if rows:
+            table.display = True
+            empty.display = False
+        else:
+            table.display = False
+            empty.display = True
+
+    # ── Phase 3b — Cross-link handlers ────────────────────────────────
+
+    @work(thread=False, exclusive=True, group="cross-link")
+    async def _jump_to_events_catalogue_for_plugin(
+        self, plugin_name: str,
+    ) -> None:
+        """Switch to the Events catalogue, inject + select the plugin
+        name on the catalogue's filter Select.
+
+        Plan Section 4.6 + cycle-2 fix + plan-cycle 2 review: shared
+        `group="cross-link"` with `_jump_to_subs_browser_for_plugin` so
+        rapid double-press serialises (latest jump wins, with its own
+        option-injection landing on its destination Select before the
+        tab activation). Different groups would let concurrent workers
+        race and land on the wrong tab with un-applied injection on
+        the OTHER Select.
+        """
+        await self._inject_option_and_select(
+            "#events-cat-filter-plugin", plugin_name,
+        )
+        try:
+            self.query_one("#main-tabs", TabbedContent).active = "tab-events"
+            self.query_one("#events-tabs", TabbedContent).active = "events-tab-cat"
+        except NoMatches:
+            return
+        # Force the outer flag so the debounce tick processes the
+        # cat refresh even if TabActivated dispatch is delayed in test
+        # mode (Phase 2b lesson).
+        self._outer_is_events = True
+
+    @work(thread=False, exclusive=True, group="cross-link")
+    async def _jump_to_subs_browser_for_plugin(
+        self, plugin_name: str,
+    ) -> None:
+        """Switch to the Subs browser, inject + select the plugin name
+        on the subs filter Select. Shared `group="cross-link"` with the
+        catalogue jump (see `_jump_to_events_catalogue_for_plugin`).
+        """
+        await self._inject_option_and_select(
+            "#events-subs-filter-plugin", plugin_name,
+        )
+        try:
+            self.query_one("#main-tabs", TabbedContent).active = "tab-events"
+            self.query_one("#events-tabs", TabbedContent).active = "events-tab-subs"
+        except NoMatches:
+            return
+        self._outer_is_events = True
+
+    async def _inject_option_and_select(
+        self, select_selector: str, plugin_name: str,
+    ) -> None:
+        """Plan Section 4.6 cycle-2 fix — explicit option-injection
+        BEFORE tab switch so the value-set always lands on the target
+        Select.
+
+        Reads `sel._options` (internal) to filter out the prepended
+        allow_blank row (`Select.NULL` sentinel — verified at
+        `plugins_test/TUI/textual/src/textual/widgets/_select.py:37`
+        + the class-level alias at line 289 `NULL = NULL`). If the
+        plugin is absent from the current options list, prepends it
+        before calling `set_options(...)` then assigns `value`.
+
+        `prevent(Select.Changed)` suppresses the in-flight change
+        event so the destination tab's filter-change observer doesn't
+        re-trigger its own refresh worker mid-injection.
+        """
+        try:
+            sel = self.query_one(select_selector, Select)
+        except NoMatches:
+            return
+        # Filter out the NULL sentinel from the existing option list —
+        # set_options would double the blank row otherwise.
+        current_options = [
+            (label, value) for label, value in sel._options
+            if value is not Select.NULL
+        ]
+        if not any(v == plugin_name for _, v in current_options):
+            new_options = current_options + [(plugin_name, plugin_name)]
+            with self.prevent(Select.Changed):
+                try:
+                    sel.set_options(new_options)
+                except Exception:
+                    # Defensive — malformed list shouldn't happen but
+                    # bailing here at worst leaves the operator on the
+                    # destination tab with no filter applied.
+                    return
+        with self.prevent(Select.Changed):
+            try:
+                sel.value = plugin_name
+            except Exception:
+                # Per plan-cycle 1 test #24: silent no-op acceptable —
+                # operator lands on the destination tab even if the
+                # filter Select rejected the value.
+                pass
+
+    # ── Phase 3b — Logger-level Apply / Clear handlers ────────────────
+
+    def _handle_per_plugin_logger_apply(self, plugin_name: str) -> None:
+        """Apply button handler for the per-plugin Logger overrides
+        Add row.
+
+        Reads the prefix Input + 2 Selects, maps `__keep__` → None,
+        calls `pc.set_logger_level` DIRECTLY (sync — plan Section 4.7
+        cycle-2 fix locks this), wrapped in try/except + `self.notify`
+        per plan-cycle 2 review fix so a validation raise inside the
+        handler doesn't tear down the widget tree silently.
+        """
+        prefix_id = self._per_plugin_widget_id(
+            "per-plugin-logger-prefix", plugin_name,
+        )
+        console_id = self._per_plugin_widget_id(
+            "per-plugin-logger-console", plugin_name,
+        )
+        file_id = self._per_plugin_widget_id(
+            "per-plugin-logger-file", plugin_name,
+        )
+        try:
+            prefix_widget = self.query_one(f"#{prefix_id}", Input)
+            console_widget = self.query_one(f"#{console_id}", Select)
+            file_widget = self.query_one(f"#{file_id}", Select)
+        except NoMatches:
+            return
+        prefix = (prefix_widget.value or "").strip()
+        if not prefix:
+            self.notify("Logger prefix required", severity="warning")
+            return
+        console_val = console_widget.value
+        file_val = file_widget.value
+        console_arg = None if console_val == "__keep__" else console_val
+        file_arg = None if file_val == "__keep__" else file_val
+        if console_arg is None and file_arg is None:
+            self.notify("Pick at least one level", severity="warning")
+            return
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        if plugin is None:
+            return
+        plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
+        if not plugin_uuid:
+            return
+        try:
+            self.plugin_core.set_logger_level(
+                prefix,
+                console=console_arg,
+                file=file_arg,
+                plugin_name=plugin_name,
+                plugin_uuid=plugin_uuid,
+            )
+        except Exception as exc:
+            self.notify(
+                f"Logger-level apply failed: {exc}", severity="error",
+            )
+            return
+        self._refresh_per_plugin_logger_list_for(plugin_name)
+
+    def _handle_per_plugin_logger_clear(
+        self, plugin_name: str, prefix: str,
+    ) -> None:
+        """Per-row Clear handler. Sync call wrapped in try/except per
+        plan-cycle 2 review fix."""
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        if plugin is None:
+            return
+        plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
+        if not plugin_uuid:
+            return
+        try:
+            self.plugin_core.clear_logger_level(
+                prefix, console=True, file=True,
+                plugin_name=plugin_name, plugin_uuid=plugin_uuid,
+            )
+        except Exception as exc:
+            self.notify(
+                f"Logger-level clear failed: {exc}", severity="error",
+            )
+            return
+        self._refresh_per_plugin_logger_list_for(plugin_name)
+
+    def _handle_per_plugin_logger_refresh(self, plugin_name: str) -> None:
+        """Section-header Refresh handler — re-read snapshot, refill
+        table. Section 4.7 documented use-case: changes from outside
+        the TUI (no bus topic for logger-level changes)."""
+        self._refresh_per_plugin_logger_list_for(plugin_name)
+
+    def _handle_per_plugin_copy_uuid(self, plugin_name: str) -> None:
+        """Copy the plugin's plugin_uuid to the OS clipboard via the
+        Textual App's `copy_to_clipboard` (terminal OSC52 escape;
+        plan Section 4.4 + test #20 require this)."""
+        plugin = self.plugin_core.plugins.get(plugin_name)
+        if plugin is None:
+            return
+        plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
+        if not plugin_uuid:
+            return
+        try:
+            self.copy_to_clipboard(plugin_uuid)
+        except Exception:
+            pass
 
     @work(thread=False)
     async def _execute_toggle(self, entry: Dict[str, str], state: bool) -> None:

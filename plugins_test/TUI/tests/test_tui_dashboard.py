@@ -4093,8 +4093,9 @@ def _install_phase3_pc(
     *,
     plugin_states_overrides=None,
     all_subs=None,
+    logger_levels_overrides=None,
 ):
-    """Extend `mock_pc` with the Phase 3a API surface.
+    """Extend `mock_pc` with the Phase 3a + 3b API surface.
 
     Adds:
       * `plugin_states[name].state` for every plugin in `mock_pc.plugins`
@@ -4109,7 +4110,10 @@ def _install_phase3_pc(
         runtime-sub lookups in the per-plugin tab (3b).
       * `get_unloaded_metadata` async — returns None for non-UNLOADED
         (matches `PluginCore.get_unloaded_metadata`).
-      * `list_logger_levels` (returns the snapshot shape utils.py uses).
+      * `list_logger_levels` (returns the snapshot shape utils.py uses)
+        — `logger_levels_overrides` is wired as the MagicMock's
+        `return_value` so 3b Logger-section tests can prime per-prefix
+        snapshot dicts that mirror `utils.py:870-903`.
       * `set_logger_level` / `clear_logger_level` MagicMocks (3b apply
         path).
 
@@ -4223,8 +4227,11 @@ def _install_phase3_pc(
     mock_pc.get_unloaded_metadata = _get_unloaded_metadata
 
     # Logger-level surface (read by Phase 3b, mocked here for fixture
-    # consistency — does no harm in 3a tests).
-    mock_pc.list_logger_levels = MagicMock(return_value={})
+    # consistency — does no harm in 3a tests). Phase 3b tests prime
+    # per-prefix snapshots via `logger_levels_overrides`.
+    mock_pc.list_logger_levels = MagicMock(
+        return_value=logger_levels_overrides or {}
+    )
     mock_pc.set_logger_level = MagicMock()
     mock_pc.clear_logger_level = MagicMock()
 
@@ -4894,3 +4901,777 @@ async def test_phase3a_failed_load_detail_pane(mock_pc, tmp_path):
             str(s.content) for s in events_col.query(Static)
         )
         assert "evt_a" in events_text
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3b — Per-plugin tab Lifecycle / Events / Subs / Logger sections
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _ppwid(kind: str, plugin_name: str) -> str:
+    """Build the deterministic per-plugin widget id mirroring
+    `DashboardApp._per_plugin_widget_id` (kind + sanitized-plugin-name).
+    """
+    from plugins_test.TUI.app import DashboardApp
+    return f"{kind}-{DashboardApp._sanitize_id(plugin_name)}"
+
+
+# ── #17 — Lifecycle strip renders with all 6 fields ────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_lifecycle_strip_renders(mock_pc):
+    """Opening the per-plugin tab mounts a Horizontal lifecycle-strip
+    container with 6 stat-card children (Phase / UUID / lifecycle_ready
+    / ready / verbose_notifier / version)."""
+    from textual.containers import Horizontal, Vertical
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        strip_id = _ppwid("lifecycle-strip", "PluginA")
+        strip = app.query_one(f"#{strip_id}", Horizontal)
+        cards = list(strip.query(Vertical))
+        # Each cell is a Vertical(.stat-card). Expect exactly 6 cells.
+        assert len(cards) == 6, f"expected 6 lifecycle cells, got {len(cards)}"
+
+
+# ── #18 — Lifecycle strip ✓/✗ markers reflect event state ──────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_lifecycle_strip_ready_flags(mock_pc):
+    """`_lifecycle_ready` set + `ready` cleared → ✓ / ✗ markers."""
+    from textual.widgets import Static
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    # Fixture set both to set (ENABLED default). Clear `ready` so we get
+    # a ✓ / ✗ split.
+    plugin._lifecycle_ready.set()
+    plugin.ready.clear()
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        lcr = app.query_one(
+            f"#{_ppwid('per-plugin-lifecycle-ready', 'PluginA')}", Static,
+        )
+        rdy = app.query_one(
+            f"#{_ppwid('per-plugin-ready', 'PluginA')}", Static,
+        )
+        assert "✓" in str(lcr.content)
+        assert "✗" in str(rdy.content)
+
+
+# ── #19 — verbose_notifier Switch bidirectional sync ───────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_lifecycle_strip_verbose_toggle(mock_pc):
+    """Two directions:
+    - Attr → Widget: pre-set `plugin.verbose_notifier=True` BEFORE
+      mounting the per-plugin tab; the Switch's `value` must reflect
+      True on initial render.
+    - Widget → Attr: toggling the Switch via direct `.value` assign
+      must propagate back to `plugin.verbose_notifier`.
+    """
+    from textual.widgets import Switch
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.verbose_notifier = True  # attr→widget half
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        sw_id = _ppwid("per-plugin-verbose", "PluginA")
+        switch = app.query_one(f"#{sw_id}", Switch)
+        # Attr → Widget: initial render reflects `True`.
+        assert switch.value is True, (
+            "Switch.value should mirror plugin.verbose_notifier at mount"
+        )
+        # Widget → Attr: toggle to False.
+        switch.value = False
+        for _ in range(3):
+            await pilot.pause()
+        assert plugin.verbose_notifier is False, (
+            "toggling Switch should write back to plugin.verbose_notifier"
+        )
+        # And back to True.
+        switch.value = True
+        for _ in range(3):
+            await pilot.pause()
+        assert plugin.verbose_notifier is True
+
+
+# ── #20 — UUID Copy button copies plugin.plugin_uuid to clipboard ──────
+
+@pytest.mark.asyncio
+async def test_phase3b_lifecycle_strip_copy_uuid(mock_pc):
+    """Copy button in the lifecycle strip calls
+    `app.copy_to_clipboard(plugin.plugin_uuid)`.
+
+    Per-plugin tab content extends past the 50-row test viewport so
+    pilot.click can land OutOfBounds; invoke the registered handler
+    directly via the deterministic-id registry lookup instead. The
+    handler routing in `on_button_pressed` is exercised separately
+    by tests #29-#31.
+    """
+    from unittest.mock import MagicMock as _MagicMock
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.plugin_uuid = "uuid-PluginA"
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        clipboard = _MagicMock()
+        app.copy_to_clipboard = clipboard  # type: ignore[method-assign]
+        copy_btn_id = next(
+            (wid for wid, e in app._id_registry.items()
+             if e.get("type") == "per-plugin-copy-uuid"
+             and e.get("plugin") == "PluginA"),
+            None,
+        )
+        assert copy_btn_id is not None, "Copy button must be registered"
+        # Invoke the catch-all routing directly so the assertion isn't
+        # coupled to viewport / pilot.click pacing.
+        app._handle_per_plugin_copy_uuid("PluginA")
+        clipboard.assert_called_once_with("uuid-PluginA")
+
+
+# ── #21 — Events section renders declared events ───────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_events_section_renders(mock_pc):
+    """Plugin with 2 declared events → events DataTable has 2 rows."""
+    from textual.widgets import DataTable
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.events = {
+        "evt_a": {"topic": "p/a", "hosts": None, "enabled": True},
+        "evt_b": {"topic": "p/b", "hosts": "local", "enabled": False},
+    }
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one(
+            f"#{_ppwid('per-plugin-events-table', 'PluginA')}", DataTable,
+        )
+        assert table.row_count == 2
+
+
+# ── #22 — Events section empty placeholder ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_events_section_empty(mock_pc):
+    """Plugin with no events → `(no events declared)` placeholder."""
+    from textual.widgets import Static
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.events = {}
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        empty = app.query_one(
+            f"#{_ppwid('per-plugin-events-empty', 'PluginA')}", Static,
+        )
+        assert "no events declared" in str(empty.content)
+
+
+# ── #23 — Events cross-link injects + switches tab ─────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_events_section_cross_link(mock_pc):
+    """Open-in-Catalogue button switches to Events / Catalogue + sets
+    the catalogue plugin filter Select value to the plugin name.
+
+    Per plan-cycle 1 review fix to this test description: assert
+    post-injection state directly (NO `call_after_refresh` deferral —
+    Section 10 cycle-2 locks the explicit option-injection pattern).
+    """
+    from textual.widgets import Select, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.events = {"evt": {"topic": "x/y", "enabled": True}}
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Pre-populate the catalogue filter Select with PluginA so the
+        # injection finds an existing entry.
+        sel = app.query_one("#events-cat-filter-plugin", Select)
+        with app.prevent(Select.Changed):
+            sel.set_options([("All plugins", "__all__"), ("PluginA", "PluginA")])
+            sel.value = "__all__"
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        # Invoke the worker directly — pilot.click on the jump button
+        # would race against viewport / @work scheduling and produces
+        # flaky assertions about the post-switch tab state.
+        app._jump_to_events_catalogue_for_plugin("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        assert app.query_one("#main-tabs", TabbedContent).active == "tab-events"
+        assert app.query_one("#events-tabs", TabbedContent).active == "events-tab-cat"
+        sel = app.query_one("#events-cat-filter-plugin", Select)
+        assert sel.value == "PluginA"
+
+
+# ── #24 — Cross-link with absent option falls through gracefully ───────
+
+@pytest.mark.asyncio
+async def test_phase3b_events_section_cross_link_options_not_populated(mock_pc):
+    """Catalogue's plugin filter Select doesn't contain the inspected
+    plugin. Press Open-in-Catalogue → no exception; option-injection
+    or silent no-op acceptable per the degraded-behavior contract
+    (Section 4.6 cycle-2 + plan-cycle 1 review on test #24).
+    """
+    from textual.widgets import Select, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.events = {"evt": {"topic": "x/y", "enabled": True}}
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Force catalogue filter Select to "__all__" only — PluginA not
+        # in options.
+        sel = app.query_one("#events-cat-filter-plugin", Select)
+        with app.prevent(Select.Changed):
+            sel.set_options([("All plugins", "__all__")])
+            sel.value = "__all__"
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        # Invoke worker directly (see test #23 note about pilot.click
+        # vs viewport / @work scheduling).
+        app._jump_to_events_catalogue_for_plugin("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        # Operator lands on the destination tab even when the plugin
+        # name was absent from the original options (the injection
+        # adds it back per Section 4.6).
+        assert app.query_one("#main-tabs", TabbedContent).active == "tab-events"
+        assert app.query_one("#events-tabs", TabbedContent).active == "events-tab-cat"
+
+
+# ── #25 — Declared subs section renders ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_subs_section_declared_renders(mock_pc):
+    """Plugin with 2 declared subs → declared DataTable has 2 rows."""
+    from textual.widgets import DataTable
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.subscriptions = {
+        "sub_a": {
+            "topic": "x/y", "target_access_name": "greet",
+            "target_plugin": "PluginA", "hosts": "any",
+            "authors": None, "enabled": True,
+        },
+        "sub_b": {
+            "topic": "p/q", "target_access_name": "greet",
+            "target_plugin": "PluginA", "hosts": "remote",
+            "authors": None, "enabled": False,
+        },
+    }
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        d_table = app.query_one(
+            f"#{_ppwid('per-plugin-subs-declared-table', 'PluginA')}",
+            DataTable,
+        )
+        assert d_table.row_count == 2
+
+
+# ── #26 — Runtime subs section populated via single list_local_subs ────
+
+@pytest.mark.asyncio
+async def test_phase3b_subs_section_runtime_renders(mock_pc):
+    """Runtime sub for the inspected plugin (declared_id=None) appears
+    in the Runtime DataTable. Single `list_local_subs()` snapshot per
+    plan Section 4.6 cycle-1 fix — NOT N awaits."""
+    from textual.widgets import DataTable
+
+    # Build a runtime sub with the same plugin_uuid as PluginA's fixture
+    # default ("uuid-PluginA" from _install_phase3_pc).
+    runtime_sub = MagicMock(
+        sub_uuid="rt-1234567890",
+        declared_id=None,  # runtime
+        plugin_uuid="uuid-PluginA",
+        plugin_name="PluginA",
+        topic_pattern="rt/topic",
+        target_plugin="PluginA",
+        target_access_name="greet",
+        hosts="any",
+        authors=None,
+    )
+    _install_phase3_pc(mock_pc, all_subs=[runtime_sub])
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # The shipped `_make_phase2b_plugin_instance` plugs in a
+        # MagicMock event_loop so `_run_on_main` short-circuits to
+        # None. Swap in the passthrough so the worker's
+        # `list_local_subs()` await actually resolves to our fixture.
+        await _patch_run_on_main_passthrough(app)
+        await app.open_plugin_tab("PluginA")
+        for _ in range(10):
+            await pilot.pause()
+        runtime_table = app.query_one(
+            f"#{_ppwid('per-plugin-subs-runtime-table', 'PluginA')}",
+            DataTable,
+        )
+        assert runtime_table.row_count == 1
+        assert runtime_table.display is True
+
+
+# ── #27 — Subs browser cross-link ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_subs_section_cross_link(mock_pc):
+    """Open-in-Subs-browser switches outer + inner tab + sets the
+    Subs filter Select value.
+
+    Seeds a sub for PluginA in `all_subs` so the inner-tab
+    activation's `_refresh_subs_browser_worker` rebuild keeps PluginA
+    in the filter Select's options (the rebuild reverts the value to
+    `__all__` when the plugin is absent from the rebuilt options,
+    per `_populate_subs_plugin_filter_options`).
+    """
+    from textual.widgets import Select, TabbedContent
+
+    sub_for_a = MagicMock(
+        sub_uuid="s-a", declared_id=None, plugin_uuid="uuid-PluginA",
+        plugin_name="PluginA", topic_pattern="t/a",
+        target_plugin="PluginA", target_access_name="greet",
+        target_plugin_uuid=None, hosts="any",
+        blocked_hosts=None, authors=None, blocked_authors=None,
+        enabled=True,
+    )
+    _install_phase3_pc(mock_pc, all_subs=[sub_for_a])
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        sel = app.query_one("#events-subs-filter-plugin", Select)
+        with app.prevent(Select.Changed):
+            sel.set_options([("All plugins", "__all__"), ("PluginA", "PluginA")])
+            sel.value = "__all__"
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        app._jump_to_subs_browser_for_plugin("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        assert app.query_one("#main-tabs", TabbedContent).active == "tab-events"
+        assert app.query_one("#events-tabs", TabbedContent).active == "events-tab-subs"
+        sel = app.query_one("#events-subs-filter-plugin", Select)
+        assert sel.value == "PluginA"
+
+
+# ── #28 — Logger overrides empty (no overrides + Add row present) ──────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_empty(mock_pc):
+    """Plugin with no logger overrides → empty placeholder rendered
+    inside the overrides list + Add row present."""
+    from textual.containers import Horizontal, Vertical
+    from textual.widgets import Static
+
+    _install_phase3_pc(mock_pc, logger_levels_overrides={})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        # Empty placeholder mounts inside the overrides Vertical
+        # container after call_after_refresh fires.
+        empty = app.query_one(
+            f"#{_ppwid('per-plugin-logger-empty', 'PluginA')}", Static,
+        )
+        assert "no overrides owned by this plugin" in str(empty.content)
+        # Add row is mounted.
+        app.query_one(
+            f"#{_ppwid('per-plugin-logger-add-row', 'PluginA')}",
+            Horizontal,
+        )
+
+
+# ── #29 — Apply with one level set calls pc.set_logger_level ───────────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_apply(mock_pc):
+    """Apply with prefix='foo', console='DEBUG', file='__keep__' calls
+    `pc.set_logger_level('foo', console='DEBUG', file=None,
+    plugin_name='PluginA', plugin_uuid='uuid-PluginA')`."""
+    from textual.widgets import Input, Select
+
+    _install_phase3_pc(mock_pc, logger_levels_overrides={})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        prefix_id = _ppwid("per-plugin-logger-prefix", "PluginA")
+        console_id = _ppwid("per-plugin-logger-console", "PluginA")
+        file_id = _ppwid("per-plugin-logger-file", "PluginA")
+        prefix_input = app.query_one(f"#{prefix_id}", Input)
+        console_sel = app.query_one(f"#{console_id}", Select)
+        file_sel = app.query_one(f"#{file_id}", Select)
+        prefix_input.value = "foo"
+        with app.prevent(Select.Changed):
+            console_sel.value = "DEBUG"
+            file_sel.value = "__keep__"
+        await pilot.pause()
+        # Invoke handler directly — Apply button sits below the test
+        # viewport and pilot.click would land OutOfBounds.
+        app._handle_per_plugin_logger_apply("PluginA")
+        for _ in range(3):
+            await pilot.pause()
+        mock_pc.set_logger_level.assert_called_once()
+        ca = mock_pc.set_logger_level.call_args
+        assert ca.args[0] == "foo"
+        assert ca.kwargs["console"] == "DEBUG"
+        assert ca.kwargs["file"] is None
+        assert ca.kwargs["plugin_name"] == "PluginA"
+        assert ca.kwargs["plugin_uuid"] == "uuid-PluginA"
+
+
+# ── #30 — Apply with both __keep__ shows warning toast, no call ────────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_apply_no_levels_picked(mock_pc):
+    """Apply with both selects at `__keep__` → notify warning, no
+    set_logger_level call."""
+    from unittest.mock import MagicMock as _MagicMock
+    from textual.widgets import Input
+
+    _install_phase3_pc(mock_pc, logger_levels_overrides={})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        prefix_input = app.query_one(
+            f"#{_ppwid('per-plugin-logger-prefix', 'PluginA')}", Input,
+        )
+        prefix_input.value = "foo"
+        await pilot.pause()
+        notify_spy = _MagicMock()
+        app.notify = notify_spy  # type: ignore[method-assign]
+        app._handle_per_plugin_logger_apply("PluginA")
+        for _ in range(3):
+            await pilot.pause()
+        assert mock_pc.set_logger_level.call_count == 0
+        assert notify_spy.called
+        msg = notify_spy.call_args.args[0]
+        assert "level" in msg.lower()
+
+
+# ── #31 — Clear button on an existing override ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_clear(mock_pc):
+    """Clear button on an existing override row calls
+    `pc.clear_logger_level(prefix, console=True, file=True,
+    plugin_name='PluginA', plugin_uuid='uuid-PluginA')`."""
+    snapshot = {
+        "foo": {
+            "config":    {"console": None, "file": None},
+            "plugin":    {"console": "DEBUG", "file": None},
+            "effective": {"console": "DEBUG", "file": None},
+            "owners":    [("PluginA", "uuid-PluginA")],
+        },
+    }
+    _install_phase3_pc(mock_pc, logger_levels_overrides=snapshot)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(10):
+            await pilot.pause()
+        clear_id = next(
+            (wid for wid, e in app._id_registry.items()
+             if e.get("type") == "per-plugin-logger-clear"
+             and e.get("plugin") == "PluginA"
+             and e.get("endpoint") == "foo"),
+            None,
+        )
+        assert clear_id is not None, (
+            "per-row Clear button must be registered after list population"
+        )
+        # Invoke handler directly (Clear button is below viewport).
+        app._handle_per_plugin_logger_clear("PluginA", "foo")
+        for _ in range(3):
+            await pilot.pause()
+        mock_pc.clear_logger_level.assert_called_once()
+        ca = mock_pc.clear_logger_level.call_args
+        assert ca.args[0] == "foo"
+        assert ca.kwargs["console"] is True
+        assert ca.kwargs["file"] is True
+        assert ca.kwargs["plugin_name"] == "PluginA"
+        assert ca.kwargs["plugin_uuid"] == "uuid-PluginA"
+
+
+# ── #32 — Plugin source wins over config (was: <config>) ───────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_plugin_wins_over_config(mock_pc):
+    """Snapshot with config-source AND plugin-source on the same prefix
+    → row renders `DEBUG (was: INFO)` (or equivalent annotation)."""
+    from textual.widgets import Static
+
+    snapshot = {
+        "foo": {
+            "config":    {"console": "INFO",  "file": None},
+            "plugin":    {"console": "DEBUG", "file": None},
+            "effective": {"console": "DEBUG", "file": None},
+            "owners":    [("PluginA", "uuid-PluginA")],
+        },
+    }
+    _install_phase3_pc(mock_pc, logger_levels_overrides=snapshot)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(10):
+            await pilot.pause()
+        from textual.containers import Vertical
+        ol = app.query_one(
+            f"#{_ppwid('per-plugin-logger-list', 'PluginA')}", Vertical,
+        )
+        joined = " ".join(str(s.content) for s in ol.query(Static))
+        assert "DEBUG" in joined
+        assert "(was: INFO)" in joined
+
+
+# ── #33 — UNLOADED plugin → placeholder, no Add row ────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_logger_overrides_unloaded_plugin(mock_pc):
+    """UNLOADED plugin → Logger section renders placeholder, no Add row."""
+    from plugin_state import State
+    from textual.widgets import Input, Static
+    from textual.css.query import NoMatches
+
+    _install_phase3_pc(
+        mock_pc, plugin_states_overrides={"PluginA": State.UNLOADED},
+    )
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        # Empty placeholder.
+        empty = app.query_one(
+            f"#{_ppwid('per-plugin-logger-empty', 'PluginA')}", Static,
+        )
+        assert "plugin not loaded" in str(empty.content)
+        # Add row should NOT exist (no prefix Input mounted).
+        prefix_id = _ppwid("per-plugin-logger-prefix", "PluginA")
+        try:
+            app.query_one(f"#{prefix_id}", Input)
+            assert False, "Add row should not exist for UNLOADED plugin"
+        except NoMatches:
+            pass
+
+
+# ── #34 — FAILED_LOAD plugin (per Option A) → same as UNLOADED ─────────
+
+@pytest.mark.asyncio
+async def test_phase3b_failed_load_logger_section_no_add_row(mock_pc):
+    """Per Option A (no live instance for FAILED_LOAD per
+    `PluginCore.py:2466-2474`): Logger section renders the placeholder
+    without an Add row. Test #34 description in the plan-cycle 1 review
+    was contradicted by Section 11.5's framework-reality note;
+    maintainer chose Option A (consistent with UNLOADED)."""
+    from plugin_state import State
+    from textual.widgets import Input, Static
+    from textual.css.query import NoMatches
+
+    _install_phase3_pc(
+        mock_pc, plugin_states_overrides={"PluginA": State.FAILED_LOAD},
+    )
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        empty = app.query_one(
+            f"#{_ppwid('per-plugin-logger-empty', 'PluginA')}", Static,
+        )
+        assert "plugin not loaded" in str(empty.content)
+        prefix_id = _ppwid("per-plugin-logger-prefix", "PluginA")
+        try:
+            app.query_one(f"#{prefix_id}", Input)
+            assert False, "Add row should not exist for FAILED_LOAD plugin"
+        except NoMatches:
+            pass
+
+
+# ── #35 — UNLOADED placeholders in Events + Subs sections ──────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_unloaded_plugin_placeholders_in_events_subs(mock_pc):
+    """UNLOADED plugin: Events section shows `(plugin not loaded)`,
+    Subs sections show `(plugin not loaded)`."""
+    from plugin_state import State
+    from textual.widgets import Static
+
+    _install_phase3_pc(
+        mock_pc, plugin_states_overrides={"PluginA": State.UNLOADED},
+    )
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        events_empty = app.query_one(
+            f"#{_ppwid('per-plugin-events-empty', 'PluginA')}", Static,
+        )
+        assert "plugin not loaded" in str(events_empty.content)
+        d_empty = app.query_one(
+            f"#{_ppwid('per-plugin-subs-declared-empty', 'PluginA')}", Static,
+        )
+        assert "plugin not loaded" in str(d_empty.content)
+        rt_empty = app.query_one(
+            f"#{_ppwid('per-plugin-subs-runtime-empty', 'PluginA')}", Static,
+        )
+        assert "plugin not loaded" in str(rt_empty.content)
+
+
+# ── #36a — `on_button_pressed` catch-all routes Phase 3b types ──────────
+
+@pytest.mark.asyncio
+async def test_phase3b_button_pressed_routing_coverage(mock_pc):
+    """Cycle 1 review fix — every Phase 3b `on_button_pressed` elif
+    branch should be exercised. Per-plugin-tab content sits below the
+    50-row test viewport so pilot.click on the rendered widgets often
+    raises OutOfBounds; the handler tests (#20, #23, #27, #29, #31)
+    bypass routing by calling the handler directly. This test
+    synthesizes `Button.Pressed` events for the registered button ids
+    of each branch type and dispatches via `app.on_button_pressed(...)`
+    — exercising the elif chain itself without depending on viewport.
+    """
+    from textual.widgets import Button
+    from unittest.mock import MagicMock as _MagicMock, patch
+
+    snapshot = {
+        "foo": {
+            "config":    {"console": None, "file": None},
+            "plugin":    {"console": "DEBUG", "file": None},
+            "effective": {"console": "DEBUG", "file": None},
+            "owners":    [("PluginA", "uuid-PluginA")],
+        },
+    }
+    _install_phase3_pc(mock_pc, logger_levels_overrides=snapshot)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await _patch_run_on_main_passthrough(app)
+        await app.open_plugin_tab("PluginA")
+        for _ in range(10):
+            await pilot.pause()
+
+        # Patch the handlers + jump workers so the test can assert each
+        # routing path fired without exercising downstream side effects.
+        with patch.object(app, "_handle_per_plugin_copy_uuid") as m_copy, \
+             patch.object(app, "_jump_to_events_catalogue_for_plugin") as m_je, \
+             patch.object(app, "_jump_to_subs_browser_for_plugin") as m_js, \
+             patch.object(app, "_handle_per_plugin_logger_apply") as m_apply, \
+             patch.object(app, "_handle_per_plugin_logger_clear") as m_clear, \
+             patch.object(app, "_handle_per_plugin_logger_refresh") as m_refresh:
+            # For each type, look up the registered button id, build
+            # a synthetic Button widget reference, and dispatch.
+            def _fire(t: str, expected_endpoint: str = ""):
+                wid = next(
+                    (w for w, e in app._id_registry.items()
+                     if e.get("type") == t
+                     and e.get("plugin") == "PluginA"
+                     and (not expected_endpoint
+                          or e.get("endpoint") == expected_endpoint)),
+                    None,
+                )
+                assert wid is not None, f"button for type={t} not registered"
+                btn = app.query_one(f"#{wid}", Button)
+                # Synthesize a Button.Pressed event — bypass viewport
+                # / pilot.click constraints.
+                event = Button.Pressed(btn)
+                app.on_button_pressed(event)
+
+            _fire("per-plugin-copy-uuid")
+            _fire("per-plugin-jump-events")
+            _fire("per-plugin-jump-subs")
+            _fire("per-plugin-logger-apply")
+            _fire("per-plugin-logger-clear", expected_endpoint="foo")
+            _fire("per-plugin-logger-refresh")
+            for _ in range(3):
+                await pilot.pause()
+
+            m_copy.assert_called_once_with("PluginA")
+            m_je.assert_called_once_with("PluginA")
+            m_js.assert_called_once_with("PluginA")
+            m_apply.assert_called_once_with("PluginA")
+            m_clear.assert_called_once_with("PluginA", "foo")
+            m_refresh.assert_called_once_with("PluginA")
+
+
+# ── #36 — Per-plugin Events DataTable is non-interactive ───────────────
+
+@pytest.mark.asyncio
+async def test_phase3b_events_table_non_interactive(mock_pc):
+    """Per Section 4.5 + plan-cycle 1 review fix: per-plugin Events
+    DataTable must have `cursor_type == 'none'` so it visually signals
+    "read-only — toggle UI lives in the Events catalogue tab".
+    Invisible regression target without an explicit test."""
+    from textual.widgets import DataTable
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.events = {"evt": {"topic": "p/a", "enabled": True}}
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        await app.open_plugin_tab("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one(
+            f"#{_ppwid('per-plugin-events-table', 'PluginA')}", DataTable,
+        )
+        # Textual 8.2.3 exposes the configured cursor type as
+        # `cursor_type` directly on the DataTable instance.
+        assert table.cursor_type == "none"
