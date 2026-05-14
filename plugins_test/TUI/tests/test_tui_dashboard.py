@@ -150,6 +150,18 @@ def _make_dashboard_app(plugin_core=None):
     # Phase 5 — networking uptime tracker.
     app._networking_started_at = None
     app._networking_instance_id = None
+    # Phase 3a — Plugins-tab refresh-debounce + detail-pane state.
+    # _make_dashboard_app bypasses __init__ so the new state attrs must
+    # be initialized here too. Mirrors the pattern for the earlier-phase
+    # additions above.
+    app._plugins_refresh_pending = False
+    app._subs_refresh_pending = False
+    app._cat_refresh_pending = False
+    app._currently_displayed_plugin = None
+    app._plugin_detail_open_sections = {}
+    app._detail_render_target = None
+    app._outer_is_events = False
+    app._inner_is_live = False
     return app
 
 def _make_mock_request(plugin="PluginA", method="do_thing", age=0.5,
@@ -4069,3 +4081,816 @@ async def test_phase2b_subs_browser_noop_toggle_no_crash(mock_pc):
         called_args = mock_pc.set_subscription_enabled.await_args.args
         assert called_args[0] == "u1"
         assert called_args[1] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3a — Plugins-tab Phase column + counts + 5-section detail pane
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _install_phase3_pc(
+    mock_pc,
+    *,
+    plugin_states_overrides=None,
+    all_subs=None,
+):
+    """Extend `mock_pc` with the Phase 3a API surface.
+
+    Adds:
+      * `plugin_states[name].state` for every plugin in `mock_pc.plugins`
+        — defaults to ENABLED for `enabled=True`, INACTIVE otherwise.
+        `plugin_states_overrides[name] = State.X` overrides per-plugin.
+      * `_lifecycle_ready` and `ready` `asyncio.Event` on each plugin
+        instance — both set when default state is ENABLED so the
+        Phase column renders READY.
+      * `plugin_uuid` on each plugin (used by the per-plugin tab in 3b
+        and by the test fixture's identity expectations).
+      * `topic_registry.list_local_subs` / `get_subscription` for
+        runtime-sub lookups in the per-plugin tab (3b).
+      * `get_unloaded_metadata` async — returns None for non-UNLOADED
+        (matches `PluginCore.get_unloaded_metadata`).
+      * `list_logger_levels` (returns the snapshot shape utils.py uses).
+      * `set_logger_level` / `clear_logger_level` MagicMocks (3b apply
+        path).
+
+    For UNLOADED state plugins: removes the plugin from `mock_pc.plugins`
+    (UNLOADED == config has entry but no live instance, per
+    `plugin_state.py:36`).
+    """
+    from plugin_state import PluginState, State, Phase, ErrorRecord
+    overrides = plugin_states_overrides or {}
+
+    states = {}
+    for name, p in list(mock_pc.plugins.items()):
+        default_state = (
+            State.ENABLED if getattr(p, "enabled", False) else State.INACTIVE
+        )
+        state = overrides.get(name, default_state)
+
+        # Lifecycle / readiness events. Real Plugin instances have these
+        # set by Plugin.__init__ (utils.py:1189) + by
+        # _enable_plugin_under_lock (PluginCore.py:2815). Mirror here so
+        # _plugin_phase reads them with .is_set().
+        p._lifecycle_ready = asyncio.Event()
+        p.ready = asyncio.Event()
+        if state == State.ENABLED:
+            p._lifecycle_ready.set()
+            p.ready.set()
+
+        # plugin_uuid — Phase 3b cross-link + logger-level identity uses this.
+        if not hasattr(p, "plugin_uuid") or isinstance(p.plugin_uuid, MagicMock):
+            p.plugin_uuid = f"uuid-{name}"
+
+        # verbose_notifier — Phase 3b Lifecycle strip Switch reads this.
+        if not hasattr(p, "verbose_notifier") or isinstance(p.verbose_notifier, MagicMock):
+            p.verbose_notifier = False
+
+        # subscriptions / events / _sub_uuids — declarative defaults so
+        # _refresh_plugin_table_worker can read len() without raising.
+        if not hasattr(p, "subscriptions") or isinstance(p.subscriptions, MagicMock):
+            p.subscriptions = {}
+        if not hasattr(p, "events") or isinstance(p.events, MagicMock):
+            p.events = {}
+        if not hasattr(p, "_sub_uuids") or isinstance(p._sub_uuids, MagicMock):
+            p._sub_uuids = []
+        if not hasattr(p, "arguments") or isinstance(p.arguments, MagicMock):
+            p.arguments = None
+
+        # PluginState entry.
+        ps = PluginState(name=name, state=state, instance=p)
+        states[name] = ps
+
+    # Add plugin_states entries for names ONLY present in overrides
+    # (UNLOADED / config-has-entry-but-no-live-instance paths).
+    for name, state in overrides.items():
+        if name in states:
+            continue
+        # Synthesize the entry without an instance. Test code can attach
+        # a `last_errors` dict afterwards if it wants to test FAILED_LOAD
+        # paths without a live instance.
+        states[name] = PluginState(name=name, state=state, instance=None)
+
+    # Drop the live instance for states where the framework wouldn't
+    # have one in `pc.plugins`:
+    #   - UNLOADED: never instantiated (or popped after disable).
+    #   - FAILED_LOAD: instantiation raised in `load_plugin_with_conf`
+    #     BEFORE the `pc.plugins[name] = plugin` assignment ran
+    #     (`PluginCore.py:2466-2474` only runs on the success path),
+    #     so `pc.plugins.get(name)` returns None for a real FAILED_LOAD
+    #     plugin. Mirror that here so the detail-pane on-disk fallback
+    #     test path matches production behaviour.
+    for name, ps in states.items():
+        if ps.state in (State.UNLOADED, State.FAILED_LOAD):
+            mock_pc.plugins.pop(name, None)
+            ps.instance = None
+
+    mock_pc.plugin_states = states
+
+    # topic_registry surface (overlaps with Phase 2b helper — idempotent).
+    all_subs_list = list(all_subs or [])
+
+    async def _list_local_subs():
+        return list(all_subs_list)
+
+    async def _get_subscription(sub_uuid):
+        return next(
+            (
+                s for s in all_subs_list
+                if getattr(s, "sub_uuid", None) == sub_uuid
+            ),
+            None,
+        )
+
+    if not hasattr(mock_pc, "topic_registry") or isinstance(mock_pc.topic_registry, MagicMock):
+        mock_pc.topic_registry = MagicMock()
+    mock_pc.topic_registry.list_local_subs = _list_local_subs
+    mock_pc.topic_registry.get_subscription = _get_subscription
+
+    # get_unloaded_metadata — only returns for UNLOADED state.
+    async def _get_unloaded_metadata(plugin_name):
+        ps = states.get(plugin_name)
+        if ps is None or getattr(ps.state, "value", None) != "unloaded":
+            return None
+        return {
+            "name": plugin_name,
+            "version": "unknown",
+            "description": "",
+            "path": f"/test/{plugin_name}",
+            "declared_endpoints": [],
+            "declared_events": [],
+            "declared_subscriptions": [],
+        }
+    mock_pc.get_unloaded_metadata = _get_unloaded_metadata
+
+    # Logger-level surface (read by Phase 3b, mocked here for fixture
+    # consistency — does no harm in 3a tests).
+    mock_pc.list_logger_levels = MagicMock(return_value={})
+    mock_pc.set_logger_level = MagicMock()
+    mock_pc.clear_logger_level = MagicMock()
+
+    # internal_observe / internal_unobserve must be MagicMocks so the
+    # app's `on_mount` observer registration loop doesn't trip on a
+    # real coroutine. Idempotent re-set if already mocked.
+    if not hasattr(mock_pc, "internal_observe") or isinstance(mock_pc.internal_observe, MagicMock):
+        mock_pc.internal_observe = MagicMock()
+    if not hasattr(mock_pc, "internal_unobserve") or isinstance(mock_pc.internal_unobserve, MagicMock):
+        mock_pc.internal_unobserve = MagicMock(return_value=True)
+
+
+def _attach_failed_load_error(
+    mock_pc, plugin_name: str, exc: BaseException, traceback_text: str = "",
+):
+    """Helper for the FAILED_LOAD detail-pane test (#16).
+
+    Populates `plugin_states[plugin_name].last_errors[Phase.LOAD]` with
+    an ErrorRecord. Assumes `_install_phase3_pc` already ran with a
+    `plugin_states_overrides={plugin_name: State.FAILED_LOAD}` entry.
+    """
+    from plugin_state import Phase, ErrorRecord
+    ps = mock_pc.plugin_states.get(plugin_name)
+    if ps is None:
+        return
+    ps.last_errors[Phase.LOAD] = ErrorRecord(
+        exception=exc,
+        traceback=traceback_text or f"Traceback for {type(exc).__name__}",
+        ts=1234567890.0,
+    )
+
+
+def _make_phase3_app(mock_pc):
+    """Standard Phase 3 test app bootstrap. Returns the configured app."""
+    from plugins_test.TUI.app import DashboardApp
+    return DashboardApp(
+        plugin_core=mock_pc,
+        plugin_instance=_make_phase2b_plugin_instance(),
+        log_handler=TUILogHandler(),
+    )
+
+
+# ── #1 — table column shape ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_plugin_table_columns(mock_pc):
+    """Plugins-tab DataTable has 8 columns in the expected order."""
+    from textual.widgets import DataTable, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        table = app.query_one("#plugin-table", DataTable)
+        # DataTable.columns is an OrderedDict; values are Column objects
+        # with a `label` attribute.
+        labels = [str(c.label) for c in table.columns.values()]
+        assert labels == [
+            "Name", "Phase", "Ver", "R", "Eps", "Subs", "Evs", "Description",
+        ]
+
+
+# ── #2-#8 — Phase column rendering for each State enum value ────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_enabled_ready(mock_pc):
+    """state==ENABLED + both readiness events set → READY (green)."""
+    from textual.widgets import DataTable, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        app._refresh_plugin_table_worker()
+        for _ in range(5):
+            await pilot.pause()
+        plugin = mock_pc.plugins["PluginA"]
+        label, css = app._plugin_phase("PluginA", plugin)
+        assert label == "READY"
+        assert css == "stat-val-good"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_enabled_waiting(mock_pc):
+    """state==ENABLED + _lifecycle_ready set + ready CLEAR → WAITING (warn)."""
+    from plugin_state import State
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.ready.clear()  # author cleared inside on_enable; not yet re-set
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        label, css = app._plugin_phase("PluginA", plugin)
+        assert label == "WAITING"
+        assert css == "stat-val-warn"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_enabling(mock_pc):
+    """state==ENABLING → LOADING (warn)."""
+    from plugin_state import State
+
+    _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.ENABLING})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        plugin = mock_pc.plugins["PluginA"]
+        label, css = app._plugin_phase("PluginA", plugin)
+        assert label == "LOADING"
+        assert css == "stat-val-warn"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_inactive(mock_pc):
+    """state==INACTIVE → DISABLED (dim)."""
+    from plugin_state import State
+
+    _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.INACTIVE})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        plugin = mock_pc.plugins["PluginA"]
+        label, css = app._plugin_phase("PluginA", plugin)
+        assert label == "DISABLED"
+        assert css == "phase-dim"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_disabling(mock_pc):
+    """state==DISABLING → DISABLING (warn)."""
+    from plugin_state import State
+
+    _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.DISABLING})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        plugin = mock_pc.plugins["PluginA"]
+        label, css = app._plugin_phase("PluginA", plugin)
+        assert label == "DISABLING"
+        assert css == "stat-val-warn"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_failed_load(mock_pc):
+    """state==FAILED_LOAD → FAILED (bad). Real FAILED_LOAD plugins have
+    no entry in `pc.plugins` (instantiation raised before the registry
+    assignment in `load_plugin_with_conf`), so the fixture drops the
+    instance and `_plugin_phase` is called with plugin=None."""
+    from plugin_state import State
+
+    _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.FAILED_LOAD})
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # FAILED_LOAD → no live instance, mirroring framework reality.
+        assert mock_pc.plugins.get("PluginA") is None
+        label, css = app._plugin_phase("PluginA", None)
+        assert label == "FAILED"
+        assert css == "stat-val-bad"
+
+
+@pytest.mark.asyncio
+async def test_phase3a_phase_column_unloaded(mock_pc):
+    """state==UNLOADED → UNLOADED (dim); no live plugin instance."""
+    from plugin_state import State
+
+    _install_phase3_pc(
+        mock_pc,
+        plugin_states_overrides={"PluginA": State.UNLOADED, "PluginB": State.UNLOADED},
+    )
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Plugin instance was dropped from pc.plugins by the helper to
+        # reflect "config has entry, no live instance".
+        assert mock_pc.plugins.get("PluginA") is None
+        label, css = app._plugin_phase("PluginA", None)
+        assert label == "UNLOADED"
+        assert css == "phase-dim"
+
+
+# ── #9 — Subs cell `+N` suffix for runtime additions ────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_subs_count_includes_runtime_suffix(mock_pc):
+    """Declared 3 + runtime 2 → cell shows `3+2`."""
+    from textual.widgets import DataTable, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    plugin.subscriptions = {
+        "s1": {"topic": "a", "target_access_name": "h"},
+        "s2": {"topic": "b", "target_access_name": "h"},
+        "s3": {"topic": "c", "target_access_name": "h"},
+    }
+    plugin._sub_uuids = ["yaml1", "yaml2", "yaml3", "runtime1", "runtime2"]
+
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        app._refresh_plugin_table_worker()
+        for _ in range(5):
+            await pilot.pause()
+        table = app.query_one("#plugin-table", DataTable)
+        # Find PluginA row.
+        for idx in range(table.row_count):
+            row = table.get_row_at(idx)
+            if row[0] == "PluginA":
+                # Subs cell is column index 5.
+                assert row[5] == "3+2"
+                break
+        else:
+            pytest.fail("PluginA row not in table")
+
+
+# ── #10 — detail pane has 5 Collapsible sections ────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_detail_pane_five_sections(mock_pc):
+    """Selecting a row mounts 5 Collapsibles with the expected ids."""
+    from textual.containers import VerticalScroll
+    from textual.widgets import Collapsible, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        # Drive the worker directly — row-highlight dispatching from the
+        # DataTable is event-driven and brittle to test pacing.
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        detail = app.query_one("#plugin-detail", VerticalScroll)
+        collapsible_ids = [c.id for c in detail.query(Collapsible)
+                           if c.id in app._DETAIL_SECTION_IDS]
+        assert set(collapsible_ids) == set(app._DETAIL_SECTION_IDS)
+
+
+# ── #11 — Args overrides indicator ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_detail_pane_args_overrides_indicator(mock_pc, tmp_path):
+    """When `plugin.arguments` differs from on-disk yaml, render
+    'overrides applied' badge in the Args section."""
+    import yaml as _yaml
+    from textual.containers import VerticalScroll
+    from textual.widgets import Static, TabbedContent
+
+    # Write a plugin_config.yml with base args.
+    plugin_dir = tmp_path / "TestPluginA"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin_config.yml").write_text(
+        _yaml.safe_dump({
+            "description": "test",
+            "version": "1.0",
+            "remote": False,
+            "arguments": {"timeout": 10},
+            "endpoints": {},
+        }),
+        encoding="utf-8",
+    )
+
+    mock_pc.yaml_config = {
+        "plugins": [{"name": "PluginA", "path": str(plugin_dir),
+                     "enabled": True}],
+        "general": {}, "networking": {},
+    }
+    _install_phase3_pc(mock_pc)
+    plugin = mock_pc.plugins["PluginA"]
+    # Live args differ from on-disk → overrides applied.
+    plugin.arguments = {"timeout": 30, "retry": 5}
+
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        detail = app.query_one("#plugin-detail", VerticalScroll)
+        # The badge is a Static with classes="plugin-detail-overrides-badge".
+        badges = [
+            s for s in detail.query(Static)
+            if "plugin-detail-overrides-badge" in s.classes
+        ]
+        assert badges, "overrides-applied badge should render"
+
+
+# ── #12 — `_core/plugin/state_changed` triggers refresh ─────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_plugin_state_changed_refresh(mock_pc):
+    """Emitting `_core/plugin/state_changed` sets the plugins flag and
+    the next debounce tick spawns the worker."""
+    from unittest.mock import MagicMock as _MagicMock
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Replace the worker with a counter so we can detect invocations.
+        called = _MagicMock()
+        app._refresh_plugin_table_worker = called  # type: ignore[method-assign]
+        # Simulate a bus emit by calling the observer directly.
+        app._on_plugin_state_changed(
+            "_core/plugin/state_changed",
+            {"name": "PluginA", "from_state": "inactive",
+             "to_state": "enabled", "ts": 0},
+        )
+        assert app._plugins_refresh_pending is True
+        # Drive the debounce tick.
+        for _ in range(5):
+            app._debounce_refresh_tick()
+            await pilot.pause()
+            if called.called:
+                break
+        assert called.called, "_refresh_plugin_table_worker should fire"
+
+
+# ── #13 — section open-state preservation across row changes ────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_detail_section_open_state_preserved(mock_pc):
+    """Expanding Endpoints on plugin A, then re-selecting A, restores
+    the expanded state. Section state stored in
+    `_plugin_detail_open_sections[plugin_name]`.
+    """
+    from textual.containers import VerticalScroll
+    from textual.widgets import Collapsible, TabbedContent
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+
+        # Select A → expand Endpoints by toggling its collapsed flag.
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        detail = app.query_one("#plugin-detail", VerticalScroll)
+        endpoints_col = detail.query_one(
+            f"#{app._DETAIL_SECTION_ENDPOINTS}", Collapsible,
+        )
+        endpoints_col.collapsed = False
+        await pilot.pause()
+
+        # Switch to B (triggers capture-then-render).
+        app._update_plugin_detail("PluginB")
+        for _ in range(8):
+            await pilot.pause()
+        # The capture-on-render saves A's open set.
+        assert app._DETAIL_SECTION_ENDPOINTS in app._plugin_detail_open_sections.get(
+            "PluginA", set(),
+        )
+
+        # Re-select A → Endpoints reopens.
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+        detail = app.query_one("#plugin-detail", VerticalScroll)
+        endpoints_col = detail.query_one(
+            f"#{app._DETAIL_SECTION_ENDPOINTS}", Collapsible,
+        )
+        assert endpoints_col.collapsed is False
+
+
+# ── #13b — regression: same-plugin re-render preserves saved state ──────
+
+@pytest.mark.asyncio
+async def test_phase3a_same_plugin_rerender_preserves_open_state(mock_pc):
+    """Regression: a same-plugin re-render (e.g. `_core/plugin/state_changed`
+    direct-refresh while a prior worker is mid-render) must NOT overwrite
+    the saved open-state set. Pre-fix: Worker2 observed `prior_open=={}`
+    (Worker1 already removed children) and saved `{}` over the
+    user-expanded state. Post-fix: same-plugin re-render skips the save
+    entirely.
+    """
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Pre-populate the saved-open set for PluginA as if the operator
+        # had expanded Endpoints previously.
+        app._plugin_detail_open_sections["PluginA"] = {
+            app._DETAIL_SECTION_ENDPOINTS,
+        }
+        app._detail_render_target = "PluginA"
+
+        # Trigger a same-plugin re-render. The pre-fix path would
+        # capture prior_open={} (no Collapsibles yet) and overwrite
+        # _plugin_detail_open_sections["PluginA"] with {}.
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+
+        # Post-fix: the saved set survives.
+        assert app._plugin_detail_open_sections.get("PluginA") == {
+            app._DETAIL_SECTION_ENDPOINTS,
+        }
+
+
+# ── #13c — regression: cross-plugin save honors prior_total guard ───────
+
+@pytest.mark.asyncio
+async def test_phase3a_cross_plugin_save_skips_on_empty_pane(mock_pc):
+    """Regression: when a prior worker was cancelled mid-`remove_children()`
+    leaving the pane empty, the next worker must NOT overwrite the
+    saved open-state set under the previous plugin name with an empty
+    set captured from the cleared pane. Cycle 2 fresh-eyes finding.
+
+    The async ordering of @work + Pilot makes this hard to reproduce
+    end-to-end deterministically (the auto-row-highlight on boot
+    races our setup). Instead we test the save-guard logic directly
+    on a fresh DashboardApp instance with NO live plugins — no
+    auto-row-highlight fires, no Workers compete, and we exercise the
+    capture-and-save block of `_update_plugin_detail` exactly once
+    against a known-empty pane.
+    """
+    from textual.containers import VerticalScroll
+    # Replace mock_pc.plugins with an empty dict so the Plugins-tab
+    # table is empty → no auto-row-highlight → no auto _update_plugin_detail
+    # invocation on boot. This isolates the save-guard test from the
+    # @work timing race entirely.
+    mock_pc.plugins = {}
+    _install_phase3_pc(mock_pc)
+
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+
+        # Confirm the pane mounted (compose ran).
+        scroll = app.query_one("#plugin-detail", VerticalScroll)
+        # Pane has no children — no auto-render happened (empty plugins).
+        assert len(list(scroll.query("Collapsible"))) == 0
+
+        # Seed B's saved set as if from a prior session.
+        app._plugin_detail_open_sections["PluginB"] = {
+            app._DETAIL_SECTION_EVENTS,
+        }
+        # Simulate Worker(B) having set the render target before being
+        # cancelled mid-remove_children().
+        app._detail_render_target = "PluginB"
+
+        # Render PluginA against the empty scroll. PluginA isn't in
+        # pc.plugins (we emptied it), so plugin=None and the worker
+        # falls through the on-disk path. What matters is the
+        # capture-and-save block runs against the empty pane.
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+
+        # B's saved set survives — capture observed prior_total == 0,
+        # guard skipped the save instead of overwriting with {}.
+        assert app._plugin_detail_open_sections.get("PluginB") == {
+            app._DETAIL_SECTION_EVENTS,
+        }
+
+
+# ── #13d — regression: _currently_displayed_plugin only set after pane found ──
+
+@pytest.mark.asyncio
+async def test_phase3a_currently_displayed_plugin_not_set_on_nomatches(mock_pc):
+    """Regression: if `_update_plugin_detail` bails because
+    `#plugin-detail` isn't mounted (e.g. observer fires after the pane
+    was torn down or before on_mount completed), `_currently_displayed_plugin`
+    MUST stay at its prior value, NOT get set to the bailed-on name.
+    Pre-fix: assignment ran before the `query_one` early-return, so a
+    subsequent state-change emit would re-spawn the worker forever
+    against an unmounted pane. Cycle 2 fresh-eyes finding.
+    """
+    from textual.containers import VerticalScroll
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Remove the pane (simulates "pane unmounted") AND explicitly
+        # reset the tracker to None so the auto-row-highlight that may
+        # have fired during boot doesn't interfere with the assertion.
+        scroll = app.query_one("#plugin-detail", VerticalScroll)
+        await scroll.remove()
+        await pilot.pause()
+        app._currently_displayed_plugin = None
+
+        # Invoke against the unmounted pane — should bail at NoMatches
+        # WITHOUT setting _currently_displayed_plugin.
+        app._update_plugin_detail("PluginA")
+        for _ in range(5):
+            await pilot.pause()
+        assert app._currently_displayed_plugin is None
+
+
+# ── #14 — direct detail refresh on state change for displayed plugin ────
+
+@pytest.mark.asyncio
+async def test_phase3a_currently_displayed_plugin_live_refresh(mock_pc):
+    """When `_core/plugin/state_changed` fires AND the changed plugin is
+    the currently displayed one, the observer direct-calls
+    `_update_plugin_detail` for that plugin (not just via the debounce)."""
+    from unittest.mock import MagicMock as _MagicMock
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        # Pretend the operator already selected PluginA.
+        app._currently_displayed_plugin = "PluginA"
+        # Replace the worker so we can count direct invocations. Patching
+        # the method on the instance overrides the @work-decorator binding
+        # for THIS instance only; the original class-level method stays
+        # intact for other tests.
+        direct_calls = _MagicMock()
+        app._update_plugin_detail = direct_calls  # type: ignore[method-assign]
+
+        # Fire the observer with a state-change for PluginA.
+        app._on_plugin_state_changed(
+            "_core/plugin/state_changed",
+            {"name": "PluginA", "from_state": "enabled",
+             "to_state": "disabling", "ts": 0},
+        )
+        direct_calls.assert_called_once_with("PluginA")
+
+        # Fire again with a DIFFERENT plugin name — should NOT direct-call.
+        direct_calls.reset_mock()
+        app._on_plugin_state_changed(
+            "_core/plugin/state_changed",
+            {"name": "PluginB", "from_state": "inactive",
+             "to_state": "enabling", "ts": 0},
+        )
+        assert direct_calls.call_count == 0
+
+
+# ── #15 — Plugins flag fires regardless of outer tab gating ─────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_plugin_table_refresh_fires_outside_events_tab(mock_pc):
+    """`_on_plugin_state_changed` sets ALL THREE pending flags. The
+    debounce tick processes the plugins flag regardless of outer tab,
+    BUT only processes the subs/cat flags when the Events tab is
+    active. Validates the split-tick semantics from Section 4.8."""
+    from unittest.mock import MagicMock as _MagicMock
+
+    _install_phase3_pc(mock_pc)
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app._outer_is_events = False
+        plugins_worker = _MagicMock()
+        subs_worker = _MagicMock()
+        cat_worker = _MagicMock()
+        app._refresh_plugin_table_worker = plugins_worker  # type: ignore[method-assign]
+        app._refresh_subs_browser_worker = subs_worker  # type: ignore[method-assign]
+        app._refresh_events_catalogue_worker = cat_worker  # type: ignore[method-assign]
+
+        app._on_plugin_state_changed(
+            "_core/plugin/state_changed",
+            {"name": "PluginA", "from_state": "inactive",
+             "to_state": "enabling", "ts": 0},
+        )
+        # All three flags set.
+        assert app._plugins_refresh_pending is True
+        assert app._subs_refresh_pending is True
+        assert app._cat_refresh_pending is True
+
+        # Tick with non-Events tab active.
+        app._debounce_refresh_tick()
+        assert plugins_worker.called, "plugins worker fires regardless of tab"
+        assert not subs_worker.called, "subs worker gated on Events tab"
+        assert not cat_worker.called, "cat worker gated on Events tab"
+        # Events flags stay True awaiting the next outer-tab activation.
+        assert app._subs_refresh_pending is True
+        assert app._cat_refresh_pending is True
+
+
+# ── #16 — FAILED_LOAD plugin detail pane ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_phase3a_failed_load_detail_pane(mock_pc, tmp_path):
+    """A FAILED_LOAD plugin renders the Info section with exception type
+    + message + traceback toggle, and pulls Endpoints/Events/Subs/Args
+    content from on-disk `plugin_config.yml`."""
+    import yaml as _yaml
+    from plugin_state import State
+    from textual.containers import VerticalScroll
+    from textual.widgets import Collapsible, Static, TabbedContent
+
+    plugin_dir = tmp_path / "PluginA"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin_config.yml").write_text(
+        _yaml.safe_dump({
+            "description": "test plugin",
+            "version": "0.9",
+            "remote": False,
+            "arguments": {"k": "v"},
+            "endpoints": {"do_thing": {
+                "remote": False, "accessible_by_other_plugins": True,
+            }},
+            "events": {"evt_a": {"topic": "p/a", "enabled": True}},
+            "subscriptions": {"sub_a": {
+                "topic": "x/y", "target_access_name": "do_thing",
+            }},
+        }),
+        encoding="utf-8",
+    )
+    mock_pc.yaml_config = {
+        "plugins": [{"name": "PluginA", "path": str(plugin_dir),
+                     "enabled": True}],
+        "general": {}, "networking": {},
+    }
+    _install_phase3_pc(
+        mock_pc,
+        plugin_states_overrides={"PluginA": State.FAILED_LOAD},
+    )
+    err = RuntimeError("simulated on_load failure")
+    _attach_failed_load_error(
+        mock_pc, "PluginA", err, "Traceback (most recent call last):\n  ...",
+    )
+
+    app = _make_phase3_app(mock_pc)
+    async with app.run_test(headless=True, size=(160, 50)) as pilot:
+        await pilot.pause()
+        app.query_one("#main-tabs", TabbedContent).active = "tab-plugins"
+        await pilot.pause()
+        app._update_plugin_detail("PluginA")
+        for _ in range(8):
+            await pilot.pause()
+
+        detail = app.query_one("#plugin-detail", VerticalScroll)
+        # Info section banner shows exception class + message.
+        banners = [
+            s for s in detail.query(Static)
+            if "plugin-detail-failed-banner" in s.classes
+        ]
+        assert banners, "FAILED_LOAD banner should render"
+        # Textual 8.2.3 — Static exposes the originally-set content via
+        # the `content` property (NOT `renderable`, which was the API in
+        # earlier Textual versions). `str()` on the content yields the
+        # raw markup string the constructor received.
+        banner_text = str(banners[0].content)
+        assert "RuntimeError" in banner_text
+        assert "simulated on_load failure" in banner_text
+
+        # On-disk fallback populates Endpoints/Events/Subs/Args sections.
+        endpoints_col = detail.query_one(
+            f"#{app._DETAIL_SECTION_ENDPOINTS}", Collapsible,
+        )
+        endpoints_text = " ".join(
+            str(s.content) for s in endpoints_col.query(Static)
+        )
+        assert "do_thing" in endpoints_text
+        events_col = detail.query_one(
+            f"#{app._DETAIL_SECTION_EVENTS}", Collapsible,
+        )
+        events_text = " ".join(
+            str(s.content) for s in events_col.query(Static)
+        )
+        assert "evt_a" in events_text

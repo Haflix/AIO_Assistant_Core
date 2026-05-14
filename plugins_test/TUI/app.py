@@ -88,6 +88,15 @@ else:
     _spec2.loader.exec_module(_mod2)
     RequestTracker = _mod2.RequestTracker
 
+# Phase 3a — plugin_state imports used by `_update_plugin_detail` for
+# FAILED_LOAD error retrieval (`PluginState.last_errors[Phase.LOAD]`).
+# Imported at module load (NOT under TYPE_CHECKING) because runtime
+# code reads `Phase.LOAD` as a dict key.
+try:
+    from plugin_state import Phase as _PluginPhase  # type: ignore[import]
+except Exception:
+    _PluginPhase = None  # tests may stub plugin_states with primitive types
+
 
 # ─── Defaults ────────────────────────────────────────────────────────
 MAX_GRAPH_POINTS = 60
@@ -131,6 +140,7 @@ Footer {
 .stat-val-good { color: #73c991; text-style: bold; width: 1fr; }
 .stat-val-warn { color: #cca75a; text-style: bold; width: 1fr; }
 .stat-val-bad { color: #d16969; text-style: bold; width: 1fr; }
+.phase-dim { color: #808080; text-style: bold; width: 1fr; }
 
 #request-table { height: auto; max-height: 14; border: round #404040; background: #2d2d2d; }
 #request-empty { height: auto; padding: 0 1; }
@@ -161,10 +171,16 @@ Footer {
 #plugin-actions { height: auto; layout: horizontal; padding: 1 0 0 0; }
 #plugin-actions Button { margin: 0 1 0 0; }
 #plugin-detail {
-    height: auto; max-height: 14;
+    height: 1fr; max-height: 18;
     border: round #404040; padding: 1 2; margin: 1 0 0 0;
     background: #2d2d2d;
 }
+#plugin-detail Collapsible { background: transparent; padding: 0; }
+#plugin-detail Collapsible CollapsibleTitle { background: #2d2d2d; color: #9bb5a0; padding: 0 1; }
+.plugin-detail-section-body { height: auto; padding: 0 1; }
+.plugin-detail-overrides-badge { color: #cca75a; text-style: italic; height: auto; padding: 0 0 1 0; }
+.plugin-detail-failed-banner { color: #d16969; text-style: bold; height: auto; padding: 0 0 1 0; }
+.plugin-detail-traceback { color: #cca75a; height: auto; padding: 0 1 1 1; }
 
 /* ── Config ──────────────────────────────── */
 #config-container { height: 1fr; }
@@ -838,6 +854,27 @@ class DashboardApp(App):
         # debounce timer / immediate-refresh on tab activation.
         self._subs_refresh_pending: bool = False
         self._cat_refresh_pending: bool = False
+        # Phase 3a — Plugins-tab refresh-debounce flag. Set by
+        # `_on_plugin_state_changed` (consolidated bus observer for
+        # `_core/plugin/state_changed`); cleared by `_debounce_refresh_tick`
+        # which spawns `_refresh_plugin_table_worker`. Unlike the Events-tab
+        # flags above, this one is processed regardless of which outer tab
+        # is active — the Plugins-tab table is always-visible-when-tabbed-to
+        # so we want it fresh whenever the operator switches over.
+        self._plugins_refresh_pending: bool = False
+        # Phase 3a — name of the plugin currently displayed in the detail
+        # pane (i.e. the row whose `RowHighlighted` last fired). None when
+        # no row is selected. Read by `_on_plugin_state_changed` to decide
+        # whether to direct-refresh the detail pane on a state transition
+        # for THIS plugin (without waiting for the next row-highlight event).
+        self._currently_displayed_plugin: Optional[str] = None
+        # Phase 3a — per-plugin remembered open/collapsed state of each
+        # detail-pane Collapsible section. Keyed by plugin name; value is
+        # the set of section ids the operator has expanded. Used to
+        # preserve open state across row-selection changes (Info section
+        # always opens for the new plugin; the other four preserve their
+        # last-seen state for that specific plugin).
+        self._plugin_detail_open_sections: Dict[str, set] = {}
         # Filter-dirty flag for Live-stream: any Input/Checkbox change
         # in the Live-stream filters sets this; the flush timer reads
         # AND clears under no lock (same-thread mutation).
@@ -1034,7 +1071,7 @@ class DashboardApp(App):
                         yield Button("Remove", id="btn-remove", variant="error")
                         yield Button("Open Tab", id="btn-open-tab")
                         yield Button("Refresh", id="btn-refresh-plugins")
-                    yield Static("Select a plugin to see details", id="plugin-detail", markup=True)
+                    yield VerticalScroll(id="plugin-detail")
 
             # ── 3. Config ────────────────────────────────────────
             with TabPane("Config", id="tab-config"):
@@ -1483,7 +1520,15 @@ class DashboardApp(App):
         # Setup tables
         try:
             t = self.query_one("#plugin-table", DataTable)
-            t.add_columns("Name", "Status", "Version", "Remote", "Endpoints", "Description")
+            # Phase 3a — 8 columns: Name / Phase / Version / Remote /
+            # Endpoints count / Subs count (`declared` or `declared+runtime`) /
+            # Events count / Description. Phase column derived by
+            # `_plugin_phase` from `pc.plugin_states[name].state` plus the
+            # plugin instance's `_lifecycle_ready` and `ready` events.
+            t.add_columns(
+                "Name", "Phase", "Ver", "R", "Eps", "Subs", "Evs",
+                "Description",
+            )
         except NoMatches:
             pass
         try:
@@ -1551,8 +1596,14 @@ class DashboardApp(App):
             self._app_bus_observers = [
                 ("_core/subscription/state_changed", self._on_subs_refresh_signal),
                 ("_core/event/state_changed", self._on_cat_refresh_signal),
-                ("_core/plugin/state_changed", self._on_subs_refresh_signal),
-                ("_core/plugin/state_changed", self._on_cat_refresh_signal),
+                # Phase 3a — consolidated observer for plugin lifecycle.
+                # Pre-Phase-3 had two entries here (subs + cat handlers,
+                # each setting their own pending flag). The new handler
+                # sets all three pending flags + direct-refreshes the
+                # detail pane when the changed plugin is currently
+                # displayed. 4 entries → 3; one listener-iteration per
+                # emit instead of two.
+                ("_core/plugin/state_changed", self._on_plugin_state_changed),
             ]
             for topic, cb in self._app_bus_observers:
                 try:
@@ -1894,8 +1945,150 @@ class DashboardApp(App):
 
     # ─── Plugin table ────────────────────────────────────────────────
 
+    def _plugin_phase(self, name: str, plugin) -> tuple[str, str]:
+        """Phase 3a — derive the Plugins-tab Phase column cell for a plugin.
+
+        Reads `pc.plugin_states[name].state` plus the readiness events
+        on the plugin instance and returns a (label, css_class) pair.
+        Centralized so the table renderer and the per-plugin tab's
+        Lifecycle strip (Phase 3b) share one source of truth.
+
+        Mapping:
+          - state == ENABLED:
+              - lifecycle_ready set AND ready set                    -> READY  (good)
+              - lifecycle_ready set AND not ready set                -> WAITING (warn)
+              - otherwise (defensive — lifecycle_ready guaranteed
+                set when state == ENABLED per framework contract)    -> READY  (good)
+          - state == ENABLING                                        -> LOADING   (warn)
+          - state == DISABLING                                       -> DISABLING (warn)
+          - state == INACTIVE                                        -> DISABLED  (dim)
+          - state == UNLOADED                                        -> UNLOADED  (dim)
+          - state == FAILED_LOAD                                     -> FAILED    (bad)
+          - state absent / enum value unknown                        -> upper-case (warn)
+
+        Compares `state.value` (string) rather than the enum directly
+        so this method doesn't need to import `plugin_state.State` — keeps
+        the TUI module independent of framework-internal enum identity
+        and tolerant of future enum additions per `plugin_state.py:19-21`
+        ("External tooling reading `state.value` should handle unknown
+        values gracefully").
+        """
+        # MagicMock auto-creates any attribute as another MagicMock, so a
+        # plain `hasattr` check passes even when the fixture didn't set
+        # plugin_states. Require an actual mapping so test fixtures that
+        # don't install Phase 3a's plugin_states surface fall through to
+        # the `?` warn cell rather than crashing on MagicMock `.get()` /
+        # `.value` cascades.
+        plugin_states = getattr(self.plugin_core, "plugin_states", None)
+        if not isinstance(plugin_states, dict):
+            return ("?", "stat-val-warn")
+        ps = plugin_states.get(name)
+        if ps is None:
+            return ("?", "stat-val-warn")
+        state = getattr(ps, "state", None)
+        val = getattr(state, "value", None)
+        if not isinstance(val, str):
+            return ("?", "stat-val-warn")
+        if val == "unloaded":
+            return ("UNLOADED", "phase-dim")
+        if val == "inactive":
+            return ("DISABLED", "phase-dim")
+        if val == "enabling":
+            return ("LOADING", "stat-val-warn")
+        if val == "disabling":
+            return ("DISABLING", "stat-val-warn")
+        if val == "failed_load":
+            return ("FAILED", "stat-val-bad")
+        if val == "enabled":
+            if plugin is None:
+                return ("READY", "stat-val-good")
+            lifecycle_ready = getattr(plugin, "_lifecycle_ready", None)
+            ready = getattr(plugin, "ready", None)
+            lifecycle_set = bool(lifecycle_ready.is_set()) \
+                if lifecycle_ready is not None and hasattr(lifecycle_ready, "is_set") \
+                else False
+            ready_set = bool(ready.is_set()) \
+                if ready is not None and hasattr(ready, "is_set") \
+                else False
+            if lifecycle_set and not ready_set:
+                return ("WAITING", "stat-val-warn")
+            return ("READY", "stat-val-good")
+        return (val.upper(), "stat-val-warn")
+
+    def _resolve_plugin_config_dict(self, plugin_name: str) -> Optional[dict]:
+        """Phase 3a — read the on-disk plugin_config.yml for ``plugin_name``.
+
+        Returns the parsed dict on success, or None when the plugin is
+        not in the main config, the plugin directory or file is missing,
+        or the YAML parse fails. Used by:
+
+          * `_build_args_section` — diff against `plugin.arguments` to
+            decide whether to render the "overrides applied" badge.
+          * `_update_plugin_detail` FAILED_LOAD path — read endpoints/
+            events/subscriptions sections directly when the plugin
+            instance never came up (per Section 7 of the Phase 3 plan;
+            `pc.get_unloaded_metadata` returns None for non-UNLOADED so
+            it can't be used as a fallback here).
+
+        Path resolution mirrors `PluginCore.load_plugin_with_conf`:
+        the plugin entry's `path` field is preferred; otherwise
+        `{plugin_package}/{plugin_name}`. Errors are swallowed at the
+        boundary — callers receive None and render their own placeholder.
+        """
+        try:
+            entry = next(
+                (
+                    p for p in (self.plugin_core.yaml_config.get("plugins") or [])
+                    if isinstance(p, dict) and p.get("name") == plugin_name
+                ),
+                None,
+            )
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        try:
+            base_path = entry.get("path") or os.path.join(
+                getattr(self.plugin_core, "plugin_package", "plugins"),
+                plugin_name,
+            )
+            cfg_path = os.path.join(os.path.abspath(base_path), "plugin_config.yml")
+            if not os.path.isfile(cfg_path):
+                return None
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                parsed = yaml.safe_load(f)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
+
     @work(thread=False, exclusive=True, group="plugins")
     async def _refresh_plugin_table_worker(self) -> None:
+        """Phase 3a — rebuild the Plugins-tab table.
+
+        Row source changed pre-Phase-3 → Phase 3a: was `pc.plugins.items()`
+        (instances dict, misses UNLOADED plugins); now iterates
+        `pc.plugin_states` keys (snapshot via `dict(...)` per the iteration
+        contract in `plugin_state.py:9-17`). This makes UNLOADED plugins
+        visible in the table (config has an entry but no live instance) —
+        the Phase column then surfaces their state explicitly.
+
+        Columns (8): Name / Phase / Ver / R / Eps / Subs / Evs / Description.
+
+          * Phase  — derived by `_plugin_phase` (state enum + readiness
+                     events). UNLOADED plugins have no instance, so phase
+                     reads enum only.
+          * Subs   — `{declared}` or `{declared}+{runtime}`. declared =
+                     `len(plugin.subscriptions)`; runtime =
+                     `len(plugin._sub_uuids) - declared` (NOT
+                     `len(_sub_uuids) > 0` — `_sub_uuids` contains BOTH
+                     YAML and runtime sub_uuids per
+                     `PluginCore._register_yaml_subscriptions` /
+                     `subscribe_event` writing to the same list).
+                     Renders `?` when the instance is absent (UNLOADED).
+          * Evs    — `len(plugin.events)`. `?` when instance absent.
+        """
         try:
             table = self.query_one("#plugin-table", DataTable)
         except NoMatches:
@@ -1910,30 +2103,104 @@ class DashboardApp(App):
 
         table.clear()
 
-        # Read without lock — dict snapshot is safe for display
+        # Snapshot under the iteration contract. Require an actual dict —
+        # MagicMock fixtures that didn't install plugin_states auto-create
+        # a MagicMock attribute, which `dict(...)` would either iterate
+        # spuriously or raise. Fall back to {} so the merge with pc.plugins
+        # below produces a coherent row list.
+        ps_attr = getattr(self.plugin_core, "plugin_states", None)
         try:
-            plugins_snapshot = [
-                (
-                    name,
-                    p.enabled,
-                    getattr(p, "version", "?"),
-                    getattr(p, "remote", False),
-                    len(getattr(p, "endpoints", [])),
-                    getattr(p, "description", ""),
-                )
-                for name, p in list(self.plugin_core.plugins.items())
-            ]
+            states_snapshot = dict(ps_attr) if isinstance(ps_attr, dict) else {}
         except Exception:
-            return
+            states_snapshot = {}
+
+        # Fall-back for tests / older fixtures that didn't populate
+        # plugin_states: include any plugin currently in pc.plugins that
+        # doesn't have a state entry. Treats them as DISABLED-style for
+        # the phase column (`_plugin_phase` returns `?` when ps is None).
+        try:
+            plugins_attr = getattr(self.plugin_core, "plugins", None)
+            if isinstance(plugins_attr, dict):
+                for name in list(plugins_attr):
+                    if name not in states_snapshot:
+                        states_snapshot[name] = None
+        except Exception:
+            pass
 
         filt = self._plugin_filter.lower()
-        for name, enabled, version, remote, ep_count, desc in plugins_snapshot:
-            if filt and filt not in name.lower() and filt not in desc.lower():
+
+        for name in sorted(states_snapshot.keys()):
+            # Live instance (None for UNLOADED / never-loaded / fallback rows).
+            plugin = None
+            try:
+                plugin = self.plugin_core.plugins.get(name)
+            except Exception:
+                plugin = None
+
+            # Plugin metadata. For UNLOADED rows the on-disk metadata
+            # could be read via _resolve_plugin_config_dict, but that's
+            # I/O per row in a hot worker — defer to the detail pane.
+            # Table row shows `?` for fields we can't cheaply derive.
+            version = getattr(plugin, "version", "?") if plugin else "?"
+            remote = bool(getattr(plugin, "remote", False)) if plugin else False
+            desc = getattr(plugin, "description", "") if plugin else ""
+            endpoints = getattr(plugin, "endpoints", {}) if plugin else {}
+            ep_count_int = len(endpoints) if isinstance(endpoints, dict) else 0
+            ep_count = str(ep_count_int) if plugin is not None else "?"
+
+            # Subs cell: declared + runtime (`+N` suffix when runtime > 0).
+            if plugin is not None:
+                declared_subs = getattr(plugin, "subscriptions", {}) or {}
+                declared_count = len(declared_subs) if isinstance(declared_subs, dict) else 0
+                sub_uuids = getattr(plugin, "_sub_uuids", []) or []
+                total_count = len(sub_uuids) if isinstance(sub_uuids, list) else 0
+                runtime_count = max(0, total_count - declared_count)
+                subs_cell = (
+                    f"{declared_count}+{runtime_count}"
+                    if runtime_count > 0
+                    else str(declared_count)
+                )
+            else:
+                subs_cell = "?"
+
+            # Evs cell.
+            if plugin is not None:
+                events = getattr(plugin, "events", {}) or {}
+                evs_cell = str(len(events)) if isinstance(events, dict) else "0"
+            else:
+                evs_cell = "?"
+
+            # Filter — applies to Name and Description.
+            if filt and filt not in name.lower() and filt not in (desc or "").lower():
                 continue
-            status = Text("ON", style="green") if enabled else Text("OFF", style="red")
+
+            phase_label, phase_class = self._plugin_phase(name, plugin)
+            # Render Phase as a Text with the matching color so the
+            # operator can spot READY/WAITING/FAILED visually. Map
+            # phase css class -> Text style. Mirrors the inline-style
+            # pattern used for the legacy Status column.
+            _PHASE_STYLE = {
+                "stat-val-good": "green",
+                "stat-val-warn": "#cca75a",
+                "stat-val-bad": "red",
+                "phase-dim": "#808080",
+            }
+            phase_cell = Text(phase_label, style=_PHASE_STYLE.get(phase_class, ""))
+
             remote_str = Text("R", style="cyan") if remote else Text("L", style="dim")
             desc_short = (desc[:40] + "...") if len(desc) > 43 else desc
-            table.add_row(name, status, version, remote_str, str(ep_count), desc_short, key=name)
+
+            table.add_row(
+                name,
+                phase_cell,
+                version,
+                remote_str,
+                ep_count,
+                subs_cell,
+                evs_cell,
+                desc_short,
+                key=name,
+            )
 
         if selected_key:
             for idx in range(table.row_count):
@@ -2974,14 +3241,65 @@ class DashboardApp(App):
         """
         self._cat_refresh_pending = True
 
+    def _on_plugin_state_changed(self, topic: str, payload: dict) -> None:
+        """Phase 3a — consolidated bus observer for `_core/plugin/state_changed`.
+
+        Plugin lifecycle changes invalidate three views at once: the
+        Plugins-tab table (Phase/Subs/Evs columns + UNLOADED visibility),
+        the Subs browser (registered subs come and go with on_enable /
+        on_disable), and the Events catalogue (declared events change
+        with load/unload). This handler sets all three pending flags so
+        the debounce tick refreshes whichever tables are currently
+        rendered. The Plugins-tab flag is processed regardless of which
+        outer tab is active (Plugins tab isn't `_outer_is_events`-gated);
+        the Subs/Cat flags stay gated on outer-tab visibility — same
+        rationale as pre-Phase-3 (those tables only exist when the
+        Events tab is rendered, so refreshing them while invisible is
+        wasted work).
+
+        Also direct-refreshes the detail pane when the changed plugin is
+        the one currently displayed — without this the operator would
+        see stale Phase / Endpoints / Subs sections until they re-select
+        the row.
+
+        Runs on the loop thread. Sync — flag-set is GIL-atomic and the
+        direct call to `_update_plugin_detail` is a `@work`-decorated
+        method (spawns its own task without awaiting here). Observer
+        callbacks must return < 1ms per the framework's observer
+        contract; this body is bounded.
+        """
+        self._plugins_refresh_pending = True
+        self._subs_refresh_pending = True
+        self._cat_refresh_pending = True
+        name = payload.get("name") if isinstance(payload, dict) else None
+        if name is not None and name == self._currently_displayed_plugin:
+            try:
+                self._update_plugin_detail(name)
+            except Exception:
+                # Observer must not raise. _update_plugin_detail is a
+                # @work method so the spawn itself shouldn't fail, but
+                # defensive against widget-not-mounted-yet edge cases.
+                pass
+
     def _debounce_refresh_tick(self) -> None:
         """Read-and-clear the debounce flags; spawn workers when set.
 
         Runs on the TUI thread at 250ms (the timer registered in
-        `_start_timers`). Skips refresh entirely when the Events tab
-        isn't the active outer tab — the next outer-activation handler
-        re-triggers the refresh as part of the immediate-on-enter path.
+        `_start_timers`).
+
+        Phase 3a — split path: the Plugins-tab flag fires regardless of
+        which outer tab is active (the Plugins-tab table itself isn't
+        `_outer_is_events`-gated). The Events-tab flags remain gated on
+        outer-tab visibility — those tables only exist when the Events
+        tab is rendered, so refreshing them while invisible is wasted
+        work. Pre-Phase-3 the whole body early-returned on `not
+        self._outer_is_events`; folding the new Plugins-tab flag into
+        the same early-return would silently swallow plugin state
+        changes whenever any non-Events tab was active.
         """
+        if self._plugins_refresh_pending:
+            self._plugins_refresh_pending = False
+            self._refresh_plugin_table_worker()
         if not self._outer_is_events:
             return
         if self._subs_refresh_pending:
@@ -5672,42 +5990,560 @@ class DashboardApp(App):
             self._set_status(f"Error: {e}", error=True)
         self._refresh_plugin_table_worker()
 
+    # Phase 3a — section ids for the detail-pane Collapsibles. Kept as
+    # module-class constants so the worker, the build helpers, and the
+    # tests share one source of truth (test #10 asserts the exact ids).
+    _DETAIL_SECTION_INFO = "plugin-detail-info"
+    _DETAIL_SECTION_ENDPOINTS = "plugin-detail-endpoints"
+    _DETAIL_SECTION_EVENTS = "plugin-detail-events"
+    _DETAIL_SECTION_SUBS = "plugin-detail-subs"
+    _DETAIL_SECTION_ARGS = "plugin-detail-args"
+    _DETAIL_SECTION_IDS = (
+        _DETAIL_SECTION_INFO,
+        _DETAIL_SECTION_ENDPOINTS,
+        _DETAIL_SECTION_EVENTS,
+        _DETAIL_SECTION_SUBS,
+        _DETAIL_SECTION_ARGS,
+    )
+    _DETAIL_NON_INFO_SECTIONS = (
+        _DETAIL_SECTION_ENDPOINTS,
+        _DETAIL_SECTION_EVENTS,
+        _DETAIL_SECTION_SUBS,
+        _DETAIL_SECTION_ARGS,
+    )
+
     @work(thread=False, exclusive=True, group="plugin-detail")
     async def _update_plugin_detail(self, plugin_name: str) -> None:
+        """Phase 3a — rebuild the 5-section detail pane for ``plugin_name``.
+
+        Behaviour:
+
+          * Captures the previously-open non-Info sections from the
+            currently-mounted Collapsibles BEFORE destroying them, so
+            the operator's section open state survives across rapid
+            row-selection changes (the `@work(exclusive=True)` group
+            cancels in-flight invocations, so capture-then-clear has
+            no race with itself).
+          * Records ``plugin_name`` as the currently displayed plugin
+            so `_on_plugin_state_changed` can direct-refresh on a
+            state transition for this plugin.
+          * Reads framework state (Plugin instance + `plugin_states`
+            entry) directly — does NOT call ``get_plugin_info`` /
+            ``get_plugin_endpoints`` (those return None for UNLOADED
+            and incomplete data for FAILED_LOAD; the on-disk fallback
+            via `_resolve_plugin_config_dict` covers both cases).
+
+        UNLOADED / FAILED_LOAD plugins fall back to reading the on-disk
+        ``plugin_config.yml`` for Endpoints/Events/Subs/Args content via
+        `_resolve_plugin_config_dict`. The Info section reports state +
+        (for FAILED_LOAD) the captured `last_errors[Phase.LOAD]`
+        exception and traceback.
+        """
+        # Snapshot live framework state. Both lookups are GIL-atomic dict
+        # reads — no `_run_on_main` needed (no awaits, no asyncio locks
+        # acquired). pc.plugin_states.get() is a `.get(name)` on a
+        # standard dict.
+        plugin = None
         try:
-            info = await self._run_on_main(self.plugin_core.get_plugin_info(plugin_name))
+            plugin = self.plugin_core.plugins.get(plugin_name)
+        except Exception:
+            plugin = None
+        ps = None
+        try:
+            states = getattr(self.plugin_core, "plugin_states", None) or {}
+            ps = states.get(plugin_name) if hasattr(states, "get") else None
+        except Exception:
+            ps = None
+
+        # Locate the container. Failure here means the Plugins tab hasn't
+        # been mounted yet — nothing to render against. Worker re-fires
+        # on the next row-highlight after the tab mounts. NOTE: we do
+        # NOT set `_currently_displayed_plugin` until AFTER this resolves
+        # — otherwise an observer-driven re-render against an unmounted
+        # pane would re-schedule itself forever via the `name ==
+        # _currently_displayed_plugin` direct-call gate in
+        # `_on_plugin_state_changed` (cycle 2 fresh-eyes finding).
+        try:
+            scroll = self.query_one("#plugin-detail", VerticalScroll)
+        except NoMatches:
+            return
+
+        # Pane is real — commit the displayed-plugin tracker for the
+        # observer's direct-refresh gate.
+        self._currently_displayed_plugin = plugin_name
+
+        # Capture the previously-open non-Info section state for THIS
+        # plugin BEFORE removing children. The Info section's collapsed
+        # state isn't tracked — Info always re-opens after a refresh per
+        # Section 4.3 of the plan.
+        try:
+            prior_open: set = set()
+            prior_total = 0
+            for col in scroll.query(Collapsible):
+                col_id = getattr(col, "id", None)
+                if col_id is None or col_id not in self._DETAIL_SECTION_IDS:
+                    continue
+                prior_total += 1
+                if col_id in self._DETAIL_NON_INFO_SECTIONS and not col.collapsed:
+                    prior_open.add(col_id)
+            # The captured snapshot is only meaningful for the plugin
+            # whose detail was previously displayed AND when the prior
+            # render actually populated the scroll. Three guards:
+            #   1. Coalesce a pre-initialized-to-None
+            #      `_detail_render_target` (`_make_dashboard_app` test
+            #      fixture path) to plugin_name. `getattr(..., default)`
+            #      doesn't fire when the attribute exists with value
+            #      None.
+            #   2. Skip the save when prior_plugin == plugin_name —
+            #      a same-plugin re-render (e.g. `_on_plugin_state_changed`
+            #      direct-refresh while a prior worker is mid-`await
+            #      scroll.remove_children()`) must not overwrite its
+            #      own saved open-state set with the empty set Worker2
+            #      observes post-remove.
+            #   3. Skip the save when prior_total == 0 — Worker2 observed
+            #      zero detail-pane Collapsibles, meaning the prior
+            #      worker was cancelled BEFORE mounting (during the
+            #      `await remove_children()`) and our `prior_open=={}`
+            #      capture is an artifact of cancellation, not a
+            #      legitimate "all collapsed" observation. Saving the
+            #      empty set here would clobber prior_plugin's
+            #      legitimate saved state from an earlier session.
+            prior_plugin = getattr(self, "_detail_render_target", None) or plugin_name
+            same_plugin_rerender = (prior_plugin == plugin_name)
+            if (
+                not same_plugin_rerender
+                and prior_total > 0
+                and (prior_open or prior_plugin in self._plugin_detail_open_sections)
+            ):
+                self._plugin_detail_open_sections[prior_plugin] = prior_open
+        except Exception:
+            pass
+
+        # Pin the new render target for the NEXT invocation's capture.
+        self._detail_render_target = plugin_name
+
+        # Determine open-state for non-Info sections on THIS plugin from
+        # the persisted dict. Info is always force-open.
+        saved_open = self._plugin_detail_open_sections.get(plugin_name, set())
+
+        # Drop registry entries for any prior detail-pane button on this
+        # plugin so a long-running TUI doesn't leak ids across re-renders.
+        try:
+            self._cleanup_registry_for_plugin(
+                plugin_name, exclude_types=frozenset({"close-tab", "view-mode-custom", "view-mode-generated"}),
+            )
+        except Exception:
+            pass
+
+        try:
+            await scroll.remove_children()
         except Exception:
             return
-        if not info:
-            return
+
+        # Read on-disk plugin_config.yml once — Args section needs it for
+        # the overrides-applied badge AND the UNLOADED/FAILED_LOAD paths
+        # need it for endpoints/events/subs fallback rendering. Sync read
+        # is fine: small file, cached by OS.
+        on_disk_cfg = self._resolve_plugin_config_dict(plugin_name)
+
+        # Build the five sections.
+        sections = [
+            self._build_info_section(plugin_name, plugin, ps, on_disk_cfg),
+            self._build_endpoints_section(plugin_name, plugin, on_disk_cfg, saved_open),
+            self._build_events_section(plugin_name, plugin, on_disk_cfg, saved_open),
+            self._build_subs_section(plugin_name, plugin, on_disk_cfg, saved_open),
+            self._build_args_section(plugin_name, plugin, on_disk_cfg, saved_open),
+        ]
         try:
-            detail = self.query_one("#plugin-detail", Static)
-            endpoints = await self._run_on_main(self.plugin_core.get_plugin_endpoints(plugin_name))
-            ep_count = len(endpoints) if endpoints else 0
+            for sec in sections:
+                await scroll.mount(sec)
+        except Exception:
+            # Container destroyed mid-mount (e.g. plugin tab popped). Swallow.
+            return
 
-            # Per-plugin request stats
+    # ── Phase 3a — detail-pane section builders ────────────────────────
+
+    def _build_info_section(
+        self, plugin_name: str, plugin, ps, on_disk_cfg: Optional[dict],
+    ) -> Collapsible:
+        """Info section — name / uuid / version / description / remote / phase.
+
+        For FAILED_LOAD plugins: also surfaces the captured exception
+        (type + message) and a short slice of the traceback. For
+        UNLOADED plugins (config-has-entry-but-no-instance): reads
+        version/description from on-disk yaml.
+
+        Includes request stats + active request count (carried over from
+        pre-Phase-3 detail pane — preserves existing UX per maintainer
+        decision logged in conversation thread).
+        """
+        # Source of metadata fields per state.
+        version = "?"
+        description = ""
+        remote = False
+        uuid_str = "?"
+        if plugin is not None:
+            version = str(getattr(plugin, "version", "?"))
+            description = str(getattr(plugin, "description", "") or "")
+            remote = bool(getattr(plugin, "remote", False))
+            uuid_str = str(getattr(plugin, "plugin_uuid", "?"))
+        elif isinstance(on_disk_cfg, dict):
+            version = str(on_disk_cfg.get("version") or "?")
+            description = str(on_disk_cfg.get("description") or "")
+            remote = bool(on_disk_cfg.get("remote") or False)
+
+        phase_label, phase_class = self._plugin_phase(plugin_name, plugin)
+
+        body: list = []
+        body.append(Static(
+            f"[bold]{escape(plugin_name)}[/bold]  "
+            f"v{escape(version)}",
+            markup=True,
+        ))
+        body.append(Static(
+            f"[dim]UUID:[/dim] {escape(uuid_str)}",
+            markup=True,
+        ))
+        # Phase pill rendered using the same css class the table uses
+        # (`stat-val-good` / `stat-val-warn` / `stat-val-bad` / `phase-dim`).
+        body.append(Static(
+            f"[dim]Phase:[/dim] [bold]{escape(phase_label)}[/bold]",
+            markup=True, classes=phase_class,
+        ))
+        if description:
+            body.append(Static(escape(description), markup=True))
+        body.append(Static(
+            f"[dim]Remote:[/dim] {'Yes' if remote else 'No'}",
+            markup=True,
+        ))
+
+        # FAILED_LOAD: surface last_errors[Phase.LOAD].
+        if ps is not None and getattr(getattr(ps, "state", None), "value", None) == "failed_load":
+            err_rec = None
+            try:
+                last_errors = getattr(ps, "last_errors", None) or {}
+                if _PluginPhase is not None:
+                    err_rec = last_errors.get(_PluginPhase.LOAD)
+                else:
+                    # Tests may pass a stubbed dict keyed by the string
+                    # value of the Phase enum. Tolerant fallback.
+                    err_rec = (
+                        last_errors.get("load")
+                        if isinstance(last_errors, dict) else None
+                    )
+            except Exception:
+                err_rec = None
+            if err_rec is not None:
+                exc = getattr(err_rec, "exception", None)
+                exc_type = type(exc).__name__ if exc is not None else "Exception"
+                exc_msg = str(exc) if exc is not None else ""
+                body.append(Static(
+                    f"[bold]FAILED_LOAD:[/bold] "
+                    f"{escape(exc_type)}: {escape(exc_msg)}",
+                    markup=True, classes="plugin-detail-failed-banner",
+                ))
+                tb = getattr(err_rec, "traceback", None)
+                if tb:
+                    # Traceback content can be long — wrap in an inner
+                    # Collapsible so it doesn't blow up the Info section
+                    # height on a deep stack.
+                    body.append(Collapsible(
+                        Static(escape(str(tb)),
+                               markup=True,
+                               classes="plugin-detail-traceback"),
+                        title="Show traceback",
+                        collapsed=True,
+                    ))
+
+        # Request stats — preserved from pre-Phase-3 detail pane per
+        # maintainer Option A decision.
+        pstats = None
+        try:
             pstats = self._tracker.per_plugin.get(plugin_name)
-            req_info = ""
-            if pstats:
-                req_info = (
-                    f"\nRequests: {pstats.total} total, "
+        except Exception:
+            pstats = None
+        if pstats is not None:
+            try:
+                body.append(Static(
+                    f"[dim]Requests:[/dim] {pstats.total} total, "
                     f"{pstats.errors} errors, "
-                    f"avg {pstats.avg_latency*1000:.0f}ms"
+                    f"avg {pstats.avg_latency * 1000:.0f}ms",
+                    markup=True,
+                ))
+            except Exception:
+                pass
+        try:
+            active_for = [
+                r for r in self._tracker.active if r.plugin == plugin_name
+            ]
+        except Exception:
+            active_for = []
+        if active_for:
+            body.append(Static(
+                f"[dim]Active:[/dim] {len(active_for)}",
+                markup=True,
+            ))
+
+        return Collapsible(
+            *body, title="Info",
+            collapsed=False,  # Info always opens on refresh per Section 4.3
+            id=self._DETAIL_SECTION_INFO,
+            classes="plugin-detail-section-body",
+        )
+
+    def _build_endpoints_section(
+        self,
+        plugin_name: str,
+        plugin,
+        on_disk_cfg: Optional[dict],
+        saved_open: set,
+    ) -> Collapsible:
+        """Endpoints section — list each endpoint with flags + tags.
+
+        Live plugin: reads `plugin.endpoints` (validated dict). UNLOADED
+        / FAILED_LOAD fallback: reads `on_disk_cfg["endpoints"]` (the
+        un-merged YAML). Empty / missing → `(none)` placeholder.
+        """
+        endpoints_dict: Optional[dict] = None
+        if plugin is not None:
+            cand = getattr(plugin, "endpoints", None)
+            if isinstance(cand, dict):
+                endpoints_dict = cand
+        if endpoints_dict is None and isinstance(on_disk_cfg, dict):
+            cand = on_disk_cfg.get("endpoints")
+            if isinstance(cand, dict):
+                endpoints_dict = cand
+
+        body: list = []
+        if not endpoints_dict:
+            body.append(Static("[dim](none)[/dim]", markup=True))
+        else:
+            for ep_key, ep in endpoints_dict.items():
+                if not isinstance(ep, dict):
+                    continue
+                access_name = str(ep_key)
+                internal_name = str(ep.get("internal_name") or access_name)
+                remote_flag = "R" if ep.get("remote") else ""
+                accessible_flag = "A" if ep.get("accessible_by_other_plugins") else ""
+                flags = " ".join(f for f in (remote_flag, accessible_flag) if f)
+                tags = ep.get("tags") or []
+                tags_str = (
+                    ", ".join(escape(str(t)) for t in tags) if tags else ""
                 )
+                line = (
+                    f"[bold]{escape(access_name)}[/bold]"
+                    + (f" → {escape(internal_name)}" if internal_name != access_name else "")
+                    + (f"  [cyan]{escape(flags)}[/cyan]" if flags else "")
+                    + (f"  [dim]tags:[/dim] {tags_str}" if tags_str else "")
+                )
+                body.append(Static(line, markup=True))
 
-            # Active requests for this plugin
-            active_for = [r for r in self._tracker.active if r.plugin == plugin_name]
-            active_info = f"\nActive: {len(active_for)}" if active_for else ""
+        return Collapsible(
+            *body, title=f"Endpoints ({len(endpoints_dict or {})})",
+            collapsed=(self._DETAIL_SECTION_ENDPOINTS not in saved_open),
+            id=self._DETAIL_SECTION_ENDPOINTS,
+            classes="plugin-detail-section-body",
+        )
 
-            detail.update(
-                f"[bold]{escape(info['name'])}[/bold] v{escape(str(info['version']))}  "
-                f"[dim]UUID: {escape(str(info['uuid']))}[/dim]\n"
-                f"{escape(info.get('description', ''))}\n"
-                f"Endpoints: {ep_count} | Remote: {'Yes' if info['remote'] else 'No'}"
-                f"{req_info}{active_info}"
-            )
-        except (NoMatches, Exception):
-            pass
+    def _build_events_section(
+        self,
+        plugin_name: str,
+        plugin,
+        on_disk_cfg: Optional[dict],
+        saved_open: set,
+    ) -> Collapsible:
+        """Events section — declared events with topic + hosts + enabled.
+
+        Live plugin: reads `plugin.events` (post-load-time placeholder
+        resolution). Fallback: `on_disk_cfg["events"]`.
+        """
+        events_dict: Optional[dict] = None
+        if plugin is not None:
+            cand = getattr(plugin, "events", None)
+            if isinstance(cand, dict):
+                events_dict = cand
+        if events_dict is None and isinstance(on_disk_cfg, dict):
+            cand = on_disk_cfg.get("events")
+            if isinstance(cand, dict):
+                events_dict = cand
+
+        body: list = []
+        if not events_dict:
+            body.append(Static("[dim](none)[/dim]", markup=True))
+        else:
+            for evt_id, entry in events_dict.items():
+                if not isinstance(entry, dict):
+                    continue
+                topic = entry.get("topic", "")
+                hosts = entry.get("hosts")
+                enabled = entry.get("enabled", True)
+                enabled_marker = "✓" if enabled else "✗"
+                enabled_color = "green" if enabled else "red"
+                hosts_str = "" if hosts is None else f"  [dim]hosts:[/dim] {escape(str(hosts))}"
+                body.append(Static(
+                    f"[bold]{escape(str(evt_id))}[/bold]  "
+                    f"[yellow]{escape(str(topic))}[/yellow]"
+                    f"{hosts_str}  "
+                    f"[{enabled_color}]{enabled_marker}[/{enabled_color}]",
+                    markup=True,
+                ))
+
+        return Collapsible(
+            *body, title=f"Events ({len(events_dict or {})})",
+            collapsed=(self._DETAIL_SECTION_EVENTS not in saved_open),
+            id=self._DETAIL_SECTION_EVENTS,
+            classes="plugin-detail-section-body",
+        )
+
+    def _build_subs_section(
+        self,
+        plugin_name: str,
+        plugin,
+        on_disk_cfg: Optional[dict],
+        saved_open: set,
+    ) -> Collapsible:
+        """Subscriptions section — declared subs (with [YAML] tag) plus
+        runtime subs (tagged [runtime]). Phase 3a renders both inside
+        one section; Phase 3b will move richer per-plugin sub views to
+        the dedicated per-plugin tab.
+        """
+        declared_dict: Optional[dict] = None
+        if plugin is not None:
+            cand = getattr(plugin, "subscriptions", None)
+            if isinstance(cand, dict):
+                declared_dict = cand
+        if declared_dict is None and isinstance(on_disk_cfg, dict):
+            cand = on_disk_cfg.get("subscriptions")
+            if isinstance(cand, dict):
+                declared_dict = cand
+
+        # Runtime subs: derive from `plugin._sub_uuids` minus the declared
+        # set. `_sub_uuids` is appended-to by both YAML registration AND
+        # runtime subscribe; we only have the count, not per-sub detail
+        # here (full detail lives in the per-plugin tab's Subs section
+        # added in Phase 3b).
+        runtime_count = 0
+        if plugin is not None and isinstance(declared_dict, dict):
+            try:
+                sub_uuids = getattr(plugin, "_sub_uuids", []) or []
+                runtime_count = max(
+                    0, len(sub_uuids) - len(declared_dict),
+                )
+            except Exception:
+                runtime_count = 0
+
+        body: list = []
+        if not declared_dict and runtime_count == 0:
+            body.append(Static("[dim](none)[/dim]", markup=True))
+        else:
+            if declared_dict:
+                for dec_id, entry in declared_dict.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    topic = entry.get("topic", "")
+                    target = entry.get("target_access_name") or "?"
+                    target_plugin = entry.get("target_plugin") or plugin_name
+                    enabled = entry.get("enabled", True)
+                    enabled_marker = "✓" if enabled else "✗"
+                    enabled_color = "green" if enabled else "red"
+                    body.append(Static(
+                        f"[dim][YAML][/dim] "
+                        f"[bold]{escape(str(dec_id))}[/bold]  "
+                        f"[yellow]{escape(str(topic))}[/yellow]  "
+                        f"→ {escape(str(target_plugin))}.{escape(str(target))}  "
+                        f"[{enabled_color}]{enabled_marker}[/{enabled_color}]",
+                        markup=True,
+                    ))
+            if runtime_count > 0:
+                body.append(Static(
+                    f"[dim][runtime][/dim] [bold]{runtime_count}[/bold] "
+                    f"runtime subscription(s) registered. "
+                    f"[dim](See per-plugin tab for details.)[/dim]",
+                    markup=True,
+                ))
+
+        declared_count = len(declared_dict or {})
+        title = (
+            f"Subscriptions ({declared_count}"
+            + (f"+{runtime_count}" if runtime_count > 0 else "")
+            + ")"
+        )
+        return Collapsible(
+            *body, title=title,
+            collapsed=(self._DETAIL_SECTION_SUBS not in saved_open),
+            id=self._DETAIL_SECTION_SUBS,
+            classes="plugin-detail-section-body",
+        )
+
+    def _build_args_section(
+        self,
+        plugin_name: str,
+        plugin,
+        on_disk_cfg: Optional[dict],
+        saved_open: set,
+    ) -> Collapsible:
+        """Args section — `plugin.arguments` rendered as YAML.
+
+        Shows an "overrides applied" badge when the live merged
+        `plugin.arguments` differs from the raw `on_disk_cfg["arguments"]`
+        block. Detection is a shallow `==` against the YAML-loaded base —
+        catches both deep-merge additions/replacements AND `__replace__:
+        true` subtree replacements (the loader strips `__replace__`
+        before storing, so the merged result already reflects the
+        replacement). The `__replace__` distinction itself is deferred
+        per Section 4.3 plan note — v1 just signals "something changed".
+        """
+        live_args = None
+        if plugin is not None:
+            live_args = getattr(plugin, "arguments", None)
+
+        # Raw base args from on-disk config — needed for the badge.
+        base_args = None
+        if isinstance(on_disk_cfg, dict):
+            base_args = on_disk_cfg.get("arguments")
+
+        body: list = []
+
+        # Overrides-applied badge: only renders when we have BOTH a live
+        # plugin AND an on-disk base AND they differ. For UNLOADED/FAILED
+        # plugins, live_args is None so we skip the badge (the badge is
+        # meaningless without a merged result to compare).
+        overrides_applied = (
+            plugin is not None
+            and isinstance(on_disk_cfg, dict)
+            and live_args is not None
+            and live_args != base_args
+        )
+        if overrides_applied:
+            body.append(Static(
+                "[italic]overrides applied[/italic]",
+                markup=True, classes="plugin-detail-overrides-badge",
+            ))
+
+        # Args content — prefer live, fall back to on-disk base.
+        rendered_args = live_args if live_args is not None else base_args
+
+        if rendered_args is None or (
+            isinstance(rendered_args, (dict, list)) and not rendered_args
+        ):
+            body.append(Static("[dim](none)[/dim]", markup=True))
+        else:
+            try:
+                yaml_text = yaml.safe_dump(
+                    rendered_args, default_flow_style=False, sort_keys=False,
+                )
+            except Exception:
+                yaml_text = repr(rendered_args)
+            body.append(Static(
+                f"[dim]{escape(yaml_text)}[/dim]", markup=True,
+            ))
+
+        return Collapsible(
+            *body, title="Args",
+            collapsed=(self._DETAIL_SECTION_ARGS not in saved_open),
+            id=self._DETAIL_SECTION_ARGS,
+            classes="plugin-detail-section-body",
+        )
 
     @work(thread=False)
     async def _execute_toggle(self, entry: Dict[str, str], state: bool) -> None:
