@@ -214,9 +214,10 @@ backups/
 # Config files — local user copy. Copy config.example.yml to config.yml and edit.
 config.yml
 
-# Vendored Textual source — pulled locally for API verification during
-# reviewer cycles; production runtime uses `pip install textual`.
-plugins_test/TUI/textual/
+# Out-of-tree plugin repos. Each plugin under plugins/ is its own
+# git repo with its own pyproject.toml and lives independently of
+# this framework repo. PlexusTUI (the dashboard) lives here.
+plugins/
 
 # TUI smoke-harness generated identity (cert.pem / key.pem). The harness
 # auto-creates these on first run via the same `_load_or_generate_identity`
