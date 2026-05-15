@@ -25,9 +25,9 @@ import asyncio  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -65,7 +65,7 @@ class TestLifecycleSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestLifecycleSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestLifecycleSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -111,16 +111,16 @@ class TestLifecycleSuite(Plugin):
         # Defensive: re-enable VICTIM if a prior case left it disabled, then
         # reset all behavior flags. Direct attribute access works even when
         # the plugin is disabled (configure endpoint would fail then).
-        victim = self._plugin_core.plugins.get(VICTIM)
+        victim = self._plexus.plugins.get(VICTIM)
         if victim is None:
             entry = self._find_yaml_entry(VICTIM)
             if entry:
                 entry["enabled"] = True
                 try:
-                    await self._plugin_core.load_plugin_with_conf(entry)
+                    await self._plexus.load_plugin_with_conf(entry)
                 except Exception:
                     pass
-                victim = self._plugin_core.plugins.get(VICTIM)
+                victim = self._plexus.plugins.get(VICTIM)
         if victim is not None:
             victim._on_enable_raises_after_setup = False
             victim._on_disable_raises = False
@@ -130,12 +130,12 @@ class TestLifecycleSuite(Plugin):
             victim.db_open = True if victim.enabled else False
             if not victim.enabled:
                 try:
-                    await self._plugin_core.enable_plugin(VICTIM)
+                    await self._plexus.enable_plugin(VICTIM)
                 except Exception:
                     pass
 
     async def _reload_victim(self) -> None:
-        await self._plugin_core._reload_plugin(VICTIM)
+        await self._plexus._reload_plugin(VICTIM)
 
     # ====================================================================
     # BASIC load
@@ -143,9 +143,9 @@ class TestLifecycleSuite(Plugin):
 
     async def _basic_load(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_valid_config(c):
-            if VICTIM not in self._plugin_core.plugins:
+            if VICTIM not in self._plexus.plugins:
                 raise AssertionError(f"{VICTIM} not in core.plugins")
-            plugin = self._plugin_core.plugins[VICTIM]
+            plugin = self._plexus.plugins[VICTIM]
             c.expect(plugin.plugin_name, VICTIM)
             assert plugin.enabled
 
@@ -161,19 +161,19 @@ class TestLifecycleSuite(Plugin):
     async def _basic_enable_disable(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_enable_success(c):
             await self._ensure_victim_clean()
-            plugin = self._plugin_core.plugins[VICTIM]
+            plugin = self._plexus.plugins[VICTIM]
             if not plugin.enabled:
-                await self._plugin_core.enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
             assert plugin.enabled
 
         async def body_disable_success(c):
             await self._ensure_victim_clean()
-            plugin = self._plugin_core.plugins[VICTIM]
-            await self._plugin_core.disable_plugin(VICTIM)
+            plugin = self._plexus.plugins[VICTIM]
+            await self._plexus.disable_plugin(VICTIM)
             try:
                 assert not plugin.enabled
             finally:
-                await self._plugin_core.enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.enable.success", body_enable_success,
@@ -197,14 +197,14 @@ class TestLifecycleSuite(Plugin):
                 # on_enable's partial-setup phase.
                 await self.execute(VICTIM, "configure",
                                    {"on_enable_raises_after_setup": True})
-                await self._plugin_core.disable_plugin(VICTIM)
+                await self._plexus.disable_plugin(VICTIM)
 
                 try:
-                    await self._plugin_core.enable_plugin(VICTIM)
+                    await self._plexus.enable_plugin(VICTIM)
                 except Exception:
                     pass  # @async_handle_errors swallows; this is defensive
 
-                plugin = self._plugin_core.plugins[VICTIM]
+                plugin = self._plexus.plugins[VICTIM]
                 if plugin.db_open:
                     c.set_marker("db_was_open_after_failed_enable")
                     raise AssertionError(
@@ -214,13 +214,13 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 # Recovery: directly close partial state, re-enable.
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 if plugin is not None:
                     plugin.db_open = False
                     plugin._on_enable_raises_after_setup = False
                     if not plugin.enabled:
                         try:
-                            await self._plugin_core.enable_plugin(VICTIM)
+                            await self._plexus.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
@@ -244,13 +244,13 @@ class TestLifecycleSuite(Plugin):
     async def _basic_b010(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
+            old_uuid = self._plexus.plugins[VICTIM].plugin_uuid
             try:
                 await self.execute(VICTIM, "configure",
                                    {"on_disable_raises": True})
 
                 try:
-                    await self._plugin_core._reload_plugin(VICTIM)
+                    await self._plexus._reload_plugin(VICTIM)
                 except Exception:
                     pass
 
@@ -265,7 +265,7 @@ class TestLifecycleSuite(Plugin):
                 # - plugin instance is the OLD one (load_plugin_with_conf
                 #   never ran because pop raised)
                 # - caller has no signal — _reload_plugin returned None
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 stuck_state = (
                     plugin is not None
                     and plugin.plugin_uuid == old_uuid  # not reloaded
@@ -281,16 +281,16 @@ class TestLifecycleSuite(Plugin):
                 # Recovery: clear the on_disable_raises flag and force a
                 # clean state so subsequent cases don't inherit the half-
                 # torn-down plugin.
-                plugin = self._plugin_core.plugins.get(VICTIM)
+                plugin = self._plexus.plugins.get(VICTIM)
                 if plugin is not None:
                     plugin._on_disable_raises = False
-                if VICTIM not in self._plugin_core.plugins:
+                if VICTIM not in self._plexus.plugins:
                     entry = self._find_yaml_entry(VICTIM)
                     if entry:
                         entry["enabled"] = True
                         try:
-                            await self._plugin_core.load_plugin_with_conf(entry)
-                            await self._plugin_core.enable_plugin(VICTIM)
+                            await self._plexus.load_plugin_with_conf(entry)
+                            await self._plexus.enable_plugin(VICTIM)
                         except Exception:
                             pass
                 await self._ensure_victim_clean()
@@ -320,7 +320,7 @@ class TestLifecycleSuite(Plugin):
             # Override runtime disable timeout for fast test (production
             # default 30s; 1s here so the timeout path runs within a few
             # seconds rather than 30+).
-            core = self._plugin_core
+            core = self._plexus
             saved_timeout = getattr(core, "plugin_disable_timeout", 30.0)
             core.plugin_disable_timeout = 1.0
             try:
@@ -388,12 +388,12 @@ class TestLifecycleSuite(Plugin):
     async def _basic_reload(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            assert self._plugin_core.plugins[VICTIM].enabled
-            old_uuid = self._plugin_core.plugins[VICTIM].plugin_uuid
+            assert self._plexus.plugins[VICTIM].enabled
+            old_uuid = self._plexus.plugins[VICTIM].plugin_uuid
 
-            await self._plugin_core._reload_plugin(VICTIM)
+            await self._plexus._reload_plugin(VICTIM)
 
-            new_plugin = self._plugin_core.plugins[VICTIM]
+            new_plugin = self._plexus.plugins[VICTIM]
             assert new_plugin.enabled
             # New instance has a new uuid
             c.expect(new_plugin.plugin_uuid != old_uuid, True)
@@ -423,23 +423,23 @@ class TestLifecycleSuite(Plugin):
                 # Stage O switched _enable_plugin_under_lock to .get() with
                 # a None-check; the reload path now cleanly honors the new
                 # disabled config — no silent exception swallow.
-                await self._plugin_core._reload_plugin(VICTIM)
+                await self._plexus._reload_plugin(VICTIM)
                 # Expected end-state: plugin removed from self.plugins.
                 # _reload_plugin pops first; load_plugin_with_conf then
                 # short-circuits on the new enabled=false config without
                 # re-registering, and _enable_plugin_under_lock early-
                 # returns on .get()=None.
-                if VICTIM in self._plugin_core.plugins:
+                if VICTIM in self._plexus.plugins:
                     raise AssertionError(
                         "B-016 regression: plugin still loaded after reload "
                         "with newly-disabled config (expected unloaded)"
                     )
             finally:
                 entry["enabled"] = original_enabled
-                if VICTIM not in self._plugin_core.plugins:
+                if VICTIM not in self._plexus.plugins:
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 await self._ensure_victim_clean()
@@ -464,7 +464,7 @@ class TestLifecycleSuite(Plugin):
             await asyncio.sleep(0.1)  # let request register
 
             try:
-                await self._plugin_core.pop_plugin(VICTIM)
+                await self._plexus.pop_plugin(VICTIM)
                 # The pending task should now error with "unloaded while pending"
                 try:
                     await asyncio.wait_for(task, timeout=5.0)
@@ -483,8 +483,8 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -510,11 +510,11 @@ class TestLifecycleSuite(Plugin):
             # other suites/targets, etc.) and only purges the one plugin
             # whose pending task we want to test against.
             keepers = [
-                name for name in self._plugin_core.plugins.keys()
+                name for name in self._plexus.plugins.keys()
                 if name != VICTIM
             ]
             try:
-                await self._plugin_core.purge_plugins_except(keepers)
+                await self._plexus.purge_plugins_except(keepers)
                 # If purge fails the pending task with "unloaded", bug is
                 # NOT present. If task hangs/timeouts → bug present.
                 try:
@@ -541,8 +541,8 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -569,7 +569,7 @@ class TestLifecycleSuite(Plugin):
         async def body(c):
             await self._ensure_victim_clean()
             # Verify config-order requirement (Victim before Victim2)
-            plugins = self._plugin_core.yaml_config.get("plugins", [])
+            plugins = self._plexus.yaml_config.get("plugins", [])
             try:
                 v_idx = next(i for i, p in enumerate(plugins)
                              if p.get("name") == VICTIM)
@@ -596,18 +596,18 @@ class TestLifecycleSuite(Plugin):
                 })
 
                 # Now disable both, then re-enable concurrently
-                await self._plugin_core.disable_plugin(VICTIM)
-                await self._plugin_core.disable_plugin(VICTIM2)
+                await self._plexus.disable_plugin(VICTIM)
+                await self._plexus.disable_plugin(VICTIM2)
 
                 await asyncio.gather(
-                    self._plugin_core.enable_plugin(VICTIM),
-                    self._plugin_core.enable_plugin(VICTIM2),
+                    self._plexus.enable_plugin(VICTIM),
+                    self._plexus.enable_plugin(VICTIM2),
                     return_exceptions=True,
                 )
 
                 # Read state via direct attribute (configure may not be
                 # available yet if VICTIM is still in mid-enable).
-                victim = self._plugin_core.plugins.get(VICTIM)
+                victim = self._plexus.plugins.get(VICTIM)
                 cross_result = (
                     victim._cross_call_result if victim is not None else None
                 )
@@ -619,8 +619,8 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 # Reset config state directly via attribute access
-                v = self._plugin_core.plugins.get(VICTIM)
-                v2 = self._plugin_core.plugins.get(VICTIM2)
+                v = self._plexus.plugins.get(VICTIM)
+                v2 = self._plexus.plugins.get(VICTIM2)
                 if v is not None:
                     v._cross_call_during_enable = False
                     v._cross_call_result = None
@@ -628,12 +628,12 @@ class TestLifecycleSuite(Plugin):
                     v2._on_enable_delay_secs = 0.0
                 if v is not None and not v.enabled:
                     try:
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
                 if v2 is not None and not v2.enabled:
                     try:
-                        await self._plugin_core.enable_plugin(VICTIM2)
+                        await self._plexus.enable_plugin(VICTIM2)
                     except Exception:
                         pass
 
@@ -657,10 +657,10 @@ class TestLifecycleSuite(Plugin):
             # the suite (lifecycle_observer). Victim-owned means the sub is
             # cleaned when victim is popped. The endpoint flips a flag we
             # check after the race.
-            victim_obj = self._plugin_core.plugins[VICTIM]
+            victim_obj = self._plexus.plugins[VICTIM]
             self._lifecycle_b037_fired = False
 
-            sub_id = await self._plugin_core.subscribe(
+            sub_id = await self._plexus.subscribe(
                 "lifecycle/event_during_pop",
                 victim_obj.plugin_name,
                 victim_obj.plugin_uuid,
@@ -671,7 +671,7 @@ class TestLifecycleSuite(Plugin):
             try:
                 # Concurrently pop + publish
                 pop_task = asyncio.create_task(
-                    self._plugin_core.pop_plugin(VICTIM)
+                    self._plexus.pop_plugin(VICTIM)
                 )
                 await asyncio.sleep(0.001)
                 await self.publish_event("lifecycle_event_during_pop")
@@ -684,15 +684,15 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 try:
-                    await self._plugin_core.unsubscribe(sub_id)
+                    await self._plexus.unsubscribe(sub_id)
                 except Exception:
                     pass
                 entry = self._find_yaml_entry(VICTIM)
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -721,7 +721,7 @@ class TestLifecycleSuite(Plugin):
             await self._ensure_victim_clean()
             # Start a long-running call against Victim; capture its req_id;
             # cancel the caller; pop the plugin; assert request entry is reaped.
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 VICTIM, "victim_hang_endpoint", {"secs": 60.0},
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
@@ -738,14 +738,14 @@ class TestLifecycleSuite(Plugin):
             # ``await req.set_collected()``; migrated to direct sync
             # pop. The producer's finally in ``_process_request`` will
             # also pop on completion (idempotent under ``pop(key, None)``).
-            self._plugin_core.requests.pop(req.id, None)
+            self._plexus.requests.pop(req.id, None)
 
             try:
-                await self._plugin_core.pop_plugin(VICTIM)
+                await self._plexus.pop_plugin(VICTIM)
 
                 deadline = time.perf_counter() + 30.0
                 while time.perf_counter() < deadline:
-                    if req_id not in self._plugin_core.requests:
+                    if req_id not in self._plexus.requests:
                         return
                     await asyncio.sleep(0.5)
                 raise AssertionError(
@@ -756,8 +756,8 @@ class TestLifecycleSuite(Plugin):
                 if entry:
                     entry["enabled"] = True
                     try:
-                        await self._plugin_core.load_plugin_with_conf(entry)
-                        await self._plugin_core.enable_plugin(VICTIM)
+                        await self._plexus.load_plugin_with_conf(entry)
+                        await self._plexus.enable_plugin(VICTIM)
                     except Exception:
                         pass
 
@@ -800,12 +800,12 @@ class TestLifecycleSuite(Plugin):
     ) -> None:
         async def body(c):
             await self._ensure_victim_clean()
-            await self._plugin_core.disable_plugin(VICTIM)
+            await self._plexus.disable_plugin(VICTIM)
             try:
                 c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
                 await self.execute(VICTIM, "is_db_open")
             finally:
-                await self._plugin_core.enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.disable.error.disabled_plugin_not_callable", body,
@@ -827,16 +827,16 @@ class TestLifecycleSuite(Plugin):
                 c.skip(f"{VICTIM2} not loaded")
                 return
 
-            v1 = self._plugin_core.plugins[VICTIM]
-            v2 = self._plugin_core.plugins[VICTIM2]
+            v1 = self._plexus.plugins[VICTIM]
+            v2 = self._plexus.plugins[VICTIM2]
             v1.disable_count = 0
             v2.disable_count = 0
 
             # Drive disable in reverse config order: Victim2 first, then Victim
-            # (matches what core.close() does at PluginCore.py:255 .reverse()).
-            await self._plugin_core.disable_plugin(VICTIM2)
+            # (matches what core.close() does at core.py:255 .reverse()).
+            await self._plexus.disable_plugin(VICTIM2)
             t_v2_disabled = time.perf_counter()
-            await self._plugin_core.disable_plugin(VICTIM)
+            await self._plexus.disable_plugin(VICTIM)
             t_v1_disabled = time.perf_counter()
 
             try:
@@ -848,8 +848,8 @@ class TestLifecycleSuite(Plugin):
                         f"v2={t_v2_disabled} v1={t_v1_disabled}"
                     )
             finally:
-                await self._plugin_core.enable_plugin(VICTIM2)
-                await self._plugin_core.enable_plugin(VICTIM)
+                await self._plexus.enable_plugin(VICTIM2)
+                await self._plexus.enable_plugin(VICTIM)
 
         await rec.run_case(
             "lifecycle.contract.disable_reverse_order_via_disable_plugin",
@@ -867,7 +867,7 @@ class TestLifecycleSuite(Plugin):
         skip_reason = (
             "args-override merging cases require fixture-heavy yaml_config "
             "manipulation + reload cycles per case; deferred to a follow-up "
-            "phase. The merge logic at PluginCore._deep_merge_args is "
+            "phase. The merge logic at Plexus._deep_merge_args is "
             "well-documented in commit 5c16050; tests will land alongside "
             "any fix that touches it."
         )
@@ -981,9 +981,9 @@ class TestLifecycleSuite(Plugin):
         # ---- 1. gate_fires_for_unready_target ----------------------
         async def body_gate_fires_for_unready_target(c):
             await self._ensure_victim_clean()
-            v = self._plugin_core.plugins[VICTIM]
+            v = self._plexus.plugins[VICTIM]
             v._on_enable_delay_secs = 0.0
-            await self._plugin_core.disable_plugin(VICTIM)
+            await self._plexus.disable_plugin(VICTIM)
             # 3.0s delay (generous margin for Windows scheduler jitter);
             # threshold 2.0s leaves 1.0s slack for the asyncio.sleep(0.1)
             # post-create_task stagger and dispatch overhead, so a loaded
@@ -995,7 +995,7 @@ class TestLifecycleSuite(Plugin):
                 # Start enable; while it sleeps, our execute() must
                 # block on the readiness gate, then succeed.
                 enable_task = asyncio.create_task(
-                    self._plugin_core.enable_plugin(VICTIM)
+                    self._plexus.enable_plugin(VICTIM)
                 )
                 await asyncio.sleep(0.1)  # let on_enable start sleeping
                 t0 = asyncio.get_event_loop().time()
@@ -1011,7 +1011,7 @@ class TestLifecycleSuite(Plugin):
                         f"sleeping (expected at least 2.0s)"
                     )
             finally:
-                v = self._plugin_core.plugins.get(VICTIM)
+                v = self._plexus.plugins.get(VICTIM)
                 if v is not None:
                     v._on_enable_delay_secs = 0.0
                 await self._ensure_victim_clean()
@@ -1032,7 +1032,7 @@ class TestLifecycleSuite(Plugin):
             # the task finishes), then schedule a delayed set, then
             # call execute() and verify the call waited.
             await self._ensure_victim_clean()
-            v = self._plugin_core.plugins[VICTIM]
+            v = self._plexus.plugins[VICTIM]
             v.ready.clear()
             try:
                 async def _delayed_ready():
@@ -1053,7 +1053,7 @@ class TestLifecycleSuite(Plugin):
                         f"(expected ≥ 0.5s)"
                     )
             finally:
-                v = self._plugin_core.plugins.get(VICTIM)
+                v = self._plexus.plugins.get(VICTIM)
                 if v is not None:
                     v.ready.set()
 
@@ -1072,8 +1072,8 @@ class TestLifecycleSuite(Plugin):
             # surface the "not ready within Ns" error instead of
             # hanging.
             await self._ensure_victim_clean()
-            v = self._plugin_core.plugins[VICTIM]
-            core = self._plugin_core
+            v = self._plexus.plugins[VICTIM]
+            core = self._plexus
             saved_timeout = getattr(core, "plugin_ready_timeout", 60.0)
             core.plugin_ready_timeout = 1.0
             v.ready.clear()
@@ -1099,7 +1099,7 @@ class TestLifecycleSuite(Plugin):
                     "to enforce timeout"
                 )
             finally:
-                v = self._plugin_core.plugins.get(VICTIM)
+                v = self._plexus.plugins.get(VICTIM)
                 if v is not None:
                     v.ready.set()
                 core.plugin_ready_timeout = saved_timeout
@@ -1150,7 +1150,7 @@ class TestLifecycleSuite(Plugin):
     # ====================================================================
 
     def _find_yaml_entry(self, name: str) -> Optional[Dict[str, Any]]:
-        for entry in self._plugin_core.yaml_config.get("plugins", []):
+        for entry in self._plexus.yaml_config.get("plugins", []):
             if entry.get("name") == name:
                 return entry
         return None

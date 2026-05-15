@@ -31,8 +31,8 @@ class SyncDispatcher:
     Default ``N=4`` per Q17, configurable via
     ``general.sync_dispatcher_workers`` in main config.yml.
 
-    Stage A: instantiated by PluginCore.__init__ and shut down by
-    PluginCore.close() AFTER the existing 30s in-flight drain (C8).
+    Stage A: instantiated by Plexus.__init__ and shut down by
+    Plexus.close() AFTER the existing 30s in-flight drain (C8).
     Callers (Stage B fan-out) submit handlers via
     ``loop.run_in_executor(dispatcher.executor, handler, event)`` —
     NOT submit + done_callback (per C3).
@@ -55,7 +55,7 @@ class SyncDispatcher:
 
     def shutdown(self, wait: bool = False) -> None:
         """Shut the executor down. ``wait=False`` matches C8 — the
-        graceful 30s drain happens upstream in PluginCore.close() before
+        graceful 30s drain happens upstream in Plexus.close() before
         this method is called, so by the time we get here pending sync
         handlers have either finished or been told to wrap up.
         """
@@ -373,7 +373,7 @@ class TopicRegistry:
         Caller is responsible for any post-mutation broadcast / emit; this
         method does NOT release the lock to call network code (per the
         framework's lock-ordering rule that disallows network I/O inside
-        registry locks — see ``_get_lifecycle_lock`` in PluginCore).
+        registry locks — see ``_get_lifecycle_lock`` in Plexus).
 
         The returned ``Subscription`` reference is the live registry entry;
         callers that need to broadcast to peers can read its fields after

@@ -9,8 +9,8 @@ disable→re-enable cycles do not leak.
 import asyncio
 from typing import Any
 
-from utils import Plugin
-from decorators import async_gen_log_errors, async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors
 
 
 class TestRemoteTarget(Plugin):
@@ -25,7 +25,7 @@ class TestRemoteTarget(Plugin):
         # Code-driven hang sub on test/r/hang — B-020 driver. Registered
         # at runtime via subscribe(target_access_name=...) so publish_event
         # dispatch goes through execute() to the r_hang_topic_handler endpoint.
-        sid_hang = await self._plugin_core.subscribe(
+        sid_hang = await self._plexus.subscribe(
             "test/r/hang",
             self.plugin_name,
             self.plugin_uuid,
@@ -41,7 +41,7 @@ class TestRemoteTarget(Plugin):
             ("test/r/req_stream_basic", "r_request_stream_basic_handler"),
             ("test/r/req_stream_raise", "r_request_stream_raise_handler"),
         ):
-            sid = await self._plugin_core.subscribe(
+            sid = await self._plexus.subscribe(
                 topic,
                 self.plugin_name,
                 self.plugin_uuid,
@@ -54,7 +54,7 @@ class TestRemoteTarget(Plugin):
         self._logger.debug("TestRemoteTarget.on_disable")
         for sid in list(self._sub_ids):
             try:
-                await self._plugin_core.unsubscribe(sid)
+                await self._plexus.unsubscribe(sid)
             except Exception:
                 pass
         self._sub_ids = []

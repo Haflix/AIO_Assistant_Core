@@ -5,8 +5,8 @@ the framework even when nobody is clicking buttons)."""
 
 import asyncio
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TUIDemoTimer(Plugin):

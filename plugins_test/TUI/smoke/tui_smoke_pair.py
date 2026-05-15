@@ -1,4 +1,4 @@
-"""Two-TUI smoke harness — spawns two PluginCore + TUI nodes in their
+"""Two-TUI smoke harness — spawns two Plexus + TUI nodes in their
 own console windows, each enabling the other as an mTLS peer.
 
 Node A (publisher): TUIDemoTimer + TUIDemoPub — fires demo events.
@@ -31,7 +31,7 @@ _HERE = Path(__file__).resolve().parent
 REPO = _HERE.parents[2]
 sys.path.insert(0, str(REPO))
 
-from serialization import generate_keypair  # noqa: E402
+from plexus.serialization import generate_keypair  # noqa: E402
 
 
 # ── Node identities ─────────────────────────────────────────────────

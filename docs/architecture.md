@@ -2,7 +2,7 @@
 
 *Last updated for AIO Assistant Core 0.22.0*
 
-This document describes the runtime shape of an AIO Assistant Core process: how PluginCore loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
+This document describes the runtime shape of an AIO Assistant Core process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
 ---
 
@@ -17,7 +17,7 @@ This document describes the runtime shape of an AIO Assistant Core process: how 
                                           |
                                           v
 +---------------+   start()    +------------------------+   peers/mTLS    +----------------+
-|   process     +------------->|       PluginCore       |<--------------->| NetworkManager |
+|   process     +------------->|       Plexus       |<--------------->| NetworkManager |
 |  (asyncio     |              |                        |                 |  (peer node)   |
 |   loop)       |<-------------+ plugins  events  subs  +---------------->|                |
 +---------------+   close()    +-----+--------+--------++                 +----------------+
@@ -27,7 +27,7 @@ This document describes the runtime shape of an AIO Assistant Core process: how 
                                   (Base)  (Extension) (Orchestrator)
 ```
 
-PluginCore is the single piece of the framework you talk to. It owns:
+Plexus is the single piece of the framework you talk to. It owns:
 
 - The asyncio event loop binding (`main_event_loop`).
 - A registry of every loaded plugin, by name (`plugins`) and by uuid (`plugins_by_uuid`).
@@ -36,7 +36,7 @@ PluginCore is the single piece of the framework you talk to. It owns:
 - A general-purpose plugin executor for synchronous plugin endpoints.
 - Optionally, a `NetworkManager` that bridges calls to peer nodes over mTLS.
 
-Plugins themselves are subclasses of `utils.Plugin`. They never construct PluginCore — they receive a back-reference at load time as `self._plugin_core` and rely on the wrapper methods on the `Plugin` base class for everything they do.
+Plugins themselves are subclasses of `utils.Plugin`. They never construct Plexus — they receive a back-reference at load time as `self._plexus` and rely on the wrapper methods on the `Plugin` base class for everything they do.
 
 ---
 
@@ -61,7 +61,7 @@ plugins:
       version: "1.4.0-local"
 ```
 
-A single class can be loaded multiple times under different `name` values — useful for running two Discord bots simultaneously, or two LLM adapters with different model configs. Each instance gets its own `plugin_uuid` and its own slot in `PluginCore.plugins`.
+A single class can be loaded multiple times under different `name` values — useful for running two Discord bots simultaneously, or two LLM adapters with different model configs. Each instance gets its own `plugin_uuid` and its own slot in `Plexus.plugins`.
 
 ---
 
@@ -89,11 +89,11 @@ Constraints:
 - No `*_sync` calls. `execute_sync`, `publish_event_sync`, and `request_event_sync` will raise `RequestException("Framework not started — sync APIs require running event loop")` until the main event loop is bound.
 - Use it to declare instance variables (empty containers, defaults).
 
-After `on_load` returns, PluginCore overwrites `plugin_name`, `version`, `remote`, `description`, `arguments`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block. So `on_load` sees framework defaults; everything outside `on_load` sees the real values.
+After `on_load` returns, Plexus overwrites `plugin_name`, `version`, `remote`, `description`, `arguments`, `prefix`, `verbose_notifier`, `endpoints`, `events`, and `subscriptions` from the merged manifest plus `overrides:` block. So `on_load` sees framework defaults; everything outside `on_load` sees the real values.
 
 ### `on_enable(self)` — async or sync
 
-Called once the plugin is registered. May be `async def` or plain `def`; PluginCore branches on `asyncio.iscoroutinefunction`. Sync versions run on the framework's plugin executor.
+Called once the plugin is registered. May be `async def` or plain `def`; Plexus branches on `asyncio.iscoroutinefunction`. Sync versions run on the framework's plugin executor.
 
 Order of operations inside `_enable_plugin_under_lock`:
 
@@ -159,7 +159,7 @@ If both events are not set within the budget, the caller's `execute()` raises `R
    attach plugin_name / endpoints / ...
             |
             v
-   register in PluginCore.plugins[name]
+   register in Plexus.plugins[name]
             |
             v
    _enable_plugin_under_lock
@@ -208,7 +208,7 @@ Public lifecycle API: `await pc.enable_plugin(name)` / `await pc.disable_plugin(
 
 ## Hot-swap
 
-`PluginCore._reload_plugin(plugin_name)` swaps a running plugin without restarting the process. Under the per-plugin lifecycle lock so concurrent enables on the same name cannot interleave:
+`Plexus._reload_plugin(plugin_name)` swaps a running plugin without restarting the process. Under the per-plugin lifecycle lock so concurrent enables on the same name cannot interleave:
 
 ```
 _reload_plugin(name)
@@ -238,7 +238,7 @@ Nothing leaks across the swap. The instance attributes a plugin set in its previ
 
 ## Shutdown order
 
-`PluginCore.close()` walks a deterministic sequence so dependents wind down before their dependencies:
+`Plexus.close()` walks a deterministic sequence so dependents wind down before their dependencies:
 
 1. Wait up to 30 seconds for in-flight tracked tasks; cancel survivors.
 2. Shut the `SyncDispatcher` down with `wait=True` and a 30-second budget. Falls back to `wait=False` on timeout.
@@ -315,7 +315,7 @@ When an upward call would be tempting (a base plugin calling an orchestrator), i
 
 ## Where state lives
 
-Per-plugin state lives on the plugin instance — `self.something`, declared in `on_load`. PluginCore itself holds no plugin state. After a hot-swap the plugin object is gone and replaced; anything that has to survive must be persisted externally — in another plugin (e.g. a database adapter), in a database, or on disk.
+Per-plugin state lives on the plugin instance — `self.something`, declared in `on_load`. Plexus itself holds no plugin state. After a hot-swap the plugin object is gone and replaced; anything that has to survive must be persisted externally — in another plugin (e.g. a database adapter), in a database, or on disk.
 
 Cross-plugin state — anything multiple plugins read or write — should live in a base plugin and be reached through its endpoints.
 

@@ -2,7 +2,7 @@
 
 *Last updated for AIO Assistant Core 0.22.3*
 
-PluginCore ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
+Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
 This document covers the trust model, peer configuration, per-node port handling, how remote dispatch flows, and the wire protocol for advanced readers.
 
@@ -93,11 +93,11 @@ Most clusters use one port for everything (`networking.port`, default `2510`). W
 - `"10.0.0.1:2511"` → `(10.0.0.1, 2511)`
 - `"[::1]:2510"` → `(::1, 2510)`
 
-Connection pools are keyed by `(ip, port)` (`networking.py:212`), so a parent and sub-node on the same IP get separate pools. `Node` objects (`networking_classes.py:28-88`) carry an optional `port` field; `None` means "use cluster default".
+Connection pools are keyed by `(ip, port)` (`networking.py:212`), so a parent and sub-node on the same IP get separate pools. `Node` objects (`plexus/networking_classes.py:28-88`) carry an optional `port` field; `None` means "use cluster default".
 
 Use cases:
 
-- Two PluginCore instances on the same host (parent + isolated child node).
+- Two Plexus instances on the same host (parent + isolated child node).
 - A peer behind NAT exposing a non-standard port.
 
 ---
@@ -149,7 +149,7 @@ A plugin endpoint is reachable from peer nodes if and only if BOTH conditions ho
 1. The plugin's manifest has top-level `remote: true`.
 2. The endpoint's entry has `remote: true`.
 
-`find_endpoint` (`PluginCore.py:2568-2571`) checks both. Forgetting either produces an "endpoint not found" error from a peer caller.
+`find_endpoint` (`core.py:2568-2571`) checks both. Forgetting either produces an "endpoint not found" error from a peer caller.
 
 The `accessible_by_other_plugins` flag is NOT consulted for inbound peer requests — that flag only gates LOCAL cross-plugin access. So an endpoint can be `accessible_by_other_plugins: false` (only this plugin can call it locally) and still be `remote: true` (peers can call it across the wire).
 
@@ -157,14 +157,14 @@ The `accessible_by_other_plugins` flag is NOT consulted for inbound peer request
 
 ## Remote `execute` flow
 
-When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a local plugin, `PluginCore._process_request` (`PluginCore.py:2676-2788`) takes the remote branch.
+When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a local plugin, `Plexus._process_request` (`core.py:2676-2788`) takes the remote branch.
 
 ```
    Plugin A on Node alpha
      |
      | await self.execute("PluginX", "method", args=..., hosts="any")
      v
-   PluginCore.execute (alpha)
+   Plexus.execute (alpha)
      |
      | find_endpoint
      |     ├── try local plugins: no PluginX here
@@ -194,7 +194,7 @@ When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a l
 `request_event` is 1:1 with insertion-order tie-break. After failing to find a local match, the framework iterates `_inbound_global_order` in insertion order. For each candidate, the per-peer host filter, the sub-level remote-publisher filter, the author filter, and the topic-pattern match all apply.
 
 ```
-   Local PluginCore.request_event
+   Local Plexus.request_event
      |
      | find_first(topic) on local registry
      |     ├── hit -> dispatch locally, return
@@ -228,10 +228,10 @@ The streaming variant (`request_event_stream`, `MSG_REQUEST_EVENT_STREAM`, id 17
 
 ## Remote `publish_event` flow
 
-`publish_event` is 1:N fan-out. Local subs are dispatched in-process; for every advertised remote sub on every reachable peer that survives per-peer and sub-level filters, the framework spawns a tracked task that sends `MSG_PUBLISH_EVENT` (id 15) over the wire (`PluginCore.py:4194-4279`).
+`publish_event` is 1:N fan-out. Local subs are dispatched in-process; for every advertised remote sub on every reachable peer that survives per-peer and sub-level filters, the framework spawns a tracked task that sends `MSG_PUBLISH_EVENT` (id 15) over the wire (`core.py:4194-4279`).
 
 ```
-   Local PluginCore.publish_event
+   Local Plexus.publish_event
      |
      | dispatch locally to every matching local sub
      |

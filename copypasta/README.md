@@ -146,7 +146,7 @@ The handler endpoint receives an `Event` object: `event.topic`, `event.payload`,
 ### Accessing Plugin Properties
 
 - **`self._logger`**: Logger instance for your plugin
-- **`self._plugin_core`**: Reference to the PluginCore instance
+- **`self._plexus`**: Reference to the Plexus instance
 - **`self.plugin_name`**: Your plugin's name
 - **`self.enabled`**: Whether the plugin is currently enabled
 
@@ -228,7 +228,7 @@ async def call_other(self):
 
 ## Tags
 
-Tags are arbitrary strings you can assign to endpoints for categorization. Other plugins can use `find_endpoints_by_tag(tag)` on the PluginCore to discover endpoints with a specific tag. This is useful for building systems where plugins need to dynamically discover each other's capabilities.
+Tags are arbitrary strings you can assign to endpoints for categorization. Other plugins can use `find_endpoints_by_tag(tag)` on the Plexus to discover endpoints with a specific tag. This is useful for building systems where plugins need to dynamically discover each other's capabilities.
 
 The AI system uses mode-based tags to discover tools at runtime:
 - `AI-minimum` — Available in all modes (device control, weather)

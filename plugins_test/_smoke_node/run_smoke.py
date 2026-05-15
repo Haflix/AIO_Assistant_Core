@@ -1,7 +1,7 @@
 """PR3 Stage C 2-node smoke test runner.
 
 Spawns a subnode subprocess loading TestPR3SmokeSub, then runs a parent
-PluginCore loading TestPR3SmokePub. Verifies that publish_event +
+Plexus loading TestPR3SmokePub. Verifies that publish_event +
 request_event both work cross-node.
 
 PR4 Stage K (B-066): rebuilt around mTLS + SPKI fingerprint pinning.
@@ -35,8 +35,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from PluginCore import PluginCore  # noqa: E402
-from serialization import generate_keypair  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
+from plexus.serialization import generate_keypair  # noqa: E402
 
 
 def _spawn_subnode(
@@ -95,7 +95,7 @@ async def _run_parent(
     sub_hostname: str,
 ):
     cfg = REPO_ROOT / "plugins_test" / "_smoke_node" / "config.smoke_pub.yml"
-    pc = PluginCore(str(cfg))
+    pc = Plexus(str(cfg))
     nw_cfg = pc.yaml_config.setdefault("networking", {})
     nw_cfg["keys_dir"] = parent_keys_dir
     nw_cfg["peers"] = [

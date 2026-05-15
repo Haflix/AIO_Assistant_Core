@@ -1,5 +1,5 @@
-from utils import Plugin
-from decorators import (
+from plexus.utils import Plugin
+from plexus.decorators import (
     log_errors,
     handle_errors,
     async_log_errors,

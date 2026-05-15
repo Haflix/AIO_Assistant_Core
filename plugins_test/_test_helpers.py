@@ -8,7 +8,7 @@ Usage from a suite plugin:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _test_helpers import CaseRecorder, RecorderError  # noqa: E402
 
-    rec = CaseRecorder("TestExecuteSuite", "0.0.1", self._plugin_core)
+    rec = CaseRecorder("TestExecuteSuite", "0.0.1", self._plexus)
 
     async def body(c):
         result = await self.execute("TestExecuteTarget", "ea_add", (2, 3), hosts=c.hosts)
@@ -332,12 +332,12 @@ class _CaseContext:
 class CaseRecorder:
     """Collects case results for a single suite invocation."""
 
-    def __init__(self, suite_name: str, version: str, plugin_core):
+    def __init__(self, suite_name: str, version: str, plexus):
         self.suite_name = suite_name
         self.version = version
-        self.plugin_core = plugin_core
+        self.plexus = plexus
         self.cases: List[Dict] = []
-        self.snapshot: set = set(plugin_core.plugins.keys())
+        self.snapshot: set = set(plexus.plugins.keys())
         self._suite_t0 = time.perf_counter()
 
     async def run_case(
@@ -461,7 +461,7 @@ class CaseRecorder:
 
         Updates the baseline snapshot if the declared drift was non-zero.
         """
-        current = set(self.plugin_core.plugins.keys())
+        current = set(self.plexus.plugins.keys())
         added = current - self.snapshot
         removed = self.snapshot - current
 

@@ -4,8 +4,8 @@ Provides a single callable endpoint `ping` that returns "pong". Used to
 verify that dict-form endpoint loading actually produces a callable endpoint.
 """
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class TestPR2Fixture(Plugin):

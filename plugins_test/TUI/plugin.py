@@ -1,5 +1,5 @@
 """
-AIO Dashboard Plugin — Textual-based TUI for the PluginCore.
+AIO Dashboard Plugin — Textual-based TUI for the Plexus.
 
 Plugins can register custom TUI panels by implementing either:
   - get_tui_module_info() -> dict  (Dashboard imports TUI package, recommended)
@@ -14,8 +14,8 @@ import os
 import sys
 import threading
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 # ── Sibling module imports ────────────────────────────────────────────
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +39,7 @@ DashboardApp = _app_mod.DashboardApp
 
 
 class TUI(Plugin):
-    """Dashboard TUI plugin for the PluginCore."""
+    """Dashboard TUI plugin for the Plexus."""
 
     @log_errors
     def on_load(self, *args, **kwargs):
@@ -56,7 +56,7 @@ class TUI(Plugin):
         # The Networking-tab cluster summary, disconnect-reason counters,
         # event log strip, and per-peer drill-down event log all read from
         # state mutated by `_on_peer_event`. The observer runs on the
-        # PluginCore event loop thread; the TUI reads from its own thread.
+        # Plexus event loop thread; the TUI reads from its own thread.
         # `_observer_lock` (threading.Lock) keeps the two dicts coherent
         # under concurrent read + observer-fire. The deque + dict live
         # here (NOT on DashboardApp) so events arriving BEFORE the TUI
@@ -139,7 +139,7 @@ class TUI(Plugin):
             self.internal_observe(topic, cb)
 
         # Run TUI in its own thread with its own event loop.
-        # This prevents PluginCore's blocking tasks (model loading, DB
+        # This prevents Plexus's blocking tasks (model loading, DB
         # schema creation) from starving Textual's message pump.
         self._tui_thread = threading.Thread(
             target=self._run_tui_thread,
@@ -149,7 +149,7 @@ class TUI(Plugin):
         self._tui_thread.start()
 
     # ── Internal-bus observers (loop thread) ───────────────────────────
-    # Callbacks must return quickly (< 1ms per PluginCore.internal_observe
+    # Callbacks must return quickly (< 1ms per Plexus.internal_observe
     # contract). We bridge to the TUI thread via `app.call_from_thread`
     # so DOM mutations happen on the right loop.
 
@@ -450,7 +450,7 @@ class TUI(Plugin):
         self._mute_console()
 
         self._app = DashboardApp(
-            plugin_core=self._plugin_core,
+            plexus=self._plexus,
             plugin_instance=self,
             log_handler=self._log_handler,
         )
@@ -469,17 +469,17 @@ class TUI(Plugin):
             # since the framework is shutting down anyway and losing
             # the signal in that narrow window is preferable to a
             # crash on the TUI thread.
-            if hasattr(self._plugin_core, "_shutdown_event"):
+            if hasattr(self._plexus, "_shutdown_event"):
                 if self._main_loop and self._main_loop.is_running():
                     try:
                         self._main_loop.call_soon_threadsafe(
-                            self._plugin_core._shutdown_event.set
+                            self._plexus._shutdown_event.set
                         )
                     except RuntimeError:
                         pass
                 else:
                     try:
-                        self._plugin_core._shutdown_event.set()
+                        self._plexus._shutdown_event.set()
                     except RuntimeError:
                         pass
 
@@ -487,7 +487,7 @@ class TUI(Plugin):
     async def on_disable(self):
         self._logger.debug("Dashboard plugin on_disable")
 
-        # Phase 1: unregister internal-bus observers. PluginCore's
+        # Phase 1: unregister internal-bus observers. Plexus's
         # `_unobserve_plugin` (called on plugin pop) cleans these up
         # automatically, but explicit unregister keeps the dicts tidy
         # under disable/re-enable churn.

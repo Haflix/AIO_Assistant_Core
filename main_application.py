@@ -1,10 +1,10 @@
 import asyncio
 import signal
-from PluginCore import PluginCore
+from plexus.core import Plexus
 
 
 async def main():
-    pc = PluginCore("config.yml")
+    pc = Plexus("config.yml")
     await pc.wait_until_ready()
 
     # Plugins (e.g., DiscordBot /shutdown) set this event to trigger exit.

@@ -33,11 +33,11 @@ import struct  # noqa: E402
 import tempfile  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
-from networking import (  # noqa: E402
+from plexus.networking import (  # noqa: E402
     MSG_EXECUTE,
     MSG_REQUEST_EVENT,
     MSG_PING,
@@ -47,7 +47,7 @@ from networking import (  # noqa: E402
     MSG_ERROR,
     PeerSpec,
 )
-from serialization import generate_keypair, Serializable  # noqa: E402
+from plexus.serialization import generate_keypair, Serializable  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -60,7 +60,7 @@ SUITE_VERSION = "0.4.3"
 #
 # Pickle resolves classes/callables by (module, qualname). For payloads
 # that traverse the wire, the class definition MUST be at module scope
-# so the receiver-side find_class can resolve them. PluginCore loads
+# so the receiver-side find_class can resolve them. Plexus loads
 # this file via spec_from_file_location(name="TestBugSuite", ...) so
 # __module__ is "TestBugSuite" (not the dotted file path).
 # ──────────────────────────────────────────────────────────────────────
@@ -197,7 +197,7 @@ async def _b066_recv_msg(reader: asyncio.StreamReader, *,
 
     return await asyncio.wait_for(_inner(), timeout)
 
-# PluginCore loads this file via spec_from_file_location + exec_module
+# Plexus loads this file via spec_from_file_location + exec_module
 # without auto-registering in sys.modules. pickle.dumps validates that
 # obj.__module__ resolves via sys.modules to an importable module
 # containing the class — without this registration, pickling our payload
@@ -250,7 +250,7 @@ class TestBugSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestBugSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestBugSuite", SUITE_VERSION, self._plexus)
         kw = dict(
             case_ids_filter=case_ids,
             bug_ids_filter=bug_ids,
@@ -283,7 +283,7 @@ class TestBugSuite(Plugin):
         fake_port: Optional[int] = None,
         hostname: Optional[str] = None,
     ) -> Dict[str, Any]:
-        nm = self._plugin_core.network
+        nm = self._plexus.network
         # Cycle 4 fix: every test peer uses a UNIQUE subject CN. If
         # two self-signed CA certs in the trust store share Subject DN,
         # OpenSSL's chain-builder picks the FIRST match by name and
@@ -324,7 +324,7 @@ class TestBugSuite(Plugin):
         }
 
     def _b066_cleanup_test_peer(self, peer_info: Dict[str, Any]) -> None:
-        nm = self._plugin_core.network
+        nm = self._plexus.network
         spec = peer_info.get("spec")
         if spec is not None:
             nm.peers_by_fingerprint.pop(spec.fingerprint, None)
@@ -341,7 +341,7 @@ class TestBugSuite(Plugin):
         ctx.check_hostname = False
         ctx.load_cert_chain(peer_info["cert_path"], peer_info["key_path"])
         if trust_parent:
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             ctx.load_verify_locations(
                 cadata=Path(nm.cert_path).read_text(encoding="utf-8")
             )
@@ -352,16 +352,16 @@ class TestBugSuite(Plugin):
     # ------------------------------------------------------------------
     async def _ensure_loaded(self, name: str) -> bool:
         """Idempotently load+enable a fixture by name from yaml_config."""
-        if name in self._plugin_core.plugins:
+        if name in self._plexus.plugins:
             return True
-        for entry in self._plugin_core.yaml_config.get("plugins", []):
+        for entry in self._plexus.yaml_config.get("plugins", []):
             if entry.get("name") == name:
                 e = dict(entry)
                 e["enabled"] = True
-                await self._plugin_core.load_plugin_with_conf(e)
-                if name in self._plugin_core.plugins:
+                await self._plexus.load_plugin_with_conf(e)
+                if name in self._plexus.plugins:
                     try:
-                        await self._plugin_core.enable_plugin(name)
+                        await self._plexus.enable_plugin(name)
                     except Exception:
                         pass
                     return True
@@ -380,7 +380,7 @@ class TestBugSuite(Plugin):
             # server handler were removed in Stage D, so the entire
             # bypass surface no longer exists.
             c.expect(getattr(self, "request_topic", None), None)
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "_handle_topic_request", None), None)
 
         # ---- B-011 ---------------------------------------------------
@@ -388,14 +388,14 @@ class TestBugSuite(Plugin):
             # B-011: legacy stream-error sentinel only existed on the
             # request_topic_stream_remote path. That whole client method
             # was removed in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "request_topic_stream_remote", None), None)
 
         # ---- B-012 ---------------------------------------------------
         async def body_b_012_handle_topic_request_stream_gone(c):
             # B-012: server-side stream-chunk error sentinel handler
             # `_handle_topic_request_stream` was removed in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(
                 getattr(nm, "_handle_topic_request_stream", None), None
             )
@@ -412,7 +412,7 @@ class TestBugSuite(Plugin):
             # MSG_NOTIFY / MSG_TOPIC_REQUEST surface they hung off no
             # longer exists, so the remote spoof path through them is
             # gone.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "_handle_notify", None), None)
             c.expect(getattr(nm, "_handle_topic_request", None), None)
 
@@ -462,7 +462,7 @@ class TestBugSuite(Plugin):
         async def body_b_027_notify_remote_gone(c):
             # B-027: notify_remote return-zero-on-transport-fail can't
             # repro — method removed in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "notify_remote", None), None)
 
         # ---- B-028 ---------------------------------------------------
@@ -471,7 +471,7 @@ class TestBugSuite(Plugin):
             # request_topic_stream_remote — all client-side notifier
             # methods removed in Stage D, so the no-client-timeout
             # caller-hang surface is gone entirely.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "notify_remote", None), None)
             c.expect(getattr(nm, "request_topic_remote", None), None)
             c.expect(getattr(nm, "request_topic_stream_remote", None), None)
@@ -481,21 +481,21 @@ class TestBugSuite(Plugin):
             # B-029: server-side `_handle_topic_request` ignored its
             # `timeout` for code-driven handlers — handler itself gone
             # in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "_handle_topic_request", None), None)
 
         # ---- B-030 ---------------------------------------------------
         async def body_b_030_notify_remote_gone(c):
             # B-030: `notify_remote` swallowing pickle errors can't
             # repro — method removed in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "notify_remote", None), None)
 
         # ---- B-032 ---------------------------------------------------
         async def body_b_032_handle_notify_gone(c):
             # B-032: server-side `_handle_notify` head-of-line blocking
             # on slow fan-out can't repro — handler removed in Stage D.
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             c.expect(getattr(nm, "_handle_notify", None), None)
 
         # ---- B-033 ---------------------------------------------------
@@ -511,7 +511,7 @@ class TestBugSuite(Plugin):
             # `publish_event` is the new fire-and-forget primitive but
             # uses asyncio.create_task per-handler (verify in source).
             c.expect(getattr(self, "notify", None), None)
-            src = inspect.getsource(self._plugin_core.publish_event)
+            src = inspect.getsource(self._plexus.publish_event)
             # Sanity: dispatch path uses create_task (per-sub
             # independent) rather than a single gather over all subs.
             c.expect("create_task" in src, True)
@@ -521,7 +521,7 @@ class TestBugSuite(Plugin):
             # B-036: `_call_sub` caught Exception not BaseException —
             # function replaced by `_fanout_sub` in PR3. Verify the old
             # name is gone.
-            core = self._plugin_core
+            core = self._plexus
             c.expect(getattr(core, "_call_sub", None), None)
 
         # ---- B-039 ---------------------------------------------------
@@ -543,7 +543,7 @@ class TestBugSuite(Plugin):
             # dataclass. Also assert the new field names are present
             # so this case fails informatively if the schema regresses.
             import dataclasses
-            from notifier import Subscription
+            from plexus.notifier import Subscription
             fields = {f.name for f in dataclasses.fields(Subscription)}
             c.expect("handler" in fields, False)
             c.expect("endpoint_access_name" in fields, False)
@@ -713,10 +713,10 @@ class TestBugSuite(Plugin):
             # Q23+C15. Verify: pop a plugin, confirm its subs vanish
             # from topic_registry, then restore via _ensure_loaded.
             target = TARGET
-            if target not in self._plugin_core.plugins:
+            if target not in self._plexus.plugins:
                 c.skip(f"{target} not loaded — fixture order issue")
                 return
-            pre = await self._plugin_core.topic_registry.list_local_subs()
+            pre = await self._plexus.topic_registry.list_local_subs()
             pre_owned = [s for s in pre if s.plugin_name == target]
             if len(pre_owned) == 0:
                 c.skip(
@@ -729,8 +729,8 @@ class TestBugSuite(Plugin):
             # state — which matches snapshot. Defensive declaration
             # nonetheless:
             c.set_expected_drift(added=(), removed=())
-            await self._plugin_core.pop_plugin(target)
-            post = await self._plugin_core.topic_registry.list_local_subs()
+            await self._plexus.pop_plugin(target)
+            post = await self._plexus.topic_registry.list_local_subs()
             post_owned = [s for s in post if s.plugin_name == target]
             c.expect(len(post_owned), 0)
             # Restore so subsequent cases find TARGET loaded.
@@ -750,15 +750,15 @@ class TestBugSuite(Plugin):
             # Instead, transiently null it and call. The event_id
             # passed below is intentionally bogus — guard fires before
             # lookup so the bogus id is never dereferenced.
-            saved = self._plugin_core.main_event_loop
-            self._plugin_core.main_event_loop = None
+            saved = self._plexus.main_event_loop
+            self._plexus.main_event_loop = None
             try:
                 c.expect_exception(
                     RequestException, match="Framework not started"
                 )
                 self.publish_event_sync("any_id_guard_fires_first")
             finally:
-                self._plugin_core.main_event_loop = saved
+                self._plexus.main_event_loop = saved
 
         # ---- B-056 ---------------------------------------------------
         async def body_b_056_disabled_subs_excluded(c):
@@ -778,7 +778,7 @@ class TestBugSuite(Plugin):
             )
             try:
                 subs = (
-                    await self._plugin_core.topic_registry.list_local_subs()
+                    await self._plexus.topic_registry.list_local_subs()
                 )
                 owned = [s for s in subs if s.sub_uuid == sub_uuid]
                 if len(owned) != 1:
@@ -790,7 +790,7 @@ class TestBugSuite(Plugin):
                 # find_all should still return the sub (enabled is a
                 # post-filter); find_first/eligibility must skip it.
                 found = (
-                    await self._plugin_core.topic_registry.find_first(topic)
+                    await self._plexus.topic_registry.find_first(topic)
                 )
                 if found is not None and found.sub_uuid == sub_uuid:
                     raise AssertionError(
@@ -837,7 +837,7 @@ class TestBugSuite(Plugin):
             # Stage F can't actually run a remote spoof here without
             # two-node infrastructure. Structural assertion: the
             # rewrite block is still present in execute()'s source.
-            src = inspect.getsource(self._plugin_core.execute)
+            src = inspect.getsource(self._plexus.execute)
             if (
                 'author == "system"' not in src
                 and "author == 'system'" not in src
@@ -932,7 +932,7 @@ class TestBugSuite(Plugin):
             # while one plugin's on_enable is mid-flight (artificially
             # delayed), a concurrent get_plugin_info on a DIFFERENT
             # plugin must return promptly (well under 1s).
-            core = self._plugin_core
+            core = self._plexus
             v_name = "TestLifecycleVictim"
             other_name = "TestLifecycleSuite"
             victim = core.plugins.get(v_name)
@@ -1003,7 +1003,7 @@ class TestBugSuite(Plugin):
             # growth. b047_probe_event is registered → b047_probe_sub →
             # handle_b047_probe so every publish spawns one real fan-out
             # task that exercises the eviction path.
-            core = self._plugin_core
+            core = self._plexus
             tlist = getattr(core, "task_list", None)
             if tlist is None:
                 # Attribute removed — fixed-by-construction.
@@ -1042,7 +1042,7 @@ class TestBugSuite(Plugin):
             # return shape against a guaranteed-miss lookup. Signature
             # is (access_name, hosts, blocked_hosts, plugin_uuid,
             # requester_id, target_plugin) — find_endpoint is async.
-            core = self._plugin_core
+            core = self._plexus
             try:
                 result = await core.find_endpoint(
                     "no_such_endpoint_for_b048_repro",
@@ -1078,7 +1078,7 @@ class TestBugSuite(Plugin):
             # raised. If the bug is fixed (separate normalize for
             # authors), the ValueError won't fire — recorder records
             # as "fail" (expected exception not raised).
-            from PluginCore import _normalize_hosts
+            from plexus.core import _normalize_hosts
             c.expect_exception(ValueError, match=r"keyword 'remote'")
             _normalize_hosts(
                 ["remote", "OtherPlugin"],
@@ -1094,7 +1094,7 @@ class TestBugSuite(Plugin):
             # corresponding entry shows up in requests. Implementation-
             # bound: skip if requests dict isn't accessible or the
             # streaming primitive isn't routable here.
-            core = self._plugin_core
+            core = self._plexus
             requests = getattr(core, "requests", None)
             if requests is None:
                 c.skip(
@@ -1230,7 +1230,7 @@ class TestBugSuite(Plugin):
 
     # Helper used by B-047 — publishes b047_probe_event which routes
     # via b047_probe_sub → handle_b047_probe. Each call spawns one
-    # real fan-out task in PluginCore.task_list; the test asserts
+    # real fan-out task in Plexus.task_list; the test asserts
     # that the eviction path (Stage Q done_callback) drains them.
     async def publish_event_for_repro(self):
         try:
@@ -1613,7 +1613,7 @@ class TestBugSuite(Plugin):
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(
                             "127.0.0.1",
-                            self._plugin_core.network.port,
+                            self._plexus.network.port,
                             ssl=client_ctx,
                         ),
                         timeout=5.0,
@@ -1667,7 +1667,7 @@ class TestBugSuite(Plugin):
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(
                         "127.0.0.1",
-                        self._plugin_core.network.port,
+                        self._plexus.network.port,
                         ssl=client_ctx,
                     ),
                     timeout=5.0,
@@ -1701,7 +1701,7 @@ class TestBugSuite(Plugin):
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(
                         "127.0.0.1",
-                        self._plugin_core.network.port,
+                        self._plexus.network.port,
                         ssl=client_ctx,
                     ),
                     timeout=5.0,
@@ -1744,7 +1744,7 @@ class TestBugSuite(Plugin):
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(
                         "127.0.0.1",
-                        self._plugin_core.network.port,
+                        self._plexus.network.port,
                         ssl=client_ctx,
                     ),
                     timeout=5.0,
@@ -1792,7 +1792,7 @@ class TestBugSuite(Plugin):
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(
                         "127.0.0.1",
-                        self._plugin_core.network.port,
+                        self._plexus.network.port,
                         ssl=client_ctx,
                     ),
                     timeout=5.0,
@@ -1834,7 +1834,7 @@ class TestBugSuite(Plugin):
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(
                         "127.0.0.1",
-                        self._plugin_core.network.port,
+                        self._plexus.network.port,
                         ssl=client_ctx,
                     ),
                     timeout=5.0,
@@ -1917,7 +1917,7 @@ class TestBugSuite(Plugin):
 
         # ---- Test 5 — client-side pin rejects unpinned server ----
         async def body_b_066_client_side_pin_rejects_unpinned_server(c):
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             actual_keys_dir = tempfile.mkdtemp(prefix="b066_test5_actual_")
             expected_keys_dir = tempfile.mkdtemp(prefix="b066_test5_expected_")
             actual_cert_path, actual_key_path, actual_fp, actual_cert_pem = \

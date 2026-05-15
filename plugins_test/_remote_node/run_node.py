@@ -1,4 +1,4 @@
-"""Headless PluginCore subprocess for Phase 5 remote tests.
+"""Headless Plexus subprocess for Phase 5 remote tests.
 
 Used by TestRemoteSuite to bring up a peer node on localhost. The subprocess
 loads only the TestRemote* fixtures and writes a ready-file once
@@ -23,7 +23,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from PluginCore import PluginCore  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
 
 
 async def main() -> None:
@@ -41,7 +41,7 @@ async def main() -> None:
     ap.add_argument("--parent-ip", default="127.0.0.1")
     args = ap.parse_args()
 
-    pc = PluginCore(args.config)
+    pc = Plexus(args.config)
 
     # Override port BEFORE wait_until_ready: NetworkManager is constructed
     # there via ``_build_network_manager``, which reads

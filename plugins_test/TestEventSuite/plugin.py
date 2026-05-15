@@ -32,9 +32,9 @@ import logging  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin, Event  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin, Event  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -116,7 +116,7 @@ class TestEventSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestEventSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestEventSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -278,33 +278,33 @@ class TestEventSuite(Plugin):
         await asyncio.sleep(secs)
 
     def _find_yaml_entry(self, name: str) -> Optional[Dict[str, Any]]:
-        for entry in self._plugin_core.yaml_config.get("plugins", []):
+        for entry in self._plexus.yaml_config.get("plugins", []):
             if entry.get("name") == name:
                 return entry
         return None
 
     async def _ensure_loaded(self, name: str) -> bool:
         """Load+enable a fixture by yaml entry. Returns True if present."""
-        if name in self._plugin_core.plugins:
+        if name in self._plexus.plugins:
             return True
         entry = self._find_yaml_entry(name)
         if not entry:
             return False
         entry_copy = dict(entry)
         entry_copy["enabled"] = True
-        await self._plugin_core.load_plugin_with_conf(entry_copy)
-        if name in self._plugin_core.plugins:
+        await self._plexus.load_plugin_with_conf(entry_copy)
+        if name in self._plexus.plugins:
             try:
-                await self._plugin_core.enable_plugin(name)
+                await self._plexus.enable_plugin(name)
             except Exception:
                 pass
             return True
         return False
 
     async def _ensure_unloaded(self, name: str) -> None:
-        if name in self._plugin_core.plugins:
+        if name in self._plexus.plugins:
             try:
-                await self._plugin_core.pop_plugin(name)
+                await self._plexus.pop_plugin(name)
             except Exception:
                 pass
 
@@ -1124,7 +1124,7 @@ class TestEventSuite(Plugin):
                 )
 
         async def body_default_workers_4(c):
-            disp = self._plugin_core.sync_dispatcher
+            disp = self._plexus.sync_dispatcher
             workers = disp._workers
             c.expect(workers, 4)
 
@@ -1152,7 +1152,7 @@ class TestEventSuite(Plugin):
                 # cross-plugin sub on a topic the suite has a declared event
                 # for. Reuse smoke_publish topic and add a runtime sub that
                 # routes to bad_actor.handle_raising_sync.
-                sub_id = await self._plugin_core.subscribe_event(
+                sub_id = await self._plexus.subscribe_event(
                     "test_event/smoke/publish",
                     self.plugin_name,
                     self.plugin_uuid,
@@ -1176,7 +1176,7 @@ class TestEventSuite(Plugin):
                     c.expect(len(fired), 1)
                 finally:
                     try:
-                        await self._plugin_core.unsubscribe_event(sub_id)
+                        await self._plexus.unsubscribe_event(sub_id)
                     except Exception:
                         pass
             finally:
@@ -1188,7 +1188,7 @@ class TestEventSuite(Plugin):
                 c.skip("TestEventBadActor not registered in test_config.yml")
                 return
             try:
-                sub_id = await self._plugin_core.subscribe_event(
+                sub_id = await self._plexus.subscribe_event(
                     "test_event/smoke/request",
                     self.plugin_name,
                     self.plugin_uuid,
@@ -1212,7 +1212,7 @@ class TestEventSuite(Plugin):
                     )
                 finally:
                     try:
-                        await self._plugin_core.unsubscribe_event(sub_id)
+                        await self._plexus.unsubscribe_event(sub_id)
                     except Exception:
                         pass
             finally:
@@ -1220,16 +1220,16 @@ class TestEventSuite(Plugin):
 
         async def body_workers_1_serializes(c):
             # Cannot reconfigure the live SyncDispatcher's worker pool
-            # without restarting PluginCore; the framework reads
+            # without restarting Plexus; the framework reads
             # general.sync_dispatcher_workers at init. Skip with note.
             c.skip(
-                "live SyncDispatcher.workers is fixed at PluginCore init; "
+                "live SyncDispatcher.workers is fixed at Plexus init; "
                 "covered by spawning two long_sync handlers and observing "
                 "thread-pool concurrency in a dedicated harness"
             )
 
         async def body_shutdown_drains_30s(c):
-            c.skip("requires PluginCore.close() in middle of suite")
+            c.skip("requires Plexus.close() in middle of suite")
 
         await rec.run_case(
             "event.sync.dispatcher_basic", body_dispatcher_basic,
@@ -1280,7 +1280,7 @@ class TestEventSuite(Plugin):
             # logger.debug() calls before they reach any handler.
             cap = _LogCapture()
             cap.setLevel(logging.DEBUG)
-            target_logger = self._plugin_core._logger
+            target_logger = self._plexus._logger
             prev_level = target_logger.level
             target_logger.setLevel(logging.DEBUG)
             target_logger.addHandler(cap)
@@ -1340,7 +1340,7 @@ class TestEventSuite(Plugin):
         async def body_subs_registered_on_enable_start(c):
             # The suite's own YAML subs were registered at on_enable. Verify
             # one of them exists in the topic_registry.
-            subs = await self._plugin_core.topic_registry.list_local_subs()
+            subs = await self._plexus.topic_registry.list_local_subs()
             owners = {(s.plugin_name, s.declared_id) for s in subs}
             if (self.plugin_name, "smoke_publish_sub") not in owners:
                 raise AssertionError(
@@ -1350,14 +1350,14 @@ class TestEventSuite(Plugin):
         async def body_runtime_subscribe_chronological(c):
             # Add a runtime sub via Plugin.subscribe; verify it lands AFTER
             # the suite's YAML subs in the registry's insertion order.
-            subs_before = await self._plugin_core.topic_registry.list_local_subs()
+            subs_before = await self._plexus.topic_registry.list_local_subs()
             n_before = len(subs_before)
             sub_id = await self.subscribe(
                 "test_event/lifecycle/runtime_chrono",
                 target_access_name="handle_runtime_chrono",
             )
             try:
-                subs_after = await self._plugin_core.topic_registry.list_local_subs()
+                subs_after = await self._plexus.topic_registry.list_local_subs()
                 if len(subs_after) != n_before + 1:
                     raise AssertionError(
                         f"sub count delta {len(subs_after) - n_before} != 1"
@@ -1389,7 +1389,7 @@ class TestEventSuite(Plugin):
             try:
                 # bad actor declared 4 subs at on_enable. Snapshot.
                 subs_loaded = await (
-                    self._plugin_core.topic_registry.list_local_subs()
+                    self._plexus.topic_registry.list_local_subs()
                 )
                 ba_subs = [s for s in subs_loaded if s.plugin_name == BAD_ACTOR]
                 if len(ba_subs) < 1:
@@ -1399,7 +1399,7 @@ class TestEventSuite(Plugin):
             finally:
                 await self._ensure_unloaded(BAD_ACTOR)
 
-            subs_after = await self._plugin_core.topic_registry.list_local_subs()
+            subs_after = await self._plexus.topic_registry.list_local_subs()
             ba_subs_after = [s for s in subs_after if s.plugin_name == BAD_ACTOR]
             c.expect(len(ba_subs_after), 0)
 
@@ -1410,7 +1410,7 @@ class TestEventSuite(Plugin):
                 return
             try:
                 subs_v1 = await (
-                    self._plugin_core.topic_registry.list_local_subs()
+                    self._plexus.topic_registry.list_local_subs()
                 )
                 ba_v1 = [s for s in subs_v1 if s.plugin_name == BAD_ACTOR]
                 ba_v1_uuids = {s.sub_uuid for s in ba_v1}
@@ -1430,7 +1430,7 @@ class TestEventSuite(Plugin):
                     )
 
                 subs_v2 = await (
-                    self._plugin_core.topic_registry.list_local_subs()
+                    self._plexus.topic_registry.list_local_subs()
                 )
                 ba_v2 = [s for s in subs_v2 if s.plugin_name == BAD_ACTOR]
                 ba_v2_uuids = {s.sub_uuid for s in ba_v2}
@@ -1549,7 +1549,7 @@ class TestEventSuite(Plugin):
             deadline = time.perf_counter() + 5.0
             while time.perf_counter() < deadline:
                 live_count = sum(
-                    1 for req in self._plugin_core.requests.values()
+                    1 for req in self._plexus.requests.values()
                     if req.kind == "request_event"
                 )
                 if live_count == 0:
@@ -1559,7 +1559,7 @@ class TestEventSuite(Plugin):
             # state that's not actively growing. The reap-window check
             # has its own slow path covered by other suites.
             live_count = sum(
-                1 for req in self._plugin_core.requests.values()
+                1 for req in self._plexus.requests.values()
                 if req.kind == "request_event"
             )
             if live_count > 0:
@@ -1615,14 +1615,14 @@ class TestEventSuite(Plugin):
             )
 
         async def body_msg_notify_constant_missing(c):
-            import networking
+            from plexus import networking
             if hasattr(networking, "MSG_NOTIFY"):
                 raise AssertionError(
                     "networking.MSG_NOTIFY still exists post Stage D removal"
                 )
 
         async def body_msg_topic_request_constant_missing(c):
-            import networking
+            from plexus import networking
             if hasattr(networking, "MSG_TOPIC_REQUEST"):
                 raise AssertionError(
                     "networking.MSG_TOPIC_REQUEST still exists "
@@ -1630,7 +1630,7 @@ class TestEventSuite(Plugin):
                 )
 
         async def body_msg_topic_request_stream_constant_missing(c):
-            import networking
+            from plexus import networking
             if hasattr(networking, "MSG_TOPIC_REQUEST_STREAM"):
                 raise AssertionError(
                     "networking.MSG_TOPIC_REQUEST_STREAM still exists "
@@ -1645,7 +1645,7 @@ class TestEventSuite(Plugin):
             # such auto-registered sub on the SUITE itself (which has no
             # `topic:` per-endpoint) is the simplest check — verify the
             # registry has only the explicitly declared subs.
-            subs = await self._plugin_core.topic_registry.list_local_subs()
+            subs = await self._plexus.topic_registry.list_local_subs()
             suite_subs = [s for s in subs if s.plugin_name == self.plugin_name]
             # Suite YAML declares ~22 subs (not counting any runtime adds
             # from earlier cases). If legacy auto-reg were alive we'd see
@@ -1735,7 +1735,7 @@ class TestEventSuite(Plugin):
                 c.skip("TestEventBadActor not registered in test_config.yml")
                 return
             try:
-                ba = self._plugin_core.plugins.get(BAD_ACTOR)
+                ba = self._plexus.plugins.get(BAD_ACTOR)
                 if ba is None:
                     raise AssertionError(f"{BAD_ACTOR} not loaded")
                 # bad_actor.events should be empty/None — verify.

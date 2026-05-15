@@ -10,8 +10,8 @@ repros plus basic load/enable/disable/reload contract checks. The B-006
 import asyncio
 from typing import Any, Dict, Optional
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TestLifecycleVictim(Plugin):

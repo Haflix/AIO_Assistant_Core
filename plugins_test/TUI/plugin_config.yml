@@ -1,4 +1,4 @@
-description: "TUI Plugin — Textual TUI for PluginCore management, monitoring, and plugin interaction"
+description: "TUI Plugin — Textual TUI for Plexus management, monitoring, and plugin interaction"
 version: 2.14.0
 remote: False
 arguments:

@@ -71,13 +71,13 @@ arguments:
 
 ### 3.4 Private-API carve-out
 
-Suites are explicitly allowed to call private-ish PluginCore methods where reproducing a bug requires it:
+Suites are explicitly allowed to call private-ish Plexus methods where reproducing a bug requires it:
 - `core._reload_plugin(name)` — Lifecycle (B-010, B-016) AND Notifier (B-034, B-040)
 - `core._disable_plugin(name)` / `core._enable_plugin(name)` — Lifecycle, Notifier (BadActor on-demand load, B-003 disable angle, B-004)
 - `core.load_plugin_with_conf(entry_dict)` — Notifier (BadActor on-demand), Lifecycle
 - Mutating `core.yaml_config['plugins']` in-memory — Notifier (BadActor on-demand)
 
-Document the dependency in each suite's README. If PluginCore refactors any of these names, suites break loudly — that's intended.
+Document the dependency in each suite's README. If Plexus refactors any of these names, suites break loudly — that's intended.
 
 ---
 
@@ -257,7 +257,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _test_helpers import CaseRecorder, RecorderError, hang_guard  # noqa: E402
 ```
 
-`spec_from_file_location` (PluginCore loader) doesn't interfere; `parent.parent` resolves to `plugins_test/`; `_test_helpers.py` is imported by name via sys.path.
+`spec_from_file_location` (Plexus loader) doesn't interfere; `parent.parent` resolves to `plugins_test/`; `_test_helpers.py` is imported by name via sys.path.
 
 ### 5.2 `_CaseContext` API
 
@@ -293,7 +293,7 @@ Every case is wrapped in `asyncio.wait_for(case_body, timeout=hard_timeout_s)`. 
 
 ### 5.4 On-demand fixture load idiom
 
-`load_plugin_with_conf` short-circuits if entry's `enabled` flag is `False` (PluginCore.py). Suites that load a fixture on demand must build a fresh entry dict to bypass this:
+`load_plugin_with_conf` short-circuits if entry's `enabled` flag is `False` (core.py). Suites that load a fixture on demand must build a fresh entry dict to bypass this:
 
 ```python
 async def _load_fixture(self):
@@ -302,16 +302,16 @@ async def _load_fixture(self):
         "enabled": True,
         "path": "./plugins_test/TestSomeFixture",
     }
-    await self._plugin_core.load_plugin_with_conf(entry)
-    await self._plugin_core._enable_plugin("TestSomeFixture")
+    await self._plexus.load_plugin_with_conf(entry)
+    await self._plexus._enable_plugin("TestSomeFixture")
 
 async def _unload_fixture(self):
-    await self._plugin_core.pop_plugin("TestSomeFixture")
+    await self._plexus.pop_plugin("TestSomeFixture")
 
 async def _unload_fixture_safe(self):
     """Defensive variant for suite-level finally — never propagates."""
     try:
-        await self._plugin_core.pop_plugin("TestSomeFixture")
+        await self._plexus.pop_plugin("TestSomeFixture")
     except Exception as e:
         self._logger.warning(
             f"fixture defensive unload failed (already gone or half-state): {e}"
@@ -576,7 +576,7 @@ cover cross-node verification at the integration level.
 
 **Plugins added:** `TestRemoteSuite`, `TestRemoteTarget` (remote=True), `TestRemoteVictim` (remote=False), `TestRemoteSpoofer`.
 
-**Why subprocess:** two PluginCore instances in one process collide on `LogUtil.create()` global state, share the asyncio loop, and bind ports in the same process. Subprocess matches how networking is meant to be used.
+**Why subprocess:** two Plexus instances in one process collide on `LogUtil.create()` global state, share the asyncio loop, and bind ports in the same process. Subprocess matches how networking is meant to be used.
 
 #### 6.5.1 `plugins_test/_remote_node/run_node.py` (sketch)
 
@@ -584,10 +584,10 @@ cover cross-node verification at the integration level.
 import argparse, asyncio, json, os, signal, sys
 from pathlib import Path
 
-# Add repo root so `from PluginCore import ...` works
+# Add repo root so `from plexus.core import ...` works
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from PluginCore import PluginCore  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
 
 async def main():
     ap = argparse.ArgumentParser()
@@ -596,7 +596,7 @@ async def main():
     ap.add_argument("--ready-file", required=True)
     args = ap.parse_args()
 
-    pc = PluginCore(args.config)
+    pc = Plexus(args.config)
     # Override port BEFORE wait_until_ready (NetworkManager is constructed there
     # and reads pc.networking_port — the INSTANCE ATTRIBUTE, not yaml).
     # Mutating yaml alone is silently no-op'd. Set both for safety.
@@ -741,7 +741,7 @@ All Phase 5 cases declare `hosts=["remote"]` (or specific subnode hostname). Gen
 | `remote.B-028.no_client_timeout` | remote hangs; outer wait_for(2s); expected_status=fail, marker="outer_wait_for_fired" | B-028 | bug_repro |
 | `remote.B-029.code_driven_timeout_ignored` | code-driven topic handler ignores caller's timeout; expected_status=fail, marker="elapsed_exceeded_timeout" | B-029 | bug_repro |
 | `remote.B-030.unpicklable_args` | local fires, remote silently misses; expected_status=fail, marker="state_diverged" | B-030 | bug_repro |
-| `remote.B-027.publish_event_return_count_misleading` | remote returns 0 from transport fail; assert PluginCore counted as +1; expected_status=fail, marker="counted_as_success" | B-027 | bug_repro |
+| `remote.B-027.publish_event_return_count_misleading` | remote returns 0 from transport fail; assert Plexus counted as +1; expected_status=fail, marker="counted_as_success" | B-027 | bug_repro |
 | `remote.B-032.head_of_line_blocking` | slow sub blocks fast call on same connection; expected_status=fail, marker="fast_call_blocked" | B-032 | bug_repro, slow |
 | `remote.B-033.request_event_stream_sync_host_remote` | hosts="remote" silently routes local | B-033 | bug_repro |
 | `remote.B-020.publish_event_sync_blocks_on_remote` | publish_event_sync from sync context with slow remote sub; assert calling thread blocked; expected_status=fail, marker="thread_blocked" | B-020 | bug_repro |
@@ -860,7 +860,7 @@ And remove their entries from `config.example.yml`.
 - **External CI harness / pytest wrapper** — `dump_path` + a small CI script can read the JSON; bridge-to-pytest is separate work.
 - **Migration guide for users** — documented in Phase 6 commit message; not part of the test framework itself.
 
-For each of these, the documentation surface (README / CLAUDE.md / commit messages) remains authoritative; the test framework focuses exclusively on runtime behavior of a started PluginCore.
+For each of these, the documentation surface (README / CLAUDE.md / commit messages) remains authoritative; the test framework focuses exclusively on runtime behavior of a started Plexus.
 
 ---
 
@@ -952,12 +952,12 @@ class _CaseContext:
         return True
 
 class CaseRecorder:
-    def __init__(self, suite_name, version, plugin_core):
+    def __init__(self, suite_name, version, plexus):
         self.suite_name = suite_name
         self.version = version
-        self.plugin_core = plugin_core
+        self.plexus = plexus
         self.cases: List[dict] = []
-        self.snapshot: set = set(plugin_core.plugins.keys())
+        self.snapshot: set = set(plexus.plugins.keys())
 
     def case(self, id, **kwargs):
         return _CaseContext(self, id, **kwargs)
@@ -980,7 +980,7 @@ If it fails, all `multi_instance`-tagged cases skip with `skip_reason="multi-ins
 These cases need design work outside the framework before they can be repro'd cleanly. Listed in `bugtracker.md` with a "Test deferred" marker:
 - `exec.sync.from_async_*` — needs runtime guard inside `execute_sync` OR deadlock-with-outer-wait_for assertion that's ambiguous (loop frozen, no clear failure mode).
 - **B-026** (rare race after partial chunk write voids `None` result): requires writer mocking the framework doesn't support.
-- **B-038** (sync wrappers raise `TypeError` pre-`start()`): requires testing PluginCore before its own `start()` runs — outside the framework's "running core" contract.
+- **B-038** (sync wrappers raise `TypeError` pre-`start()`): requires testing Plexus before its own `start()` runs — outside the framework's "running core" contract.
 
 ---
 

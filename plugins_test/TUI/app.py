@@ -1,12 +1,12 @@
 """
-AIO Dashboard — Textual TUI for the PluginCore.
+AIO Dashboard — Textual TUI for the Plexus.
 
 Tabs:
   1. Home:    system stats, plugin health, active requests, network nodes
   2. Plugins: searchable list, detail panel with stats, per-plugin actions
   3. Config:  YAML editor with file picker, backup-on-save
   4. Logs:    live log viewer with level filter, auto-scroll toggle
-  5. Settings: TUI refresh rates, PluginCore info, networking display
+  5. Settings: TUI refresh rates, Plexus info, networking display
   Dynamic:    per-plugin tabs with collapsible endpoints, form/JSON input
 """
 
@@ -93,7 +93,7 @@ else:
 # Imported at module load (NOT under TYPE_CHECKING) because runtime
 # code reads `Phase.LOAD` as a dict key.
 try:
-    from plugin_state import Phase as _PluginPhase  # type: ignore[import]
+    from plexus.plugin_state import Phase as _PluginPhase  # type: ignore[import]
 except Exception:
     _PluginPhase = None  # tests may stub plugin_states with primitive types
 
@@ -111,7 +111,7 @@ DEFAULT_NETWORK_INTERVAL = 3.0  # Phase 1 — peers-table refresh tick
 # Select.NULL singleton is reserved for the prepended allow_blank=True
 # row, which would create a confusing dual-blank UX when an explicit
 # "no change" option is also needed). Apply handler maps `__keep__` →
-# Python None before calling PluginCore.set_logger_level.
+# Python None before calling Plexus.set_logger_level.
 _LOGGER_LEVEL_OPTIONS = [
     ("(none) — don't change", "__keep__"),
     ("DEBUG", "DEBUG"),
@@ -219,7 +219,7 @@ Footer {
     background: #2d2d2d; color: #d4d4d4;
 }
 
-/* ── PluginCore stats ───────────────────── */
+/* ── Plexus stats ───────────────────── */
 #plugincore-section { height: auto; }
 #top-plugins-table { height: auto; max-height: 10; border: round #404040; background: #2d2d2d; }
 
@@ -790,7 +790,7 @@ class DashboardApp(App):
     """AIO Dashboard TUI."""
 
     TITLE = "AIO Dashboard"
-    SUB_TITLE = "PluginCore Management"
+    SUB_TITLE = "Plexus Management"
     CSS = APP_CSS
 
     BINDINGS = [
@@ -808,16 +808,16 @@ class DashboardApp(App):
 
     def __init__(
         self,
-        plugin_core,
+        plexus,
         plugin_instance,
         log_handler: TUILogHandler,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.plugin_core = plugin_core
+        self.plexus = plexus
         self.plugin_instance = plugin_instance
         self.log_handler = log_handler
-        # Main event loop reference — used to dispatch PluginCore calls
+        # Main event loop reference — used to dispatch Plexus calls
         # from the TUI thread back to the correct event loop.
         self._main_loop: asyncio.AbstractEventLoop = plugin_instance.event_loop
         self._start_time = time.time()
@@ -972,7 +972,7 @@ class DashboardApp(App):
     async def _run_on_main(self, coro, timeout: float = 30.0):
         """Schedule a coroutine on the main event loop and await its result.
 
-        PluginCore's async methods (execute, _enable_plugin, etc.) use
+        Plexus's async methods (execute, _enable_plugin, etc.) use
         asyncio primitives bound to the main loop. Awaiting them directly
         from the TUI thread's loop would use the wrong event loop, breaking
         locks, tasks, and futures. This helper dispatches correctly.
@@ -990,7 +990,7 @@ class DashboardApp(App):
             return None
         future = asyncio.run_coroutine_threadsafe(coro, self._main_loop)
         # Wrap the concurrent.futures.Future so we can await it on Textual's loop.
-        # Timeout prevents a hung PluginCore call from freezing the entire TUI.
+        # Timeout prevents a hung Plexus call from freezing the entire TUI.
         try:
             return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
         except asyncio.TimeoutError:
@@ -1119,9 +1119,9 @@ class DashboardApp(App):
                                 yield Static("", id="graph-mem-val", classes="graph-value")
                             yield Sparkline([], id="graph-mem")
 
-                    # PluginCore internals
+                    # Plexus internals
                     with Vertical(id="plugincore-section"):
-                        yield Static("PluginCore", classes="section-header")
+                        yield Static("Plexus", classes="section-header")
                         with Horizontal(classes="stat-row"):
                             with Horizontal(classes="stat-card"):
                                 yield Static("Tasks ", classes="stat-key")
@@ -1480,9 +1480,9 @@ class DashboardApp(App):
                         yield Button("Apply", id="btn-apply-settings", variant="primary")
                         yield Static("", id="settings-status", markup=True)
 
-                    # PluginCore info
+                    # Plexus info
                     with Vertical(classes="settings-group"):
-                        yield Static("PluginCore", classes="settings-group-title")
+                        yield Static("Plexus", classes="settings-group-title")
                         with Horizontal(classes="setting-row"):
                             yield Static("Hostname:", classes="setting-label")
                             yield Static("...", id="info-hostname", classes="setting-value")
@@ -1668,7 +1668,7 @@ class DashboardApp(App):
         except AttributeError:
             plugin_uuid = None
         if plugin_uuid is not None:
-            pc = self.plugin_core
+            pc = self.plexus
             self._app_bus_observers = [
                 ("_core/subscription/state_changed", self._on_subs_refresh_signal),
                 ("_core/event/state_changed", self._on_cat_refresh_signal),
@@ -1801,7 +1801,7 @@ class DashboardApp(App):
     async def _shutdown(self) -> None:
         self.log_handler.detach()
         # Phase 2b — explicitly unregister the app-side bus observers
-        # registered in `on_mount`. PluginCore's `_unobserve_plugin`
+        # registered in `on_mount`. Plexus's `_unobserve_plugin`
         # auto-cleans on plugin pop, but app exit (e.g. user presses
         # `q`) is independent of plugin pop. Without explicit
         # cleanup, these observers stay registered in
@@ -1812,7 +1812,7 @@ class DashboardApp(App):
         except AttributeError:
             plugin_uuid = None
         if plugin_uuid is not None:
-            pc = self.plugin_core
+            pc = self.plexus
             for topic, cb in getattr(self, "_app_bus_observers", []):
                 try:
                     pc.internal_unobserve(plugin_uuid, topic, cb)
@@ -1845,7 +1845,7 @@ class DashboardApp(App):
             pass
 
         try:
-            hostname_w.update(getattr(self.plugin_core, "hostname", "?") or "?")
+            hostname_w.update(getattr(self.plexus, "hostname", "?") or "?")
 
             # Uptime
             secs = int(time.time() - self._start_time)
@@ -1854,7 +1854,7 @@ class DashboardApp(App):
             self.query_one("#stat-uptime", Static).update(f"{h}h{m:02d}m")
 
             # Plugins — snapshot to avoid RuntimeError from cross-thread dict mutation
-            plugins = list(self.plugin_core.plugins.values())
+            plugins = list(self.plexus.plugins.values())
             total = len(plugins)
             enabled = sum(1 for p in plugins if p.enabled)
             disabled = total - enabled
@@ -1919,9 +1919,9 @@ class DashboardApp(App):
                 self.query_one("#stat-cpu", Static).update("n/a")
                 self.query_one("#stat-memory", Static).update("n/a")
 
-            # PluginCore stats
+            # Plexus stats
             # Active tasks — snapshot to avoid cross-thread mutation
-            task_list = getattr(self.plugin_core, "task_list", [])
+            task_list = getattr(self.plexus, "task_list", [])
             try:
                 task_count = len(list(task_list)) if task_list else 0
             except RuntimeError:
@@ -1929,7 +1929,7 @@ class DashboardApp(App):
             self.query_one("#stat-pc-tasks", Static).update(str(task_count))
 
             # Thread pool — _threads is an internal set, snapshot defensively
-            executor = getattr(self.plugin_core, "_plugin_executor", None)
+            executor = getattr(self.plexus, "_plugin_executor", None)
             if executor:
                 try:
                     threads = getattr(executor, "_threads", set())
@@ -1967,10 +1967,10 @@ class DashboardApp(App):
 
     @work(thread=False, exclusive=True, group="requests")
     async def _refresh_requests_worker(self) -> None:
-        # Snapshot the dict — PluginCore mutates it from the main thread.
+        # Snapshot the dict — Plexus mutates it from the main thread.
         # dict() is GIL-safe in CPython, but wrap for defensive safety.
         try:
-            requests_dict = dict(getattr(self.plugin_core, "requests", {}))
+            requests_dict = dict(getattr(self.plexus, "requests", {}))
         except RuntimeError:
             return
         try:
@@ -2055,7 +2055,7 @@ class DashboardApp(App):
         # don't install Phase 3a's plugin_states surface fall through to
         # the `?` warn cell rather than crashing on MagicMock `.get()` /
         # `.value` cascades.
-        plugin_states = getattr(self.plugin_core, "plugin_states", None)
+        plugin_states = getattr(self.plexus, "plugin_states", None)
         if not isinstance(plugin_states, dict):
             return ("?", "stat-val-warn")
         ps = plugin_states.get(name)
@@ -2106,7 +2106,7 @@ class DashboardApp(App):
             `pc.get_unloaded_metadata` returns None for non-UNLOADED so
             it can't be used as a fallback here).
 
-        Path resolution mirrors `PluginCore.load_plugin_with_conf`:
+        Path resolution mirrors `Plexus.load_plugin_with_conf`:
         the plugin entry's `path` field is preferred; otherwise
         `{plugin_package}/{plugin_name}`. Errors are swallowed at the
         boundary — callers receive None and render their own placeholder.
@@ -2114,7 +2114,7 @@ class DashboardApp(App):
         try:
             entry = next(
                 (
-                    p for p in (self.plugin_core.yaml_config.get("plugins") or [])
+                    p for p in (self.plexus.yaml_config.get("plugins") or [])
                     if isinstance(p, dict) and p.get("name") == plugin_name
                 ),
                 None,
@@ -2125,7 +2125,7 @@ class DashboardApp(App):
             return None
         try:
             base_path = entry.get("path") or os.path.join(
-                getattr(self.plugin_core, "plugin_package", "plugins"),
+                getattr(self.plexus, "plugin_package", "plugins"),
                 plugin_name,
             )
             cfg_path = os.path.join(os.path.abspath(base_path), "plugin_config.yml")
@@ -2160,7 +2160,7 @@ class DashboardApp(App):
                      `len(plugin._sub_uuids) - declared` (NOT
                      `len(_sub_uuids) > 0` — `_sub_uuids` contains BOTH
                      YAML and runtime sub_uuids per
-                     `PluginCore._register_yaml_subscriptions` /
+                     `Plexus._register_yaml_subscriptions` /
                      `subscribe_event` writing to the same list).
                      Renders `?` when the instance is absent (UNLOADED).
           * Evs    — `len(plugin.events)`. `?` when instance absent.
@@ -2184,7 +2184,7 @@ class DashboardApp(App):
         # a MagicMock attribute, which `dict(...)` would either iterate
         # spuriously or raise. Fall back to {} so the merge with pc.plugins
         # below produces a coherent row list.
-        ps_attr = getattr(self.plugin_core, "plugin_states", None)
+        ps_attr = getattr(self.plexus, "plugin_states", None)
         try:
             states_snapshot = dict(ps_attr) if isinstance(ps_attr, dict) else {}
         except Exception:
@@ -2195,7 +2195,7 @@ class DashboardApp(App):
         # doesn't have a state entry. Treats them as DISABLED-style for
         # the phase column (`_plugin_phase` returns `?` when ps is None).
         try:
-            plugins_attr = getattr(self.plugin_core, "plugins", None)
+            plugins_attr = getattr(self.plexus, "plugins", None)
             if isinstance(plugins_attr, dict):
                 for name in list(plugins_attr):
                     if name not in states_snapshot:
@@ -2209,7 +2209,7 @@ class DashboardApp(App):
             # Live instance (None for UNLOADED / never-loaded / fallback rows).
             plugin = None
             try:
-                plugin = self.plugin_core.plugins.get(name)
+                plugin = self.plexus.plugins.get(name)
             except Exception:
                 plugin = None
 
@@ -2292,11 +2292,11 @@ class DashboardApp(App):
     def _build_config_file_list(self) -> None:
         try:
             self._config_files = {}
-            main_config = os.path.abspath(self.plugin_core.config_path)
+            main_config = os.path.abspath(self.plexus.config_path)
             self._config_files["config.yml (main)"] = main_config
 
-            plugin_package = getattr(self.plugin_core, "plugin_package", "plugins")
-            for entry in self.plugin_core.yaml_config.get("plugins", []):
+            plugin_package = getattr(self.plexus, "plugin_package", "plugins")
+            for entry in self.plexus.yaml_config.get("plugins", []):
                 name = entry.get("name", "")
                 if not name:
                     continue
@@ -2353,7 +2353,7 @@ class DashboardApp(App):
                 self._save_config_on_main(self._current_config_file, content)
             )
             self._config_clean_hash = hashlib.md5(content.encode()).hexdigest()
-            main = os.path.abspath(self.plugin_core.config_path)
+            main = os.path.abspath(self.plexus.config_path)
             if self._current_config_file == main:
                 self._set_status("Saved main config. Restart to apply.")
             else:
@@ -2364,8 +2364,8 @@ class DashboardApp(App):
             self._set_status(f"Error: {e}", error=True)
 
     async def _save_config_on_main(self, path: str, content: str) -> None:
-        """Dispatch config save to PluginCore (thread-safe with backup)."""
-        self.plugin_core.save_config_file(path, content, backup=True)
+        """Dispatch config save to Plexus (thread-safe with backup)."""
+        self.plexus.save_config_file(path, content, backup=True)
 
     def _config_is_dirty(self) -> bool:
         """Check if config editor content differs from last load/save."""
@@ -2390,16 +2390,16 @@ class DashboardApp(App):
     def _populate_settings_info(self) -> None:
         try:
             self.query_one("#info-hostname", Static).update(
-                getattr(self.plugin_core, "hostname", "?") or "?"
+                getattr(self.plexus, "hostname", "?") or "?"
             )
             self.query_one("#info-plugin-package", Static).update(
-                getattr(self.plugin_core, "plugin_package", "?")
+                getattr(self.plexus, "plugin_package", "?")
             )
 
             # Networking group: hide data rows when networking disabled,
             # show disabled placeholder. Single source of truth for the
             # split is `pc.networking_enabled`.
-            net_enabled = getattr(self.plugin_core, "networking_enabled", False)
+            net_enabled = getattr(self.plexus, "networking_enabled", False)
             try:
                 self.query_one("#settings-net-disabled").display = not net_enabled
             except NoMatches:
@@ -2411,10 +2411,10 @@ class DashboardApp(App):
 
             self.query_one("#info-net-enabled", Static).update("Yes" if net_enabled else "No")
             self.query_one("#info-net-port", Static).update(
-                str(getattr(self.plugin_core, "networking_port", "?"))
+                str(getattr(self.plexus, "networking_port", "?"))
             )
-            auto = getattr(self.plugin_core, "networking_auto_discoverable", False)
-            direct = getattr(self.plugin_core, "networking_direct_discoverable", False)
+            auto = getattr(self.plexus, "networking_auto_discoverable", False)
+            direct = getattr(self.plexus, "networking_direct_discoverable", False)
             self.query_one("#info-net-discoverable", Static).update(
                 f"Auto: {'Y' if auto else 'N'} | Direct: {'Y' if direct else 'N'}"
             )
@@ -2428,16 +2428,16 @@ class DashboardApp(App):
                 self._format_peers_display()
             )
 
-            # B-069 runtime intervals — read from PluginCore-level attrs
+            # B-069 runtime intervals — read from Plexus-level attrs
             # which mirror the YAML at boot + on async_load_config_yaml.
             self.query_one("#info-net-heartbeat", Static).update(
-                str(getattr(self.plugin_core, "networking_heartbeat_interval", "?"))
+                str(getattr(self.plexus, "networking_heartbeat_interval", "?"))
             )
             self.query_one("#info-net-lookup", Static).update(
-                str(getattr(self.plugin_core, "networking_lookup_interval", "?"))
+                str(getattr(self.plexus, "networking_lookup_interval", "?"))
             )
             self.query_one("#info-net-liveness", Static).update(
-                str(getattr(self.plugin_core, "networking_liveness_timeout", "?"))
+                str(getattr(self.plexus, "networking_liveness_timeout", "?"))
             )
 
             # Phase 5 additions — identity paths, uptime, secret status,
@@ -2446,7 +2446,7 @@ class DashboardApp(App):
             self._populate_settings_phase5_rows()
 
             # Set log level select to current
-            log_level = self.plugin_core.yaml_config.get("general", {}).get(
+            log_level = self.plexus.yaml_config.get("general", {}).get(
                 "console_log_level", "DEBUG"
             )
             try:
@@ -2466,7 +2466,7 @@ class DashboardApp(App):
         Uptime is tracked via `_tick_networking_uptime` from the stats
         worker — this method just renders the latest value.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         net_enabled = getattr(pc, "networking_enabled", False)
         nm = getattr(pc, "network", None)
 
@@ -2522,7 +2522,7 @@ class DashboardApp(App):
           2. else `os.environ.get("NETWORKING_SECRET")` truthy → `set via env`.
           3. else → `unset`.
         """
-        pc_secret = getattr(self.plugin_core, "networking_secret", None)
+        pc_secret = getattr(self.plexus, "networking_secret", None)
         if pc_secret:
             return "set via config"
         env_secret = os.environ.get("NETWORKING_SECRET")
@@ -2539,7 +2539,7 @@ class DashboardApp(App):
         resets the timestamp to `now` so a hot-reload rebuild does not
         carry the old uptime.
         """
-        nm = getattr(self.plugin_core, "network", None)
+        nm = getattr(self.plexus, "network", None)
         if nm is not None and getattr(nm, "is_ready", False):
             nm_id = id(nm)
             if nm_id != self._networking_instance_id:
@@ -2570,7 +2570,7 @@ class DashboardApp(App):
         NoMatches` because the Networking tab may not be present yet
         during an early on-mount race or partial DOM teardown.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         net_enabled = getattr(pc, "networking_enabled", False)
 
         # Banner vs cards visibility — single switch driven by
@@ -2822,7 +2822,7 @@ class DashboardApp(App):
         summary would say "2/3 alive" while the peers table marked one
         of those rows as "degraded" (yellow). Single semantic now.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         if not getattr(pc, "networking_enabled", False):
             return "Networking OFF"
         nm = getattr(pc, "network", None)
@@ -2949,7 +2949,7 @@ class DashboardApp(App):
         avoids advertising "ready" before identity provisioning has
         finished writing the cert.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         if not getattr(pc, "networking_enabled", False):
             return False
         nm = getattr(pc, "network", None)
@@ -2979,7 +2979,7 @@ class DashboardApp(App):
         + cert-expiry row so they refresh on every tick alongside the
         peers table.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         if not getattr(pc, "networking_enabled", False):
             return
         # Phase 2 — always re-render cluster summary (cheap, derived).
@@ -3130,7 +3130,7 @@ class DashboardApp(App):
         never-heartbeat peers count toward (Y - X). Auto-discovered
         peers not in `nm.peers` are excluded entirely.
         """
-        pc = self.plugin_core
+        pc = self.plexus
         if not getattr(pc, "networking_enabled", False):
             return "OFF"
         nm = getattr(pc, "network", None)
@@ -3263,7 +3263,7 @@ class DashboardApp(App):
 
     # ── Phase 2b helpers — shared by Subs + Catalogue + Live-stream ────
 
-    # Template-var regex defined locally (NOT imported from PluginCore)
+    # Template-var regex defined locally (NOT imported from Plexus)
     # so the TUI plugin doesn't take a hard dependency on framework
     # internals — see plan Section 5.3 cycle 2 M10 fix.
     _TEMPLATE_VAR_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
@@ -3499,12 +3499,12 @@ class DashboardApp(App):
     async def _refresh_subs_browser_worker(self) -> None:
         """Rebuild the Subs browser table from a `list_local_subs` snapshot.
 
-        Runs on the TUI loop via Textual's worker. The PluginCore call
+        Runs on the TUI loop via Textual's worker. The Plexus call
         is async and acquires `topic_registry._lock`, so we bridge via
         `_run_on_main` (it runs on the main loop, where the registry
         lock lives).
         """
-        pc = self.plugin_core
+        pc = self.plexus
         try:
             subs = await self._run_on_main(
                 pc.topic_registry.list_local_subs()
@@ -3667,7 +3667,7 @@ class DashboardApp(App):
         new_value = not current
         try:
             result = await self._run_on_main(
-                self.plugin_core.set_subscription_enabled(sub_uuid, new_value)
+                self.plexus.set_subscription_enabled(sub_uuid, new_value)
             )
         except asyncio.TimeoutError:
             self.notify("Toggle timed out (30s)", severity="warning")
@@ -3833,7 +3833,7 @@ class DashboardApp(App):
         Only enabled plugins are surfaced (matches the dispatch path —
         events on a disabled plugin can never fire anyway).
         """
-        pc = self.plugin_core
+        pc = self.plexus
         try:
             plugins_snapshot = list(pc.plugins.items())
         except RuntimeError:
@@ -3959,7 +3959,7 @@ class DashboardApp(App):
         new_value = not current
         try:
             result = await self._run_on_main(
-                self.plugin_core.set_event_enabled(
+                self.plexus.set_event_enabled(
                     plugin_name, event_id, new_value,
                 )
             )
@@ -4277,7 +4277,7 @@ class DashboardApp(App):
         # Double-push guard — a modal is already up; do nothing.
         if any(isinstance(s, CertPEMScreen) for s in self.screen_stack):
             return
-        nm = getattr(self.plugin_core, "network", None)
+        nm = getattr(self.plexus, "network", None)
         if nm is None:
             self.push_screen(CertPEMScreen(
                 title=title,
@@ -4340,7 +4340,7 @@ class DashboardApp(App):
         - Single app-level 1s timer drives all refreshes; created lazily
           on first open, stopped on last close.
         """
-        if not getattr(self.plugin_core, "networking_enabled", False):
+        if not getattr(self.plexus, "networking_enabled", False):
             return
         # Already open — just switch to it.
         if hostname in self._peer_tabs:
@@ -4613,7 +4613,7 @@ class DashboardApp(App):
 
         # Kick a synchronous render so the operator sees data on first
         # paint instead of waiting up to 1s for the shared timer.
-        pc = self.plugin_core
+        pc = self.plexus
         nm = getattr(pc, "network", None)
         if nm is not None:
             try:
@@ -4717,7 +4717,7 @@ class DashboardApp(App):
             return
         if not self._peer_tabs:
             return
-        pc = self.plugin_core
+        pc = self.plexus
         nm = pc.network  # snapshot ONCE per tick (avoid mid-tick rebuild race)
         if not getattr(pc, "networking_enabled", False) or nm is None:
             for host in list(self._peer_tabs.keys()):
@@ -5004,7 +5004,7 @@ class DashboardApp(App):
 
     def _lookup_peer(self, host: str):
         """Resolve a PeerSpec-like object from `nm.peers` by hostname."""
-        nm = getattr(self.plugin_core, "network", None)
+        nm = getattr(self.plexus, "network", None)
         if nm is None:
             return None
         for peer in getattr(nm, "peers", []) or []:
@@ -5104,7 +5104,7 @@ class DashboardApp(App):
         """
         if any(isinstance(s, CertPEMScreen) for s in self.screen_stack):
             return
-        nm = getattr(self.plugin_core, "network", None)
+        nm = getattr(self.plexus, "network", None)
         if nm is None:
             return
         peer = next((p for p in getattr(nm, "peers", []) or []
@@ -5129,7 +5129,7 @@ class DashboardApp(App):
         Output format: `count (host @ ip:port, host2 @ ip:port, ...)` capped
         at 4 entries; overflow elided as ` +N more`.
         """
-        nm = getattr(self.plugin_core, "network", None)
+        nm = getattr(self.plexus, "network", None)
         if nm is not None:
             peers = list(getattr(nm, "peers", []) or [])
             if not peers:
@@ -5143,7 +5143,7 @@ class DashboardApp(App):
             return f"{count} ({', '.join(entries)}{tail})"
         # NM is None — read raw YAML so peers configured but-not-yet-built
         # still render. Defensive .get() against partial configs.
-        net_cfg = (self.plugin_core.yaml_config or {}).get("networking", {}) or {}
+        net_cfg = (self.plexus.yaml_config or {}).get("networking", {}) or {}
         raw_peers = net_cfg.get("peers", []) or []
         if not raw_peers:
             return "none"
@@ -5178,17 +5178,17 @@ class DashboardApp(App):
         """
         _log = logging.getLogger("TUI.TabBuilder")
         if plugin is None:
-            plugin = self.plugin_core.plugins.get(plugin_name)
+            plugin = self.plexus.plugins.get(plugin_name)
         if not plugin:
             # Phase 3b — UNLOADED / FAILED_LOAD plugins lack a live
-            # instance in `pc.plugins` (per `PluginCore.py:2466-2474`,
+            # instance in `pc.plugins` (per `core.py:2466-2474`,
             # the assignment only runs on the success path). When the
             # plugin still has a `plugin_states` entry, fall through
             # to the generated view with `plugin=None` so the per-plugin
             # Lifecycle / Events / Subs / Logger sections render their
             # "(plugin not loaded)" placeholders. The endpoint loop
             # also tolerates `plugin=None` (defaults to `{}`).
-            plugin_states = getattr(self.plugin_core, "plugin_states", None)
+            plugin_states = getattr(self.plexus, "plugin_states", None)
             if isinstance(plugin_states, dict) and plugin_name in plugin_states:
                 _log.debug(
                     "[%s] plugin instance missing — rendering Phase 3b "
@@ -5564,7 +5564,7 @@ class DashboardApp(App):
 
         self._cleanup_registry_for_plugin(plugin_name)
 
-        plugin_snapshot = self.plugin_core.plugins.get(plugin_name)
+        plugin_snapshot = self.plexus.plugins.get(plugin_name)
         has_custom = self._plugin_has_custom_view(plugin_snapshot)
 
         # Default to custom view when available
@@ -5711,10 +5711,10 @@ class DashboardApp(App):
 
     @work(thread=False)
     async def _reload_main_config(self) -> None:
-        """Reload config.yml into PluginCore (re-applies general settings)."""
+        """Reload config.yml into Plexus (re-applies general settings)."""
         try:
             await self._run_on_main(
-                self.plugin_core.async_load_config_yaml(self.plugin_core.config_path)
+                self.plexus.async_load_config_yaml(self.plexus.config_path)
             )
             self._set_status("Main config reloaded. General settings applied.")
             # Refresh settings display and config file list
@@ -5917,7 +5917,7 @@ class DashboardApp(App):
         self._cleanup_registry_for_plugin(
             plugin_name, exclude_types=self._VIEW_MODE_TYPES,
         )
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         content = self._build_plugin_tab_content(
             plugin_name, plugin, force_mode=new_mode,
             has_bar=True,
@@ -6025,7 +6025,7 @@ class DashboardApp(App):
             # instance (plan Section 4.4 cycle-1 LOW fix #6: no lock
             # needed; GIL-safe; faster than `_run_on_main` bridge).
             plugin_name = entry.get("plugin", "")
-            target = self.plugin_core.plugins.get(plugin_name)
+            target = self.plexus.plugins.get(plugin_name)
             if target is not None:
                 try:
                     target.verbose_notifier = bool(event.value)
@@ -6125,13 +6125,13 @@ class DashboardApp(App):
 
         try:
             if action == "enable":
-                await self._run_on_main(self.plugin_core.enable_plugin(plugin_name))
+                await self._run_on_main(self.plexus.enable_plugin(plugin_name))
             elif action == "disable":
-                await self._run_on_main(self.plugin_core.disable_plugin(plugin_name))
+                await self._run_on_main(self.plexus.disable_plugin(plugin_name))
             elif action == "reload":
-                await self._run_on_main(self.plugin_core._reload_plugin(plugin_name))
+                await self._run_on_main(self.plexus._reload_plugin(plugin_name))
             elif action == "remove":
-                await self._run_on_main(self.plugin_core.pop_plugin(plugin_name))
+                await self._run_on_main(self.plexus.pop_plugin(plugin_name))
             elif action == "open_tab":
                 await self.open_plugin_tab(plugin_name)
                 return
@@ -6194,12 +6194,12 @@ class DashboardApp(App):
         # standard dict.
         plugin = None
         try:
-            plugin = self.plugin_core.plugins.get(plugin_name)
+            plugin = self.plexus.plugins.get(plugin_name)
         except Exception:
             plugin = None
         ps = None
         try:
-            states = getattr(self.plugin_core, "plugin_states", None) or {}
+            states = getattr(self.plexus, "plugin_states", None) or {}
             ps = states.get(plugin_name) if hasattr(states, "get") else None
         except Exception:
             ps = None
@@ -6739,7 +6739,7 @@ class DashboardApp(App):
 
         # Runtime subs worker — skip for plugins without a live instance
         # (UNLOADED/FAILED_LOAD have no plugin_uuid to filter by).
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         if plugin is None:
             return
         plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
@@ -6758,7 +6758,7 @@ class DashboardApp(App):
         ready ✓/✗, verbose_notifier Switch, version.
 
         For UNLOADED / FAILED_LOAD plugins (plugin is None per the
-        framework — `PluginCore.py:2466-2474` only assigns to
+        framework — `core.py:2466-2474` only assigns to
         `pc.plugins` on the success path), the strip renders best-effort
         cells: phase + version from state/on-disk-cfg fallback,
         readiness/uuid cells render `?`, no Copy / Switch widgets.
@@ -7139,11 +7139,11 @@ class DashboardApp(App):
         plugin_uuid): render placeholder without Add row — per plan
         Section 4.7 edge case + plan-cycle 2 resolution (option A:
         treat both states identically since `pc.plugins.get(name)` is
-        None for both per `PluginCore.py:2466-2474`).
+        None for both per `core.py:2466-2474`).
 
         `pc.list_logger_levels()`, `set_logger_level`, `clear_logger_level`
         are sync (per plan Section 4.7 cycle-2 fix referencing
-        `PluginCore.py:1737-1763`). Direct-call from the handler is
+        `core.py:1737-1763`). Direct-call from the handler is
         correct — wrapping in `_run_on_main` would raise TypeError
         ("a coroutine was expected") because run_coroutine_threadsafe
         expects a coroutine.
@@ -7292,14 +7292,14 @@ class DashboardApp(App):
             overrides_list = self.query_one(f"#{list_id}", Vertical)
         except NoMatches:
             return
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         if plugin is None:
             return
         plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
         if not plugin_uuid:
             return
         try:
-            snapshot = self.plugin_core.list_logger_levels()
+            snapshot = self.plexus.list_logger_levels()
         except Exception:
             snapshot = {}
         if not isinstance(snapshot, dict):
@@ -7434,7 +7434,7 @@ class DashboardApp(App):
         # topic_registry._lock on the main loop.
         try:
             subs = await self._run_on_main(
-                self.plugin_core.topic_registry.list_local_subs()
+                self.plexus.topic_registry.list_local_subs()
             )
         except Exception:
             subs = None
@@ -7626,14 +7626,14 @@ class DashboardApp(App):
         if console_arg is None and file_arg is None:
             self.notify("Pick at least one level", severity="warning")
             return
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         if plugin is None:
             return
         plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
         if not plugin_uuid:
             return
         try:
-            self.plugin_core.set_logger_level(
+            self.plexus.set_logger_level(
                 prefix,
                 console=console_arg,
                 file=file_arg,
@@ -7652,14 +7652,14 @@ class DashboardApp(App):
     ) -> None:
         """Per-row Clear handler. Sync call wrapped in try/except per
         plan-cycle 2 review fix."""
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         if plugin is None:
             return
         plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")
         if not plugin_uuid:
             return
         try:
-            self.plugin_core.clear_logger_level(
+            self.plexus.clear_logger_level(
                 prefix, console=True, file=True,
                 plugin_name=plugin_name, plugin_uuid=plugin_uuid,
             )
@@ -7680,7 +7680,7 @@ class DashboardApp(App):
         """Copy the plugin's plugin_uuid to the OS clipboard via the
         Textual App's `copy_to_clipboard` (terminal OSC52 escape;
         plan Section 4.4 + test #20 require this)."""
-        plugin = self.plugin_core.plugins.get(plugin_name)
+        plugin = self.plexus.plugins.get(plugin_name)
         if plugin is None:
             return
         plugin_uuid = str(getattr(plugin, "plugin_uuid", "") or "")

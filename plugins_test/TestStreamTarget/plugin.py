@@ -7,8 +7,8 @@ import asyncio
 import time
 from typing import Any
 
-from utils import Plugin
-from decorators import (
+from plexus.utils import Plugin
+from plexus.decorators import (
     async_gen_log_errors,
     async_log_errors,
     gen_log_errors,

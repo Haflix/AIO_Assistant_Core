@@ -1,7 +1,7 @@
 """
 Lightweight request statistics tracker.
 
-Polls PluginCore.requests periodically, diffs against previous snapshot,
+Polls Plexus.requests periodically, diffs against previous snapshot,
 and accumulates throughput, latency, error rate, and per-plugin stats.
 """
 

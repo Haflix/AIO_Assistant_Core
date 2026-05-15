@@ -13,7 +13,7 @@ Categories:
 
 Bus topics use the framework-internal ``_core/test/bus/...`` prefix —
 ``_internal_emit`` does not call any topic validator (direct dict
-lookup at PluginCore.py:885), so the leading-underscore is safe. The
+lookup at core.py:885), so the leading-underscore is safe. The
 per-case YAML subscription (``bus_stream_sub`` → ``handle_bus_stream``)
 uses a plain ``tibs/stream`` topic since the events/subscriptions path
 DOES go through the validator and must be forward-compatible with
@@ -29,14 +29,14 @@ import logging  # noqa: E402
 import uuid as _uuid  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin, Event  # noqa: E402
-from decorators import async_gen_log_errors, async_log_errors, log_errors  # noqa: E402
+from plexus.utils import Plugin, Event  # noqa: E402
+from plexus.decorators import async_gen_log_errors, async_log_errors, log_errors  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 # Module-level ContextVar imported so cases 9/10 can read depth from
-# inside / outside an emit. Owned by PluginCore — read-only in tests.
-from PluginCore import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
+# inside / outside an emit. Owned by Plexus — read-only in tests.
+from plexus.core import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 
 
 SUITE_VERSION = "0.1.0"
@@ -99,7 +99,7 @@ class TestInternalEventBusSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestInternalEventBusSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestInternalEventBusSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -137,7 +137,7 @@ class TestInternalEventBusSuite(Plugin):
 
             self.internal_observe(topic, cb)
             try:
-                self._plugin_core._internal_emit(topic, x=1, y="z")
+                self._plexus._internal_emit(topic, x=1, y="z")
                 c.expect(log, [(topic, {"x": 1, "y": "z"})])
             finally:
                 self.internal_unobserve(topic, cb)
@@ -152,15 +152,15 @@ class TestInternalEventBusSuite(Plugin):
             self.internal_observe(topic, cb)
             self.internal_observe(topic, cb)  # second call must be no-op
             try:
-                self._plugin_core._internal_emit(topic, n=1)
+                self._plexus._internal_emit(topic, n=1)
                 # Single dispatch despite double-register
                 c.expect(len(log), 1)
                 # Owner set should have a single (topic, cb) pair
-                owners = self._plugin_core._observer_owners.get(self.plugin_uuid, set())
+                owners = self._plexus._observer_owners.get(self.plugin_uuid, set())
                 pair_count = sum(1 for t, _ in owners if t == topic)
                 c.expect(pair_count, 1)
                 # Per-topic listener list should also be deduplicated
-                listeners = self._plugin_core._internal_observers.get(topic, [])
+                listeners = self._plexus._internal_observers.get(topic, [])
                 c.expect(len(listeners), 1)
             finally:
                 self.internal_unobserve(topic, cb)
@@ -190,7 +190,7 @@ class TestInternalEventBusSuite(Plugin):
             self.internal_observe(topic, cb)
             removed = self.internal_unobserve(topic, cb)
             c.expect(removed, True)
-            self._plugin_core._internal_emit(topic, n=1)
+            self._plexus._internal_emit(topic, n=1)
             c.expect(log, [])
 
         async def body_during_emit(c):
@@ -203,19 +203,19 @@ class TestInternalEventBusSuite(Plugin):
 
             def cb_a(t, p):
                 log_a.append((t, p))
-                # Mid-emit: unobserve B. Snapshot taken at PluginCore.py:897
+                # Mid-emit: unobserve B. Snapshot taken at core.py:897
                 # means B still fires THIS emit, but NOT the next one.
                 self.internal_unobserve(topic, cb_b)
 
             self.internal_observe(topic, cb_a)
             self.internal_observe(topic, cb_b)
             try:
-                self._plugin_core._internal_emit(topic, n=1)
+                self._plexus._internal_emit(topic, n=1)
                 # Snapshot semantics: A fires (and unregisters B), B fires THIS emit
                 c.expect(len(log_a), 1)
                 c.expect(len(log_b), 1)
                 # Next emit: B was unobserved, only A fires
-                self._plugin_core._internal_emit(topic, n=2)
+                self._plexus._internal_emit(topic, n=2)
                 c.expect(len(log_a), 2)
                 c.expect(len(log_b), 1)
             finally:
@@ -266,11 +266,11 @@ class TestInternalEventBusSuite(Plugin):
             topic = "_core/test/bus/fast_path/no_observer"
             # Should be a no-op: no observers registered for topic.
             # Just confirm no exception raised, no side effects.
-            self._plugin_core._internal_emit(topic, x=1)
-            self._plugin_core._internal_emit(topic, x=2)
-            self._plugin_core._internal_emit(topic, x=3)
+            self._plexus._internal_emit(topic, x=1)
+            self._plexus._internal_emit(topic, x=2)
+            self._plexus._internal_emit(topic, x=3)
             # Topic should not be added to _internal_observers as a side effect
-            c.expect(topic in self._plugin_core._internal_observers, False)
+            c.expect(topic in self._plexus._internal_observers, False)
 
         await rec.run_case(
             "bus.fast_path.no_observer", body,
@@ -295,13 +295,13 @@ class TestInternalEventBusSuite(Plugin):
 
             cap = _LogCapture()
             cap.setLevel(logging.ERROR)
-            pc_logger = self._plugin_core._logger
+            pc_logger = self._plexus._logger
             try:
                 pc_logger.addHandler(cap)
                 self.internal_observe(topic, cb_a)
                 self.internal_observe(topic, cb_b)
                 # A raises, B still fires — exception swallowed per docstring.
-                self._plugin_core._internal_emit(topic, n=1)
+                self._plexus._internal_emit(topic, n=1)
                 c.expect(len(log_b), 1)
                 # Verify the framework logged the swallowed exception.
                 matches = [
@@ -338,7 +338,7 @@ class TestInternalEventBusSuite(Plugin):
             self.internal_observe(topic, cb)
             try:
                 for i in range(1000):
-                    self._plugin_core._internal_emit(topic, i=i)
+                    self._plexus._internal_emit(topic, i=i)
                 c.expect(counter[0], 1000)
             finally:
                 self.internal_unobserve(topic, cb)
@@ -363,15 +363,15 @@ class TestInternalEventBusSuite(Plugin):
                 # Re-emit same topic. Each level increments depth via
                 # set(depth+1); when depth reaches _MAX_EMIT_DEPTH (5)
                 # the next emit aborts at the guard check.
-                self._plugin_core._internal_emit(t, n=counter[0])
+                self._plexus._internal_emit(t, n=counter[0])
 
             cap = _LogCapture()
             cap.setLevel(logging.WARNING)
-            pc_logger = self._plugin_core._logger
+            pc_logger = self._plexus._logger
             try:
                 pc_logger.addHandler(cap)
                 self.internal_observe(topic, cb)
-                self._plugin_core._internal_emit(topic, n=0)
+                self._plexus._internal_emit(topic, n=0)
                 # _MAX_EMIT_DEPTH nested observer invocations (depths
                 # 1.._MAX_EMIT_DEPTH); the deepest observer's re-emit
                 # attempt sees depth==_MAX_EMIT_DEPTH and is rejected
@@ -402,13 +402,13 @@ class TestInternalEventBusSuite(Plugin):
                 # Nested emit on a different topic. Inner observer
                 # sees depth==2; after inner emit returns control,
                 # outer's depth is back to its original value.
-                self._plugin_core._internal_emit(topic_inner, kind="inner")
+                self._plexus._internal_emit(topic_inner, kind="inner")
 
             self.internal_observe(topic_outer, cb_outer)
             self.internal_observe(topic_inner, cb_inner)
             try:
                 pre = _EMIT_DEPTH.get()
-                self._plugin_core._internal_emit(topic_outer, kind="outer")
+                self._plexus._internal_emit(topic_outer, kind="outer")
                 post = _EMIT_DEPTH.get()
                 # Inside outer observer: depth == 1
                 c.expect(depths_seen["outer"], 1)
@@ -436,7 +436,7 @@ class TestInternalEventBusSuite(Plugin):
     async def _bus_cleanup(self, rec: CaseRecorder, kw: Dict) -> None:
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             fake_uuid = f"_test_fake_uuid_{_uuid.uuid4().hex}"
             topics = [
                 "_core/test/bus/cleanup/topic_a",
@@ -487,7 +487,7 @@ class TestInternalEventBusSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _eviction(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def _wait_for_eviction(pre: int, max_settle_s: float = 1.0) -> int:
             """Poll-loop: wait until ``len(pc.requests)`` returns to ``pre``,
@@ -508,7 +508,7 @@ class TestInternalEventBusSuite(Plugin):
             pre = len(pc.requests)
             r = await self.execute(EXEC_TARGET, "ea_add", (2, 3))
             c.expect(r, 5)
-            # execute()'s own consumer-side finally pops at PluginCore.py:4418
+            # execute()'s own consumer-side finally pops at core.py:4418
             # before await returns; no settle needed.
             post = len(pc.requests)
             if post != pre:

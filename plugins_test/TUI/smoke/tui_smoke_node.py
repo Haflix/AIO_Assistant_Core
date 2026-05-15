@@ -1,6 +1,6 @@
-"""TUI-enabled PluginCore subprocess for the two-TUI smoke harness.
+"""TUI-enabled Plexus subprocess for the two-TUI smoke harness.
 
-Boots a PluginCore + dashboard TUI in its own console window. Spawned
+Boots a Plexus + dashboard TUI in its own console window. Spawned
 by `tui_smoke_pair.py` so each side of the pair has a live, interactive
 dashboard (rather than one TUI + one headless peer).
 
@@ -24,7 +24,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from PluginCore import PluginCore  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
 
 
 async def main() -> None:
@@ -39,7 +39,7 @@ async def main() -> None:
     ap.add_argument("--peer-ip", default="127.0.0.1")
     args = ap.parse_args()
 
-    pc = PluginCore(args.config)
+    pc = Plexus(args.config)
 
     # `_shutdown_event` must exist BEFORE wait_until_ready so the TUI
     # plugin's _run_tui_thread can pick it up via hasattr at TUI thread

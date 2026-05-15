@@ -4,7 +4,7 @@
 
 A Python async plugin framework for personal-assistant projects.
 
-`PluginCore` loads small, single-responsibility Python classes — *plugins* — from
+`Plexus` loads small, single-responsibility Python classes — *plugins* — from
 disk, drives a deterministic `on_load` / `on_enable` / `on_disable` lifecycle,
 and gives them three ways to talk to each other:
 
@@ -78,8 +78,8 @@ cross-plugin call, and a topic-subscribed endpoint.
 ### `copypasta/AveragePlugin/plugin.py` (excerpt)
 
 ```python
-from utils import Plugin
-from decorators import (
+from plexus.utils import Plugin
+from plexus.decorators import (
     log_errors, async_log_errors,
     async_handle_errors, async_gen_log_errors,
 )
@@ -183,7 +183,7 @@ Then launch:
 python main_application.py
 ```
 
-`PluginCore` will load and enable AveragePlugin. From any other plugin you
+`Plexus` will load and enable AveragePlugin. From any other plugin you
 can now call:
 
 ```python
@@ -229,7 +229,7 @@ more endpoints, more events, more subscriptions.
 ## Status
 
 Active development. Public API of the `Plugin` base class is stable;
-internal `PluginCore` helpers (`_*` prefix) are not. See the wire-protocol
+internal `Plexus` helpers (`_*` prefix) are not. See the wire-protocol
 table in [docs/networking.md](docs/networking.md) for cross-version
 compatibility.
 

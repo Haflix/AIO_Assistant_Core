@@ -2,8 +2,8 @@
 TUIDemoPub. Adds rows to the Subscriptions panel so that pane is not
 empty in single-node smoke testing."""
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TUIDemoSub(Plugin):

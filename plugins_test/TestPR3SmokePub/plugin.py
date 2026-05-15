@@ -6,7 +6,7 @@ that expects a return value from the remote subscriber.
 """
 
 import asyncio
-from utils import Plugin
+from plexus.utils import Plugin
 
 
 class TestPR3SmokePub(Plugin):

@@ -6,8 +6,8 @@ periodic refresh tick (the `_core/plugin/state_changed` bus
 subscription drives the immediate update).
 """
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TUIDemoSpare(Plugin):

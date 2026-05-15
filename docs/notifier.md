@@ -90,7 +90,7 @@ owner's `plugin_name` (`notifier.py:237`,
 `effective_target_plugin = target_plugin or plugin_name`).
 
 Subscriptions are registered with the topic registry BEFORE `on_enable`
-runs, by `_register_yaml_subscriptions` (`PluginCore.py:2108-2145`).
+runs, by `_register_yaml_subscriptions` (`core.py:2108-2145`).
 Subscriptions added at runtime via `await self.subscribe(...)` follow
 the YAML registrations in insertion order.
 
@@ -103,7 +103,7 @@ Two kinds of placeholders are supported in event and subscription topics.
 ### Load-time placeholders (resolved when the YAML is parsed)
 
 Resolved once, when the plugin loads, by `_resolve_load_time_template`
-(`PluginCore.py:155-186`):
+(`core.py:155-186`):
 
 | Placeholder | Substituted with |
 |---|---|
@@ -154,7 +154,7 @@ Runtime placeholders only make sense on the publish side — the
 publisher knows what value to fill in. On the subscribe side, `{var}`
 cannot be resolved at load time and would never match anything at
 dispatch time. The subscription validator
-(`PluginCore.py:247-263`, `_validate_subscription_topic`) rejects them.
+(`core.py:247-263`, `_validate_subscription_topic`) rejects them.
 A subscriber that wants to handle every user uses a wildcard:
 
 ```yaml
@@ -230,7 +230,7 @@ cleanly.
 
 ### 1. Publisher hosts gate
 
-`_publisher_targets_local` (`PluginCore.py:3737-3784`) decides whether
+`_publisher_targets_local` (`core.py:3737-3784`) decides whether
 this publish should target local subs at all. The publisher's effective
 `hosts` and `blocked_hosts` (manifest, optionally overridden per-call)
 gate this. Default `hosts="local"` if the publisher omits it. `"any"`,
@@ -239,21 +239,21 @@ those accepts. `blocked_hosts` excludes.
 
 ### 2. Sub-level local accept
 
-`_sub_accepts_local` (`PluginCore.py:3786-3814`). Whether the
+`_sub_accepts_local` (`core.py:3786-3814`). Whether the
 subscriber wants local events. The sub's `hosts` must accept `"local"`,
 own hostname, or `"any"`; the sub's `blocked_hosts` must not block
 them. Default sub `hosts="any"` accepts everything.
 
 ### 3. Sub-level remote-publisher accept
 
-`_sub_accepts_remote_publisher` (`PluginCore.py:3816-3871`). For
+`_sub_accepts_remote_publisher` (`core.py:3816-3871`). For
 inbound peer publishes only. A sub with `hosts="local"` rejects remote
 publishers. Otherwise the sub's `hosts` / `blocked_hosts` are checked
 against the remote publisher's `author_host`.
 
 ### 4. Author filter
 
-`_sub_accepts_author` (`PluginCore.py:3873-3906`). `authors` is a
+`_sub_accepts_author` (`core.py:3873-3906`). `authors` is a
 whitelist; `blocked_authors` is a blacklist. The publisher's
 `plugin_name` is checked against both.
 
@@ -343,7 +343,7 @@ endpoints are usually one or the other.
 
 Use YAML when the subscription set is static — known at plugin load
 time. The framework registers YAML subs before `on_enable` runs
-(`PluginCore.py:2108-2145`), so the subscription is live from the
+(`core.py:2108-2145`), so the subscription is live from the
 moment the plugin enables.
 
 Use `await self.subscribe(...)` (`utils.py:1495-1530`) when the
@@ -421,7 +421,7 @@ runs each kind on a different executor:
   (`_plugin_executor`). The two pools do not contend, so a slow sync
   subscriber cannot starve sync `execute()` calls.
 - Shutdown happens AFTER the 30 s in-flight drain in
-  `PluginCore.close()`, with a 30 s budget; falls back to `wait=False`
+  `Plexus.close()`, with a 30 s budget; falls back to `wait=False`
   on timeout.
 
 ---

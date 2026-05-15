@@ -22,7 +22,7 @@ the custom TUI and the auto-generated endpoint view. No plugin code needed.
 The plugin returns a dict pointing to its TUI package. The Dashboard imports it
 via importlib, registering the package properly so internal relative imports work.
 
-This approach exists because PluginCore loads plugins as standalone modules without
+This approach exists because Plexus loads plugins as standalone modules without
 `__package__`, which breaks relative imports inside plugin subpackages. The Dashboard
 works around this by registering the TUI module in `sys.modules` as `_tui_{PluginName}`.
 
@@ -170,4 +170,4 @@ can be closed via the "Close Tab" button within it.
 - The tab is destroyed and recreated each time it's opened (no persistent state between opens)
 - Menu dict is read once at tab creation — to update values, close and reopen the tab
 - Widget CSS should not conflict with Dashboard CSS classes
-- `get_tui_widget()` is **not supported** — PluginCore loads plugins without `__package__`, breaking relative imports. Use `get_tui_module_info()` instead
+- `get_tui_widget()` is **not supported** — Plexus loads plugins without `__package__`, breaking relative imports. Use `get_tui_module_info()` instead

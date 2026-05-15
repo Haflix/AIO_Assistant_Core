@@ -64,7 +64,7 @@ def _make_mock_data_table():
     w.add_columns = MagicMock()
     return w
 
-def _make_mock_plugin_core(plugins=None, yaml_config=None):
+def _make_mock_plexus(plugins=None, yaml_config=None):
     pc = MagicMock()
     pc.plugins = plugins or {}
     pc.yaml_config = yaml_config or {"plugins": [], "general": {}, "networking": {}}
@@ -108,11 +108,11 @@ def _make_mock_plugin(
         p.get_tui_menu.return_value = tui_menu_return
     return p
 
-def _make_dashboard_app(plugin_core=None):
+def _make_dashboard_app(plexus=None):
     from plugins_test.TUI.app import DashboardApp
     import collections as _c
     app = object.__new__(DashboardApp)
-    app.plugin_core = plugin_core or _make_mock_plugin_core()
+    app.plexus = plexus or _make_mock_plexus()
     app.plugin_instance = MagicMock(plugin_name="TUI")
     app.log_handler = TUILogHandler()
     app._start_time = 1000000.0
@@ -549,7 +549,7 @@ class TestPluginViewGeneration:
 
     def test_not_found(self):
         app = _make_dashboard_app()
-        app.plugin_core.plugins = {}
+        app.plexus.plugins = {}
         widgets = app._build_plugin_tab_content("Nope")
         assert len(widgets) == 1
 
@@ -559,7 +559,7 @@ class TestPluginViewGeneration:
             {"title": "Info", "type": "info", "items": ["hello"]},
         ]}
         plugin = _make_mock_plugin(has_tui_menu=True, tui_menu_return=menu)
-        app.plugin_core.plugins = {"P": plugin}
+        app.plexus.plugins = {"P": plugin}
         result = app._build_plugin_tab_content("P")
         # Should return rendered menu widgets, not auto-generated
         assert len(result) > 0
@@ -638,7 +638,7 @@ async def test_compose_all_tabs(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static, TabbedContent, DataTable, TextArea
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -672,7 +672,7 @@ async def test_tab_switching(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -688,7 +688,7 @@ async def test_keyboard_shortcuts(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import TabbedContent
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
@@ -706,7 +706,7 @@ async def test_plugin_table_populates(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import DataTable
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -719,7 +719,7 @@ async def test_log_handler_attaches(mock_pc):
     from plugins_test.TUI.app import DashboardApp
 
     handler = TUILogHandler()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=handler)
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         assert handler._widget is not None
@@ -732,7 +732,7 @@ async def test_log_table_columns(mock_pc):
     from textual.widgets import DataTable
 
     handler = TUILogHandler()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=handler)
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         table = app.query_one("#log-table", DataTable)
@@ -750,7 +750,7 @@ async def test_settings_networking_disabled_shows_placeholder(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -782,7 +782,7 @@ async def test_settings_networking_enabled_shows_peers(mock_pc):
         },
     }
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -810,7 +810,7 @@ async def test_settings_peers_label_renamed(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -835,7 +835,7 @@ async def test_networking_tab_disabled_shows_banner(mock_pc):
     from plugins_test.TUI.app import DashboardApp
     from textual.widgets import Static
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -911,7 +911,7 @@ async def test_networking_tab_enabled_with_nm_populates_thisnode(mock_pc, tmp_pa
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -976,7 +976,7 @@ async def test_networking_tab_bootstrap_helper_visible_when_peers_empty(mock_pc,
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -992,7 +992,7 @@ async def test_phase1_home_network_section_removed(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1014,7 +1014,7 @@ async def test_phase1_reload_button_removed(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1042,7 +1042,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
     # Case 1: networking OFF
     mock_pc.networking_enabled = False
     mock_pc.network = None
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1053,7 +1053,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
     # Case 2: networking ON but NM is None
     mock_pc.networking_enabled = True
     mock_pc.network = None
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1089,7 +1089,7 @@ async def test_phase1_net_stat_card_states(mock_pc):
 
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1118,7 +1118,7 @@ async def test_settings_peers_display_overflow_elided(mock_pc):
         },
     }
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(120, 40)) as pilot:
         await pilot.pause()
@@ -1275,7 +1275,7 @@ async def test_phase2_cluster_summary_renders(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1317,7 +1317,7 @@ async def test_phase2_counter_card_and_clear_button(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None  # peers worker still runs, counters still updated
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+    app = DashboardApp(plexus=mock_pc, plugin_instance=plugin,
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1344,7 +1344,7 @@ async def test_phase2_event_log_writes_colored_lines(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1427,7 +1427,7 @@ async def test_phase2_cert_expiry_row_renders(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -1504,7 +1504,7 @@ async def test_phase4a_drill_down_opens_on_row_select(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1534,7 +1534,7 @@ async def test_phase4a_drill_down_cap_evicts_oldest(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1567,7 +1567,7 @@ async def test_phase4a_drill_down_sparkline_data_grows(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1608,7 +1608,7 @@ async def test_phase4a_drill_down_closes_when_networking_disabled(mock_pc, tmp_p
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1668,7 +1668,7 @@ async def test_phase4b_subs_tables_populate_from_advert_state(mock_pc, tmp_path)
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -1704,7 +1704,7 @@ async def test_phase4b_inflight_count_renders(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -1753,7 +1753,7 @@ async def test_phase4b_per_peer_log_filters_to_host(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+    app = DashboardApp(plexus=mock_pc, plugin_instance=plugin,
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -1832,7 +1832,7 @@ async def test_phase4b_baseline_dedup_skips_hydrated_events(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=plugin,
+    app = DashboardApp(plexus=mock_pc, plugin_instance=plugin,
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -1907,7 +1907,7 @@ async def test_phase5_settings_identity_rows_populate(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -1952,7 +1952,7 @@ async def test_phase5_settings_uptime_counts_on_is_ready(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = nm1
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2001,7 +2001,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
     mock_pc.networking_secret = b"from-config"
     monkeypatch.setenv("NETWORKING_SECRET", "from-env")
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2012,7 +2012,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
 
     # Case 2: env-set when config is empty.
     mock_pc.networking_secret = None
-    app2 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app2 = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app2.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2024,7 +2024,7 @@ async def test_phase5_settings_secret_status_three_paths(mock_pc, monkeypatch):
     # Case 3: unset.
     monkeypatch.delenv("NETWORKING_SECRET", raising=False)
     mock_pc.networking_secret = None
-    app3 = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app3 = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app3.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2043,7 +2043,7 @@ async def test_phase5_settings_rebuild_indicator_toggles(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2101,7 +2101,7 @@ async def test_phase5_settings_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2129,7 +2129,7 @@ async def test_phase4c_copy_fingerprint_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2153,7 +2153,7 @@ async def test_phase4c_copy_pem_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2197,7 +2197,7 @@ async def test_phase4c_jump_to_config_finds_hostname_line(mock_pc, tmp_path):
                            "networking": {"enabled": True}}
     mock_pc.plugin_package = "plugins_test"
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(180, 60)) as pilot:
         await pilot.pause()
@@ -2231,7 +2231,7 @@ async def test_phase4a_drill_down_gone_title_on_disconnect(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2269,7 +2269,7 @@ async def test_phase4a_drill_down_view_cert_opens_peer_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = nm
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(160, 60)) as pilot:
         await pilot.pause()
@@ -2317,7 +2317,7 @@ async def test_phase3_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2368,7 +2368,7 @@ async def test_phase3_close_button_dismisses(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2412,7 +2412,7 @@ async def test_phase3_double_push_guard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2453,7 +2453,7 @@ async def test_phase3_bootstrap_view_cert_button_opens_modal(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2496,7 +2496,7 @@ async def test_phase3_modal_copy_button_invokes_clipboard(mock_pc, tmp_path):
     mock_pc.networking_enabled = True
     mock_pc.network = FakeNM()
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2520,7 +2520,7 @@ async def test_phase3_view_cert_when_nm_is_none(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2542,7 +2542,7 @@ async def test_phase2_disable_hides_all_new_cards(mock_pc):
     mock_pc.networking_enabled = True
     mock_pc.network = None
 
-    app = DashboardApp(plugin_core=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
+    app = DashboardApp(plexus=mock_pc, plugin_instance=MagicMock(plugin_name="TUI"),
                        log_handler=TUILogHandler())
     async with app.run_test(headless=True, size=(140, 50)) as pilot:
         await pilot.pause()
@@ -2674,7 +2674,7 @@ async def test_phase2b_events_tab_renders(mock_pc):
 
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2730,7 +2730,7 @@ async def test_phase2b_subs_browser_populates_from_registry(mock_pc):
     _install_phase2b_pc(mock_pc, subs=subs)
 
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2773,7 +2773,7 @@ async def test_phase2b_subs_browser_filter_by_plugin(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2817,7 +2817,7 @@ async def test_phase2b_subs_browser_filter_by_topic_substring(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2859,7 +2859,7 @@ async def test_phase2b_subs_browser_filter_by_hostname(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2895,7 +2895,7 @@ async def test_phase2b_subs_browser_filter_by_sub_uuid_substring(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2932,7 +2932,7 @@ async def test_phase2b_subs_browser_enabled_only(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -2965,7 +2965,7 @@ async def test_phase2b_subs_browser_counter_updates(mock_pc):
     ]
     _install_phase2b_pc(mock_pc, subs=subs)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3001,7 +3001,7 @@ async def test_phase2b_subs_toggle_via_e_key(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub])
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3034,7 +3034,7 @@ async def test_phase2b_subs_copy_uuid_via_c_key(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub])
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3064,7 +3064,7 @@ async def test_phase2b_subs_detail_modal_opens_on_enter(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub])
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3102,7 +3102,7 @@ async def test_phase2b_subs_toggle_on_popped_plugin_uuid(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=False)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3148,7 +3148,7 @@ async def test_phase2b_events_catalogue_populates(mock_pc):
         },
     )
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3201,7 +3201,7 @@ async def test_phase2b_events_catalogue_toggle_via_e_key(mock_pc):
         },
     )
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3248,7 +3248,7 @@ async def test_phase2b_events_catalogue_idempotent_toggle(mock_pc):
         },
     )
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3401,7 +3401,7 @@ async def test_phase2b_live_stream_filter_topic(mock_pc):
     # expected `(list, int)` tuple — MagicMock returns a MagicMock
     # which trips the flush's defensive `except Exception: return`.
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_real_plugin(),
         log_handler=TUILogHandler(),
     )
@@ -3452,7 +3452,7 @@ async def test_phase2b_live_stream_filter_type_checkboxes(mock_pc):
 
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_real_plugin(),
         log_handler=TUILogHandler(),
     )
@@ -3505,7 +3505,7 @@ async def test_phase2b_live_stream_filter_debounce(mock_pc):
 
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_real_plugin(),
         log_handler=TUILogHandler(),
     )
@@ -3552,7 +3552,7 @@ async def test_phase2b_live_stream_clear_button(mock_pc):
     plugin = _make_phase2b_real_plugin()
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=plugin,
         log_handler=TUILogHandler(),
     )
@@ -3594,7 +3594,7 @@ async def test_phase2b_live_visible_gates_flush(mock_pc):
     plugin = _make_phase2b_real_plugin()
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=plugin,
         log_handler=TUILogHandler(),
     )
@@ -3622,7 +3622,7 @@ async def test_phase2b_live_visible_catchup_flush_on_reenter(mock_pc):
     plugin = _make_phase2b_real_plugin()
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=plugin,
         log_handler=TUILogHandler(),
     )
@@ -3734,7 +3734,7 @@ async def test_phase2b_observer_cleanup_on_disable():
     """
     from plugins_test.TUI.plugin import TUI
 
-    # Synthetic plugin_core stub that mirrors `internal_observe`
+    # Synthetic plexus stub that mirrors `internal_observe`
     # / `internal_unobserve` semantics on a plain dict so we can
     # inspect. Also satisfies the surface `on_disable` reaches into
     # (log handler removal happens against root logger; the TUI
@@ -3756,7 +3756,7 @@ async def test_phase2b_observer_cleanup_on_disable():
 
     plugin = TUI.__new__(TUI)
     plugin._logger = MagicMock()
-    plugin._plugin_core = StubPC()
+    plugin._plexus = StubPC()
     plugin.plugin_uuid = "tui-uuid"
     plugin.on_load()
     # Mirror the registration loop from `on_enable` — observer pairs
@@ -3774,7 +3774,7 @@ async def test_phase2b_observer_cleanup_on_disable():
         ("_core/event/state_changed", plugin._on_bus_event),
     ]
     for topic, cb in plugin._observed_topics:
-        plugin._plugin_core.internal_observe(
+        plugin._plexus.internal_observe(
             plugin.plugin_uuid, topic, cb,
         )
 
@@ -3788,7 +3788,7 @@ async def test_phase2b_observer_cleanup_on_disable():
         "_core/event/state_changed",
     }
     assert expected.issubset(
-        set(plugin._plugin_core._internal_observers.keys())
+        set(plugin._plexus._internal_observers.keys())
     )
 
     # Set up the minimal state on_disable touches before running it.
@@ -3802,7 +3802,7 @@ async def test_phase2b_observer_cleanup_on_disable():
     # to our stub PC's unobserve (the Plugin base's `internal_unobserve`
     # auto-fills plugin_uuid; our stub PC has its own signature).
     def _plugin_unobserve(topic, cb):
-        return plugin._plugin_core.internal_unobserve(
+        return plugin._plexus.internal_unobserve(
             plugin.plugin_uuid, topic, cb,
         )
     plugin.internal_unobserve = _plugin_unobserve
@@ -3812,7 +3812,7 @@ async def test_phase2b_observer_cleanup_on_disable():
 
     # All 7 observer registrations should be cleaned up.
     for topic in expected:
-        assert topic not in plugin._plugin_core._internal_observers, (
+        assert topic not in plugin._plexus._internal_observers, (
             f"on_disable left observer for {topic!r} registered"
         )
     # And the plugin's own bookkeeping list should be empty.
@@ -3830,7 +3830,7 @@ async def test_phase2b_outer_tab_handler_scoping_against_nested_event(mock_pc):
 
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3862,7 +3862,7 @@ async def test_phase2b_filter_persistence_across_tab_switch(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub])
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3898,7 +3898,7 @@ async def test_phase2b_run_on_main_none_return_shows_toast(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub])
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -3974,7 +3974,7 @@ async def test_phase2b_run_on_main_false_return_shows_toast(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=False)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -4014,7 +4014,7 @@ async def test_phase2b_outer_is_events_clears_on_home_activation(mock_pc):
 
     _install_phase2b_pc(mock_pc)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -4059,7 +4059,7 @@ async def test_phase2b_subs_browser_noop_toggle_no_crash(mock_pc):
     )
     _install_phase2b_pc(mock_pc, subs=[sub], set_sub_result=True)
     app = DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -4109,7 +4109,7 @@ def _install_phase3_pc(
       * `topic_registry.list_local_subs` / `get_subscription` for
         runtime-sub lookups in the per-plugin tab (3b).
       * `get_unloaded_metadata` async — returns None for non-UNLOADED
-        (matches `PluginCore.get_unloaded_metadata`).
+        (matches `Plexus.get_unloaded_metadata`).
       * `list_logger_levels` (returns the snapshot shape utils.py uses)
         — `logger_levels_overrides` is wired as the MagicMock's
         `return_value` so 3b Logger-section tests can prime per-prefix
@@ -4121,7 +4121,7 @@ def _install_phase3_pc(
     (UNLOADED == config has entry but no live instance, per
     `plugin_state.py:36`).
     """
-    from plugin_state import PluginState, State, Phase, ErrorRecord
+    from plexus.plugin_state import PluginState, State, Phase, ErrorRecord
     overrides = plugin_states_overrides or {}
 
     states = {}
@@ -4133,7 +4133,7 @@ def _install_phase3_pc(
 
         # Lifecycle / readiness events. Real Plugin instances have these
         # set by Plugin.__init__ (utils.py:1189) + by
-        # _enable_plugin_under_lock (PluginCore.py:2815). Mirror here so
+        # _enable_plugin_under_lock (core.py:2815). Mirror here so
         # _plugin_phase reads them with .is_set().
         p._lifecycle_ready = asyncio.Event()
         p.ready = asyncio.Event()
@@ -4179,7 +4179,7 @@ def _install_phase3_pc(
     #   - UNLOADED: never instantiated (or popped after disable).
     #   - FAILED_LOAD: instantiation raised in `load_plugin_with_conf`
     #     BEFORE the `pc.plugins[name] = plugin` assignment ran
-    #     (`PluginCore.py:2466-2474` only runs on the success path),
+    #     (`core.py:2466-2474` only runs on the success path),
     #     so `pc.plugins.get(name)` returns None for a real FAILED_LOAD
     #     plugin. Mirror that here so the detail-pane on-disk fallback
     #     test path matches production behaviour.
@@ -4253,7 +4253,7 @@ def _attach_failed_load_error(
     an ErrorRecord. Assumes `_install_phase3_pc` already ran with a
     `plugin_states_overrides={plugin_name: State.FAILED_LOAD}` entry.
     """
-    from plugin_state import Phase, ErrorRecord
+    from plexus.plugin_state import Phase, ErrorRecord
     ps = mock_pc.plugin_states.get(plugin_name)
     if ps is None:
         return
@@ -4268,7 +4268,7 @@ def _make_phase3_app(mock_pc):
     """Standard Phase 3 test app bootstrap. Returns the configured app."""
     from plugins_test.TUI.app import DashboardApp
     return DashboardApp(
-        plugin_core=mock_pc,
+        plexus=mock_pc,
         plugin_instance=_make_phase2b_plugin_instance(),
         log_handler=TUILogHandler(),
     )
@@ -4321,7 +4321,7 @@ async def test_phase3a_phase_column_enabled_ready(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3a_phase_column_enabled_waiting(mock_pc):
     """state==ENABLED + _lifecycle_ready set + ready CLEAR → WAITING (warn)."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(mock_pc)
     plugin = mock_pc.plugins["PluginA"]
@@ -4337,7 +4337,7 @@ async def test_phase3a_phase_column_enabled_waiting(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3a_phase_column_enabling(mock_pc):
     """state==ENABLING → LOADING (warn)."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.ENABLING})
     app = _make_phase3_app(mock_pc)
@@ -4352,7 +4352,7 @@ async def test_phase3a_phase_column_enabling(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3a_phase_column_inactive(mock_pc):
     """state==INACTIVE → DISABLED (dim)."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.INACTIVE})
     app = _make_phase3_app(mock_pc)
@@ -4367,7 +4367,7 @@ async def test_phase3a_phase_column_inactive(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3a_phase_column_disabling(mock_pc):
     """state==DISABLING → DISABLING (warn)."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.DISABLING})
     app = _make_phase3_app(mock_pc)
@@ -4385,7 +4385,7 @@ async def test_phase3a_phase_column_failed_load(mock_pc):
     no entry in `pc.plugins` (instantiation raised before the registry
     assignment in `load_plugin_with_conf`), so the fixture drops the
     instance and `_plugin_phase` is called with plugin=None."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(mock_pc, plugin_states_overrides={"PluginA": State.FAILED_LOAD})
     app = _make_phase3_app(mock_pc)
@@ -4401,7 +4401,7 @@ async def test_phase3a_phase_column_failed_load(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3a_phase_column_unloaded(mock_pc):
     """state==UNLOADED → UNLOADED (dim); no live plugin instance."""
-    from plugin_state import State
+    from plexus.plugin_state import State
 
     _install_phase3_pc(
         mock_pc,
@@ -4826,7 +4826,7 @@ async def test_phase3a_failed_load_detail_pane(mock_pc, tmp_path):
     + message + traceback toggle, and pulls Endpoints/Events/Subs/Args
     content from on-disk `plugin_config.yml`."""
     import yaml as _yaml
-    from plugin_state import State
+    from plexus.plugin_state import State
     from textual.containers import VerticalScroll
     from textual.widgets import Collapsible, Static, TabbedContent
 
@@ -5481,7 +5481,7 @@ async def test_phase3b_logger_overrides_plugin_wins_over_config(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3b_logger_overrides_unloaded_plugin(mock_pc):
     """UNLOADED plugin → Logger section renders placeholder, no Add row."""
-    from plugin_state import State
+    from plexus.plugin_state import State
     from textual.widgets import Input, Static
     from textual.css.query import NoMatches
 
@@ -5513,11 +5513,11 @@ async def test_phase3b_logger_overrides_unloaded_plugin(mock_pc):
 @pytest.mark.asyncio
 async def test_phase3b_failed_load_logger_section_no_add_row(mock_pc):
     """Per Option A (no live instance for FAILED_LOAD per
-    `PluginCore.py:2466-2474`): Logger section renders the placeholder
+    `core.py:2466-2474`): Logger section renders the placeholder
     without an Add row. Test #34 description in the plan-cycle 1 review
     was contradicted by Section 11.5's framework-reality note;
     maintainer chose Option A (consistent with UNLOADED)."""
-    from plugin_state import State
+    from plexus.plugin_state import State
     from textual.widgets import Input, Static
     from textual.css.query import NoMatches
 
@@ -5548,7 +5548,7 @@ async def test_phase3b_failed_load_logger_section_no_add_row(mock_pc):
 async def test_phase3b_unloaded_plugin_placeholders_in_events_subs(mock_pc):
     """UNLOADED plugin: Events section shows `(plugin not loaded)`,
     Subs sections show `(plugin not loaded)`."""
-    from plugin_state import State
+    from plexus.plugin_state import State
     from textual.widgets import Static
 
     _install_phase3_pc(

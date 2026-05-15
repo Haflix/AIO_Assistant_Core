@@ -22,8 +22,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PluginCore import PluginCore
-from serialization import generate_keypair
+from plexus.core import Plexus
+from plexus.serialization import generate_keypair
 
 
 CONFIG_PATH = "test_config.yml"
@@ -115,7 +115,7 @@ def _exit_code(report: Dict[str, Any]) -> int:
 
 def _provision_test_mtls_identities() -> Dict[str, str]:
     """Generate parent + subnode keypairs in temp dirs and return paths
-    + cert PEM bodies. Called BEFORE PluginCore loads so the parent's
+    + cert PEM bodies. Called BEFORE Plexus loads so the parent's
     networking.peers can be patched with the subnode entry up-front.
 
     Returns a dict with keys:
@@ -154,7 +154,7 @@ def _provision_test_mtls_identities() -> Dict[str, str]:
     }
 
 
-def _patch_networking_for_mtls(pc: "PluginCore", mtls: Dict[str, str]) -> None:
+def _patch_networking_for_mtls(pc: "Plexus", mtls: Dict[str, str]) -> None:
     """Inject mTLS keys_dir + peers into pc.yaml_config.networking BEFORE
     NetworkManager is constructed (NetworkManager reads peers + keys_dir
     once at __init__, so this must run before wait_until_ready).
@@ -212,12 +212,12 @@ async def run_tests() -> int:
     try:
         _set_subnode_env_for_test_remote_suite(mtls)
 
-        pc = PluginCore(CONFIG_PATH)
+        pc = Plexus(CONFIG_PATH)
         _patch_networking_for_mtls(pc, mtls)
         await pc.wait_until_ready()
     except Exception:
         # Cycle 2 fresh-eyes / verifier MED fix: ensure the temp dirs +
-        # env vars are cleaned up even if PluginCore startup raises.
+        # env vars are cleaned up even if Plexus startup raises.
         # The downstream try/finally only fires if pc was constructed
         # successfully.
         _cleanup_test_mtls_identities(mtls)

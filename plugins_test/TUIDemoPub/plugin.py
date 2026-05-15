@@ -10,8 +10,8 @@ Two purposes:
      Plugins-tab tag-search input has something to filter against.
 """
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TUIDemoPub(Plugin):

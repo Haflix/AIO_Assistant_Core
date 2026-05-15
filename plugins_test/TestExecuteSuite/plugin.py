@@ -30,14 +30,14 @@ from collections import OrderedDict  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import (  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import (  # noqa: E402
     async_log_errors,
     async_handle_errors,
     async_gen_log_errors,
     log_errors,
 )
-from exceptions import RequestException  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
 from _test_helpers import CaseRecorder, FRAMEWORK_VERSION  # noqa: E402
 
@@ -81,7 +81,7 @@ class TestExecuteSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestExecuteSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestExecuteSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -478,7 +478,7 @@ class TestExecuteSuite(Plugin):
         async def body_block_self_hostname(c):
             # hosts="any" + blocked_hosts=<own hostname> → local skipped.
             # No remote subnode hosts this target → not found.
-            own_host = self._plugin_core.hostname
+            own_host = self._plexus.hostname
             c.expect_exception(RequestException, match=r"not found")
             await self.execute(
                 TARGET, "ea_no_args",
@@ -660,7 +660,7 @@ class TestExecuteSuite(Plugin):
             # Create the request directly so we know its id deterministically;
             # then await its result via a separate task and cancel it. Avoids the
             # snapshot-diff race of inferring the id from `core.requests.keys()`.
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 TARGET, "ea_hang", {"seconds": 60.0},
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
@@ -678,11 +678,11 @@ class TestExecuteSuite(Plugin):
             # after ``collected=True``). Migrated to direct sync pop;
             # the producer's finally in ``_process_request`` will also
             # pop on completion (idempotent under ``pop(key, None)``).
-            self._plugin_core.requests.pop(req.id, None)
+            self._plexus.requests.pop(req.id, None)
 
             deadline = time.perf_counter() + 25.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     break
                 await asyncio.sleep(0.5)
             else:
@@ -792,20 +792,20 @@ class TestExecuteSuite(Plugin):
 
     async def _basic_request_context(self, rec: CaseRecorder, kw: Dict) -> None:
         async def body_ctx_async(c):
-            req = await self._plugin_core.create_request(
+            req = await self._plexus.create_request(
                 TARGET, "ea_add", (5, 6),
                 "", "any", self.plugin_name, self.plugin_uuid,
             )
-            async with self._plugin_core.request_context_async(req) as result:
+            async with self._plexus.request_context_async(req) as result:
                 c.expect(result, 11)
 
         async def body_ctx_sync(c):
             def sync_block():
-                req = self._plugin_core.create_request_sync(
+                req = self._plexus.create_request_sync(
                     TARGET, "ea_add", (8, 9),
                     "", "any", self.plugin_name, self.plugin_uuid,
                 )
-                with self._plugin_core.request_context_sync(req) as result:
+                with self._plexus.request_context_sync(req) as result:
                     return result
 
             r = await asyncio.to_thread(sync_block)
@@ -889,7 +889,7 @@ class TestExecuteSuite(Plugin):
                 c.expect(collected, [1])
 
         async def body_gen_log_errors_smoke(c):
-            from decorators import gen_log_errors
+            from plexus.decorators import gen_log_errors
 
             class _Holder:
                 _logger = suite_logger

@@ -3,7 +3,7 @@ import inspect
 import logging
 import traceback
 from typing import Callable, Any, Optional
-from exceptions import PluginTypeMissmatchError, RequestException
+from .exceptions import PluginTypeMissmatchError, RequestException
 
 
 def _check_type(func, expected_type, correct_decorator):

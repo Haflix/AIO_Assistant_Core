@@ -4,7 +4,7 @@ Loaded on the subnode only. Subscribes to `smoke/ping` (publish_event
 fan-out) and `smoke/ask` (request_event with return value).
 """
 
-from utils import Plugin
+from plexus.utils import Plugin
 
 
 class TestPR3SmokeSub(Plugin):

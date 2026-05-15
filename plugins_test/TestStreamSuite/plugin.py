@@ -22,9 +22,9 @@ import asyncio  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
-from exceptions import RequestException  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.exceptions import RequestException  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -59,7 +59,7 @@ class TestStreamSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestStreamSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestStreamSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -91,7 +91,7 @@ class TestStreamSuite(Plugin):
     async def _make_gen_request(self, method: str, args: Any = None):
         """Create a GeneratorRequest directly so the case has access to the
         Request object (for queue.qsize() inspection)."""
-        return await self._plugin_core.create_gen_request(
+        return await self._plexus.create_gen_request(
             TARGET, method, args,
             "", "any", self.plugin_name, self.plugin_uuid,
         )
@@ -168,7 +168,7 @@ class TestStreamSuite(Plugin):
             # raises mid-stream, Request.get_queue_stream breaks silently on the
             # error+EndOfQueue chunk (utils.py:1664-1667). The consumer just
             # sees the stream end after the items that were already pushed — no
-            # exception. PluginCore.execute_stream's `if error: raise` (line
+            # exception. Plexus.execute_stream's `if error: raise` (line
             # 1767) is therefore dead code. Bugtracker entry to be added.
             items = []
             try:
@@ -239,7 +239,7 @@ class TestStreamSuite(Plugin):
             req_holder: Dict[str, Any] = {}
 
             def sync_block():
-                req = self._plugin_core.create_gen_request_sync(
+                req = self._plexus.create_gen_request_sync(
                     TARGET, "ea_gen_infinite", None,
                     "", "any", self.plugin_name, self.plugin_uuid,
                 )
@@ -378,7 +378,7 @@ class TestStreamSuite(Plugin):
 
             deadline = time.perf_counter() + 30.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     return
                 await asyncio.sleep(0.5)
             raise AssertionError(
@@ -468,7 +468,7 @@ class TestStreamSuite(Plugin):
             # leave well within 30s via that path.
             deadline = time.perf_counter() + 30.0
             while time.perf_counter() < deadline:
-                if req_id not in self._plugin_core.requests:
+                if req_id not in self._plexus.requests:
                     return
                 await asyncio.sleep(0.5)
             raise AssertionError(

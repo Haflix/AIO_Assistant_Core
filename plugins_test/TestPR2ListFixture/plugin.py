@@ -4,8 +4,8 @@ Used by TestPR2Suite case 1 to verify that load_plugin_with_conf rejects
 the list-form with a clear error message referencing the dict form.
 """
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class TestPR2ListFixture(Plugin):

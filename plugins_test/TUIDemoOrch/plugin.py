@@ -9,8 +9,8 @@ variety to the Subscriptions / Plugins-detail panes:
 
 import asyncio
 
-from utils import Plugin
-from decorators import async_log_errors, async_gen_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, async_gen_log_errors, log_errors
 
 
 class TUIDemoOrch(Plugin):

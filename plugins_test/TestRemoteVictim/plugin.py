@@ -14,8 +14,8 @@ live in TestBugSuite (`bug.B-001.request_topic_method_gone`,
 
 from typing import Any
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
 
 
 class TestRemoteVictim(Plugin):

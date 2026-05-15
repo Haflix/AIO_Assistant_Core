@@ -4,8 +4,8 @@ Used by TestPR2Suite case 6 to verify that when the access_name field
 differs from the dict key, the framework warns and uses the key.
 """
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class TestPR2MismatchFixture(Plugin):

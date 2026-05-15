@@ -5,9 +5,9 @@ allowlist of safe stdlib types plus any plugin classes that opt in via
 the Serializable mixin (or SerializableException for exception classes).
 
 The pre-auth pickle.loads RCE surface (B-066) is closed by the mTLS
-fingerprint pinning layer in networking.py — this module addresses the
-post-auth defense-in-depth: a compromised pinned peer cannot RCE other
-peers via crafted pickle payloads either.
+fingerprint pinning layer in plexus.networking — this module addresses
+the post-auth defense-in-depth: a compromised pinned peer cannot RCE
+other peers via crafted pickle payloads either.
 
 Plugin authors:
 - Custom data classes that traverse the wire: inherit `Serializable`.
@@ -61,28 +61,29 @@ _BUILTIN_ALLOWLIST: FrozenSet[Tuple[str, str]] = frozenset({
 })
 
 
-# --- Project exceptions (static enumerate; avoids editing protected exceptions.py) ---
+# --- Project exceptions (static enumerate; mirrors plexus.exceptions) ---
 
 _PROJECT_EXCEPTIONS: FrozenSet[Tuple[str, str]] = frozenset({
-    ("exceptions", "RequestException"),
-    ("exceptions", "NetworkRequestException"),
-    ("exceptions", "NoLocalSubException"),
-    ("exceptions", "ConfigException"),
-    ("exceptions", "NodeException"),
-    ("exceptions", "PluginTypeMissmatchError"),
+    ("plexus.exceptions", "RequestException"),
+    ("plexus.exceptions", "NetworkRequestException"),
+    ("plexus.exceptions", "NoLocalSubException"),
+    ("plexus.exceptions", "ConfigException"),
+    ("plexus.exceptions", "NodeException"),
+    ("plexus.exceptions", "PluginTypeMissmatchError"),
 })
 
 
 # --- Project framework types — allowed across wire post-auth ---
-# Stage N (PR4) — B-067 fix. utils.Event is the wire envelope for the
-# first chunk of a request_event_stream response (LOCKED I). Without
-# this allowlist entry, the receiver's SafeUnpickler rejects the Event
-# pickled by the server and every cross-node request_event_stream call
-# fails with "Disallowed class during deserialization: utils.Event".
+# Stage N (PR4) — B-067 fix. plexus.utils.Event is the wire envelope
+# for the first chunk of a request_event_stream response (LOCKED I).
+# Without this allowlist entry, the receiver's SafeUnpickler rejects
+# the Event pickled by the server and every cross-node
+# request_event_stream call fails with
+# "Disallowed class during deserialization: plexus.utils.Event".
 # Static frozenset (not the dynamic Serializable opt-in) because Event
 # is part of the framework, not a plugin-defined type.
 _PROJECT_TYPES: FrozenSet[Tuple[str, str]] = frozenset({
-    ("utils", "Event"),
+    ("plexus.utils", "Event"),
 })
 
 
@@ -93,7 +94,7 @@ _TRUSTED_EXCEPTION_MODULES: FrozenSet[str] = frozenset({
     # at the pickle stream layer (see PEP 678 / bpo-45390). Older
     # versions still pickle it under "asyncio". Keep both module names
     # so cross-node propagation works regardless of Python version.
-    "builtins", "exceptions", "asyncio", "asyncio.exceptions",
+    "builtins", "plexus.exceptions", "asyncio", "asyncio.exceptions",
     "concurrent.futures", "concurrent.futures._base",
     "pickle", "ssl", "socket", "json",
 })
@@ -133,7 +134,7 @@ class Serializable:
     for safe deserialization across the network boundary.
 
     Example:
-        from serialization import Serializable
+        from plexus.serialization import Serializable
 
         class MyPluginData(Serializable):
             ...
@@ -152,7 +153,7 @@ class SerializableException(Exception, Serializable):
     """Plugin-defined exceptions that need to traverse the network must
     inherit from this mixin. Plain Exception subclasses raised inside
     remote handlers will be replaced with NetworkRequestException on the
-    receive side (see networking.py MSG_ERROR receive path).
+    receive side (see plexus.networking MSG_ERROR receive path).
 
     For exception subclasses with complex __init__ signatures, ensure
     the args passed to super().__init__() are pickle-friendly (strings,
@@ -188,9 +189,9 @@ class SafeUnpickler(pickle.Unpickler):
             return _EXCEPTION_REGISTRY[key]
         raise pickle.UnpicklingError(
             f"Disallowed class during deserialization: {module}.{name}. "
-            f"For plugin-defined types, inherit from serialization.Serializable. "
+            f"For plugin-defined types, inherit from plexus.serialization.Serializable. "
             f"For plugin-defined exceptions, inherit from "
-            f"serialization.SerializableException."
+            f"plexus.serialization.SerializableException."
         )
 
 

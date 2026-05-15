@@ -4,8 +4,8 @@ Used by TestPR2Suite case 5 to verify that when the access_name field
 matches the dict key exactly, the plugin loads without a warning.
 """
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class TestPR2MatchFixture(Plugin):

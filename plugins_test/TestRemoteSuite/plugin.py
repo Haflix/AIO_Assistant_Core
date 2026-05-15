@@ -45,8 +45,8 @@ import tempfile  # noqa: E402
 import time  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -77,7 +77,7 @@ class TestRemoteSuite(Plugin):
 
     @async_log_errors
     async def on_enable(self):
-        if not getattr(self._plugin_core, "networking_enabled", False):
+        if not getattr(self._plexus, "networking_enabled", False):
             self._logger.info(
                 "TestRemoteSuite: networking disabled in main config — "
                 "subprocess peer not started; remote cases will skip"
@@ -103,7 +103,7 @@ class TestRemoteSuite(Plugin):
         peer_hostname = self._peer_info.get("hostname")
         if not peer_hostname:
             return False
-        network = getattr(self._plugin_core, "network", None)
+        network = getattr(self._plexus, "network", None)
         if network is None:
             return False
         loop = asyncio.get_running_loop()
@@ -226,7 +226,7 @@ class TestRemoteSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestRemoteSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestRemoteSuite", SUITE_VERSION, self._plexus)
 
         kw = dict(
             case_ids_filter=case_ids,
@@ -268,7 +268,7 @@ class TestRemoteSuite(Plugin):
             c.expect(r, "x")
 
         async def body_remote_false_blocked(c):
-            from exceptions import RequestException
+            from plexus.exceptions import RequestException
             c.expect_exception(RequestException, match=r"[Ee]ndpoint.*not found")
             await self.execute(
                 "TestRemoteVictim", "r_local_only", {"value": "x"},
@@ -294,7 +294,7 @@ class TestRemoteSuite(Plugin):
         async def body_request_event_handler_raises(c):
             """Remote handler raising ValueError must surface to caller as
             RequestException with the original message preserved."""
-            from exceptions import RequestException
+            from plexus.exceptions import RequestException
             c.expect_exception(RequestException, match=r"requested-error-marker")
             await self.request_event(
                 "r_request_raise", payload={},
@@ -307,7 +307,7 @@ class TestRemoteSuite(Plugin):
             wait_for_result_async) sends the timeout result back, which
             unblocks the client receive loop. Regression guard for the
             B-028-class concern in the Stage-D-replacement API."""
-            from exceptions import RequestException
+            from plexus.exceptions import RequestException
             loop = asyncio.get_running_loop()
             start = loop.time()
             raised = False
@@ -337,7 +337,7 @@ class TestRemoteSuite(Plugin):
         async def body_request_event_stream_basic(c):
             """Happy-path streaming: 3 chunks. First chunk arrives wrapped
             in an Event object (LOCKED I); subsequent chunks are raw."""
-            from utils import Event
+            from plexus.utils import Event
             chunks = []
             async for chunk in self.request_event_stream(
                 "r_request_stream_basic", payload={},
@@ -359,7 +359,7 @@ class TestRemoteSuite(Plugin):
             """Mid-stream handler raise: 2 chunks then RequestException
             with original message preserved. Caller's `async for` exits
             via the exception, not silent termination."""
-            from exceptions import RequestException
+            from plexus.exceptions import RequestException
             chunks = []
             raised: Optional[BaseException] = None
             try:
@@ -399,7 +399,7 @@ class TestRemoteSuite(Plugin):
             We verify msgs_sent ≥ 1 and bytes_sent > 0 because the unary
             path issues at least one MSG_EXECUTE frame + receives one
             MSG_STREAM_CHUNK + MSG_END_STREAM."""
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             stats_before = dict(nm.peer_stats.get(peer_host, {
                 "bytes_sent": 0, "bytes_recv": 0,
                 "msgs_sent": 0, "msgs_recv": 0,
@@ -439,7 +439,7 @@ class TestRemoteSuite(Plugin):
             marker. Verifies that the stream-path coverage (chunk paths
             + no-payload ITEM_END counters) actually fires — the bulk of
             real-world traffic flows through these sites."""
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             stats_before = dict(nm.peer_stats.get(peer_host, {
                 "bytes_sent": 0, "bytes_recv": 0,
                 "msgs_sent": 0, "msgs_recv": 0,
@@ -471,7 +471,7 @@ class TestRemoteSuite(Plugin):
             directly (mirrors what heartbeat does on dead-peer detection),
             then verify the entry is gone and a fresh subsequent stamp
             recreates a zeroed entry."""
-            nm = self._plugin_core.network
+            nm = self._plexus.network
             # Ensure we have a stats entry to drop
             await self.execute(
                 "TestRemoteTarget", "r_open", {"value": "before_drop"},
@@ -620,7 +620,7 @@ class TestRemoteSuite(Plugin):
             )
 
         async def body_find_endpoints_by_tag(c):
-            r = await self._plugin_core.find_endpoints_by_tag("nonexistent")
+            r = await self._plexus.find_endpoints_by_tag("nonexistent")
             assert isinstance(r, list)
 
         # Session 4 (v0.27.0): sub-advert ack protocol regression guard.
@@ -632,9 +632,9 @@ class TestRemoteSuite(Plugin):
         async def body_advert_ack_basic(c):
             if not self._remote_available:
                 c.skip(UNAVAILABLE_REASON)
-            network = self._plugin_core.network
+            network = self._plexus.network
             peer_hostname = self._peer_info["hostname"]
-            sub_uuid = await self._plugin_core.subscribe_event(
+            sub_uuid = await self._plexus.subscribe_event(
                 "test/advert_ack/probe",
                 self.plugin_name,
                 self.plugin_uuid,
@@ -668,7 +668,7 @@ class TestRemoteSuite(Plugin):
                     )
             finally:
                 try:
-                    await self._plugin_core.unsubscribe_event(sub_uuid)
+                    await self._plexus.unsubscribe_event(sub_uuid)
                 except Exception:
                     pass
 

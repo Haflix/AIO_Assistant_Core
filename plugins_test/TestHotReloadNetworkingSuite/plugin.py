@@ -43,8 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from copy import deepcopy  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
-from utils import Plugin  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.utils import Plugin  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -123,7 +123,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
         rec = CaseRecorder(
-            "TestHotReloadNetworkingSuite", SUITE_VERSION, self._plugin_core
+            "TestHotReloadNetworkingSuite", SUITE_VERSION, self._plexus
         )
 
         kw = dict(
@@ -152,7 +152,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         """B-070 _networking_config_changed: True when peers differ."""
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             old = _baseline_yaml()
             new = deepcopy(old)
             new["networking"]["peers"] = [
@@ -179,7 +179,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         non-rebuild fields (heartbeat_interval) differ."""
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             old = _baseline_yaml()
             new = deepcopy(old)
             # heartbeat_interval is NOT in _REBUILD_FIELDS — change
@@ -203,7 +203,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         ``apply_configvalues``' fallback behavior (utils.py:970-973)."""
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             old = _baseline_yaml()
             new = deepcopy(old)
             # Both sides explicitly miss general.hostname. After
@@ -226,7 +226,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         ``cert_pem`` (no PEM header)."""
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             yaml = _baseline_yaml()
             # Override the peer's cert_pem with a string that lacks
             # the PEM header. _parse_one_peer's PEM-header check
@@ -260,7 +260,7 @@ class TestHotReloadNetworkingSuite(Plugin):
         """
 
         async def body(c):
-            pc = self._plugin_core
+            pc = self._plexus
             # Snapshot pre-call state for restoration + assertion.
             old_network = pc.network
             old_yaml = deepcopy(pc.yaml_config)

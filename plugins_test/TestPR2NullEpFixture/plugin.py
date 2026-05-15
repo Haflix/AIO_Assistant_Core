@@ -4,8 +4,8 @@ Used by TestPR2Suite case 13 to verify that a plugin with no endpoints
 loads cleanly with 0 endpoints and no error.
 """
 
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class TestPR2NullEpFixture(Plugin):

@@ -18,9 +18,9 @@ from uuid import uuid4
 import time
 import yaml
 from typing import Any, Optional, Tuple, Union, final
-from decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
-from exceptions import RequestException, ConfigException
-from plugin_state import State
+from .decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+from .exceptions import RequestException, ConfigException
+from .plugin_state import State
 from colorama import Fore, Style
 
 
@@ -493,7 +493,7 @@ class _PerLoggerLevelFilter(logging.Filter):
     def clear_owned_by(self, plugin_name: str, plugin_uuid: str) -> None:
         # Matches by plugin_uuid only — uuid4 is unique, and entries set during
         # Plugin.on_load may be registered with the placeholder name "UNKNOWN"
-        # (PluginCore assigns the real plugin_name AFTER __init__ returns).
+        # (Plexus assigns the real plugin_name AFTER __init__ returns).
         # plugin_name is accepted for API symmetry but ignored for matching.
         with self._lock:
             mutated = False
@@ -728,7 +728,7 @@ class LogUtil(logging.Logger):
         empty-string keys are rejected with a warning. Invalid level strings are
         logged + skipped; sibling entries still apply.
 
-        Plugin-source thresholds (set via Plugin.set_logger_level / PluginCore
+        Plugin-source thresholds (set via Plugin.set_logger_level / Plexus
         wrapper) are NOT touched — only the config source is replaced.
         """
         root = logging.getLogger()
@@ -964,27 +964,27 @@ class ConfigUtil:
 
     @staticmethod
     @log_errors
-    def apply_configvalues(plugin_core):
+    def apply_configvalues(plexus):
 
-        general_config = plugin_core.yaml_config.get("general", {})
+        general_config = plexus.yaml_config.get("general", {})
 
         hostname = general_config.get("hostname")
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
-            plugin_core.yaml_config["general"]["hostname"] = hostname
-        plugin_core.hostname = hostname  # uuid4().hex
-        plugin_core._logger.info(f"Network hostname: {plugin_core.hostname}")
+            plexus.yaml_config["general"]["hostname"] = hostname
+        plexus.hostname = hostname  # uuid4().hex
+        plexus._logger.info(f"Network hostname: {plexus.hostname}")
 
         # Plugin base directory
-        plugin_core.plugin_package = general_config.get("plugin_package", "plugins")
-        plugin_core._logger.info(f"Plugin base directory: {plugin_core.plugin_package}")
+        plexus.plugin_package = general_config.get("plugin_package", "plugins")
+        plexus._logger.info(f"Plugin base directory: {plexus.plugin_package}")
 
         # Plugin-readiness gate timeout. Default 60.0 seconds; spec
         # forbids reducing below 30 in normal operation but tests may
         # override via the same config key for cycle-timeout repros.
         # Bad values fall back to default with a warning so a typo can
         # never silently zero the timeout.
-        from PluginCore import (  # local import — avoids circular import at module load
+        from .core import (  # local import — avoids circular import at module load
             DEFAULT_PLUGIN_READY_TIMEOUT,
             DEFAULT_PLUGIN_DISABLE_TIMEOUT,
         )
@@ -996,13 +996,13 @@ class ConfigUtil:
             if ready_timeout <= 0:
                 raise ValueError("must be > 0")
         except (TypeError, ValueError):
-            plugin_core._logger.warning(
+            plexus._logger.warning(
                 "Invalid general.plugin_ready_timeout=%r; defaulting to %.1f",
                 raw_ready_timeout,
                 DEFAULT_PLUGIN_READY_TIMEOUT,
             )
             ready_timeout = DEFAULT_PLUGIN_READY_TIMEOUT
-        plugin_core.plugin_ready_timeout = ready_timeout
+        plexus.plugin_ready_timeout = ready_timeout
 
         # Plugin-disable timeout. Default 30.0 seconds; matches
         # close()'s on_disable cap. Wraps user on_disable in
@@ -1019,13 +1019,13 @@ class ConfigUtil:
             if disable_timeout <= 0:
                 raise ValueError("must be > 0")
         except (TypeError, ValueError):
-            plugin_core._logger.warning(
+            plexus._logger.warning(
                 "Invalid general.plugin_disable_timeout=%r; defaulting to %.1f",
                 raw_disable_timeout,
                 DEFAULT_PLUGIN_DISABLE_TIMEOUT,
             )
             disable_timeout = DEFAULT_PLUGIN_DISABLE_TIMEOUT
-        plugin_core.plugin_disable_timeout = disable_timeout
+        plexus.plugin_disable_timeout = disable_timeout
 
         # B-073 Session 2 Step 4: ``cleanup_request_interval`` removed
         # entirely. Done-callback eviction in ``_process_request*`` and
@@ -1036,58 +1036,58 @@ class ConfigUtil:
         # not a deprecation). Tests using the old override knob updated
         # in Step 6 of Session 2.
 
-        networking_config = plugin_core.yaml_config.get("networking")
+        networking_config = plexus.yaml_config.get("networking")
 
-        plugin_core.networking_enabled = networking_config.get("enabled", False)
-        plugin_core.yaml_config["networking"][
+        plexus.networking_enabled = networking_config.get("enabled", False)
+        plexus.yaml_config["networking"][
             "enabled"
-        ] = plugin_core.networking_enabled
-        plugin_core._logger.info(
-            f"Networking enabled: {plugin_core.networking_enabled}"
+        ] = plexus.networking_enabled
+        plexus._logger.info(
+            f"Networking enabled: {plexus.networking_enabled}"
         )
 
-        plugin_core.networking_port = networking_config.get("port", 2510)
-        plugin_core.yaml_config["networking"]["port"] = plugin_core.networking_port
-        plugin_core._logger.info(f"Networking Port: {plugin_core.networking_port}")
+        plexus.networking_port = networking_config.get("port", 2510)
+        plexus.yaml_config["networking"]["port"] = plexus.networking_port
+        plexus._logger.info(f"Networking Port: {plexus.networking_port}")
 
-        plugin_core.networking_auto_discoverable = networking_config.get(
+        plexus.networking_auto_discoverable = networking_config.get(
             "auto_discoverable", False
         )
-        plugin_core.yaml_config["networking"][
+        plexus.yaml_config["networking"][
             "auto_discoverable"
-        ] = plugin_core.networking_auto_discoverable
-        plugin_core._logger.info(
-            f"auto_discoverable: {plugin_core.networking_auto_discoverable}"
+        ] = plexus.networking_auto_discoverable
+        plexus._logger.info(
+            f"auto_discoverable: {plexus.networking_auto_discoverable}"
         )
 
-        plugin_core.networking_direct_discoverable = networking_config.get(
+        plexus.networking_direct_discoverable = networking_config.get(
             "direct_discoverable", False
         )
 
         if (
-            plugin_core.networking_auto_discoverable
-            and not plugin_core.networking_direct_discoverable
+            plexus.networking_auto_discoverable
+            and not plexus.networking_direct_discoverable
         ):
-            plugin_core._logger.info(
+            plexus._logger.info(
                 "direct_discoverable will be set to True as auto_discoverable is active. You cannot deactivate direct_discoverable if auto_discoverable is set to True."
             )
-            plugin_core.networking_direct_discoverable = True
+            plexus.networking_direct_discoverable = True
 
-        plugin_core.yaml_config["networking"][
+        plexus.yaml_config["networking"][
             "direct_discoverable"
-        ] = plugin_core.networking_direct_discoverable
-        plugin_core._logger.info(
-            f"direct_discoverable: {plugin_core.networking_direct_discoverable}"
+        ] = plexus.networking_direct_discoverable
+        plexus._logger.info(
+            f"direct_discoverable: {plexus.networking_direct_discoverable}"
         )
 
         # Security and connection pool configuration
-        plugin_core.networking_secret = networking_config.get("secret", None)
-        plugin_core.networking_cert_file = networking_config.get("cert_file", None)
-        plugin_core.networking_key_file = networking_config.get("key_file", None)
-        plugin_core.networking_pool_size = networking_config.get("pool_size", 5)
+        plexus.networking_secret = networking_config.get("secret", None)
+        plexus.networking_cert_file = networking_config.get("cert_file", None)
+        plexus.networking_key_file = networking_config.get("key_file", None)
+        plexus.networking_pool_size = networking_config.get("pool_size", 5)
 
-        if plugin_core.networking_secret:
-            plugin_core._logger.warning(
+        if plexus.networking_secret:
+            plexus._logger.warning(
                 "Using shared secret from config file. Consider using environment variable NETWORKING_SECRET for better security."
             )
 
@@ -1097,7 +1097,7 @@ class ConfigUtil:
         # constants in networking.py. Bad values fall back to default
         # with a warning so a typo can never silently zero an interval
         # and starve the heartbeat / discovery loops.
-        from networking import (  # local import — avoids circular import at module load
+        from .networking import (  # local import — avoids circular import at module load
             DEFAULT_HEARTBEAT_INTERVAL,
             DEFAULT_LOOKUP_INTERVAL,
             DEFAULT_LIVENESS_TIMEOUT,
@@ -1111,13 +1111,13 @@ class ConfigUtil:
             if heartbeat_interval <= 0:
                 raise ValueError("must be > 0")
         except (TypeError, ValueError):
-            plugin_core._logger.warning(
+            plexus._logger.warning(
                 "Invalid networking.heartbeat_interval=%r; defaulting to %.1f",
                 raw_heartbeat,
                 DEFAULT_HEARTBEAT_INTERVAL,
             )
             heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
-        plugin_core.networking_heartbeat_interval = heartbeat_interval
+        plexus.networking_heartbeat_interval = heartbeat_interval
 
         raw_lookup = networking_config.get(
             "lookup_interval", DEFAULT_LOOKUP_INTERVAL
@@ -1127,13 +1127,13 @@ class ConfigUtil:
             if lookup_interval <= 0:
                 raise ValueError("must be > 0")
         except (TypeError, ValueError):
-            plugin_core._logger.warning(
+            plexus._logger.warning(
                 "Invalid networking.lookup_interval=%r; defaulting to %.1f",
                 raw_lookup,
                 DEFAULT_LOOKUP_INTERVAL,
             )
             lookup_interval = DEFAULT_LOOKUP_INTERVAL
-        plugin_core.networking_lookup_interval = lookup_interval
+        plexus.networking_lookup_interval = lookup_interval
 
         raw_liveness = networking_config.get(
             "liveness_timeout", DEFAULT_LIVENESS_TIMEOUT
@@ -1143,20 +1143,20 @@ class ConfigUtil:
             if liveness_timeout <= 0:
                 raise ValueError("must be > 0")
         except (TypeError, ValueError):
-            plugin_core._logger.warning(
+            plexus._logger.warning(
                 "Invalid networking.liveness_timeout=%r; defaulting to %.1f",
                 raw_liveness,
                 DEFAULT_LIVENESS_TIMEOUT,
             )
             liveness_timeout = DEFAULT_LIVENESS_TIMEOUT
-        plugin_core.networking_liveness_timeout = liveness_timeout
+        plexus.networking_liveness_timeout = liveness_timeout
 
 
 class Plugin(ABC):
     """Base class for all plugins."""
 
     @final
-    def __init__(self, logger: Logger, plugin_core, arguments):
+    def __init__(self, logger: Logger, plexus, arguments):
         self.description = "UNKNOWN"
         self.plugin_name = "UNKNOWN"
         self.version = "0.0.0"
@@ -1167,11 +1167,11 @@ class Plugin(ABC):
         # PR3 Stage B: events: + subscriptions: parsed from plugin_config
         # by load_plugin_with_conf. Empty dicts here so plugin code in
         # on_load can read them safely (load order: __init__ -> on_load,
-        # then PluginCore overwrites these attributes from YAML).
+        # then Plexus overwrites these attributes from YAML).
         self.events = {}
         self.subscriptions = {}
         # PR3 Stage B: prefix + verbose_notifier — resolved final values
-        # set by PluginCore.load_plugin_with_conf.
+        # set by Plexus.load_plugin_with_conf.
         self.prefix = ""
         self.verbose_notifier = False
         # PR3 Stage B: track sub_uuids registered on behalf of THIS plugin
@@ -1188,15 +1188,15 @@ class Plugin(ABC):
         # callers from OTHER plugins block on this.
         self.ready: asyncio.Event = asyncio.Event()
         self.ready.set()
-        # self._lifecycle_ready: framework-controlled. Set by PluginCore
+        # self._lifecycle_ready: framework-controlled. Set by Plexus
         # after on_enable returns successfully; cleared at the start of
         # _disable_plugin (and on rollback when on_enable raises). Plugin
         # authors should NOT touch this directly — use self.ready.
         self._lifecycle_ready: asyncio.Event = asyncio.Event()
 
         self._logger = logger
-        self._plugin_core = plugin_core
-        self.event_loop = plugin_core.main_event_loop
+        self._plexus = plexus
+        self.event_loop = plexus.main_event_loop
 
         self.on_load(
             *(
@@ -1215,22 +1215,22 @@ class Plugin(ABC):
         semantics where the `enabled = True` flag flipped BEFORE on_enable
         ran (so cross-plugin calls from inside on_enable saw the target
         as enabled). Code that needs to distinguish "fully ready" from
-        "mid-enable" should read pc.plugin_states[name].state directly
+        "mid-enable" should read plx.plugin_states[name].state directly
         and check against State.ENABLED, or wait on
         plugin._lifecycle_ready.
 
-        Returns False during init bootstrap (when _plugin_core is not
+        Returns False during init bootstrap (when _plexus is not
         yet bound).
 
         Subclasses MUST call super().__init__() BEFORE reading self.enabled.
-        The property depends on self._plugin_core being bound, which __init__
+        The property depends on self._plexus being bound, which __init__
         does at the end. Otherwise the read returns False even when the
         plugin is enabled.
         """
-        pc = getattr(self, "_plugin_core", None)
-        if pc is None:
+        plx = getattr(self, "_plexus", None)
+        if plx is None:
             return False
-        ps = pc.plugin_states.get(self.plugin_name)
+        ps = plx.plugin_states.get(self.plugin_name)
         if ps is None:
             return False
         return ps.state in (State.ENABLING, State.ENABLED)
@@ -1239,7 +1239,7 @@ class Plugin(ABC):
         if name == "enabled":
             raise AttributeError(
                 "Plugin.enabled is read-only since v0.26.0. Use "
-                "pc.enable_plugin(name) / pc.disable_plugin(name) instead."
+                "plx.enable_plugin(name) / plx.disable_plugin(name) instead."
             )
         super().__setattr__(name, value)
 
@@ -1252,7 +1252,7 @@ class Plugin(ABC):
         info_dict["remote"] = self.remote
         info_dict["description"] = self.description
         info_dict["arguments"] = self.arguments
-        # TODO: Include endpoint info. For now use PluginCore.get_plugin_info() instead.
+        # TODO: Include endpoint info. For now use Plexus.get_plugin_info() instead.
         raise NotImplementedError
 
     def set_logger_level(
@@ -1267,7 +1267,7 @@ class Plugin(ABC):
         Plugin-source overrides survive config.yml reloads but are auto-cleared
         when this plugin is disabled, popped, purged, or shut down.
         """
-        self._plugin_core.set_logger_level(
+        self._plexus.set_logger_level(
             name,
             console=console,
             file=file,
@@ -1283,7 +1283,7 @@ class Plugin(ABC):
         file: bool = True,
     ) -> None:
         """Remove this plugin's override for `name` (other plugins' overrides survive)."""
-        self._plugin_core.clear_logger_level(
+        self._plexus.clear_logger_level(
             name,
             console=console,
             file=file,
@@ -1293,7 +1293,7 @@ class Plugin(ABC):
 
     def list_logger_levels(self) -> dict:
         """Snapshot of all configured per-logger thresholds (config + plugin sources)."""
-        return self._plugin_core.list_logger_levels()
+        return self._plexus.list_logger_levels()
 
     @async_log_errors
     async def execute(
@@ -1327,7 +1327,7 @@ class Plugin(ABC):
         Returns:
             The result from the target method or None if an error occurs.
         """
-        return await self._plugin_core.execute(
+        return await self._plexus.execute(
             plugin,
             method,
             args,
@@ -1376,7 +1376,7 @@ class Plugin(ABC):
         # main_event_loop is bound) used to silently hang on
         # run_coroutine_threadsafe(..., None); now it raises clearly.
         self._check_framework_started()
-        return self._plugin_core.execute_sync(
+        return self._plexus.execute_sync(
             plugin,
             method,
             args,
@@ -1420,7 +1420,7 @@ class Plugin(ABC):
         Yields:
             Each value yielded by the target streaming method.
         """
-        async for i in self._plugin_core.execute_stream(
+        async for i in self._plexus.execute_stream(
             plugin,
             method,
             args,
@@ -1498,7 +1498,7 @@ class Plugin(ABC):
     ):
         """Generator body for execute_stream_sync (split out so the
         pre-start guard fires at call time, not at first iteration)."""
-        for i in self._plugin_core.execute_stream_sync(
+        for i in self._plexus.execute_stream_sync(
             plugin,
             method,
             args,
@@ -1537,7 +1537,7 @@ class Plugin(ABC):
                 "subscribe(): target_access_name must be a non-empty string "
                 "naming a declared endpoint."
             )
-        return await self._plugin_core.subscribe_event(
+        return await self._plexus.subscribe_event(
             topic,
             self.plugin_name,
             self.plugin_uuid,
@@ -1552,7 +1552,7 @@ class Plugin(ABC):
 
     async def unsubscribe(self, subscription_id: str) -> bool:
         """Remove a subscription by its sub_uuid."""
-        return await self._plugin_core.unsubscribe_event(subscription_id)
+        return await self._plexus.unsubscribe_event(subscription_id)
 
     # ── B-073: Internal event bus observer API ────────────────────────
 
@@ -1561,20 +1561,20 @@ class Plugin(ABC):
 
         Auto-fills ``plugin_uuid`` so framework auto-cleanup on
         ``pop_plugin`` removes this registration. See
-        ``PluginCore.internal_observe`` for the full contract:
+        ``Plexus.internal_observe`` for the full contract:
         loop-thread only, observers must return < 1ms, ``Exception``
         subclasses are logged + swallowed (``BaseException`` propagates),
         idempotent (re-registering same ``(topic, callback)`` is a no-op).
         """
-        self._plugin_core.internal_observe(self.plugin_uuid, topic, callback)
+        self._plexus.internal_observe(self.plugin_uuid, topic, callback)
 
     def internal_unobserve(self, topic: str, callback) -> bool:
         """Remove an observer registration. Returns ``True`` if removed.
 
-        Auto-fills ``plugin_uuid``. See ``PluginCore.internal_unobserve``
+        Auto-fills ``plugin_uuid``. See ``Plexus.internal_unobserve``
         for matching semantics (FIRST occurrence by equality; idempotent).
         """
-        return self._plugin_core.internal_unobserve(
+        return self._plexus.internal_unobserve(
             self.plugin_uuid, topic, callback
         )
 
@@ -1587,7 +1587,7 @@ class Plugin(ABC):
         guidance, closing B-038) by ``execute_sync`` when no event
         loop is available yet.
         """
-        if self._plugin_core.main_event_loop is None:
+        if self._plexus.main_event_loop is None:
             raise RequestException(
                 "Framework not started — sync APIs require running event loop"
             )
@@ -1602,7 +1602,7 @@ class Plugin(ABC):
         blocked_hosts: Union[str, list, None] = None,
     ) -> int:
         """Publish an event (1:N fire-and-forget) per PR3 LOCKED L."""
-        return await self._plugin_core.publish_event(
+        return await self._plexus.publish_event(
             self,
             event_id,
             payload=payload,
@@ -1622,7 +1622,7 @@ class Plugin(ABC):
     ) -> int:
         """Sync variant of publish_event (C16)."""
         self._check_framework_started()
-        return self._plugin_core.publish_event_sync(
+        return self._plexus.publish_event_sync(
             self,
             event_id,
             payload=payload,
@@ -1642,7 +1642,7 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """Request an event (1:1 ask) per PR3 LOCKED L."""
-        return await self._plugin_core.request_event(
+        return await self._plexus.request_event(
             self,
             event_id,
             payload=payload,
@@ -1664,7 +1664,7 @@ class Plugin(ABC):
     ) -> Any:
         """Sync variant of request_event (C16)."""
         self._check_framework_started()
-        return self._plugin_core.request_event_sync(
+        return self._plexus.request_event_sync(
             self,
             event_id,
             payload=payload,
@@ -1684,7 +1684,7 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ):
         """Streaming variant of request_event."""
-        async for chunk in self._plugin_core.request_event_stream(
+        async for chunk in self._plexus.request_event_stream(
             self,
             event_id,
             payload=payload,
@@ -1722,7 +1722,7 @@ class Plugin(ABC):
     ):
         """Generator body — same split pattern as execute_stream_sync
         so the pre-start guard fires at call time, not first iteration."""
-        for chunk in self._plugin_core.request_event_stream_sync(
+        for chunk in self._plexus.request_event_stream_sync(
             self,
             event_id,
             payload=payload,
@@ -1751,7 +1751,7 @@ class Plugin(ABC):
         should use the declarative target_access_name shape."""
         self._check_framework_started()
         future = asyncio.run_coroutine_threadsafe(
-            self._plugin_core.subscribe_event(
+            self._plexus.subscribe_event(
                 topic,
                 self.plugin_name,
                 self.plugin_uuid,
@@ -1763,7 +1763,7 @@ class Plugin(ABC):
                 authors=authors,
                 blocked_authors=blocked_authors,
             ),
-            self._plugin_core.main_event_loop,
+            self._plexus.main_event_loop,
         )
         return future.result()
 
@@ -1772,8 +1772,8 @@ class Plugin(ABC):
         """Sync variant of unsubscribe (C16)."""
         self._check_framework_started()
         future = asyncio.run_coroutine_threadsafe(
-            self._plugin_core.unsubscribe_event(sub_uuid),
-            self._plugin_core.main_event_loop,
+            self._plexus.unsubscribe_event(sub_uuid),
+            self._plexus.main_event_loop,
         )
         return future.result()
 
@@ -1810,7 +1810,7 @@ class Event:
     Endpoints called via execute() are NOT wrapped — they keep the args
     (tuple/dict/None) shape. Dispatch path determines the wrapping; the
     sole place this class is constructed is the kind-aware branch in
-    PluginCore._call_endpoint (Stage A) and the local fan-out path
+    Plexus._call_endpoint (Stage A) and the local fan-out path
     (Stage B).
     """
 
@@ -1826,7 +1826,7 @@ class Event:
     def from_request(cls, request: "Request") -> "Event":
         """Build an Event from a kind-aware Request.
 
-        Used by PluginCore._call_endpoint when ``request.kind`` is one of
+        Used by Plexus._call_endpoint when ``request.kind`` is one of
         ``"publish_event"`` / ``"request_event"``. The Request's
         ``origin_subscription_id`` carries either the declared_id (for
         YAML subs) or the sub_uuid (for runtime subs) — Stage B sets the
@@ -1891,7 +1891,7 @@ class Request:
         # B-073 Session 2 Step 4: ``self.collected`` field removed —
         # was read only by ``cleanup_requests`` polling reap (killed
         # in this step). Done-callback eviction at all 7 framework
-        # Request sites pops the entry from ``pc.requests`` directly.
+        # Request sites pops the entry from ``plx.requests`` directly.
         self.timeout = False
         self.ready = False
         self.error = False
@@ -1899,7 +1899,7 @@ class Request:
         self.finished_at = None
 
         # PR3 Stage A: kind-aware fields. `kind` selects execute vs event
-        # dispatch in PluginCore._call_endpoint; `topic` carries the
+        # dispatch in Plexus._call_endpoint; `topic` carries the
         # resolved literal topic for event kinds; `origin_subscription_id`
         # carries the sub_uuid this Request was fanned out for;
         # `timestamp` is epoch seconds at Request creation;
@@ -2051,7 +2051,7 @@ class GeneratorRequest:
 
         self.event_loop = event_loop or asyncio.get_event_loop()
         self._future = self.event_loop.create_future()
-        # B-002 fix: producer task ref. PluginCore.create_gen_request
+        # B-002 fix: producer task ref. Plexus.create_gen_request
         # attaches the task it spawns so set_collected() can cancel
         # the producer when the consumer abandons the stream.
         self._producer_task: Optional[asyncio.Task] = None
@@ -2147,7 +2147,7 @@ class GeneratorRequest:
                 try:
                     if error:
                         # B-044 fix: yield the error tuple BEFORE breaking so
-                        # PluginCore.execute_stream's `if error: raise
+                        # Plexus.execute_stream's `if error: raise
                         # RequestException(result)` branch fires. Previously
                         # broke silently — consumer saw clean iteration end
                         # with no signal of the underlying error. `self.result`

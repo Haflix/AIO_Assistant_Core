@@ -6,9 +6,9 @@ Exposes predictable sync/async/error endpoints. No business logic. Tier-1.
 import asyncio
 from typing import Any, Optional
 
-from utils import Plugin
-from decorators import async_log_errors, log_errors
-from exceptions import RequestException
+from plexus.utils import Plugin
+from plexus.decorators import async_log_errors, log_errors
+from plexus.exceptions import RequestException
 
 
 class TestExecuteTarget(Plugin):

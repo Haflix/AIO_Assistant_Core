@@ -4,8 +4,8 @@ sub/event enable-toggle API + the ``kind=`` field added to
 
 Categories:
   1. registry_level  — TopicRegistry.set_subscription_enabled atomic + unknown_uuid
-  2. pc_subscription — PluginCore.set_subscription_enabled wrapper
-  3. pc_event        — PluginCore.set_event_enabled wrapper
+  2. pc_subscription — Plexus.set_subscription_enabled wrapper
+  3. pc_event        — Plexus.set_event_enabled wrapper
   4. kind_field      — kind=request.kind on _core/request/* emits
   5. dispatch        — disabled subs/events drop at dispatch time
   6. emit_depth      — chained toggle stays inside the emit-depth budget
@@ -29,14 +29,14 @@ import time  # noqa: E402
 import uuid as _uuid  # noqa: E402
 from typing import Any, Dict, List, Optional, Tuple  # noqa: E402
 
-from utils import Plugin, Event  # noqa: E402
-from decorators import async_log_errors, log_errors  # noqa: E402
+from plexus.utils import Plugin, Event  # noqa: E402
+from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
 # Module-level ContextVar imported so the emit_depth case can read the
 # depth observed inside a recursive observer call.
-from PluginCore import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
+from plexus.core import _EMIT_DEPTH, _MAX_EMIT_DEPTH  # noqa: E402
 
 
 SUITE_VERSION = "0.1.0"
@@ -84,7 +84,7 @@ class TestRuntimeToggleSuite(Plugin):
         """Register a runtime subscription owned by THIS plugin so it
         cleans up automatically on suite disable. Returns sub_uuid.
         """
-        return await self._plugin_core.topic_registry.subscribe(
+        return await self._plexus.topic_registry.subscribe(
             topic_pattern=topic,
             plugin_name=self.plugin_name,
             plugin_uuid=self.plugin_uuid,
@@ -98,7 +98,7 @@ class TestRuntimeToggleSuite(Plugin):
         if sub_uuid is None:
             return
         try:
-            await self._plugin_core.topic_registry.unsubscribe(sub_uuid)
+            await self._plexus.topic_registry.unsubscribe(sub_uuid)
         except Exception:
             pass
 
@@ -116,7 +116,7 @@ class TestRuntimeToggleSuite(Plugin):
         skip_slow: bool = False,
         allow_destructive: bool = True,
     ) -> Dict[str, Any]:
-        rec = CaseRecorder("TestRuntimeToggleSuite", SUITE_VERSION, self._plugin_core)
+        rec = CaseRecorder("TestRuntimeToggleSuite", SUITE_VERSION, self._plexus)
         kw = dict(
             case_ids_filter=case_ids,
             bug_ids_filter=bug_ids,
@@ -141,7 +141,7 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _registry_level(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
         reg = pc.topic_registry
 
         async def body_atomic(c):
@@ -193,7 +193,7 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _pc_subscription(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def body_toggles_flag(c):
             """Test #37 — wrapper mutates Subscription.enabled + returns True."""
@@ -459,7 +459,7 @@ class TestRuntimeToggleSuite(Plugin):
                 else:
                     # Networking not ready but nm exists: spy WAS
                     # installed. Implementation MUST respect the
-                    # ``is_ready`` gate at PluginCore.py:6712-6716 and
+                    # ``is_ready`` gate at core.py:6712-6716 and
                     # skip the broadcast call. If captured_broadcast_ts
                     # is non-empty, the gate was bypassed — real bug.
                     if captured_broadcast_ts:
@@ -528,7 +528,7 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _pc_event(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def body_toggles_flag(c):
             """Test #42 — wrapper mutates plugin.events[id]["enabled"]."""
@@ -660,7 +660,7 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _kind_field(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def body_started_includes_kind(c):
             """Test #47 — fire execute() + publish_event + request_event,
@@ -872,11 +872,11 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _dispatch(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def body_event_disabled_drops_publish(c):
             """Test #50 — set_event_enabled(False) makes publish_event
-            return 0 (silent-drop on disabled event per PluginCore.py:5447).
+            return 0 (silent-drop on disabled event per core.py:5447).
             """
             self.events[RUNTIME_TOGGLE_EVENT_ID]["enabled"] = True
             try:
@@ -970,7 +970,7 @@ class TestRuntimeToggleSuite(Plugin):
     # ─────────────────────────────────────────────────────────────────
 
     async def _emit_depth(self, rec: CaseRecorder, kw: Dict) -> None:
-        pc = self._plugin_core
+        pc = self._plexus
 
         async def body_under_max(c):
             """Test #55 — chained toggle should not extend the

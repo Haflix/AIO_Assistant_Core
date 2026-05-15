@@ -2,7 +2,7 @@
 
 *Last updated for AIO Assistant Core 0.22.3*
 
-Reference manual for the public surface of `utils.Plugin` — the methods and attributes a plugin author calls from inside their own class. Methods on `PluginCore` itself are covered at the end for tooling and harness authors.
+Reference manual for the public surface of `utils.Plugin` — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
 All entries cite the source file and line number. Argument types use Python conventions; `Any` means no constraint. For tutorials and patterns, see [plugin authoring](./plugin_authoring.md). For event-system semantics, see [notifier](./notifier.md).
 
@@ -31,7 +31,7 @@ All entries cite the source file and line number. Argument types use Python conv
 - [The `Event` object](#the-event-object)
 - [Exceptions](#exceptions)
 - [Argument-shape contract (canonical)](#argument-shape-contract-canonical)
-- [PluginCore methods](#plugincore-methods-for-tooling-harnesses-cli-authors)
+- [Plexus methods](#plexus-methods-for-tooling-harnesses-cli-authors)
 - [Quick reference card](#quick-reference-card)
 
 ---
@@ -54,7 +54,7 @@ Source: `utils.py:1743-1745`. May be `async def` or `def`. Called once, after fr
 
 ### `on_disable(self) -> None`
 
-Source: `utils.py:1749-1751`. May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `PluginCore.close()` (`PluginCore.py:797`) hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
+Source: `utils.py:1749-1751`. May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `Plexus.close()` (`core.py:797`) hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
 
 ---
 
@@ -64,7 +64,7 @@ Set by `Plugin.__init__` (`utils.py:1172-1223`) before `on_load` runs, then part
 
 | Name                 | Type             | Description                                                                                                       |
 |----------------------|------------------|-------------------------------------------------------------------------------------------------------------------|
-| `self._plugin_core`  | `PluginCore`     | Back-reference to the running core. Prefer the wrapper methods below over reaching into it directly.              |
+| `self._plexus`  | `Plexus`     | Back-reference to the running core. Prefer the wrapper methods below over reaching into it directly.              |
 | `self._logger`       | `logging.Logger` | Plugin-scoped logger (`{root}.{plugin_name}`).                                                                    |
 | `self.plugin_name`   | `str`            | Name from `config.yml` (NOT the class name). Set after `on_load` returns.                                         |
 | `self.plugin_uuid`   | `str`            | uuid4 hex; unique per instance, regenerated on every load and reload.                                             |
@@ -231,7 +231,7 @@ Source: `utils.py:1654-1689`. Sync equivalent. Pre-start guard fires at call tim
 
 ### `topic_vars` constraints
 
-Validated in `PluginCore.py:3949-3997`.
+Validated in `core.py:3949-3997`.
 
 - Type: `Dict[str, str]` or `None`. A non-dict, non-None value raises `TypeError`.
 - Keys must be `str` (`TypeError` otherwise) and must NOT be in `{"prefix", "plugin_name", "hostname", "plugin_uuid"}` (`ValueError`).
@@ -267,7 +267,7 @@ Register a subscription at runtime (in addition to the declarative `subscription
 
 **Raises**
 - `TypeError` if `target_access_name` is empty or non-string (`utils.py:1514-1518`).
-- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` (`PluginCore.py:5048`) and the `target_access_name` re-check at `PluginCore.py:5059-5064`. Topic and filter values are validated identically to YAML load.
+- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` (`core.py:5048`) and the `target_access_name` re-check at `core.py:5059-5064`. Topic and filter values are validated identically to YAML load.
 
 > **Do not use** the legacy `handler=` keyword form — it was removed. Runtime subs always route to a NAMED endpoint via `target_access_name`.
 
@@ -349,7 +349,7 @@ Subscriber handlers receive ONE positional argument: an `Event`. Endpoints calle
 
 ## Exceptions
 
-Source: `exceptions.py`.
+Source: `plexus/exceptions.py`.
 
 | Class                     | Base               | Raised when                                                                                                                                              |
 |---------------------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -366,7 +366,7 @@ In practice, catch `RequestException` — it covers `execute*`, `request_event*`
 
 ## Argument-shape contract (canonical)
 
-From `_call_endpoint` (`PluginCore.py:2838-2868`). Restated here for skim-readers:
+From `_call_endpoint` (`core.py:2838-2868`). Restated here for skim-readers:
 
 | `args=` value | Endpoint receives                  |
 |---------------|------------------------------------|
@@ -379,30 +379,30 @@ Subscriber handlers (publish_event / request_event) bypass this rule: they alway
 
 ---
 
-## PluginCore methods (for tooling, harnesses, CLI authors)
+## Plexus methods (for tooling, harnesses, CLI authors)
 
-The methods below are on `PluginCore` itself. Plugin authors use the `Plugin` wrappers above; tooling that drives the framework from outside uses these. All are on `pc: PluginCore`.
+The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappers above; tooling that drives the framework from outside uses these. All are on `pc: Plexus`.
 
 ### Lifecycle
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `PluginCore(config_path: str)` | `PluginCore.py:526` | Constructor. Loads config. Does NOT load plugins or start networking. |
-| `await pc.start()` | `PluginCore.py:674-711` | Initialise background tasks, load plugins, start networking. |
-| `await pc.wait_until_ready()` | `PluginCore.py:624-672` | Idempotent variant — for callers that want lazy init. |
-| `await pc.close()` | `PluginCore.py:713-827` | Graceful shutdown. |
-| `await pc.graceful_shutdown()` | `PluginCore.py:1670-1675` | Alias for `close()`. |
+| `Plexus(config_path: str)` | `core.py:526` | Constructor. Loads config. Does NOT load plugins or start networking. |
+| `await pc.start()` | `core.py:674-711` | Initialise background tasks, load plugins, start networking. |
+| `await pc.wait_until_ready()` | `core.py:624-672` | Idempotent variant — for callers that want lazy init. |
+| `await pc.close()` | `core.py:713-827` | Graceful shutdown. |
+| `await pc.graceful_shutdown()` | `core.py:1670-1675` | Alias for `close()`. |
 
 ### Config
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `pc.load_config_yaml(path)` | `PluginCore.py:829-848` | Re-read, validate, re-apply (sync). |
-| `await pc.async_load_config_yaml(path)` | `PluginCore.py:850-852` | Async wrapper. |
-| `pc.list_config_files() -> Dict[str, str]` | `PluginCore.py:894-907` | Paths to main + per-plugin configs. |
-| `pc.read_config_file(path) -> str` | `PluginCore.py:909-929` | Read a known config file. |
-| `pc.save_config_file(path, content, backup=True)` | `PluginCore.py:931-965` | Validate YAML, save. Does NOT auto-reload. |
-| `pc.is_main_config(path) -> bool` | `PluginCore.py:967-969` | |
+| `pc.load_config_yaml(path)` | `core.py:829-848` | Re-read, validate, re-apply (sync). |
+| `await pc.async_load_config_yaml(path)` | `core.py:850-852` | Async wrapper. |
+| `pc.list_config_files() -> Dict[str, str]` | `core.py:894-907` | Paths to main + per-plugin configs. |
+| `pc.read_config_file(path) -> str` | `core.py:909-929` | Read a known config file. |
+| `pc.save_config_file(path, content, backup=True)` | `core.py:931-965` | Validate YAML, save. Does NOT auto-reload. |
+| `pc.is_main_config(path) -> bool` | `core.py:967-969` | |
 
 ### Plugin management
 
@@ -424,23 +424,23 @@ The methods below are on `PluginCore` itself. Plugin authors use the `Plugin` wr
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `await pc.get_plugin_info(plugin_name) -> Optional[dict]` | `PluginCore.py:1610-1626` | name/version/uuid/enabled/remote/description/arguments. |
-| `await pc.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | `PluginCore.py:1628-1655` | Per-endpoint metadata. |
-| `await pc.list_plugins_state() -> List[dict]` | `PluginCore.py:1657-1668` | name/enabled/description for every plugin. |
-| `await pc.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | `PluginCore.py:2468-2649` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
-| `await pc.find_endpoints_by_tag(tag) -> Optional[List]` | `PluginCore.py:2431-2466` | Tag-based discovery (local + remote). |
+| `await pc.get_plugin_info(plugin_name) -> Optional[dict]` | `core.py:1610-1626` | name/version/uuid/enabled/remote/description/arguments. |
+| `await pc.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | `core.py:1628-1655` | Per-endpoint metadata. |
+| `await pc.list_plugins_state() -> List[dict]` | `core.py:1657-1668` | name/enabled/description for every plugin. |
+| `await pc.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | `core.py:2468-2649` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
+| `await pc.find_endpoints_by_tag(tag) -> Optional[List]` | `core.py:2431-2466` | Tag-based discovery (local + remote). |
 
 ### Events and subscriptions (low-level)
 
 | Method | Source | Purpose |
 |--------|--------|---------|
-| `await pc.publish_event(publisher, event_id, ...)` | `PluginCore.py:4060-4279` | Underlying publish path. |
-| `pc.publish_event_sync(...)` | `PluginCore.py:4409-4437` | Sync. |
-| `await pc.request_event(publisher, event_id, ...)` | `PluginCore.py:4440-4629` | Underlying request path. |
+| `await pc.publish_event(publisher, event_id, ...)` | `core.py:4060-4279` | Underlying publish path. |
+| `pc.publish_event_sync(...)` | `core.py:4409-4437` | Sync. |
+| `await pc.request_event(publisher, event_id, ...)` | `core.py:4440-4629` | Underlying request path. |
 | `pc.request_event_sync(...)` | as above | Sync. |
-| `await pc.request_event_stream(publisher, event_id, ...)` | `PluginCore.py:4655-4954` | Streaming request path. |
-| `await pc.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | `PluginCore.py:5023-5122` | Runtime sub registration with full validation and delta broadcast. |
-| `await pc.unsubscribe_event(sub_uuid) -> bool` | `PluginCore.py:5124-5157` | With remove-delta broadcast. |
+| `await pc.request_event_stream(publisher, event_id, ...)` | `core.py:4655-4954` | Streaming request path. |
+| `await pc.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | `core.py:5023-5122` | Runtime sub registration with full validation and delta broadcast. |
+| `await pc.unsubscribe_event(sub_uuid) -> bool` | `core.py:5124-5157` | With remove-delta broadcast. |
 
 ### Read-mostly attributes
 

@@ -36,14 +36,14 @@ import yaml
 # that would deadlock the ThreadPoolExecutor.
 _sync_call_chain = threading.local()
 
-from exceptions import (
+from .exceptions import (
     NetworkRequestException,
     NoLocalSubException,
     RequestException,
 )
-from networking_classes import Node, RemotePlugin
-from utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
-from decorators import (
+from .networking_classes import Node, RemotePlugin
+from .utils import LogUtil, Request, Plugin, ConfigUtil, GeneratorRequest, Event
+from .decorators import (
     log_errors,
     handle_errors,
     async_log_errors,
@@ -53,9 +53,9 @@ from decorators import (
     gen_log_errors,
     gen_handle_errors,
 )
-from networking import NetworkManager
-from notifier import TopicRegistry, Subscription, SyncDispatcher
-from plugin_state import State, Phase, ErrorRecord, PluginState
+from .networking import NetworkManager
+from .notifier import TopicRegistry, Subscription, SyncDispatcher
+from .plugin_state import State, Phase, ErrorRecord, PluginState
 
 
 # Reserved identifier names — disallowed as plugin names AND endpoint
@@ -149,7 +149,7 @@ _TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 #   - networking.enabled          (bool)
 #   - networking.port             (int)
 #   - networking.hostname         (str — read by NetworkManager.__init__:175)
-#   - general.hostname            (str — read by apply_configvalues for pc.hostname)
+#   - general.hostname            (str — read by apply_configvalues for plx.hostname)
 #   - networking.keys_dir         (str — read by NetworkManager.__init__:176)
 # (``hostname`` covers BOTH source paths — see _networking_config_changed.)
 # All OTHER networking fields (heartbeat_interval, lookup_interval,
@@ -238,7 +238,7 @@ def _validate_topic_static(
 
     # B-073 Step 9: reject topics starting with the framework-internal
     # prefix ``_``. ``_core/...`` is reserved for the internal event bus
-    # (PluginCore._internal_emit, exempt from this validator). Plugin
+    # (Plexus._internal_emit, exempt from this validator). Plugin
     # authors must use a non-underscore-prefixed namespace.
     if stripped.startswith("_"):
         raise ValueError(
@@ -549,7 +549,7 @@ def _warn_redundant_host_combos(hosts, blocked_hosts, logger) -> None:
         )
 
 
-class PluginCore:
+class Plexus:
     """Manages all plugins and facilitates communication between them."""
 
     def __init__(self, config_path: str):
@@ -603,8 +603,8 @@ class PluginCore:
         self.plugins = {}
         self.plugins_by_uuid = {}
         # Session 3 (v0.26.0): plugin state machine. Read-only data
-        # container; all mutations through pc._transition_plugin(name, state).
-        # External readers MUST snapshot before iterating: dict(pc.plugin_states).
+        # container; all mutations through plx._transition_plugin(name, state).
+        # External readers MUST snapshot before iterating: dict(plx.plugin_states).
         self.plugin_states: Dict[str, PluginState] = {}
         self.plugin_lock = asyncio.Lock()
         # Stage O: per-plugin lifecycle locks (B-046 fix). Each plugin
@@ -1120,7 +1120,7 @@ class PluginCore:
         * Bootstrap (``self.yaml_config is None``): apply new config
           directly. NO networking action — NetworkManager construction
           happens later in ``wait_until_ready()`` via Option A. NOTE:
-          unreachable in practice — ``PluginCore.__init__`` calls
+          unreachable in practice — ``Plexus.__init__`` calls
           ``load_config_yaml`` synchronously, populating
           ``self.yaml_config`` before any caller reaches this method.
           Kept as a defensive guard.
@@ -1404,7 +1404,7 @@ class PluginCore:
         if not isinstance(nw_cfg, dict):
             return
 
-        from networking import (
+        from .networking import (
             DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
             DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
             DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
@@ -1483,7 +1483,7 @@ class PluginCore:
         matching ``apply_configvalues``' defensive parsing.
         """
         from pathlib import Path as _Path
-        from networking import (
+        from .networking import (
             DEFAULT_HEARTBEAT_INTERVAL as _DEF_HB,
             DEFAULT_LOOKUP_INTERVAL as _DEF_LOOK,
             DEFAULT_LIVENESS_TIMEOUT as _DEF_LIVE,
@@ -1669,7 +1669,7 @@ class PluginCore:
           at networking.py:175 for ``self.hostname`` (the value the
           network layer uses on the wire).
         * ``general.hostname`` — read by ``apply_configvalues`` at
-          utils.py:970-973 for ``plugin_core.hostname`` (the value the
+          utils.py:970-973 for ``plexus.hostname`` (the value the
           framework uses for topic-dispatch / sub author-id / etc.).
 
         ``apply_configvalues`` writes ONLY to ``general.hostname``
@@ -2660,7 +2660,7 @@ class PluginCore:
 
     @async_log_errors
     async def graceful_shutdown(self):
-        """Gracefully shutdown the system by closing PluginCore."""
+        """Gracefully shutdown the system by closing Plexus."""
         self._logger.info("Initiating graceful shutdown...")
         await self.close()
         # Note: Stopping the event loop should be handled by the main application
@@ -4522,7 +4522,7 @@ class PluginCore:
                 # uses for sync endpoints).
                 sentinel = object()
                 gen = func(event_meta)
-                # Mirrors current inline code (PluginCore.py:4780-4784):
+                # Mirrors current inline code (core.py:4780-4784):
                 # request_event_stream_sync passes non-None caller_chain;
                 # Plugin.request_event_stream (utils.py:1572) does NOT,
                 # so async callers leave it as None — fallback reads
@@ -5071,7 +5071,7 @@ class PluginCore:
         callers previously used to skip validation.
         """
         _validate_subscription_topic(
-            topic, context=f"PluginCore.subscribe(plugin={plugin_name!r})"
+            topic, context=f"Plexus.subscribe(plugin={plugin_name!r})"
         )
         return await self.topic_registry.subscribe(
             topic_pattern=topic,
@@ -5927,7 +5927,7 @@ class PluginCore:
             # networking guard's dispatch loop even if observer-driven
             # state flips networking between the two guards.
             from uuid import uuid4 as _uuid4
-            from notifier import TopicRegistry as _TR
+            from .notifier import TopicRegistry as _TR
             candidates: list = []
             request_uuid = _uuid4().hex
             nm = self.network
@@ -6183,7 +6183,7 @@ class PluginCore:
                 and getattr(nm, "is_ready", False)
             ):
                 from uuid import uuid4 as _uuid4
-                from notifier import TopicRegistry as _TR
+                from .notifier import TopicRegistry as _TR
                 request_uuid = _uuid4().hex
 
                 async with nm._adverts_struct_lock:
@@ -6533,7 +6533,7 @@ class PluginCore:
         )
         # Defensive: target_access_name must be a non-empty identifier-style
         # string. The Plugin.subscribe wrapper already checks this for the
-        # standard call path, but direct PluginCore.subscribe_event calls
+        # standard call path, but direct Plexus.subscribe_event calls
         # (test code, future internal callers) bypass the wrapper. Without
         # this guard, an empty string silently produces a permanently dead
         # subscription — find_endpoint(access_name="") returns
@@ -6654,7 +6654,7 @@ class PluginCore:
     # ``_private/tui_phase2_events_plan.md`` sections 4.2-4.4 for the
     # detailed design + the lock-ordering rationale for splitting
     # subscription toggle across notifier (atomic mutation under registry
-    # lock) and PluginCore (broadcast + emit outside the lock).
+    # lock) and Plexus (broadcast + emit outside the lock).
 
     async def set_subscription_enabled(
         self, sub_uuid: str, enabled: bool
@@ -6670,7 +6670,7 @@ class PluginCore:
         happen OUTSIDE the registry lock, per the framework's
         lock-ordering rule (mirrored from the
         ``subscribe_event``/``unsubscribe_event`` patterns at
-        ``PluginCore.py:6595`` + ``6626`` — see the lock-ordering
+        ``core.py:6595`` + ``6626`` — see the lock-ordering
         comment block at ``_get_lifecycle_lock`` for the
         "no-network-I/O-under-registry-lock" invariant).
 

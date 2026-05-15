@@ -2,7 +2,7 @@
 
 *Last updated for AIO Assistant Core 0.22.3*
 
-Reference for the top-level `config.yml` — the file PluginCore reads on
+Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
 up networking. The shipped `config.example.yml` is the starting point;
 copy it to `config.yml` (which is gitignored) and edit.
@@ -120,7 +120,7 @@ Each `plugins:` entry can carry an `overrides:` block that deep-merges
 into the plugin's own `plugin_config.yml` at load time. Use this when
 you want to customize a single instance of a class without forking the
 plugin folder. Implemented by `apply_overrides`
-(`PluginCore.py:328-439`).
+(`core.py:328-439`).
 
 ```yaml
 plugins:
@@ -154,7 +154,7 @@ Override semantics:
   override are fail-load errors. Protects against typos that would
   silently change nothing. Driven by
   `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})`
-  (`PluginCore.py:135`).
+  (`core.py:135`).
 - **`arguments:`**, **`events:`**, **`subscriptions:`** — LENIENT.
   Unknown subkeys merge in.
 - **`__replace__: true`** in any sub-mapping triggers wholesale
@@ -203,7 +203,7 @@ same forbidden list as plugin names: `system`, `general`, `any`,
 ## `general:` (dict)
 
 Framework-wide settings. Read by `ConfigUtil.apply_configvalues`
-(`utils.py`) and `PluginCore.__init__`.
+(`utils.py`) and `Plexus.__init__`.
 
 ```yaml
 general:
@@ -503,7 +503,7 @@ those cert files.
 
 ## Hot-reloading config
 
-`PluginCore.load_config_yaml(path)` re-reads the config file,
+`Plexus.load_config_yaml(path)` re-reads the config file,
 validates it, and re-applies it. The async wrapper is
 `async_load_config_yaml(path)`. Behaviour:
 
@@ -521,7 +521,7 @@ does NOT trigger a reload — call `load_config_yaml` afterwards if
 that's what you want.
 
 For a forced full-cycle reload of one plugin without changing config,
-use `PluginCore._reload_plugin(name)` directly.
+use `Plexus._reload_plugin(name)` directly.
 
 ---
 

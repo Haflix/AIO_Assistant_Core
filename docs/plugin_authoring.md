@@ -52,7 +52,7 @@ plugins:
     path: ./plugins/my_plugin
 ```
 
-If `path` is omitted, PluginCore resolves it as
+If `path` is omitted, Plexus resolves it as
 `{general.plugin_package}/{name}` — so a plugin named `MyPlugin` with
 `general.plugin_package: plugins` auto-resolves to `plugins/MyPlugin/`.
 
@@ -69,8 +69,8 @@ Every plugin must implement `on_load`, `on_enable`, and `on_disable`.
 `Plugin.__init__` is `@final` — do not override it.
 
 ```python
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class MyPlugin(Plugin):
@@ -176,7 +176,7 @@ Field details:
 | `internal_name` | str | optional | access_name | The real method name on the class. Use it when the public name differs from the implementation name. Must be non-empty ASCII. |
 | `remote` | bool | YES | — | Required even when `plugin.remote: true`. Both flags must be true for a peer to reach the endpoint. |
 | `accessible_by_other_plugins` | bool | YES | — | When `false`, only the plugin itself (matched by `plugin_uuid`) can call. |
-| `description` | str | optional | `""` | Surfaced via `PluginCore.get_plugin_endpoints`. |
+| `description` | str | optional | `""` | Surfaced via `Plexus.get_plugin_endpoints`. |
 | `tags` | list[str] | optional | `[]` | Used by `find_endpoints_by_tag` for tag-based discovery. |
 | `arguments` | list[dict] | optional | absent | Pure metadata for introspection (CLI, AI tool schema builders). The framework does not validate the shape of individual arg specs. |
 
@@ -246,8 +246,8 @@ in [notifier](./notifier.md).
 
 ```python
 # copypasta/AveragePlugin/plugin.py
-from utils import Plugin
-from decorators import log_errors, async_log_errors
+from plexus.utils import Plugin
+from plexus.decorators import log_errors, async_log_errors
 
 
 class AveragePlugin(Plugin):
@@ -274,7 +274,7 @@ arguments:
 endpoints: {}
 ```
 
-Add to `config.yml` and run. PluginCore loads, enables, disables on
+Add to `config.yml` and run. Plexus loads, enables, disables on
 shutdown. Nothing exposed yet.
 
 ### Step 2 — expose an endpoint
@@ -468,7 +468,7 @@ async def on_enable(self):
 @async_log_errors
 async def on_disable(self):
     # framework auto-clears declared and runtime subs after `on_disable`
-    # returns (PluginCore.py:2167-2198)
+    # returns (core.py:2167-2198)
     pass
 ```
 
@@ -485,7 +485,7 @@ async def on_disable(self):
 
 | Attribute | Type | Purpose |
 |---|---|---|
-| `self._plugin_core` | `PluginCore` | Back-reference. Prefer the `Plugin`-level wrappers. |
+| `self._plexus` | `Plexus` | Back-reference. Prefer the `Plugin`-level wrappers. |
 | `self._logger` | `Logger` | Plugin-scoped logger. |
 | `self.plugin_name` | str | Name from `config.yml` (NOT the class name). |
 | `self.plugin_uuid` | str | uuid4 hex; unique per instance, regenerated on each (re)load. |
@@ -542,8 +542,8 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `FAILED_LOAD` | `on_load` raised. No instance. `last_errors[Phase.LOAD]` populated. |
 
 Read state with `pc.plugin_states[name].state`. The state enum lives in
-[`plugin_state.py`](../plugin_state.py); import as
-`from plugin_state import State`.
+[`plexus/plugin_state.py`](../plexus/plugin_state.py); import as
+`from plexus.plugin_state import State`.
 
 `Plugin.enabled` is a read-only `@property` returning `True` for state in
 `{ENABLING, ENABLED}`. Author code MUST NOT write `self.enabled = ...` —
@@ -552,7 +552,7 @@ the override raises `AttributeError`. Use `pc.enable_plugin(name)` /
 
 **Subclass init contract:** subclasses must call `super().__init__(...)`
 BEFORE reading `self.enabled` — the property depends on
-`self._plugin_core` being bound, which the parent `__init__` does at the
+`self._plexus` being bound, which the parent `__init__` does at the
 end. Reading the property earlier in subclass init returns `False` even
 for an enabled plugin.
 
@@ -561,7 +561,7 @@ from inside your own `on_load` / `on_enable` / handler body re-enters
 the per-plugin lifecycle lock and **deadlocks**. If you need to
 self-disable, schedule it on a separate task:
 ```python
-asyncio.create_task(self._plugin_core.disable_plugin(self.plugin_name))
+asyncio.create_task(self._plexus.disable_plugin(self.plugin_name))
 ```
 
 ### Observers of `_core/plugin/state_changed`
@@ -689,8 +689,8 @@ A single copy-paste reference combining all seven steps.
 `copypasta/AveragePlugin/plugin.py`:
 
 ```python
-from utils import Plugin
-from decorators import (
+from plexus.utils import Plugin
+from plexus.decorators import (
     log_errors,
     async_log_errors,
     async_handle_errors,

@@ -14,16 +14,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Set, Union, Optional, Tuple
-from decorators import async_log_errors, async_handle_errors, async_gen_handle_errors, async_gen_log_errors
-from exceptions import (
+from .decorators import async_log_errors, async_handle_errors, async_gen_handle_errors, async_gen_log_errors
+from .exceptions import (
     NetworkRequestException,
     NodeException,
     NoLocalSubException,
     RequestException,
 )
-from networking_classes import Node
-from networking_classes import RemotePlugin
-from serialization import safe_loads, FINGERPRINT_CLI_CMD, generate_keypair
+from .networking_classes import Node
+from .networking_classes import RemotePlugin
+from .serialization import safe_loads, FINGERPRINT_CLI_CMD, generate_keypair
 
 
 # PR3 Stage C — in-memory advertised-subscription record (per-peer wire
@@ -131,7 +131,7 @@ DEFAULT_LIVENESS_TIMEOUT: float = 30.0
 class NetworkManager:
     def __init__(
         self,
-        plugin_core,
+        plexus,
         logger: Logger,
         node_ips: list,
         discover_nodes: bool,
@@ -148,7 +148,7 @@ class NetworkManager:
         lookup_interval: float = DEFAULT_LOOKUP_INTERVAL,
         liveness_timeout: float = DEFAULT_LIVENESS_TIMEOUT,
     ):
-        self.plugin_core = plugin_core
+        self.plexus = plexus
         self._logger = logger
 
         # PR4 Stage K (B-066) — hard error on legacy node_ips schema.
@@ -214,7 +214,7 @@ class NetworkManager:
                 self.node_ips.append(entry)
 
         # PR4 Stage K: legacy secret / cert_file / key_file kwargs accepted
-        # for PluginCore call-site compatibility but no longer used. The
+        # for Plexus call-site compatibility but no longer used. The
         # K-3 startup gate uses self.peers, not self.secret.
         self.secret = secret or os.getenv("NETWORKING_SECRET", "")
         if isinstance(self.secret, str):
@@ -243,7 +243,7 @@ class NetworkManager:
         # DEFAULT_LIVENESS_TIMEOUT; override via networking.heartbeat_interval
         # / networking.lookup_interval / networking.liveness_timeout in
         # config.yml (parsed by ConfigUtil.apply_configvalues and passed in
-        # by PluginCore at NetworkManager construction).
+        # by Plexus at NetworkManager construction).
         self.heartbeat_interval: float = heartbeat_interval
         self.lookup_interval: float = lookup_interval
         self.liveness_timeout: float = liveness_timeout
@@ -432,8 +432,8 @@ class NetworkManager:
         # Part 2 — author_id impersonation rewrite, runs in all paths that
         # didn't return above. Preserves author="system" if Part 1 permitted.
         if (
-            author_id in self.plugin_core.plugins_by_uuid
-            or author_id == self.plugin_core.hostname
+            author_id in self.plexus.plugins_by_uuid
+            or author_id == self.plexus.hostname
         ):
             if author == "system":
                 self._logger.warning(
@@ -1401,7 +1401,7 @@ class NetworkManager:
         # not produce spurious connect events. ``port`` is the TCP source
         # port from the connecting client (typically ephemeral OS-assigned),
         # NOT the peer's listener port — useful for connection tracing.
-        self.plugin_core._internal_emit(
+        self.plexus._internal_emit(
             "_core/peer/connected",
             hostname=peer_cfg.hostname,
             ip=client_addr[0],
@@ -1530,7 +1530,7 @@ class NetworkManager:
             # mutated by the inner+outer except handlers above; defaults
             # to "normal" on clean loop exit.
             if peer_hostname:
-                self.plugin_core._internal_emit(
+                self.plexus._internal_emit(
                     "_core/peer/disconnected",
                     hostname=peer_hostname,
                     reason=disconnect_reason,
@@ -1574,10 +1574,10 @@ class NetworkManager:
             )
 
             # Execute plugin method
-            # Pass args as a single object — PluginCore.execute unpacks internally
+            # Pass args as a single object — Plexus.execute unpacks internally
             if isinstance(args, list):
                 args = tuple(args)
-            result = await self.plugin_core.execute(
+            result = await self.plexus.execute(
                 plugin,
                 method,
                 args=args if args else None,
@@ -1667,10 +1667,10 @@ class NetworkManager:
             )
 
             # Execute streaming plugin method
-            # Pass args as a single object — PluginCore.execute_stream unpacks internally
+            # Pass args as a single object — Plexus.execute_stream unpacks internally
             if isinstance(args, list):
                 args = tuple(args)
-            agen = self.plugin_core.execute_stream(
+            agen = self.plexus.execute_stream(
                 plugin=plugin,
                 method=method,
                 args=args if args else None,
@@ -1786,8 +1786,8 @@ class NetworkManager:
                 f"{_peer_addr[0]}:{_peer_addr[1]}" if _peer_addr else "unknown"
             )
             if (
-                requester_id == self.plugin_core.hostname
-                or requester_id in self.plugin_core.plugins_by_uuid
+                requester_id == self.plexus.hostname
+                or requester_id in self.plexus.plugins_by_uuid
             ):
                 self._logger.warning(
                     "[ENDPOINT] B-018b guard: rejected wire-supplied "
@@ -1808,7 +1808,7 @@ class NetworkManager:
                 f"hosts='local', plugin_uuid={plugin_uuid}, requester_id={requester_id}, "
                 f"target_plugin={target_plugin}"
             )
-            plugin, endpoint, node = await self.plugin_core.find_endpoint(
+            plugin, endpoint, node = await self.plexus.find_endpoint(
                 access_name=access_name,
                 hosts="local",
                 plugin_uuid=plugin_uuid,
@@ -1826,7 +1826,7 @@ class NetworkManager:
 
             response = {
                 "available": available,
-                "hostname": self.plugin_core.hostname,
+                "hostname": self.plexus.hostname,
             }
 
             if plugin:
@@ -1884,9 +1884,9 @@ class NetworkManager:
             # F4 fix: skip plugins/endpoints not flagged remote-eligible
             # so wire callers can't enumerate non-public endpoint metadata
             # via tag search. Mirrors find_endpoint's remote-eligibility
-            # gate (PluginCore.py:2104-2107). Tag-search bypassed it
+            # gate (core.py:2104-2107). Tag-search bypassed it
             # entirely before this guard.
-            for plugin in self.plugin_core.plugins.values():
+            for plugin in self.plexus.plugins.values():
                 if not plugin.enabled:
                     continue
                 if not getattr(plugin, "remote", False):
@@ -1916,7 +1916,7 @@ class NetworkManager:
             await self._send_message(
                 writer,
                 MSG_RESULT,
-                {"hostname": self.plugin_core.hostname, "endpoints": endpoints},
+                {"hostname": self.plexus.hostname, "endpoints": endpoints},
             )
 
         except Exception as e:
@@ -1945,7 +1945,7 @@ class NetworkManager:
     ) -> bool:
         """Networking-layer peer-host filter (PR3 PLAN F step 5a).
 
-        Mirrors PluginCore's nested ``_matches_remote_node`` /
+        Mirrors Plexus's nested ``_matches_remote_node`` /
         ``_is_remote_node_blocked`` predicates without re-importing them
         (they're closures inside find_endpoint).
         """
@@ -2053,7 +2053,7 @@ class NetworkManager:
         """
         if author_host is None:
             return False
-        if author_host == self.plugin_core.hostname:
+        if author_host == self.plexus.hostname:
             try:
                 peer = writer.get_extra_info("peername")
             except Exception:
@@ -2073,7 +2073,7 @@ class NetworkManager:
         """Reciprocal advert trigger (locked #7 + #10). Idempotent via
         ``_snapshot_sent`` fast-path; authoritative gate inside
         ``_initial_advert_exchange``."""
-        if not author_host or author_host == self.plugin_core.hostname:
+        if not author_host or author_host == self.plexus.hostname:
             return
         if author_host in self._snapshot_sent:
             return
@@ -2142,7 +2142,7 @@ class NetworkManager:
 
             # Resolve local subs.
             try:
-                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+                all_subs = await self.plexus.topic_registry.find_all(topic)
             except Exception:
                 self._logger.exception(
                     "[PUBLISH_EVENT] find_all failed for topic %r", topic
@@ -2150,16 +2150,16 @@ class NetworkManager:
                 return
 
             for sub in all_subs:
-                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                if sub.plugin_uuid not in self.plexus.plugins_by_uuid:
                     continue
-                if not self.plugin_core._sub_accepts_remote_publisher(
+                if not self.plexus._sub_accepts_remote_publisher(
                     sub, author_host, author
                 ):
                     continue
-                if not self.plugin_core._sub_accepts_author(sub, author):
+                if not self.plexus._sub_accepts_author(sub, author):
                     continue
                 try:
-                    await self.plugin_core._fanout_sub(
+                    await self.plexus._fanout_sub(
                         sub=sub,
                         publisher=None,
                         resolved_topic=topic,
@@ -2234,7 +2234,7 @@ class NetworkManager:
                 return
 
             try:
-                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+                all_subs = await self.plexus.topic_registry.find_all(topic)
             except Exception as exc:
                 self._logger.exception(
                     "[REQUEST_EVENT] find_all failed for topic %r", topic
@@ -2244,13 +2244,13 @@ class NetworkManager:
 
             local_match = None
             for sub in all_subs:
-                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                if sub.plugin_uuid not in self.plexus.plugins_by_uuid:
                     continue
-                if not self.plugin_core._sub_accepts_remote_publisher(
+                if not self.plexus._sub_accepts_remote_publisher(
                     sub, author_host, author
                 ):
                     continue
-                if not self.plugin_core._sub_accepts_author(sub, author):
+                if not self.plexus._sub_accepts_author(sub, author):
                     continue
                 local_match = sub
                 break
@@ -2266,7 +2266,7 @@ class NetworkManager:
                 return
 
             try:
-                request = await self.plugin_core._fanout_sub(
+                request = await self.plexus._fanout_sub(
                     sub=local_match,
                     publisher=None,
                     resolved_topic=topic,
@@ -2297,7 +2297,7 @@ class NetworkManager:
                 # pops on completion. Try/except dropped — sync ``pop``
                 # cannot raise (the only failure mode of the old async
                 # path was an event-loop scheduling issue, gone now).
-                self.plugin_core.requests.pop(request.id, None)
+                self.plexus.requests.pop(request.id, None)
                 if error:
                     if isinstance(result, BaseException):
                         await self._send_error_pickled(writer, result)
@@ -2390,7 +2390,7 @@ class NetworkManager:
                 return
 
             try:
-                all_subs = await self.plugin_core.topic_registry.find_all(topic)
+                all_subs = await self.plexus.topic_registry.find_all(topic)
             except Exception as exc:
                 self._logger.exception(
                     "[REQUEST_EVENT_STREAM] find_all failed for topic %r", topic
@@ -2402,13 +2402,13 @@ class NetworkManager:
 
             local_match = None
             for sub in all_subs:
-                if sub.plugin_uuid not in self.plugin_core.plugins_by_uuid:
+                if sub.plugin_uuid not in self.plexus.plugins_by_uuid:
                     continue
-                if not self.plugin_core._sub_accepts_remote_publisher(
+                if not self.plexus._sub_accepts_remote_publisher(
                     sub, author_host, author
                 ):
                     continue
-                if not self.plugin_core._sub_accepts_author(sub, author):
+                if not self.plexus._sub_accepts_author(sub, author):
                     continue
                 local_match = sub
                 break
@@ -2426,7 +2426,7 @@ class NetworkManager:
             # (C18 access check). `endpoint["func"]` is unbound — we need
             # the BOUND method via getattr on the target plugin.
             try:
-                target_plugin, endpoint, _ = await self.plugin_core.find_endpoint(
+                target_plugin, endpoint, _ = await self.plexus.find_endpoint(
                     access_name=local_match.target_access_name,
                     hosts="local",
                     plugin_uuid=local_match.target_plugin_uuid,
@@ -2464,7 +2464,7 @@ class NetworkManager:
                 )
                 return
 
-            from utils import Event as _Event  # local import to avoid cycle
+            from .utils import Event as _Event  # local import to avoid cycle
 
             ts = timestamp if isinstance(timestamp, (int, float)) else 0.0
             sub_id_for_event = (
@@ -2541,7 +2541,7 @@ class NetworkManager:
                     try:
                         while True:
                             fut = loop.run_in_executor(
-                                self.plugin_core.sync_dispatcher.executor,
+                                self.plexus.sync_dispatcher.executor,
                                 lambda g=gen, s=sentinel: next(g, s),
                             )
                             chunk = await fut
@@ -2897,7 +2897,7 @@ class NetworkManager:
                 writer,
                 MSG_SUB_ADVERTISE_ACK,
                 {
-                    "author_host": self.plugin_core.hostname,
+                    "author_host": self.plexus.hostname,
                     "processed_uuids": list(processed_uuids),
                 },
             )
@@ -3214,12 +3214,12 @@ class NetworkManager:
 
         Lock order (locked #9): list_local_subs() acquires
         topic_registry._lock; the subscribe/unsubscribe broadcast hooks
-        in PluginCore acquire topic_registry._lock first then reach
+        in Plexus acquire topic_registry._lock first then reach
         _advert_locks[peer] via send_sub_delta_remote. To avoid a cycle,
         snapshot the local subs list BEFORE acquiring _advert_locks[peer].
         """
         try:
-            subs = await self.plugin_core.topic_registry.list_local_subs()
+            subs = await self.plexus.topic_registry.list_local_subs()
         except Exception:
             self._logger.exception(
                 "[ADVERTISE] list_local_subs failed for peer %s", peer_hostname
@@ -3257,7 +3257,7 @@ class NetworkManager:
                 self._outbound_adverts[peer_hostname] = projected
 
             wire_payload = {
-                "author_host": self.plugin_core.hostname,
+                "author_host": self.plexus.hostname,
                 "kind": "snapshot",
                 "subscriptions": [
                     self._serialize_local_sub_for_peer(s) for s in filtered
@@ -3351,7 +3351,7 @@ class NetworkManager:
                 wire_subs = [{"sub_uuid": sub.sub_uuid}]
 
             wire_payload = {
-                "author_host": self.plugin_core.hostname,
+                "author_host": self.plexus.hostname,
                 "kind": kind,
                 "subscriptions": wire_subs,
             }
@@ -3523,7 +3523,7 @@ class NetworkManager:
                 if sub is not None and sub.state == "pending":
                     sub.retry_count = 1
 
-    # ── Sub-broadcast helpers (called from PluginCore subscribe/unsubscribe) ──
+    # ── Sub-broadcast helpers (called from Plexus subscribe/unsubscribe) ──
 
     async def broadcast_local_sub_added(self, sub) -> None:
         """Filter peers + send add-delta. No-op when not ready."""
@@ -3532,7 +3532,7 @@ class NetworkManager:
         for node in list(self.nodes):
             if node.hostname is None:
                 continue
-            if node.hostname == self.plugin_core.hostname:
+            if node.hostname == self.plexus.hostname:
                 continue
             try:
                 if not (node.enabled and await node.is_alive()):
@@ -3559,7 +3559,7 @@ class NetworkManager:
         for node in list(self.nodes):
             if node.hostname is None:
                 continue
-            if node.hostname == self.plugin_core.hostname:
+            if node.hostname == self.plexus.hostname:
                 continue
             try:
                 if not (node.enabled and await node.is_alive()):
@@ -3742,7 +3742,7 @@ class NetworkManager:
         event after applying peer-level + sub-level filters. Returns dict
         keyed by peer_hostname → list of surviving AdvertSub instances.
         """
-        from notifier import TopicRegistry as _TR  # local import: cycle
+        from .notifier import TopicRegistry as _TR  # local import: cycle
 
         out: Dict[str, List[AdvertSub]] = {}
         async with self._adverts_struct_lock:
@@ -3752,7 +3752,7 @@ class NetworkManager:
             }
 
         for node in list(self.nodes):
-            if node.hostname == self.plugin_core.hostname:
+            if node.hostname == self.plexus.hostname:
                 continue
             # Cycle-3 fresh-F3 fix: skip nodes whose hostname hasn't been
             # discovered yet (newly-created Node before first INFO/discovery
@@ -3778,11 +3778,11 @@ class NetworkManager:
             for advert in peer_subs:
                 if not _TR._topic_matches(advert.topic_pattern, topic):
                     continue
-                if not self.plugin_core._sub_accepts_remote_publisher(
-                    advert, self.plugin_core.hostname, author
+                if not self.plexus._sub_accepts_remote_publisher(
+                    advert, self.plexus.hostname, author
                 ):
                     continue
-                if not self.plugin_core._sub_accepts_author(advert, author):
+                if not self.plexus._sub_accepts_author(advert, author):
                     continue
                 surviving.append(advert)
             if surviving:
@@ -3884,7 +3884,7 @@ class NetworkManager:
                         self.node_ips.append(client_entry)
 
             response = {
-                "hostname": self.plugin_core.hostname,
+                "hostname": self.plexus.hostname,
                 "auto_discoverable": self.auto_discoverable,
                 "nodes": [
                     await node._to_tuple()
@@ -4158,7 +4158,7 @@ class NetworkManager:
                 "author": author,
                 "author_id": author_id,
                 "timeout": timeout,
-                "author_host": author_host or self.plugin_core.hostname,
+                "author_host": author_host or self.plexus.hostname,
                 "request_id": request_id,
             }
 
@@ -4218,7 +4218,7 @@ class NetworkManager:
                             raise NetworkRequestException(
                                 f"Remote node {IP} sent an exception class this node "
                                 f"does not recognize: {_e}. Plugin authors: make custom "
-                                f"exceptions inherit from serialization.SerializableException."
+                                f"exceptions inherit from plexus.serialization.SerializableException."
                             )
                         if (
                             isinstance(error_data, tuple)
@@ -4337,7 +4337,7 @@ class NetworkManager:
                 "author": author,
                 "author_id": author_id,
                 "timeout": timeout,
-                "author_host": author_host or self.plugin_core.hostname,
+                "author_host": author_host or self.plexus.hostname,
                 "request_id": request_id,
             }
 
@@ -4450,7 +4450,7 @@ class NetworkManager:
                             raise NetworkRequestException(
                                 f"Remote node {IP} sent an exception class this node "
                                 f"does not recognize: {_e}. Plugin authors: make custom "
-                                f"exceptions inherit from serialization.SerializableException."
+                                f"exceptions inherit from plexus.serialization.SerializableException."
                             )
                         error_msg = str(error_data)
                         if isinstance(error_data, tuple) and len(error_data) == 2:
@@ -4533,7 +4533,7 @@ class NetworkManager:
             # F5 fix: NetworkRequestException raised from the decoder's
             # sentinel-detection path means the remote handler reported
             # a real error. Re-raise so _process_request_stream's outer
-            # except (PluginCore.py) handles it (sets request error,
+            # except (core.py) handles it (sets request error,
             # propagates as RequestException to local consumer via B-044
             # path). Previously this fell to the generic "yield sentinel"
             # branch below and the error was tunneled as data.
@@ -4616,7 +4616,7 @@ class NetworkManager:
     #                "author": author,
     #                "author_id": author_id,
     #                "timeout": timeout,
-    #                "author_host": self.plugin_core.hostname,
+    #                "author_host": self.plexus.hostname,
     #                "request_id": request_id,
     #            },
     #        )
@@ -4658,7 +4658,7 @@ class NetworkManager:
     #                    "author": author,
     #                    "author_id": author_id,
     #                    "timeout": timeout,
-    #                    "author_host": self.plugin_core.hostname,
+    #                    "author_host": self.plexus.hostname,
     #                    "request_id": request_id,
     #                },
     #            ) as response:
@@ -4800,14 +4800,14 @@ class NetworkManager:
             node = await self._get_node(IP)
             if node:
                 node.enabled = True
-                await node.update(response, self.plugin_core.hostname)
+                await node.update(response, self.plexus.hostname)
                 # PR3 Stage C: peer-connect lifecycle hook (Site A —
                 # locked #7). Symmetric initial-exchange — fire-and-
                 # forget; idempotent via `_snapshot_sent`.
                 if (
-                    getattr(self.plugin_core, "networking_enabled", False)
+                    getattr(self.plexus, "networking_enabled", False)
                     and node.hostname
-                    and node.hostname != self.plugin_core.hostname
+                    and node.hostname != self.plexus.hostname
                     and node.hostname not in self._snapshot_sent
                 ):
                     asyncio.create_task(self._spawn_initial_exchange(node))
@@ -4826,7 +4826,7 @@ class NetworkManager:
                     # to None (→ cluster default).
                     sub_port, sub_hostname = None, sub_node[1]
 
-                if sub_hostname == self.plugin_core.hostname:
+                if sub_hostname == self.plexus.hostname:
                     self._logger.info(
                         f"[DISCOVERY] Found own node at {sub_ip} (skipping)"
                     )
@@ -4949,7 +4949,7 @@ class NetworkManager:
             reader, writer = await self._get_connection(IP)
 
             request_data = {
-                "hostname": self.plugin_core.hostname,
+                "hostname": self.plexus.hostname,
                 "discover_nodes_info": self.discover_nodes,
                 # Tell the receiver which port WE listen on. The TCP source
                 # port of an inbound connection is ephemeral, so the receiver
@@ -5267,7 +5267,7 @@ class NetworkManager:
 
         Returns:
             List of tuples (RemotePlugin, endpoint_dict, description, arguments)
-            matching the format used by PluginCore.find_endpoints_by_tag,
+            matching the format used by Plexus.find_endpoints_by_tag,
             or None on error.
         """
         reader = None

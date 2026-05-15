@@ -1,4 +1,4 @@
-"""Single-node TUI smoke harness — boots PluginCore with a minimal
+"""Single-node TUI smoke harness — boots Plexus with a minimal
 config so the dashboard's Settings / Networking disabled-state UI,
 Plugins table (with one DISABLED row from TUIDemoSpare), Logs view,
 and general navigation can be exercised end-to-end.
@@ -28,20 +28,20 @@ import sys
 from pathlib import Path
 
 # Script lives in plugins_test/TUI/smoke/. Push the repo root onto
-# sys.path so `from PluginCore import PluginCore` resolves regardless
+# sys.path so `from plexus.core import Plexus` resolves regardless
 # of CWD, and resolve the config path relative to the script.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 sys.path.insert(0, str(_REPO))
 
-from PluginCore import PluginCore  # noqa: E402
+from plexus.core import Plexus  # noqa: E402
 
 
 CONFIG = str(_HERE / "tui_smoke_config.yml")
 
 
 async def main():
-    pc = PluginCore(CONFIG)
+    pc = Plexus(CONFIG)
     await pc.wait_until_ready()
     pc._shutdown_event = asyncio.Event()
 
