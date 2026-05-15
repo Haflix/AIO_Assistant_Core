@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plexus-core"
+version = "0.39.1"
+description = "Async plugin framework with multi-node mTLS networking and pub/sub event routing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Haflix", email = "info@haas-flo.de" },
+]
+keywords = [
+    "plugin",
+    "framework",
+    "async",
+    "asyncio",
+    "mtls",
+    "pubsub",
+    "event-bus",
+    "assistant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "PyYAML",
+    "colorama",
+    "cryptography",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["plexus*"]

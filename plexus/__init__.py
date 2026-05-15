@@ -37,6 +37,8 @@ Submodules:
     networking_classes  — Node + RemotePlugin data classes
 """
 
+__version__ = "0.39.1"
+
 from .core import Plexus
 from .utils import (
     Plugin,
