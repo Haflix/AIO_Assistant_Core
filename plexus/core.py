@@ -3515,7 +3515,7 @@ class Plexus:
     ) -> Request:
         """Create a new request asynchronously."""
 
-        if author_host == None:
+        if author_host is None:
             author_host = self.hostname
 
         request = Request(
@@ -3604,7 +3604,7 @@ class Plexus:
     ) -> GeneratorRequest:
         """Create a new request asynchronously."""
 
-        if author_host == None:
+        if author_host is None:
             author_host = self.hostname
 
         request = GeneratorRequest(
@@ -4364,7 +4364,7 @@ class Plexus:
                     elif isinstance(request.args, dict):
                         async for result in func(**request.args):
                             await request.queue.put((result, False, False))
-                    elif request.args == None:
+                    elif request.args is None:
                         async for result in func():
                             await request.queue.put((result, False, False))
                     else:
@@ -4376,7 +4376,7 @@ class Plexus:
                         generator = func(*request.args)
                     elif isinstance(request.args, dict):
                         generator = func(**request.args)
-                    elif request.args == None:
+                    elif request.args is None:
                         generator = func()
                     else:
                         generator = func(request.args)
