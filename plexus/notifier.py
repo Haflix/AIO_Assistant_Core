@@ -258,7 +258,7 @@ class TopicRegistry:
         """Remove a subscription by sub_uuid. Returns True if found and removed."""
         async with self._lock:
             sub = self._subs.pop(sub_uuid, None)
-            if sub is None:
+            if not sub:
                 return False
 
             plugin_subs = self._by_plugin.get(sub.plugin_uuid)
@@ -283,7 +283,7 @@ class TopicRegistry:
             count = 0
             for sub_uuid in list(sub_uuids):
                 sub = self._subs.pop(sub_uuid, None)
-                if sub is None:
+                if not sub:
                     continue
                 count += 1
                 if sub.declared_id is not None:
