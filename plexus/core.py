@@ -2556,12 +2556,30 @@ class Plexus:
         # still-in-dicts plugins on partial failure). Both shapes are
         # partial cleanups; this one cleans up incrementally.
         self._logger.info("Purging plugins")
-        try:
-            for plugin_name in list(self.plugins.keys()):
+        # C-022 fix: continue-and-collect. A failing pop on one plugin
+        # used to abort the whole loop, leaving the rest of the plugins
+        # still loaded with no operator signal which ones got purged.
+        # Now each pop is wrapped individually and all exceptions are
+        # surfaced together via ExceptionGroup (3.11+) at the end.
+        plugins_to_purge = list(self.plugins.keys())
+        errors: List[BaseException] = []
+        for plugin_name in plugins_to_purge:
+            try:
                 await self.pop_plugin(plugin_name)
-            self._logger.info("Purged all plugins")
-        except Exception as error:
-            raise Exception(f"Error while purging plugins: {error}")
+            except Exception as exc:
+                self._logger.error(
+                    "purge_plugins: pop_plugin %r raised — continuing",
+                    plugin_name,
+                    exc_info=True,
+                )
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup(
+                f"purge_plugins: {len(errors)} of "
+                f"{len(plugins_to_purge)} plugins failed to pop",
+                errors,
+            )
+        self._logger.info("Purged all plugins")
 
     @async_log_errors
     async def purge_plugins_except(self, excluded_names: List[str]):
@@ -2569,19 +2587,34 @@ class Plexus:
 
         B-005 fix: delegate to pop_plugin per-name. See purge_plugins
         for the full rationale.
+
+        C-022 fix: per-iteration try/except + ExceptionGroup aggregation
+        (3.11+). Symmetric with purge_plugins above.
         """
         self._logger.info(f"Purging plugins except: {excluded_names}")
-        try:
-            plugins_to_purge = [
-                name for name in list(self.plugins.keys()) if name not in excluded_names
-            ]
-            for plugin_name in plugins_to_purge:
+        plugins_to_purge = [
+            name for name in list(self.plugins.keys()) if name not in excluded_names
+        ]
+        errors: List[BaseException] = []
+        for plugin_name in plugins_to_purge:
+            try:
                 await self.pop_plugin(plugin_name)
-            self._logger.info(
-                f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
+            except Exception as exc:
+                self._logger.error(
+                    "purge_plugins_except: pop_plugin %r raised — continuing",
+                    plugin_name,
+                    exc_info=True,
+                )
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup(
+                f"purge_plugins_except: {len(errors)} of "
+                f"{len(plugins_to_purge)} plugins failed to pop",
+                errors,
             )
-        except Exception as error:
-            raise Exception(f"Error while purging plugins: {error}")
+        self._logger.info(
+            f"Purged {len(plugins_to_purge)} plugins, kept {len(excluded_names)}"
+        )
 
     @async_log_errors
     async def get_plugin_info(self, plugin_name: str) -> Optional[Dict[str, Any]]:
