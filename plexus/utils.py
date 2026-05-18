@@ -1259,18 +1259,6 @@ class Plugin(ABC):
             )
         super().__setattr__(name, value)
 
-    async def _to_dict(self):
-        info_dict = {}
-        info_dict["plugin_name"] = self.plugin_name
-        info_dict["version"] = self.version
-        info_dict["plugin_uuid"] = self.plugin_uuid
-        info_dict["enabled"] = self.enabled
-        info_dict["remote"] = self.remote
-        info_dict["description"] = self.description
-        info_dict["arguments"] = self.arguments
-        # TODO: Include endpoint info. For now use Plexus.get_plugin_info() instead.
-        raise NotImplementedError
-
     def set_logger_level(
         self,
         name: str,

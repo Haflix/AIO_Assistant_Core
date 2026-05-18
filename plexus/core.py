@@ -2143,8 +2143,13 @@ class Plexus:
         if name in self.plugin_states:
             if self.plugin_states[name].state != State.INACTIVE:
                 self._transition_plugin(name, State.INACTIVE)
-            # Clear stale errors from previous failed loads.
-            self.plugin_states[name].last_errors.clear()
+            # C-021 fix: clear ONLY the prior Phase.LOAD error. Phase.ENABLE
+            # / Phase.DISABLE errors from previous lifecycle cycles are
+            # preserved so operators can still see why the plugin's last
+            # enable / disable failed — re-load shouldn't wipe that
+            # diagnostic context. The original `.clear()` wiped the whole
+            # dict and lost those errors silently.
+            self.plugin_states[name].last_errors.pop(Phase.LOAD, None)
         else:
             self.plugin_states[name] = PluginState(name=name, state=State.INACTIVE)
 
