@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire

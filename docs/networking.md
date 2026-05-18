@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 

@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page

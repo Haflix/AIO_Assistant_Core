@@ -1,6 +1,6 @@
 # API Reference
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 

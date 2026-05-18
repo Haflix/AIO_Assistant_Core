@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
