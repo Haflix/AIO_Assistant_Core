@@ -26,6 +26,7 @@ Argument types use Python conventions; `Any` means no constraint. For tutorials 
   - [`request_event_stream_sync`](#for-chunk-in-selfrequest_event_stream_syncevent_id-payloadnone-topic_varsnone-hostsnone-blocked_hostsnone-timeoutnone)
   - [`topic_vars` constraints](#topic_vars-constraints)
 - [Subscribe / unsubscribe at runtime](#subscribe--unsubscribe-at-runtime)
+- [Runtime sub/event enable-toggle](#runtime-subevent-enable-toggle)
 - [Logger administration](#logger-administration)
 - [Decorators](#decorators)
 - [The `Event` object](#the-event-object)
@@ -267,6 +268,34 @@ Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
 
 ---
 
+## Runtime sub/event enable-toggle
+
+Flip the `enabled` flag on an existing subscription or event without unsubscribing / re-declaring it. The registry keeps the entry; matching just skips it while disabled. Idempotent — a no-op call (already at target value) returns `True` without broadcasting or emitting.
+
+### `await self.set_subscription_enabled(sub_uuid, enabled) -> bool`
+
+Toggle one of this plugin's runtime subscriptions. Returns `True` when `sub_uuid` is in the registry (covers toggled + no-op), `False` on unknown uuid. On a True transition, the framework broadcasts an add-delta to peers (peer starts advertising the sub); on False, a remove-delta. Broadcast failures are logged at DEBUG and do not propagate.
+
+After mutation, the framework emits `_core/subscription/state_changed` (only on actual change) so TUI and other observers can react.
+
+### `self.set_subscription_enabled_sync(sub_uuid, enabled) -> bool`
+
+Sync variant — bridges via `run_coroutine_threadsafe`.
+
+### `await self.set_event_enabled(event_id, enabled) -> bool`
+
+Toggle one of this plugin's declared events. Returns `True` when the `event_id` exists on this plugin (covers toggled + no-op), `False` if not declared. Local-only — events are not advertised to peers (publishers don't advertise; only subscribers do).
+
+For cross-plugin toggling (rare), call `self._plexus.set_event_enabled(other_plugin_name, event_id, enabled)` directly.
+
+After mutation, emits `_core/event/state_changed` on actual change.
+
+### `self.set_event_enabled_sync(event_id, enabled) -> bool`
+
+Sync variant — bridges via `run_coroutine_threadsafe`.
+
+---
+
 ## Logger administration
 
 Set per-logger thresholds at runtime. Plugin-source overrides survive config reloads but are auto-cleared on `on_disable`, `pop_plugin`, `purge_plugins`, or shutdown.
@@ -421,6 +450,8 @@ The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappe
 | `await plx.request_event_stream(publisher, event_id, ...)` | Streaming request path. |
 | `await plx.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | Runtime sub registration with full validation and delta broadcast. |
 | `await plx.unsubscribe_event(sub_uuid) -> bool` | With remove-delta broadcast. |
+| `await plx.set_subscription_enabled(sub_uuid, enabled) -> bool` | Toggle a subscription's enabled flag. Broadcasts add/remove-delta on transition; emits `_core/subscription/state_changed`. |
+| `await plx.set_event_enabled(plugin_name, event_id, enabled) -> bool` | Toggle an event's enabled flag. Local-only — emits `_core/event/state_changed` on change. |
 
 ### Read-mostly attributes
 
@@ -464,4 +495,9 @@ async for chunk in self.request_event_stream("event_id", payload=data):
 # Runtime subscription
 sub_uuid = await self.subscribe("messages/*", target_access_name="handler")
 await self.unsubscribe(sub_uuid)
+
+# Runtime sub/event enable-toggle (no re-registration needed)
+await self.set_subscription_enabled(sub_uuid, False)  # disable
+await self.set_subscription_enabled(sub_uuid, True)   # re-enable
+await self.set_event_enabled("event_id", False)       # disable own event
 ```

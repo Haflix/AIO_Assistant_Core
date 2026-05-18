@@ -478,6 +478,13 @@ async def on_disable(self):
 `target_access_name` must be a non-empty string — runtime subs route to a
 *declared endpoint*, never to a free-floating callable.
 
+To temporarily disable a sub without removing it, call
+`await self.set_subscription_enabled(sub_uuid, False)` (re-enable with
+`True`). For one of your own declared events, use
+`await self.set_event_enabled("event_id", False)`. Both have
+`_sync` mirrors for worker-thread callers. See
+[notifier.md — Toggling at runtime](./notifier.md#toggling-at-runtime).
+
 ---
 
 ## Useful attributes inside any plugin

@@ -1804,6 +1804,58 @@ class Plugin(ABC):
         )
         return future.result()
 
+    @async_log_errors
+    async def set_subscription_enabled(self, sub_uuid: str, enabled: bool) -> bool:
+        """Toggle a subscription's ``enabled`` flag at runtime.
+
+        Wraps ``Plexus.set_subscription_enabled``. Returns True when
+        ``sub_uuid`` is found (covers both "toggled" and "no-op already
+        at target value"); False on unknown sub_uuid. On True
+        transition, an add-delta is broadcast to peers; on False
+        transition, a remove-delta. Broadcast failures are logged at
+        DEBUG and not propagated.
+        """
+        return await self._plexus.set_subscription_enabled(sub_uuid, enabled)
+
+    @log_errors
+    def set_subscription_enabled_sync(self, sub_uuid: str, enabled: bool) -> bool:
+        """Sync variant of ``set_subscription_enabled``."""
+        self._check_framework_started()
+        future = asyncio.run_coroutine_threadsafe(
+            self._plexus.set_subscription_enabled(sub_uuid, enabled),
+            self._plexus.main_event_loop,
+        )
+        return future.result()
+
+    @async_log_errors
+    async def set_event_enabled(self, event_id: str, enabled: bool) -> bool:
+        """Toggle one of THIS plugin's declared events at runtime.
+
+        Wraps ``Plexus.set_event_enabled`` with ``self.plugin_name`` as
+        the owning plugin. Returns True when the event_id exists on
+        this plugin (covers toggled + no-op); False if the event_id is
+        not declared. Local-only — events are not advertised.
+
+        For cross-plugin toggling (rare), call
+        ``self._plexus.set_event_enabled(other_plugin_name, event_id,
+        enabled)`` directly.
+        """
+        return await self._plexus.set_event_enabled(
+            self.plugin_name, event_id, enabled
+        )
+
+    @log_errors
+    def set_event_enabled_sync(self, event_id: str, enabled: bool) -> bool:
+        """Sync variant of ``set_event_enabled``."""
+        self._check_framework_started()
+        future = asyncio.run_coroutine_threadsafe(
+            self._plexus.set_event_enabled(
+                self.plugin_name, event_id, enabled
+            ),
+            self._plexus.main_event_loop,
+        )
+        return future.result()
+
     @log_errors
     @abstractmethod
     def on_load(self):

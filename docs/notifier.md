@@ -298,6 +298,27 @@ deployment without removing the YAML.
 Useful for feature flags and for advertising future bindings without
 activating them yet.
 
+### Toggling at runtime
+
+The `enabled` flag can be flipped after registration without
+unsubscribing. From plugin code:
+
+```python
+await self.set_subscription_enabled(sub_uuid, False)  # disable
+await self.set_subscription_enabled(sub_uuid, True)   # re-enable
+await self.set_event_enabled("my_event_id", False)    # disable own event
+```
+
+Sync mirrors `set_subscription_enabled_sync` / `set_event_enabled_sync`
+exist for worker-thread callers. Returns `True` on success (including
+no-op when already at target value), `False` on unknown id.
+
+On a True transition for subscriptions, the framework broadcasts an
+add-delta to peers; on False, a remove-delta. Events are local-only
+(publishers never advertise). Both surfaces emit
+`_core/subscription/state_changed` or `_core/event/state_changed`
+on actual change — TUI and other observers can react.
+
 ---
 
 ## What handlers receive
