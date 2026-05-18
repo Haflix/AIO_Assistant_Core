@@ -756,9 +756,14 @@ class Plexus:
         ``KeyboardInterrupt``, ``SystemExit``) propagate up to the
         framework caller — observer authors must NOT raise those.
 
-        Auto-cleanup: when the plugin owning ``plugin_uuid`` is popped via
-        ``_pop_plugin_under_lock``, every observer registration owned by
-        this plugin_uuid is removed (mirrors ``topic_registry.unsubscribe_plugin``).
+        Auto-cleanup: every observer registration owned by ``plugin_uuid``
+        is removed on BOTH ``_disable_plugin_under_lock`` (so a
+        disable→enable cycle does not accumulate duplicates when
+        ``on_enable`` re-registers observers) and
+        ``_pop_plugin_under_lock`` (idempotent — owners-set already
+        cleared by disable in the normal pop-while-enabled path).
+        Mirrors ``topic_registry.unsubscribe_plugin`` cleanup which
+        is symmetric across both lifecycle paths.
 
         Idempotent: registering the same ``(topic, callback)`` pair twice
         for the same ``plugin_uuid`` is a no-op — single registration per
@@ -813,12 +818,16 @@ class Plexus:
     def _unobserve_plugin(self, plugin_uuid: str) -> int:
         """Remove all observer registrations owned by ``plugin_uuid``.
 
-        Called from ``_pop_plugin_under_lock`` alongside
-        ``topic_registry.unsubscribe_plugin`` so observer state mirrors
-        topic-sub state on plugin removal. Without this, a popped plugin's
-        bound-method observers keep the Plugin instance alive in
-        ``_internal_observers`` indefinitely (memory leak) AND continue
-        firing against a torn-down plugin instance.
+        Called from both ``_disable_plugin_under_lock`` (so a
+        disable→enable cycle does not accumulate duplicate observers
+        when on_enable re-registers them) and ``_pop_plugin_under_lock``
+        alongside ``topic_registry.unsubscribe_plugin`` so observer
+        state mirrors topic-sub state on plugin removal. The pop call
+        is idempotent — disable already cleared the owners-set, so the
+        re-call simply finds nothing to remove. Without this, a
+        popped plugin's bound-method observers keep the Plugin
+        instance alive in ``_internal_observers`` indefinitely (memory
+        leak) AND continue firing against a torn-down plugin instance.
 
         Returns count removed. Cleans up empty topic lists.
         """
@@ -3067,9 +3076,18 @@ class Plexus:
                 )
             raise
         finally:
-            # Unregister all subs (YAML + runtime) regardless of
-            # whether on_disable raised, was cancelled, or timed out.
-            # Symmetric with rollback in _enable_plugin_under_lock.
+            # Unregister all subs (YAML + runtime) AND clear internal-bus
+            # observers registered by this plugin via internal_observe,
+            # regardless of whether on_disable raised, was cancelled, or
+            # timed out. Symmetric with rollback in
+            # _enable_plugin_under_lock. Without the observer cleanup
+            # here, declarative subs would be auto-cleared on disable
+            # but bound-method observers would persist — a re-enable
+            # cycle that re-registers observers in on_enable would
+            # accumulate duplicate callbacks across each disable→enable
+            # cycle. The pop path still calls _unobserve_plugin
+            # defensively (idempotent — owners-set is already empty
+            # after disable ran).
             try:
                 try:
                     await self._unregister_plugin_subscriptions(plugin)
@@ -3088,6 +3106,23 @@ class Plexus:
                         "plugin %r — original on_disable exception (if "
                         "any) still propagates; best-effort cleanup "
                         "incomplete",
+                        plugin.plugin_name,
+                    )
+                # Mirror the sub-cleanup with observer-cleanup so
+                # internal_observe registrations don't survive a
+                # disable→enable cycle as duplicates. Wrapped in its
+                # own try so a failure here can't mask either the
+                # original on_disable exception or the unregister-subs
+                # exception above.
+                try:
+                    plugin_uuid = getattr(plugin, "plugin_uuid", None)
+                    if plugin_uuid:
+                        self._unobserve_plugin(plugin_uuid)
+                except Exception:
+                    self._logger.exception(
+                        "_disable_plugin_under_lock: "
+                        "_unobserve_plugin raised for plugin %r — "
+                        "best-effort cleanup incomplete",
                         plugin.plugin_name,
                     )
             finally:
@@ -3183,6 +3218,12 @@ class Plexus:
                 # above so observer state can't outlive the Plugin
                 # instance (memory leak) AND post-pop emits don't
                 # dispatch to a torn-down plugin's bound methods.
+                # Idempotent — _disable_plugin_under_lock already
+                # cleared the owners-set in its finally block; this
+                # re-call covers the edge where a pop happens against
+                # an INACTIVE plugin that never ran enable→disable
+                # (no observers registered) or where a future caller
+                # bypasses the disable path.
                 self._unobserve_plugin(plugin_uuid)
                 LogUtil.clear_logger_levels_owned_by(plugin_name, plugin_uuid)
         return True

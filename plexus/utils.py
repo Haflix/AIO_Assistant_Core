@@ -1572,7 +1572,11 @@ class Plugin(ABC):
         """Register a sync observer for a ``_core/...`` framework topic.
 
         Auto-fills ``plugin_uuid`` so framework auto-cleanup on
-        ``pop_plugin`` removes this registration. See
+        ``disable_plugin`` AND ``pop_plugin`` removes this
+        registration — observers are cleared symmetrically with
+        topic-subs at each disable. Register observers in
+        ``on_enable`` and they will be re-registered cleanly across
+        each enable cycle without accumulating duplicates. See
         ``Plexus.internal_observe`` for the full contract:
         loop-thread only, observers must return < 1ms, ``Exception``
         subclasses are logged + swallowed (``BaseException`` propagates),
