@@ -27,11 +27,15 @@ import enum
 import hashlib
 import importlib
 import io
+import logging
 import pathlib
 import pickle
 import uuid
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Tuple, Type
+
+
+_logger = logging.getLogger(__name__)
 
 
 # Module-level constant for the CLI command — referenced by migration errors
@@ -106,11 +110,25 @@ def _populate_exception_registry():
     """Walk trusted exception modules at import time, register every
     BaseException subclass found. After this, find_class can do an O(1)
     membership check with zero import side effects on hot path.
+
+    C-046 fix: module import failures are logged at WARNING with the
+    module name and exception. Previously the failure was silently
+    swallowed, leaving the registry partial — cross-network
+    ``MSG_ERROR`` frames carrying exception types from a missing module
+    would then be rejected with an opaque "not allowlisted" error and
+    no diagnostic linking the failure back to the missing module.
     """
     for module_name in _TRUSTED_EXCEPTION_MODULES:
         try:
             mod = importlib.import_module(module_name)
-        except Exception:
+        except Exception as exc:
+            _logger.warning(
+                "_populate_exception_registry: trusted module %r failed to "
+                "import — exception types from this module will not "
+                "round-trip across the network: %s",
+                module_name,
+                exc,
+            )
             continue
         for attr_name in dir(mod):
             try:
