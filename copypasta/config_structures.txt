@@ -1,69 +1,215 @@
+Reference for current Plexus config schema. For the authoritative,
+narrative form with examples and edge cases, see docs/configuration.md
+and docs/plugin_authoring.md. This file is a quick cheat-sheet only.
+
+
 config.yml:::
 ================================================================================
-Main configuration file for the AIO Assistant Core system.
-Place this in the root directory of your project.
+Main configuration file for Plexus. Place this in the root directory of
+your project. Three top-level keys (plugins, general, networking) are
+all REQUIRED — Plexus raises ConfigException at startup if any is
+missing.
 
-plugins:
-  - name: str                    # Plugin name (must match class name in plugin.py)
-    enabled: boolean             # Whether to load and enable this plugin on startup
-    path: str | Empty            # Optional: Explicit path to plugin directory
-                                 # If empty, auto-resolves to plugin_package/<name>
-    arguments:                   # Optional: Arguments passed to plugin during load
-        [Any] | Empty            # Can be any data structure (dict, list, etc.)
+plugins:                          # List of plugin entries. Disable order
+                                  # at shutdown = REVERSE config order, so
+                                  # list dependencies BEFORE their dependents.
+  - name: str                     # Must be a valid Python identifier.
+                                  # Reserved names rejected: system, general,
+                                  # any, remote, local.
+    enabled: boolean              # If false, entry is parsed and immediately
+                                  # popped (plugin never loaded).
+    path: str | Empty             # Optional. Default: "{plugin_package}/{name}".
+    overrides:                    # Optional. Deep-merged into the plugin's
+                                  # own plugin_config.yml at load time.
+                                  # See "Overrides mechanics" in
+                                  # docs/configuration.md.
+        description: str          # Plugin-level scalar — value-replace.
+        version: str
+        remote: boolean
+        verbose_notifier: boolean
+        arguments:                # Forwarded to on_load (lenient merge).
+            [Any]                 # Can be dict, list, or any shape.
+        endpoints:                # STRICT merge — unknown sub-keys are
+            access_name_1:        # fail-load errors. Keyed by access_name.
+                remote: boolean
+        events:                   # Lenient merge.
+            event_id:
+                enabled: boolean
+        subscriptions:            # Lenient merge.
+            declared_id:
+                authors: ["..."]
 
-  - name: str
-    enabled: boolean
-    path: str | Empty
-    arguments:
-        [Any] | Empty
+
+general:                          # Framework-wide settings.
+    hostname: str                 # Empty = socket.gethostname(). Used for
+                                  # local / remote host filtering + advert
+                                  # protocol.
+    plugin_package: str           # Default base dir for entries without
+                                  # explicit path. Default: "plugins".
+    console_log_level: str        # DEBUG | INFO | WARNING | ERROR | CRITICAL | MUTE
+                                  # Default: "DEBUG"
+    file_log_level: str           # Same valid set. Default: "DEBUG"
+    asyncio_debug: boolean        # Enables loop.set_debug(True) +
+                                  # slow_callback_duration=0.5. Default: false
+    logger_levels:                # Per-logger thresholds. Longest matching
+                                  # prefix wins. Dot-boundary required.
+        logger_name: str          # Single string applies to both handlers.
+        other_name:               # OR split form for independent thresholds:
+            console: str
+            file: str
+    plugin_ready_timeout: float   # Cross-plugin readiness gate budget.
+                                  # Default: 60.0
+    plugin_disable_timeout: float # Per-plugin on_disable cap during
+                                  # runtime disable / pop / reload.
+                                  # Default: 30.0
+    sync_dispatcher_workers: int  # Workers in SyncDispatcher thread pool
+                                  # (sync subscriber handlers). Default: 4
 
 
-general:
-    hostname: str                # Unique identifier for this node (used in networking)
-                                 # Empty = uses system hostname
-    plugin_package: str          # Base directory for plugins when path is not specified
-                                 # Default: "plugins"
-    console_log_level: str       # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
-                                 # Default: "DEBUG"
+networking:                       # Cluster topology. See docs/networking.md
+                                  # for the operational reference.
+    enabled: boolean              # Toggles all networking. When false,
+                                  # NetworkManager is never created.
+    port: int                     # Cluster default TCP port for mTLS server.
+                                  # Default: 2510. Per-peer override allowed
+                                  # via address: ip:port.
+    hostname: str                 # Default: socket.gethostname().
+    keys_dir: str                 # Where this node's cert.pem / key.pem live
+                                  # (auto-generated on first run). Default:
+                                  # "_keys". Resolved relative to config file
+                                  # directory if not absolute.
+    peers:                        # Peer trust list. REQUIRED (non-empty)
+                                  # when networking is enabled. Each entry
+                                  # describes one trusted peer.
+      - hostname: str             # REQUIRED. Canonical key for advert
+                                  # state + routing.
+        address: str              # REQUIRED. "ip", "ip:port", or "[ipv6]:port".
+                                  # Bare IP uses cluster default port.
+        cert_pem: str             # REQUIRED (or alternative below). Inline
+                                  # PEM string (use YAML | block scalar).
+                                  # ALTERNATIVE: a path-based key whose
+                                  # value points at a PEM file relative
+                                  # to config.yml — see docs/networking.md
+                                  # for the per-peer trust setup.
+        fingerprint: str          # Optional. "sha256:<hex>" of the SPKI DER.
+                                  # Derived from cert at parse time; if
+                                  # supplied, mismatch is a hard error.
+        system_caller: boolean    # Optional. When true, this peer's calls
+                                  # inherit "system" author privileges.
+                                  # Default: false.
+    pool_size: int                # Connection-pool depth per (ip, port).
+                                  # Default: 5.
+    discover_nodes: boolean       # Run periodic node-lookup loop.
+                                  # Default: false.
+    direct_discoverable: boolean  # Allow peers that explicitly know this
+                                  # node's IP to connect. Auto-coerced to
+                                  # true when auto_discoverable=true.
+    auto_discoverable: boolean    # Allow peers to find this node via
+                                  # subnet scan. Forces direct_discoverable.
+    heartbeat_interval: float     # Seconds between heartbeat ticks.
+                                  # Default: 10.0.
+    lookup_interval: float        # Seconds between discovery loop ticks.
+                                  # Default: 60.0.
+    liveness_timeout: float       # Peer dead if last successful heartbeat
+                                  # older than this. Should be >=
+                                  # heartbeat_interval (2-3x typical).
+                                  # Default: 30.0.
 
-networking:
-    enabled: boolean             # Enable/disable networking features
-    node_ips:                    # List of known node IP addresses for manual connection
-      - "str"                    # Example: "172.23.0.12"
-      - "str"                    # Example: "172.23.0.18"
-    port: int                    # Port for all networking communication
-                                 # Default: 2510
-    discover_nodes: boolean      # Enable automatic discovery of nodes on the network
-    direct_discoverable: boolean # Allow other nodes to discover this node directly
-    auto_discoverable: boolean   # Enable automatic discovery broadcasting
-    secret: str                  # Shared secret for authentication (or use NETWORKING_SECRET env var)
-    cert_file: str               # Path to TLS certificate file (PEM). Empty = auto-generated self-signed
-    key_file: str                # Path to TLS private key file (PEM). Empty = auto-generated
-    pool_size: int               # Connection pool size per remote node. Default: 5
+
+REMOVED in 0.39.x / 0.40.x:::
+    networking.node_ips           # Replaced by peers: with mTLS pinning.
+    networking.secret             # Shared-secret auth removed; mTLS only.
+    networking.cert_file          # Per-node cert path. Replaced by
+                                  # keys_dir auto-generation.
+    networking.key_file           # Same — replaced by keys_dir.
+
+If your config still uses any of these keys at networking.enabled=true,
+NetworkManager.start() raises a fail-fast error with migration guidance.
 
 
 plugin_config.yml:::
 ================================================================================
-Plugin-specific configuration file.
-Place this in the same folder as plugin.py. Every plugin should have its own folder.
+Plugin-specific manifest. Place in the same folder as plugin.py — one
+folder per plugin. See docs/plugin_authoring.md for the tutorial form.
 
-description: str                 # Description of what the plugin does
-version: str                     # Plugin version (e.g., "1.0.0")
-remote: boolean                  # Whether this plugin should be accessible remotely
-arguments:                       # Optional: List of arguments expected during loading
-endpoints:                       # List of methods that can be called by other plugins
-  - internal_name: str           # Actual method name in the plugin class
-    access_name: str             # Name used when calling from other plugins
-    topic: str | Empty           # Optional: Topic for notifier system (e.g. "ai/chat")
-                                 # Subscribes this endpoint to the topic on load.
-                                 # Uses "/" separator. Supports "*" wildcard per segment.
-                                 # Example: "sensor/*/temperature" matches "sensor/bath/temperature"
-    tags:                        # Tags for categorization (can be any string)
-      - str
-    remote: boolean              # Whether this endpoint can be called remotely
-    accessible_by_other_plugins: boolean  # Whether other plugins can call this
-    description: str             # Description of what the endpoint does
-    arguments:                   # List of arguments this endpoint accepts
-      - name: str                # Argument name
-        type: str                # Argument type (int, str, dict, list, any, bool, float)
-        description: str         # Description of the argument
+description: str                  # What the plugin does.
+version: str                      # Semantic version (e.g. "1.0.0").
+remote: boolean                   # Whether this plugin is accessible
+                                  # remotely. Per-endpoint remote: can
+                                  # override per method.
+prefix: str | Empty               # Default: plugin_name. Used by topic
+                                  # templates as {prefix}.
+verbose_notifier: boolean         # Per-plugin verbose logging for the
+                                  # event system. Default: false.
+arguments:                        # Optional. Passed to on_load:
+    [Any]                         # list/tuple unpacks as *args, dict as
+                                  # **kwargs, anything else passed as-is.
+
+endpoints:                        # Dict keyed by access_name (the name
+                                  # other plugins use when calling this
+                                  # endpoint). NOT a list.
+    access_name:                  # Outer key = access_name.
+        internal_name: str        # Optional. Method name in the plugin
+                                  # class. Defaults to the outer key.
+        tags: ["str"]             # Optional. For find_endpoints_by_tag.
+        remote: boolean           # Whether this endpoint is callable
+                                  # remotely.
+        accessible_by_other_plugins: boolean
+                                  # Whether other plugins can call it.
+        description: str          # What the endpoint does.
+        arguments:                # List of arguments this endpoint
+                                  # accepts.
+          - name: str             # Argument name.
+            type: str             # int | str | dict | list | any | bool | float
+            description: str      # What the argument is for.
+
+subscriptions:                    # Dict keyed by declared_id (an
+                                  # author-chosen identifier for this
+                                  # subscription — used in logs and for
+                                  # set_subscription_enabled). REPLACES
+                                  # the legacy per-endpoint topic: field.
+    declared_id:
+        topic: str                # REQUIRED. "/" separator; "*" wildcard
+                                  # per segment. {prefix}/{plugin_name}/
+                                  # {hostname}/{plugin_uuid} placeholders
+                                  # resolved at load. {var} unknowns kept
+                                  # for runtime templating.
+        target_access_name: str   # REQUIRED. Endpoint that receives the
+                                  # Event object.
+        target_plugin: str        # Optional. Default: this plugin.
+        hosts: str | [str]        # Optional. "any" | "local" | "remote" |
+                                  # ["hostname1", ...]. Default: "any".
+        blocked_hosts: str | [str]
+        authors: str | [str]      # Filter publishers by name.
+        blocked_authors: str | [str]
+        enabled: boolean          # Optional. Default: true. Disabled subs
+                                  # stay in the registry but are skipped
+                                  # at match time.
+
+events:                           # Dict keyed by event_id (your
+                                  # author-chosen identifier). Declares
+                                  # what THIS plugin publishes.
+    event_id:
+        topic: str                # REQUIRED. Same templating + wildcard
+                                  # rules as subscriptions.
+        hosts: str | [str]        # Optional. Default: "local". Must be
+                                  # "any" or include remote peers for
+                                  # cross-node delivery.
+        blocked_hosts: str | [str]
+        enabled: boolean          # Optional. Default: true. Disabled
+                                  # events drop publish_event silently
+                                  # and raise on request_event.
+
+
+REMOVED in 0.39.x / 0.40.x:::
+    endpoints[].topic             # Legacy per-endpoint auto-subscribe.
+                                  # Replaced by the top-level
+                                  # subscriptions: block. The fix is
+                                  # mechanical: move the topic into a
+                                  # subscriptions entry and point its
+                                  # target_access_name at the endpoint.
+    endpoints (as a list)         # Replaced by dict keyed by access_name.
+
+If your plugin_config.yml still uses endpoints as a list OR carries
+endpoints[].topic, Plexus refuses to load the plugin with a fail-load
+error pointing at the offending key.

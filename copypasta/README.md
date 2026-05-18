@@ -146,9 +146,11 @@ The handler endpoint receives an `Event` object: `event.topic`, `event.payload`,
 ### Accessing Plugin Properties
 
 - **`self._logger`**: Logger instance for your plugin
-- **`self._plexus`**: Reference to the Plexus instance
 - **`self.plugin_name`**: Your plugin's name
-- **`self.enabled`**: Whether the plugin is currently enabled
+- **`self.plugin_uuid`**: Stable UUID for this plugin instance (changes on reload)
+- **`self.enabled`**: Whether the plugin is currently enabled (read-only since v0.26.0 — use `plx.enable_plugin` / `plx.disable_plugin` instead)
+- **`self.ready`**: `asyncio.Event` you can `clear()` in `on_enable` and `set()` after async setup finishes — gates cross-plugin calls into this plugin
+- **`self._plexus`**: Reference to the Plexus instance. Escape hatch for advanced cases (e.g. toggling another plugin's event). Most APIs you'd reach through `self._plexus` already have first-class `self.*` wrappers — prefer those
 
 ## Configuration Files
 
@@ -159,11 +161,13 @@ description: str                 # What your plugin does
 version: str                     # Semantic version (e.g., "1.0.0")
 remote: boolean                  # Allow remote access
 arguments:                       # Optional: Load-time arguments
-endpoints:
-  - internal_name: method_name   # Method in your class
-    access_name: method_name     # Name others use to call it
-    topic: "some/topic"          # Optional: Subscribe to a notifier topic
-    tags: []                     # Optional categorization tags
+prefix: str                      # Optional: Topic template prefix. Default: plugin_name.
+verbose_notifier: boolean        # Optional: Verbose event-system logging. Default: false.
+
+endpoints:                       # Dict keyed by access_name (NOT a list)
+  method_name:                   # Outer key = access_name (what callers use)
+    internal_name: method_name   # Optional: Python method on the class. Defaults to outer key.
+    tags: []                     # Optional: For find_endpoints_by_tag
     remote: boolean              # Allow remote calls
     accessible_by_other_plugins: boolean
     description: str             # What the method does
@@ -171,6 +175,18 @@ endpoints:
       - name: param_name
         type: str                # int, str, dict, list, any, bool, float
         description: str
+
+subscriptions:                   # Dict keyed by declared_id. Replaces the
+                                 # legacy per-endpoint `topic:` field.
+  my_sub:
+    topic: "some/topic"          # Topic pattern (supports `*` wildcard per segment)
+    target_access_name: method_name  # Endpoint that receives the Event
+
+events:                          # Dict keyed by event_id — declares what
+                                 # this plugin publishes.
+  my_event:
+    topic: "{prefix}/something"
+    hosts: "any"                 # Default "local"; use "any" for cross-node delivery
 ```
 
 ### config.yml Plugin Entry
@@ -180,9 +196,20 @@ plugins:
   - name: YourPluginName          # Must match class name
     enabled: true                 # Load on startup
     path: ./path/to/plugin        # Optional: explicit path
-    arguments:                    # Optional: Pass data to plugin
-      key: value
+    overrides:                    # Optional: deep-merge into the plugin's
+                                  # own plugin_config.yml at load time.
+      arguments:                  # Forwarded to on_load.
+        key: value
+      verbose_notifier: true
+      endpoints:
+        method_name:
+          remote: true
 ```
+
+Note: A top-level `arguments:` on the plugin entry (rather than inside
+`overrides:`) is ignored with a renamed-key warning. `arguments:`
+belongs either in the plugin's own `plugin_config.yml` or in an
+`overrides:` block.
 
 ## Examples
 
