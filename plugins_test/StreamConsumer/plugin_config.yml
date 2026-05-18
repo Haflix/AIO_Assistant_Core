@@ -1,0 +1,21 @@
+description: Perf fixture — consumes execute_stream against StreamProducer; used to measure cross-plugin + cross-node streaming overhead via the Plugin wrapper (vs the Plexus-level execute_stream which the StreamProducer bench uses).
+version: 0.1.0
+remote: True
+arguments:
+
+endpoints:
+  drain_local:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Calls self.execute_stream against StreamProducer with the given (count, chunk_size, hosts) and returns {wall_s, received_chunks, received_bytes, per_chunk_us}. hosts='local' forces same-node; hosts='remote' forces cross-node."
+    arguments:
+      - name: count
+        type: int
+        required: True
+      - name: chunk_size
+        type: int
+        required: True
+      - name: hosts
+        type: str
+        description: "'local' | 'remote' | 'any'"
+        required: False

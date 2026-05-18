@@ -1,6 +1,6 @@
 # Networking
 
-*Last updated for AIO Assistant Core 0.22.3*
+*Last updated for Plexus 0.40.0*
 
 Plexus ships with an optional `NetworkManager` that bridges plugin calls between nodes over an mTLS-pinned TCP protocol. With networking enabled, calling `await self.execute("OtherPlugin", ...)` works whether `OtherPlugin` is on this node or another node. The same applies to `publish_event` and `request_event`.
 
@@ -14,11 +14,11 @@ For the full configuration block reference, see [configuration](./configuration.
 
 Every node holds its own self-signed certificate. Peers trust each other by **certificate pinning** on the SubjectPublicKeyInfo (SPKI) — there is no CA, no chain, no DNS-name verification. Each node's `peers:` config lists the exact other nodes it accepts.
 
-- Each node has `cert.pem` and `key.pem` in `keys_dir` (default `_keys/`). When neither file is present, NetworkManager generates a self-signed pair via `_load_or_generate_identity` (`networking.py:584-658`).
+- Each node has `cert.pem` and `key.pem` in `keys_dir` (default `_keys/`). When neither file is present, NetworkManager generates a self-signed pair via `_load_or_generate_identity`.
 - The fingerprint is the sha256 of the SPKI DER, prefixed with `sha256:`. NetworkManager derives this at parse time from each peer's cert PEM.
-- mTLS contexts are built by `_create_server_ssl_context` / `_create_client_ssl_context` / `_create_pinned_ssl_context` (`networking.py:680-705`). Both sides require client certificates.
-- On every inbound connection, `_handle_client` (`networking.py:1188-1217`) extracts the peer's SPKI fingerprint as its FIRST act, BEFORE any protocol message is read or sent, and looks the fingerprint up in `peers_by_fingerprint`. A pin failure closes the socket silently — no `_send_message` ever fires on a non-pinned peer.
-- `start()` (`networking.py:985-999`) hard-errors if `peers:` is empty when networking is enabled, because an empty trust store would reject every inbound connection with an opaque OpenSSL error.
+- mTLS contexts are built by `_create_server_ssl_context` / `_create_client_ssl_context` / `_create_pinned_ssl_context`. Both sides require client certificates.
+- On every inbound connection, `_handle_client` extracts the peer's SPKI fingerprint as its FIRST act, BEFORE any protocol message is read or sent, and looks the fingerprint up in `peers_by_fingerprint`. A pin failure closes the socket silently — no `_send_message` ever fires on a non-pinned peer.
+- `NetworkManager.start()` hard-errors if `peers:` is empty when networking is enabled, because an empty trust store would reject every inbound connection with an opaque OpenSSL error.
 
 The legacy `node_ips:` schema is removed. Presence of `node_ips:` in a config raises `RuntimeError` at boot with migration guidance pointing at the `peers:` schema.
 
@@ -93,7 +93,7 @@ Most clusters use one port for everything (`networking.port`, default `2510`). W
 - `"10.0.0.1:2511"` → `(10.0.0.1, 2511)`
 - `"[::1]:2510"` → `(::1, 2510)`
 
-Connection pools are keyed by `(ip, port)` (`networking.py:212`), so a parent and sub-node on the same IP get separate pools. `Node` objects (`plexus/networking_classes.py:28-88`) carry an optional `port` field; `None` means "use cluster default".
+Connection pools are keyed by `(ip, port)`, so a parent and sub-node on the same IP get separate pools. `Node` objects (in `plexus.networking_classes`) carry an optional `port` field; `None` means "use cluster default".
 
 Use cases:
 
@@ -104,7 +104,7 @@ Use cases:
 
 ## Hostname-based routing
 
-Peers are addressed by **hostname**, not IP. Internal advert tables (`networking.py:234-253`) all key on `hostname`, so reconnect or IP change does not invalidate them:
+Peers are addressed by **hostname**, not IP. Internal advert tables all key on `hostname`, so reconnect or IP change does not invalidate them:
 
 | Table                    | Shape                                              | Purpose                                                |
 |--------------------------|----------------------------------------------------|--------------------------------------------------------|
@@ -149,7 +149,7 @@ A plugin endpoint is reachable from peer nodes if and only if BOTH conditions ho
 1. The plugin's manifest has top-level `remote: true`.
 2. The endpoint's entry has `remote: true`.
 
-`find_endpoint` (`core.py:2568-2571`) checks both. Forgetting either produces an "endpoint not found" error from a peer caller.
+`find_endpoint` checks both. Forgetting either produces an "endpoint not found" error from a peer caller.
 
 The `accessible_by_other_plugins` flag is NOT consulted for inbound peer requests — that flag only gates LOCAL cross-plugin access. So an endpoint can be `accessible_by_other_plugins: false` (only this plugin can call it locally) and still be `remote: true` (peers can call it across the wire).
 
@@ -157,7 +157,7 @@ The `accessible_by_other_plugins` flag is NOT consulted for inbound peer request
 
 ## Remote `execute` flow
 
-When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a local plugin, `Plexus._process_request` (`core.py:2676-2788`) takes the remote branch.
+When `find_endpoint` finds the endpoint on a `RemotePlugin` proxy instead of a local plugin, `Plexus._process_request` takes the remote branch.
 
 ```
    Plugin A on Node alpha
@@ -228,7 +228,7 @@ The streaming variant (`request_event_stream`, `MSG_REQUEST_EVENT_STREAM`, id 17
 
 ## Remote `publish_event` flow
 
-`publish_event` is 1:N fan-out. Local subs are dispatched in-process; for every advertised remote sub on every reachable peer that survives per-peer and sub-level filters, the framework spawns a tracked task that sends `MSG_PUBLISH_EVENT` (id 15) over the wire (`core.py:4194-4279`).
+`publish_event` is 1:N fan-out. Local subs are dispatched in-process; for every advertised remote sub on every reachable peer that survives per-peer and sub-level filters, the framework spawns a tracked task that sends `MSG_PUBLISH_EVENT` (id 15) over the wire.
 
 ```
    Local Plexus.publish_event
@@ -272,7 +272,7 @@ Adverts are fire-and-forget on the wire — the sender does not block awaiting a
 
 ## Wire protocol message types
 
-For tooling authors and protocol debuggers. Constants live at `networking.py:56-87`. Each message is length-prefixed and routed by type ID. Numbers are part of the wire format and must not be repurposed.
+For tooling authors and protocol debuggers. Constants live at the top of `plexus.networking`. Each message is length-prefixed and routed by type ID. Numbers are part of the wire format and must not be repurposed.
 
 | ID | Name                       | Direction | Purpose                                                                       |
 |----|----------------------------|-----------|-------------------------------------------------------------------------------|
@@ -296,7 +296,7 @@ For tooling authors and protocol debuggers. Constants live at `networking.py:56-
 
 IDs 7, 8, 9 are reserved and must not be reused; they held legacy `MSG_NOTIFY`, `MSG_TOPIC_REQUEST`, and `MSG_TOPIC_REQUEST_STREAM`, retired in PR3 Stage D when `notify` / `request_topic` were removed. ID 20 is also reserved (formerly `MSG_AUTH`, removed in PR4 Stage K-3 when SPKI-pinned mTLS replaced the shared-secret auth). ID 21 was claimed in v0.27.0 by `MSG_SUB_ADVERTISE_ACK`.
 
-The sentinel `REMOTE_NO_RESULT` (`networking.py:91`) distinguishes "handler returned `None`" (a valid result) from "no remote handler responded" (treated as no-match for fall-through).
+The sentinel `REMOTE_NO_RESULT` distinguishes "handler returned `None`" (a valid result) from "no remote handler responded" (treated as no-match for fall-through).
 
 ---
 

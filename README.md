@@ -1,8 +1,9 @@
-# AIO Assistant Core
+# Plexus
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for Plexus 0.40.0*
 
-A Python async plugin framework for personal-assistant projects.
+An async Python plugin framework with multi-node mTLS networking and pub/sub
+event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
 
 `Plexus` loads small, single-responsibility Python classes — *plugins* — from
 disk, drives a deterministic `on_load` / `on_enable` / `on_disable` lifecycle,
@@ -17,9 +18,10 @@ protocol (`NetworkManager`), so the same `execute` / `publish_event` /
 `request_event` calls transparently fan out to peer machines whose plugins
 are flagged `remote: true`.
 
-A typical assistant deployment looks like a Discord-bot plugin, a Postgres
-adapter, a wake-word detector, an LLM adapter, and a TTS pipeline — each one
-a class plus a YAML manifest, wired together by topics and `execute` calls.
+A typical deployment in conversational AI, data-pipeline, or event-driven
+domains wires together base plugins (a Discord bot, a Postgres adapter, an
+LLM adapter, a TTS pipeline) with orchestrator plugins that hold the
+business logic — each one a class plus a YAML manifest.
 
 ---
 
@@ -52,13 +54,21 @@ a class plus a YAML manifest, wired together by topics and `execute` calls.
 
 Requires Python 3.11+.
 
+From PyPI (recommended for using Plexus as a library):
+
 ```bash
-git clone <repo>
+pip install plexus-core
+```
+
+From source (for developing on the framework itself):
+
+```bash
+git clone https://github.com/Haflix/AIO_Assistant_Core.git
 cd AIO_Assistant_Core
 python -m venv .venv
 .venv/Scripts/activate          # Windows
 # source .venv/bin/activate     # Linux / macOS
-pip install -r requirements.txt
+pip install -e .
 cp config.example.yml config.yml
 ```
 
@@ -123,8 +133,8 @@ class AveragePlugin(Plugin):
 ### `copypasta/AveragePlugin/plugin_config.yml`
 
 ```yaml
-description: Example plugin demonstrating the AIO Assistant Core plugin structure
-version: 1.1.0
+description: Example plugin demonstrating the Plexus plugin structure
+version: 1.2.0
 remote: True
 arguments:
 

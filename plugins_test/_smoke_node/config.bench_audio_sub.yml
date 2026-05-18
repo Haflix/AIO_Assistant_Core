@@ -1,0 +1,30 @@
+# Bench subnode config for publish_event throughput test (revised topology).
+# Loads ONLY AudioSubscriber. Parent hosts AudioPublisher, subnode receives.
+# Matches the proven topology of the smoke test (publisher upstream,
+# subscriber downstream), which the prior bench attempt (sub upstream,
+# pub downstream) failed to deliver across the wire.
+plugins:
+  - name: AudioSubscriber
+    enabled: true
+    path: ./plugins_test/AudioSubscriber
+
+general:
+  hostname: "bench-audio-subnode"
+  plugin_package: plugins_test
+  console_log_level: "ERROR"
+  file_log_level: "ERROR"
+  asyncio_debug: false
+  logger_levels:
+    asyncio: "MUTE"
+    urllib3: "MUTE"
+    Plexus: "MUTE"
+    networking: "MUTE"
+    notifier: "MUTE"
+    AudioSubscriber: "MUTE"
+
+networking:
+  enabled: true
+  port: 0
+  discover_nodes: true
+  direct_discoverable: true
+  auto_discoverable: true

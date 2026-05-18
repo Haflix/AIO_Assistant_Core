@@ -1,0 +1,28 @@
+# Bench subnode config for publish_event throughput test.
+# Loads ONLY AudioPublisher. Used by stream_throughput_publish.py
+# to measure cross-node publish_event throughput + delivery latency.
+plugins:
+  - name: AudioPublisher
+    enabled: true
+    path: ./plugins_test/AudioPublisher
+
+general:
+  hostname: "bench-audio-subnode"
+  plugin_package: plugins_test
+  console_log_level: "ERROR"
+  file_log_level: "ERROR"
+  asyncio_debug: false
+  logger_levels:
+    asyncio: "MUTE"
+    urllib3: "MUTE"
+    Plexus: "MUTE"
+    networking: "MUTE"
+    notifier: "MUTE"
+    AudioPublisher: "MUTE"
+
+networking:
+  enabled: true
+  port: 0
+  discover_nodes: true
+  direct_discoverable: true
+  auto_discoverable: true

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plexus-core"
-version = "0.40.0"
+version = "0.40.1"
 description = "Async plugin framework with multi-node mTLS networking and pub/sub event routing."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,22 @@
+description: Perf fixture — bursts N publish_event calls with audio-sized payloads. Simulates DiscordBot's sink callback firing one event per 20ms PCM frame.
+version: 0.1.0
+remote: True
+arguments:
+
+events:
+  audio_chunk:
+    topic: "{prefix}/audio/chunk"
+    hosts: "any"   # default is "local" — must be "any" for cross-node delivery
+
+endpoints:
+  burst:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Publishes `count` audio_chunk events, each with a payload of `chunk_size` bytes + a sequence number + a t_publish_us monotonic timestamp. Returns timing data {wall_s, publish_count, publish_per_chunk_us}."
+    arguments:
+      - name: count
+        type: int
+        required: True
+      - name: chunk_size
+        type: int
+        required: True

@@ -1,0 +1,30 @@
+description: Perf fixture — subscribes to AudioPublisher's audio_chunk topic, records receive timestamps for delivery-latency stats.
+version: 0.1.0
+remote: True
+arguments:
+
+subscriptions:
+  on_audio_chunk:
+    topic: "AudioPublisher/audio/chunk"
+    target_access_name: handle_chunk
+    hosts: "any"
+
+endpoints:
+  handle_chunk:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Internal subscription handler. Records (seq, t_publish_us, t_receive_us) into the in-memory log."
+    arguments:
+      - name: event
+        type: any
+        required: True
+
+  reset:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Clears the in-memory chunk log. Call before each bench run."
+
+  collect:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Returns the recorded log: {received_count, latencies_us, delta_us}. latencies_us is per-chunk publish-to-receive in microseconds; delta_us is the gap between consecutive receives. Useful for jitter analysis."

@@ -1,6 +1,6 @@
 # Plugin Authoring Guide
 
-*Last updated for AIO Assistant Core 0.22.3*
+*Last updated for Plexus 0.40.0*
 
 Write a plugin from scratch. This page walks through the moving parts in
 the order an author meets them; reference details live in
@@ -13,7 +13,7 @@ The shipped `copypasta/AveragePlugin/` is the running example.
 
 ## Tier discipline (read this first)
 
-AIO Assistant Core organises plugins into three tiers. Stay inside one
+Plexus organises plugins into three tiers. Stay inside one
 tier per plugin — mixing them produces tangled dependencies that hot-swap
 cannot rescue.
 
@@ -467,8 +467,7 @@ async def on_enable(self):
 
 @async_log_errors
 async def on_disable(self):
-    # framework auto-clears declared and runtime subs after `on_disable`
-    # returns (core.py:2167-2198)
+    # framework auto-clears declared and runtime subs after `on_disable` returns
     pass
 ```
 
@@ -541,14 +540,14 @@ Each plugin tracked by the framework follows a 6-state machine:
 | `DISABLING` | `on_disable` in progress. |
 | `FAILED_LOAD` | `on_load` raised. No instance. `last_errors[Phase.LOAD]` populated. |
 
-Read state with `pc.plugin_states[name].state`. The state enum lives in
+Read state with `plx.plugin_states[name].state`. The state enum lives in
 [`plexus/plugin_state.py`](../plexus/plugin_state.py); import as
 `from plexus.plugin_state import State`.
 
 `Plugin.enabled` is a read-only `@property` returning `True` for state in
 `{ENABLING, ENABLED}`. Author code MUST NOT write `self.enabled = ...` —
-the override raises `AttributeError`. Use `pc.enable_plugin(name)` /
-`pc.disable_plugin(name)` to change state.
+the override raises `AttributeError`. Use `plx.enable_plugin(name)` /
+`plx.disable_plugin(name)` to change state.
 
 **Subclass init contract:** subclasses must call `super().__init__(...)`
 BEFORE reading `self.enabled` — the property depends on
@@ -556,7 +555,7 @@ BEFORE reading `self.enabled` — the property depends on
 end. Reading the property earlier in subclass init returns `False` even
 for an enabled plugin.
 
-**Re-entrant lifecycle warning:** calling `pc.disable_plugin(self.plugin_name)`
+**Re-entrant lifecycle warning:** calling `plx.disable_plugin(self.plugin_name)`
 from inside your own `on_load` / `on_enable` / handler body re-enters
 the per-plugin lifecycle lock and **deadlocks**. If you need to
 self-disable, schedule it on a separate task:
@@ -566,7 +565,7 @@ asyncio.create_task(self._plexus.disable_plugin(self.plugin_name))
 
 ### Observers of `_core/plugin/state_changed`
 
-Internal event-bus observers (registered via `pc.internal_observe(...)`)
+Internal event-bus observers (registered via `plx.internal_observe(...)`)
 receive a synchronous callback for every state transition with payload
 `(name, from_state, to_state, ts)` (state strings are the enum
 `.value`). Observer contract:
@@ -576,8 +575,8 @@ receive a synchronous callback for every state transition with payload
 - Observers MUST NOT acquire `plugin_lock` / `lifecycle_lock` /
   `request_lock` — the dispatch happens inside one of these locks; recursive
   acquisition deadlocks.
-- Observers MUST NOT call `pc.enable_plugin(name)` /
-  `pc.disable_plugin(name)` for the SAME plugin whose state just changed —
+- Observers MUST NOT call `plx.enable_plugin(name)` /
+  `plx.disable_plugin(name)` for the SAME plugin whose state just changed —
   same lock-recursion deadlock. For a DIFFERENT plugin, defer with
   `asyncio.create_task(...)`.
 
@@ -587,11 +586,11 @@ Some operations emit multiple state-change events in rapid succession:
 
 | Operation | Sequence |
 |---|---|
-| `pc.disable_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE` |
-| `pc.pop_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED` |
-| `pc.pop_plugin(name)` on INACTIVE | `INACTIVE → UNLOADED` |
-| `pc._reload_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` |
-| `pc.enable_plugin(name)` on UNLOADED | `UNLOADED → INACTIVE → ENABLING → ENABLED` |
+| `plx.disable_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE` |
+| `plx.pop_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED` |
+| `plx.pop_plugin(name)` on INACTIVE | `INACTIVE → UNLOADED` |
+| `plx._reload_plugin(name)` on ENABLED | `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` |
+| `plx.enable_plugin(name)` on UNLOADED | `UNLOADED → INACTIVE → ENABLING → ENABLED` |
 
 Observers reacting to INACTIVE alone may take action assuming the plugin
 is just disabled (re-enableable) and then immediately see UNLOADED.
@@ -737,8 +736,8 @@ class AveragePlugin(Plugin):
 `copypasta/AveragePlugin/plugin_config.yml`:
 
 ```yaml
-description: Example plugin demonstrating the AIO Assistant Core plugin structure
-version: 1.1.0
+description: Example plugin demonstrating the Plexus plugin structure
+version: 1.2.0
 remote: True
 arguments:
 

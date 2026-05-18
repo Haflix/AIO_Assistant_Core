@@ -1,8 +1,8 @@
 # Architecture
 
-*Last updated for AIO Assistant Core 0.22.0*
+*Last updated for Plexus 0.40.0*
 
-This document describes the runtime shape of an AIO Assistant Core process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
+This document describes the runtime shape of a Plexus process: how Plexus loads plugins, how the lifecycle hooks fire, what guarantees the framework gives during hot-swap and shutdown, and how the three-tier discipline organises the plugins themselves.
 
 ---
 
@@ -187,7 +187,7 @@ If both events are not set within the budget, the caller's `execute()` raises `R
 
 ### Plugin state machine (v0.26.0)
 
-Each plugin tracked in `pc.plugins` (and config-disabled plugins tracked in `pc.plugin_states`) follows a 6-state machine:
+Each plugin tracked in `plx.plugins` (and config-disabled plugins tracked in `plx.plugin_states`) follows a 6-state machine:
 
 | State | Meaning |
 |---|---|
@@ -198,11 +198,11 @@ Each plugin tracked in `pc.plugins` (and config-disabled plugins tracked in `pc.
 | `DISABLING` | `on_disable` in progress. |
 | `FAILED_LOAD` | `on_load` raised. Instance is `None`. `last_errors[Phase.LOAD]` populated. |
 
-Every state mutation funnels through `pc._transition_plugin(name, new_state)`, which emits `_core/plugin/state_changed` on the internal event bus. Observers must NOT acquire `plugin_lock` / `lifecycle_lock` / `request_lock` during dispatch (sync observer contract — see [`api_reference.md`](./api_reference.md)).
+Every state mutation funnels through `plx._transition_plugin(name, new_state)`, which emits `_core/plugin/state_changed` on the internal event bus. Observers must NOT acquire `plugin_lock` / `lifecycle_lock` / `request_lock` during dispatch (sync observer contract — see [`api_reference.md`](./api_reference.md)).
 
-`Plugin.enabled` is a read-only `@property` that returns `True` for state in `{ENABLING, ENABLED}` (matches pre-v0.26 semantics). To distinguish "fully ready" from "mid-enable" externally, read `pc.plugin_states[name].state` directly.
+`Plugin.enabled` is a read-only `@property` that returns `True` for state in `{ENABLING, ENABLED}` (matches pre-v0.26 semantics). To distinguish "fully ready" from "mid-enable" externally, read `plx.plugin_states[name].state` directly.
 
-Public lifecycle API: `await pc.enable_plugin(name)` / `await pc.disable_plugin(name)`. Direct writes to `plugin.enabled` raise `AttributeError`.
+Public lifecycle API: `await plx.enable_plugin(name)` / `await plx.disable_plugin(name)`. Direct writes to `plugin.enabled` raise `AttributeError`.
 
 ---
 

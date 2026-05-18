@@ -1,0 +1,19 @@
+description: Perf fixture — yields N chunks of configurable size for execute_stream throughput benchmarking
+version: 0.1.0
+remote: True
+arguments:
+
+endpoints:
+  produce_chunks:
+    remote: True
+    accessible_by_other_plugins: True
+    description: "Async generator: yields `count` chunks of `chunk_size` bytes each (zero-filled). Used to measure execute_stream throughput."
+    arguments:
+      - name: count
+        type: int
+        description: How many chunks to yield
+        required: True
+      - name: chunk_size
+        type: int
+        description: Bytes per chunk
+        required: True

@@ -1,6 +1,6 @@
 # Notifier and Events
 
-*Last updated for AIO Assistant Core 0.22.3*
+*Last updated for Plexus 0.40.0*
 
 Deep dive on the topic-based event system. The user-facing Plugin
 methods are covered in [api_reference.md](./api_reference.md); this page
@@ -49,7 +49,7 @@ Validation rules:
 - Event topics (publisher-declared) MAY NOT contain `*`. Subscription
   topics MAY.
 
-The matcher (`notifier.py:164-188`, `_topic_matches`) splits both
+The matcher (`_topic_matches` in `plexus.notifier`) splits both
 strings on `/` and matches segment-by-segment, requiring identical
 segment counts. `*` matches exactly one non-empty segment.
 
@@ -86,13 +86,12 @@ subscriptions:
 `target_access_name` must name a declared endpoint on this plugin (or, if
 `target_plugin` is set, on the named plugin). When `target_plugin` is
 unset or empty, the sub self-routes — the framework substitutes the
-owner's `plugin_name` (`notifier.py:237`,
-`effective_target_plugin = target_plugin or plugin_name`).
+owner's `plugin_name` (`effective_target_plugin = target_plugin or plugin_name`).
 
 Subscriptions are registered with the topic registry BEFORE `on_enable`
-runs, by `_register_yaml_subscriptions` (`core.py:2108-2145`).
-Subscriptions added at runtime via `await self.subscribe(...)` follow
-the YAML registrations in insertion order.
+runs, by `_register_yaml_subscriptions`. Subscriptions added at runtime
+via `await self.subscribe(...)` follow the YAML registrations in
+insertion order.
 
 ---
 
@@ -102,8 +101,7 @@ Two kinds of placeholders are supported in event and subscription topics.
 
 ### Load-time placeholders (resolved when the YAML is parsed)
 
-Resolved once, when the plugin loads, by `_resolve_load_time_template`
-(`core.py:155-186`):
+Resolved once, when the plugin loads, by `_resolve_load_time_template`:
 
 | Placeholder | Substituted with |
 |---|---|
@@ -154,8 +152,8 @@ Runtime placeholders only make sense on the publish side — the
 publisher knows what value to fill in. On the subscribe side, `{var}`
 cannot be resolved at load time and would never match anything at
 dispatch time. The subscription validator
-(`core.py:247-263`, `_validate_subscription_topic`) rejects them.
-A subscriber that wants to handle every user uses a wildcard:
+(`_validate_subscription_topic`) rejects them. A subscriber that wants
+to handle every user uses a wildcard:
 
 ```yaml
 subscriptions:
@@ -169,7 +167,7 @@ subscriptions:
 ## The Subscription dataclass
 
 Every YAML or runtime sub becomes a `Subscription` in the topic
-registry. Defined in `notifier.py:66-119`.
+registry. Defined in `plexus.notifier`.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -179,7 +177,7 @@ registry. Defined in `notifier.py:66-119`.
 | `plugin_name` / `plugin_uuid` | str / str | OWNER (the plugin that declared/registered the sub). |
 | `target_plugin` / `target_access_name` | str / str | Routing target. Defaults to self-routing (`target_plugin == plugin_name`) when `target_plugin` is unset. |
 | `target_plugin_uuid` | `Optional[str]` | Optional instance pin. |
-| `hosts` | `str / list / None` | Receiver-side host filter. Default `"any"` (`notifier.py:108`). |
+| `hosts` | `str / list / None` | Receiver-side host filter. Default `"any"`. |
 | `blocked_hosts` | `str / list / None` | Receiver-side host blacklist. |
 | `authors` / `blocked_authors` | str / list / None | Author whitelist / blacklist. |
 | `enabled` | `bool` | Default `True`. Disabled subs stay registered but are skipped at match time. |
@@ -197,7 +195,7 @@ the subscription itself.
 
 ## The matching algorithm
 
-The topic registry (`TopicRegistry`, `notifier.py:122-367`) stores
+The topic registry (`TopicRegistry` in `plexus.notifier`) stores
 subscriptions in a single insertion-ordered dict keyed by `sub_uuid`.
 
 - `find_all(topic)` iterates all subs in insertion order, returns every
@@ -230,7 +228,7 @@ cleanly.
 
 ### 1. Publisher hosts gate
 
-`_publisher_targets_local` (`core.py:3737-3784`) decides whether
+`_publisher_targets_local` decides whether
 this publish should target local subs at all. The publisher's effective
 `hosts` and `blocked_hosts` (manifest, optionally overridden per-call)
 gate this. Default `hosts="local"` if the publisher omits it. `"any"`,
@@ -239,23 +237,22 @@ those accepts. `blocked_hosts` excludes.
 
 ### 2. Sub-level local accept
 
-`_sub_accepts_local` (`core.py:3786-3814`). Whether the
-subscriber wants local events. The sub's `hosts` must accept `"local"`,
-own hostname, or `"any"`; the sub's `blocked_hosts` must not block
-them. Default sub `hosts="any"` accepts everything.
+`_sub_accepts_local`. Whether the subscriber wants local events. The
+sub's `hosts` must accept `"local"`, own hostname, or `"any"`; the
+sub's `blocked_hosts` must not block them. Default sub `hosts="any"`
+accepts everything.
 
 ### 3. Sub-level remote-publisher accept
 
-`_sub_accepts_remote_publisher` (`core.py:3816-3871`). For
-inbound peer publishes only. A sub with `hosts="local"` rejects remote
-publishers. Otherwise the sub's `hosts` / `blocked_hosts` are checked
-against the remote publisher's `author_host`.
+`_sub_accepts_remote_publisher`. For inbound peer publishes only. A sub
+with `hosts="local"` rejects remote publishers. Otherwise the sub's
+`hosts` / `blocked_hosts` are checked against the remote publisher's
+`author_host`.
 
 ### 4. Author filter
 
-`_sub_accepts_author` (`core.py:3873-3906`). `authors` is a
-whitelist; `blocked_authors` is a blacklist. The publisher's
-`plugin_name` is checked against both.
+`_sub_accepts_author`. `authors` is a whitelist; `blocked_authors` is a
+blacklist. The publisher's `plugin_name` is checked against both.
 
 ### The `"system"` author bypass
 
@@ -306,7 +303,7 @@ activating them yet.
 ## What handlers receive
 
 Subscriber endpoints receive ONE positional argument: an `Event`
-dataclass (`utils.py:1754-1807`).
+dataclass (`plexus.Event`).
 
 ```python
 @async_log_errors
@@ -342,13 +339,12 @@ endpoints are usually one or the other.
 ## Declarative YAML vs runtime subscribe
 
 Use YAML when the subscription set is static — known at plugin load
-time. The framework registers YAML subs before `on_enable` runs
-(`core.py:2108-2145`), so the subscription is live from the
-moment the plugin enables.
+time. The framework registers YAML subs before `on_enable` runs, so the
+subscription is live from the moment the plugin enables.
 
-Use `await self.subscribe(...)` (`utils.py:1495-1530`) when the
-subscription set is dynamic — e.g. an orchestrator that subscribes to a
-per-user topic when a user appears.
+Use `await self.subscribe(...)` when the subscription set is dynamic —
+e.g. an orchestrator that subscribes to a per-user topic when a user
+appears.
 
 ```python
 async def on_enable(self):
@@ -407,16 +403,15 @@ A subscriber endpoint can be `async def` or plain `def`. The framework
 runs each kind on a different executor:
 
 - Async handlers run on the main event loop directly.
-- Sync handlers are submitted to a dedicated `SyncDispatcher`
-  (`notifier.py:24-63`) — a
+- Sync handlers are submitted to a dedicated `SyncDispatcher` — a
   `ThreadPoolExecutor(max_workers=N, thread_name_prefix="sync-notifier")`
   separate from the framework's general-purpose plugin executor.
 
 - Default workers: 4. Configurable via `general.sync_dispatcher_workers`
   in `config.yml`.
-- Min 1 worker (clamped via `max(1, int(workers))` at
-  `notifier.py:46`). With `workers=1` you get serialization of all sync
-  subscriber handlers — useful when handlers share non-thread-safe state.
+- Min 1 worker (clamped via `max(1, int(workers))`). With `workers=1`
+  you get serialization of all sync subscriber handlers — useful when
+  handlers share non-thread-safe state.
 - Sync `execute()` endpoints use a SEPARATE shared thread pool
   (`_plugin_executor`). The two pools do not contend, so a slow sync
   subscriber cannot starve sync `execute()` calls.

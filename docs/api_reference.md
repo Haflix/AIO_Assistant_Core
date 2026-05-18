@@ -1,10 +1,10 @@
 # API Reference
 
-*Last updated for AIO Assistant Core 0.22.3*
+*Last updated for Plexus 0.40.0*
 
-Reference manual for the public surface of `utils.Plugin` — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
+Reference manual for the public surface of `Plugin` (in `plexus.utils`) — the methods and attributes a plugin author calls from inside their own class. Methods on `Plexus` itself are covered at the end for tooling and harness authors.
 
-All entries cite the source file and line number. Argument types use Python conventions; `Any` means no constraint. For tutorials and patterns, see [plugin authoring](./plugin_authoring.md). For event-system semantics, see [notifier](./notifier.md).
+Argument types use Python conventions; `Any` means no constraint. For tutorials and patterns, see [plugin authoring](./plugin_authoring.md). For event-system semantics, see [notifier](./notifier.md).
 
 ---
 
@@ -40,27 +40,27 @@ All entries cite the source file and line number. Argument types use Python conv
 
 These are abstract — every concrete plugin must define them. See [architecture](./architecture.md) for the lifecycle contract and [plugin authoring](./plugin_authoring.md) for examples.
 
-`Plugin.__init__` is `@final` (`utils.py:1172-1223`). Subclasses MUST NOT override it — declare instance state in `on_load` instead.
+`Plugin.__init__` is `@final`. Subclasses MUST NOT override it — declare instance state in `on_load` instead.
 
 ### `on_load(self, *args, **kwargs) -> None`
 
-Source: `utils.py:1737-1739`. Synchronous. Called inside `Plugin.__init__`. Must NOT be `async def`.
+Synchronous. Called inside `Plugin.__init__`. Must NOT be `async def`.
 
 The arguments come from `plugin_config.yml`'s `arguments:` field, unpacked by shape: list/tuple → `*args`, dict → `**kwargs`, anything else → no args.
 
 ### `on_enable(self) -> None`
 
-Source: `utils.py:1743-1745`. May be `async def` or `def`. Called once, after framework registration. Sync versions run on the framework's plugin executor.
+May be `async def` or `def`. Called once, after framework registration. Sync versions run on the framework's plugin executor.
 
 ### `on_disable(self) -> None`
 
-Source: `utils.py:1749-1751`. May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `Plexus.close()` (`core.py:797`) hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
+May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `Plexus.close()` hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
 
 ---
 
 ## Public attributes
 
-Set by `Plugin.__init__` (`utils.py:1172-1223`) before `on_load` runs, then partially overwritten by the framework after `on_load` returns.
+Set by `Plugin.__init__` before `on_load` runs, then partially overwritten by the framework after `on_load` returns.
 
 | Name                 | Type             | Description                                                                                                       |
 |----------------------|------------------|-------------------------------------------------------------------------------------------------------------------|
@@ -74,7 +74,7 @@ Set by `Plugin.__init__` (`utils.py:1172-1223`) before `on_load` runs, then part
 | `self.subscriptions` | `dict`           | Parsed `subscriptions:` block.                                                                                    |
 | `self.prefix`        | `str`            | Resolved prefix for `{prefix}` substitution. Defaults to `plugin_name`.                                           |
 | `self.verbose_notifier` | `bool`        | When `true`, notifier dispatch logs include match counts.                                                         |
-| `self.enabled`       | `bool` (read-only `@property` since v0.26.0) | `True` for state in `{ENABLING, ENABLED}`. Direct writes raise `AttributeError`. Use `pc.enable_plugin(name)` / `pc.disable_plugin(name)` to change state. |
+| `self.enabled`       | `bool` (read-only `@property` since v0.26.0) | `True` for state in `{ENABLING, ENABLED}`. Direct writes raise `AttributeError`. Use `plx.enable_plugin(name)` / `plx.disable_plugin(name)` to change state. |
 | `self.remote`        | `bool`           | Plugin-level remote flag from manifest.                                                                            |
 | `self.description`   | `str`            | From manifest.                                                                                                    |
 | `self.version`       | `str`            | From manifest.                                                                                                    |
@@ -100,8 +100,6 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 
 ### `await self.execute(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
-Source: `utils.py:1278-1319`.
-
 | Argument | Type | Default | Notes |
 |---|---|---|---|
 | `plugin` | `str` | — | Target plugin's `plugin_name`. |
@@ -124,8 +122,6 @@ Source: `utils.py:1278-1319`.
 
 ### `self.execute_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
-Source: `utils.py:1322-1368`.
-
 Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestException` if no event loop is bound yet. Detects circular sync calls via a per-thread chain and raises `RequestException("Circular sync call: ...")` rather than deadlocking the executor. Bridges to the loop via `asyncio.run_coroutine_threadsafe`. Same args, same return, same `RequestException` on error.
 
 **Decorator** `@log_errors`.
@@ -134,17 +130,13 @@ Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestExc
 
 ### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
 
-Source: `utils.py:1371-1413`.
-
 Async generator. Yields each chunk produced by the target generator/async-generator method. If the producer raises mid-stream, the call surfaces as `RequestException`.
 
-No top-level decorator (the `@async_log_errors` line in source is commented out at `utils.py:1370`).
+No top-level decorator on the wrapper (errors propagate raw to the consumer).
 
 ---
 
 ### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
-
-Source: `utils.py:1416-1464` (with inner generator at 1466-1491).
 
 Sync generator. Pre-start guard fires at call time, not at first iteration.
 
@@ -157,8 +149,6 @@ Sync generator. Pre-start guard fires at call time, not at first iteration.
 These methods are how plugins emit and request events.
 
 ### `await self.publish_event(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None) -> int`
-
-Source: `utils.py:1551-1567`.
 
 Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote) the dispatch was scheduled for.
 
@@ -180,13 +170,11 @@ Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote
 
 ### `self.publish_event_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None) -> int`
 
-Source: `utils.py:1570-1587`. Sync equivalent. Pre-start guard included.
+Sync equivalent. Pre-start guard included.
 
 ---
 
 ### `await self.request_event(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None) -> Any`
-
-Source: `utils.py:1590-1608`.
 
 1:1 ask. Returns the FIRST matching handler's result, where matching order is the insertion order in the topic registry (YAML declaration order plus runtime registrations as they happen).
 
@@ -211,13 +199,11 @@ Local subs are tried first, in insertion order. On no local match, remote candid
 
 ### `self.request_event_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None) -> Any`
 
-Source: `utils.py:1611-1630`. Sync equivalent.
+Sync equivalent.
 
 ---
 
 ### `async for chunk in self.request_event_stream(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None)`
-
-Source: `utils.py:1632-1651`.
 
 Streaming 1:1 ask. Same selection rules as `request_event`. Pre-first-chunk fall-through is identical (skip `NoLocalSubException` / `NetworkRequestException`, propagate other `RequestException`). Once the first chunk yields, the consumer is committed to that producer — no fall-through past the first yield. The `timeout` is a whole-stream budget enforced by the producer's monotonic deadline.
 
@@ -225,13 +211,11 @@ Streaming 1:1 ask. Same selection rules as `request_event`. Pre-first-chunk fall
 
 ### `for chunk in self.request_event_stream_sync(event_id, payload=None, topic_vars=None, hosts=None, blocked_hosts=None, timeout=None)`
 
-Source: `utils.py:1654-1689`. Sync equivalent. Pre-start guard fires at call time.
+Sync equivalent. Pre-start guard fires at call time.
 
 ---
 
 ### `topic_vars` constraints
-
-Validated in `core.py:3949-3997`.
 
 - Type: `Dict[str, str]` or `None`. A non-dict, non-None value raises `TypeError`.
 - Keys must be `str` (`TypeError` otherwise) and must NOT be in `{"prefix", "plugin_name", "hostname", "plugin_uuid"}` (`ValueError`).
@@ -240,15 +224,13 @@ Validated in `core.py:3949-3997`.
 - Extra keys not used by the template → warning logged.
 - Static topic with non-empty `topic_vars` → warning logged.
 
-These exceptions are NOT wrapped — `@async_log_errors` re-raises whatever was raised (`decorators.py:209`). The caller sees the raw `ValueError` / `TypeError`.
+These exceptions are NOT wrapped — `@async_log_errors` re-raises whatever was raised. The caller sees the raw `ValueError` / `TypeError`.
 
 ---
 
 ## Subscribe / unsubscribe at runtime
 
 ### `await self.subscribe(topic, target_access_name, *, target_plugin=None, target_plugin_uuid=None, hosts="any", blocked_hosts=None, authors=None, blocked_authors=None) -> str`
-
-Source: `utils.py:1495-1530`.
 
 Register a subscription at runtime (in addition to the declarative `subscriptions:` block).
 
@@ -266,8 +248,8 @@ Register a subscription at runtime (in addition to the declarative `subscription
 **Returns** `str` — the new `sub_uuid`. Pass this back to `unsubscribe`.
 
 **Raises**
-- `TypeError` if `target_access_name` is empty or non-string (`utils.py:1514-1518`).
-- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` (`core.py:5048`) and the `target_access_name` re-check at `core.py:5059-5064`. Topic and filter values are validated identically to YAML load.
+- `TypeError` if `target_access_name` is empty or non-string.
+- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` and a `target_access_name` re-check on the Plexus side. Topic and filter values are validated identically to YAML load.
 
 > **Do not use** the legacy `handler=` keyword form — it was removed. Runtime subs always route to a NAMED endpoint via `target_access_name`.
 
@@ -275,13 +257,13 @@ Register a subscription at runtime (in addition to the declarative `subscription
 
 ### `await self.unsubscribe(subscription_id) -> bool`
 
-Source: `utils.py:1532-1534`. Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
+Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
 
 ---
 
 ### `self.subscribe_sync(...)` and `self.unsubscribe_sync(...)`
 
-Source: `utils.py:1692-1733`. Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
+Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
 
 ---
 
@@ -291,34 +273,34 @@ Set per-logger thresholds at runtime. Plugin-source overrides survive config rel
 
 ### `self.set_logger_level(name, *, console=None, file=None) -> None`
 
-Source: `utils.py:1237-1255`. Override threshold on a specific logger. `name` is the dotted logger name (e.g. `"httpx"`). Pass `console=` and/or `file=` strings (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`, `"MUTE"`).
+Override threshold on a specific logger. `name` is the dotted logger name (e.g. `"httpx"`). Pass `console=` and/or `file=` strings (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`, `"MUTE"`).
 
 ### `self.clear_logger_level(name, *, console=True, file=True) -> None`
 
-Source: `utils.py:1257-1271`. Remove this plugin's overrides on the named logger. Other plugins' overrides on the same logger survive.
+Remove this plugin's overrides on the named logger. Other plugins' overrides on the same logger survive.
 
 ### `self.list_logger_levels() -> dict`
 
-Source: `utils.py:1273-1275`. Snapshot of all per-logger thresholds.
+Snapshot of all per-logger thresholds.
 
 ---
 
 ## Decorators
 
-All eight error-handling decorators live in `decorators.py`. They come in matched (sync / async / generator / async generator) × (`log_errors` / `handle_errors`) pairs.
+All eight error-handling decorators live in `plexus.decorators`. They come in matched (sync / async / generator / async generator) × (`log_errors` / `handle_errors`) pairs.
 
-| Decorator                              | Source                | Function shape       | Behaviour on raise                                          |
-|----------------------------------------|-----------------------|----------------------|-------------------------------------------------------------|
-| `log_errors(logger=None)`              | `decorators.py:67-119` | sync                 | Log via injected logger or `args[0]._logger`. Re-raise.     |
-| `handle_errors(default_return=None, logger=None)` | `decorators.py:122-172` | sync         | Log. Swallow. Return `default_return`.                      |
-| `async_log_errors`                     | `decorators.py:175-211` | async                | Log. Re-raise. (Bare decorator — no parameters.)            |
-| `async_handle_errors(default_return=None)` | `decorators.py:214-273` | async             | Log. Swallow. Return `default_return`. **`RequestException` always propagates** so callers can still catch plugin-call errors. |
-| `gen_log_errors(logger=None)`          | `decorators.py:276-337` | sync generator       | Log. Re-raise.                                              |
-| `gen_handle_errors(default_return=None, logger=None)` | `decorators.py:340-401` | sync generator | Log. Stop the generator (does NOT yield default).         |
-| `async_gen_log_errors(logger=None)`    | `decorators.py:404-464` | async generator      | Log. Re-raise.                                              |
-| `async_gen_handle_errors(default_return=None, logger=None)` | `decorators.py:467-533` | async gen | Log. Stop the generator.                                |
+| Decorator                              | Function shape       | Behaviour on raise                                          |
+|----------------------------------------|----------------------|-------------------------------------------------------------|
+| `log_errors(logger=None)`              | sync                 | Log via injected logger or `args[0]._logger`. Re-raise.     |
+| `handle_errors(default_return=None, logger=None)` | sync         | Log. Swallow. Return `default_return`.                      |
+| `async_log_errors`                     | async                | Log. Re-raise. (Bare decorator — no parameters.)            |
+| `async_handle_errors(default_return=None)` | async             | Log. Swallow. Return `default_return`. **`RequestException` always propagates** so callers can still catch plugin-call errors. |
+| `gen_log_errors(logger=None)`          | sync generator       | Log. Re-raise.                                              |
+| `gen_handle_errors(default_return=None, logger=None)` | sync generator | Log. Stop the generator (does NOT yield default).         |
+| `async_gen_log_errors(logger=None)`    | async generator      | Log. Re-raise.                                              |
+| `async_gen_handle_errors(default_return=None, logger=None)` | async gen | Log. Stop the generator.                                |
 
-All decorators run a `_check_type` check (`decorators.py:9-64`) up front, so applying e.g. `@log_errors` to an `async def` raises `PluginTypeMissmatchError` with a hint to use `@async_log_errors` instead.
+All decorators run a kind-check up front, so applying e.g. `@log_errors` to an `async def` raises `PluginTypeMissmatchError` with a hint to use `@async_log_errors` instead.
 
 `log_errors`, `handle_errors`, `async_handle_errors`, `gen_log_errors`, and `async_gen_log_errors` accept the no-parens form (`@log_errors` works) — they detect the callable-instead-of-logger argument and rewrap. `async_log_errors` is bare by design (`def async_log_errors(func)`, no parameters at all).
 
@@ -330,8 +312,6 @@ All decorators run a `_check_type` check (`decorators.py:9-64`) up front, so app
 ---
 
 ## The `Event` object
-
-Source: `utils.py:1754-1807`.
 
 Subscriber handlers receive ONE positional argument: an `Event`. Endpoints called via `execute()` are NOT wrapped — they get whatever the caller passed, unpacked per the [argument-shape contract](#argument-shape-contract-canonical).
 
@@ -349,7 +329,7 @@ Subscriber handlers receive ONE positional argument: an `Event`. Endpoints calle
 
 ## Exceptions
 
-Source: `plexus/exceptions.py`.
+From `plexus.exceptions` (also re-exported from the top-level `plexus` package).
 
 | Class                     | Base               | Raised when                                                                                                                                              |
 |---------------------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -366,7 +346,7 @@ In practice, catch `RequestException` — it covers `execute*`, `request_event*`
 
 ## Argument-shape contract (canonical)
 
-From `_call_endpoint` (`core.py:2838-2868`). Restated here for skim-readers:
+Applied by the endpoint dispatcher. Restated here for skim-readers:
 
 | `args=` value | Endpoint receives                  |
 |---------------|------------------------------------|
@@ -381,81 +361,81 @@ Subscriber handlers (publish_event / request_event) bypass this rule: they alway
 
 ## Plexus methods (for tooling, harnesses, CLI authors)
 
-The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappers above; tooling that drives the framework from outside uses these. All are on `pc: Plexus`.
+The methods below are on `Plexus` itself. Plugin authors use the `Plugin` wrappers above; tooling that drives the framework from outside uses these. All examples assume `plx: Plexus`.
 
 ### Lifecycle
 
-| Method | Source | Purpose |
-|--------|--------|---------|
-| `Plexus(config_path: str)` | `core.py:526` | Constructor. Loads config. Does NOT load plugins or start networking. |
-| `await pc.start()` | `core.py:674-711` | Initialise background tasks, load plugins, start networking. |
-| `await pc.wait_until_ready()` | `core.py:624-672` | Idempotent variant — for callers that want lazy init. |
-| `await pc.close()` | `core.py:713-827` | Graceful shutdown. |
-| `await pc.graceful_shutdown()` | `core.py:1670-1675` | Alias for `close()`. |
+| Method | Purpose |
+|--------|---------|
+| `Plexus(config_path: str)` | Constructor. Loads config. Does NOT load plugins or start networking. |
+| `await plx.start()` | Initialise background tasks, load plugins, start networking. |
+| `await plx.wait_until_ready()` | Idempotent variant — for callers that want lazy init. |
+| `await plx.close()` | Graceful shutdown. |
+| `await plx.graceful_shutdown()` | Alias for `close()`. |
 
 ### Config
 
-| Method | Source | Purpose |
-|--------|--------|---------|
-| `pc.load_config_yaml(path)` | `core.py:829-848` | Re-read, validate, re-apply (sync). |
-| `await pc.async_load_config_yaml(path)` | `core.py:850-852` | Async wrapper. |
-| `pc.list_config_files() -> Dict[str, str]` | `core.py:894-907` | Paths to main + per-plugin configs. |
-| `pc.read_config_file(path) -> str` | `core.py:909-929` | Read a known config file. |
-| `pc.save_config_file(path, content, backup=True)` | `core.py:931-965` | Validate YAML, save. Does NOT auto-reload. |
-| `pc.is_main_config(path) -> bool` | `core.py:967-969` | |
+| Method | Purpose |
+|--------|---------|
+| `plx.load_config_yaml(path)` | Re-read, validate, re-apply (sync). |
+| `await plx.async_load_config_yaml(path)` | Async wrapper. |
+| `plx.list_config_files() -> Dict[str, str]` | Paths to main + per-plugin configs. |
+| `plx.read_config_file(path) -> str` | Read a known config file. |
+| `plx.save_config_file(path, content, backup=True)` | Validate YAML, save. Does NOT auto-reload. |
+| `plx.is_main_config(path) -> bool` | True if `path` is the main `config.yml`. |
 
 ### Plugin management
 
 | Method | Purpose |
 |--------|---------|
-| `await pc.load_plugins()` | Load and enable every configured plugin. |
-| `await pc.get_plugins()` | Load (without enabling). |
-| `await pc.start_plugins()` | Enable all loaded plugins concurrently. |
-| `await pc.load_plugin_with_conf(entry)` | Load one plugin from a config dict. |
-| `await pc.enable_plugin(plugin_name)` | Public-facing enable; transitions `INACTIVE → ENABLING → ENABLED`. UNLOADED / FAILED_LOAD plugins silently no-op — call `_reload_plugin(name)` first to (re-)instantiate. (v0.26.0) |
-| `await pc.disable_plugin(plugin_name)` | Public-facing disable; transitions `ENABLED` → `DISABLING` → `INACTIVE`. (v0.26.0) |
-| `await pc.pop_plugin(plugin_name)` | Disable, remove, unsubscribe. State becomes `UNLOADED` if config still references the plugin, else entry removed from `plugin_states`. |
-| `await pc.purge_plugins()` | Pop all. |
-| `await pc.purge_plugins_except(excluded_names)` | Pop all except listed. |
-| `await pc._reload_plugin(plugin_name)` | Hot-swap entry point. State sequence: `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` (or shorter for non-enabled source). |
-| `await pc.get_unloaded_metadata(name) -> Optional[dict]` | Read on-disk `plugin_config.yml` for an UNLOADED plugin. Returns `None` for any other state. (v0.26.0) |
+| `await plx.load_plugins()` | Load and enable every configured plugin. |
+| `await plx.get_plugins()` | Load (without enabling). |
+| `await plx.start_plugins()` | Enable all loaded plugins concurrently. |
+| `await plx.load_plugin_with_conf(entry)` | Load one plugin from a config dict. |
+| `await plx.enable_plugin(plugin_name)` | Public-facing enable; transitions `INACTIVE → ENABLING → ENABLED`. UNLOADED / FAILED_LOAD plugins silently no-op — call `_reload_plugin(name)` first to (re-)instantiate. |
+| `await plx.disable_plugin(plugin_name)` | Public-facing disable; transitions `ENABLED → DISABLING → INACTIVE`. |
+| `await plx.pop_plugin(plugin_name)` | Disable, remove, unsubscribe. State becomes `UNLOADED` if config still references the plugin, else entry removed from `plugin_states`. |
+| `await plx.purge_plugins()` | Pop all. |
+| `await plx.purge_plugins_except(excluded_names)` | Pop all except listed. |
+| `await plx._reload_plugin(plugin_name)` | Hot-swap entry point. State sequence: `ENABLED → DISABLING → INACTIVE → UNLOADED → INACTIVE → ENABLING → ENABLED` (or shorter for non-enabled source). |
+| `await plx.get_unloaded_metadata(name) -> Optional[dict]` | Read on-disk `plugin_config.yml` for an UNLOADED plugin. Returns `None` for any other state. |
 
 ### Introspection
 
-| Method | Source | Purpose |
-|--------|--------|---------|
-| `await pc.get_plugin_info(plugin_name) -> Optional[dict]` | `core.py:1610-1626` | name/version/uuid/enabled/remote/description/arguments. |
-| `await pc.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | `core.py:1628-1655` | Per-endpoint metadata. |
-| `await pc.list_plugins_state() -> List[dict]` | `core.py:1657-1668` | name/enabled/description for every plugin. |
-| `await pc.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | `core.py:2468-2649` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
-| `await pc.find_endpoints_by_tag(tag) -> Optional[List]` | `core.py:2431-2466` | Tag-based discovery (local + remote). |
+| Method | Purpose |
+|--------|---------|
+| `await plx.get_plugin_info(plugin_name) -> Optional[dict]` | name/version/uuid/enabled/remote/description/arguments. |
+| `await plx.get_plugin_endpoints(plugin_name) -> Optional[List[dict]]` | Per-endpoint metadata. |
+| `await plx.list_plugins_state() -> List[dict]` | name/enabled/description for every plugin. |
+| `await plx.find_endpoint(access_name, hosts, blocked_hosts, plugin_uuid, requester_id, target_plugin)` | Endpoint lookup with access control. Returns `(plugin, endpoint, node)` or `(None, None, None)`. |
+| `await plx.find_endpoints_by_tag(tag) -> Optional[List]` | Tag-based discovery (local + remote). |
 
 ### Events and subscriptions (low-level)
 
-| Method | Source | Purpose |
-|--------|--------|---------|
-| `await pc.publish_event(publisher, event_id, ...)` | `core.py:4060-4279` | Underlying publish path. |
-| `pc.publish_event_sync(...)` | `core.py:4409-4437` | Sync. |
-| `await pc.request_event(publisher, event_id, ...)` | `core.py:4440-4629` | Underlying request path. |
-| `pc.request_event_sync(...)` | as above | Sync. |
-| `await pc.request_event_stream(publisher, event_id, ...)` | `core.py:4655-4954` | Streaming request path. |
-| `await pc.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | `core.py:5023-5122` | Runtime sub registration with full validation and delta broadcast. |
-| `await pc.unsubscribe_event(sub_uuid) -> bool` | `core.py:5124-5157` | With remove-delta broadcast. |
+| Method | Purpose |
+|--------|---------|
+| `await plx.publish_event(publisher, event_id, ...)` | Underlying publish path. |
+| `plx.publish_event_sync(...)` | Sync. |
+| `await plx.request_event(publisher, event_id, ...)` | Underlying request path. |
+| `plx.request_event_sync(...)` | Sync. |
+| `await plx.request_event_stream(publisher, event_id, ...)` | Streaming request path. |
+| `await plx.subscribe_event(topic, plugin_name, plugin_uuid, target_access_name, ...)` | Runtime sub registration with full validation and delta broadcast. |
+| `await plx.unsubscribe_event(sub_uuid) -> bool` | With remove-delta broadcast. |
 
 ### Read-mostly attributes
 
 | Attribute | Description |
 |-----------|-------------|
-| `pc.plugins` | `dict[name, Plugin]` — only plugins with a live instance (NOT including UNLOADED / FAILED_LOAD entries). |
-| `pc.plugins_by_uuid` | `dict[uuid, Plugin]` |
-| `pc.plugin_states` | `dict[name, PluginState]` — superset of `pc.plugins` keys; includes UNLOADED / FAILED_LOAD entries. v0.26.0. **Iteration contract:** snapshot via `dict(pc.plugin_states)` before iterating; concurrent `pop_plugin` may `del` entries. Single-key lookup via `.get(name)` / `[name]` is GIL-atomic and safe. |
-| `pc.hostname` | This node's hostname. |
-| `pc.network` | `NetworkManager` or `None`. |
-| `pc.networking_enabled` | `bool` |
-| `pc.topic_registry` | The `TopicRegistry` instance. |
-| `pc.sync_dispatcher` | The `SyncDispatcher` instance. |
-| `pc.requests` | In-flight + recently-collected request map. |
-| `pc.main_event_loop` | The bound asyncio loop. |
+| `plx.plugins` | `dict[name, Plugin]` — only plugins with a live instance (NOT including UNLOADED / FAILED_LOAD entries). |
+| `plx.plugins_by_uuid` | `dict[uuid, Plugin]` |
+| `plx.plugin_states` | `dict[name, PluginState]` — superset of `plx.plugins` keys; includes UNLOADED / FAILED_LOAD entries. **Iteration contract:** snapshot via `dict(plx.plugin_states)` before iterating; concurrent `pop_plugin` may `del` entries. Single-key lookup via `.get(name)` / `[name]` is GIL-atomic and safe. |
+| `plx.hostname` | This node's hostname. |
+| `plx.network` | `NetworkManager` or `None`. |
+| `plx.networking_enabled` | `bool` |
+| `plx.topic_registry` | The `TopicRegistry` instance. |
+| `plx.sync_dispatcher` | The `SyncDispatcher` instance. |
+| `plx.requests` | In-flight + recently-collected request map. |
+| `plx.main_event_loop` | The bound asyncio loop. |
 
 ---
 

@@ -1,0 +1,30 @@
+# Bench subnode config: loads ONLY StreamProducer. Used by
+# stream_throughput_cross.py to measure cross-node execute_stream
+# throughput. Mirrors the structure of config.smoke_sub.yml — the
+# bench runner injects keys_dir + peers at runtime via pc.yaml_config
+# patching, so neither field is present here.
+plugins:
+  - name: StreamProducer
+    enabled: true
+    path: ./plugins_test/StreamProducer
+
+general:
+  hostname: "bench-subnode"
+  plugin_package: plugins_test
+  console_log_level: "ERROR"
+  file_log_level: "ERROR"
+  asyncio_debug: false
+  logger_levels:
+    asyncio: "MUTE"
+    urllib3: "MUTE"
+    Plexus: "MUTE"
+    networking: "MUTE"
+    notifier: "MUTE"
+    StreamProducer: "MUTE"
+
+networking:
+  enabled: true
+  port: 0                              # overridden via run_node.py --port
+  discover_nodes: true
+  direct_discoverable: true
+  auto_discoverable: true

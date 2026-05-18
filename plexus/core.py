@@ -9,13 +9,6 @@ if hasattr(sys.stdout, "reconfigure"):  # Reconfigure console streams to UTF-8
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-# Windows defaults to ProactorEventLoop, which is incompatible with psycopg3
-# async and other libraries. Switch to SelectorEventLoop before any loop is created.
-if sys.platform == "win32":
-    import asyncio as _asyncio
-
-    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
-
 import contextlib
 import functools
 import importlib
@@ -57,7 +50,6 @@ from .networking import NetworkManager
 from .notifier import TopicRegistry, Subscription, SyncDispatcher
 from .plugin_state import State, Phase, ErrorRecord, PluginState
 
-
 # Reserved identifier names — disallowed as plugin names AND endpoint
 # access_names because they are framework-reserved keywords used in
 # config/system contexts. Future-proof: extend as new framework-reserved
@@ -67,9 +59,7 @@ from .plugin_state import State, Phase, ErrorRecord, PluginState
 # these as plugin names creates ambiguity in `authors:` and
 # `blocked_authors:` subscription filter lists (which delegate validation
 # to _normalize_hosts and would silently reject the literal name).
-_RESERVED_IDENTIFIER_NAMES = frozenset(
-    {"system", "general", "any", "remote", "local"}
-)
+_RESERVED_IDENTIFIER_NAMES = frozenset({"system", "general", "any", "remote", "local"})
 
 # Default plugin-readiness gate timeout (seconds). Used by
 # _wait_for_plugin_ready before dispatching to a plugin endpoint;
@@ -87,6 +77,7 @@ DEFAULT_PLUGIN_READY_TIMEOUT: float = 60.0
 # general.plugin_disable_timeout in config.yml; tests may override
 # self.plugin_disable_timeout directly.
 DEFAULT_PLUGIN_DISABLE_TIMEOUT: float = 30.0
+
 
 def _validate_identifier_name(name, *, context: str) -> None:
     """Validate that ``name`` is a Python-identifier-style string and not in
@@ -136,7 +127,9 @@ _PLUGIN_LEVEL_OVERRIDE_FIELDS = (
 )
 
 # Reserved topic_vars / load-time-templating names.
-_RESERVED_TEMPLATE_VARS = frozenset({"prefix", "plugin_name", "hostname", "plugin_uuid"})
+_RESERVED_TEMPLATE_VARS = frozenset(
+    {"prefix", "plugin_name", "hostname", "plugin_uuid"}
+)
 
 # {var}-style placeholder regex. Matches {name} where name is identifier-style.
 _TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -704,14 +697,10 @@ class Plexus:
                 # would both attempt construction; the second would
                 # double-register tasks + duplicate the NM instance.
                 if not self._init_tasks:
-                    self._init_tasks.append(
-                        asyncio.create_task(self.load_plugins())
-                    )
+                    self._init_tasks.append(asyncio.create_task(self.load_plugins()))
                     if getattr(self, "networking_enabled", False):
                         if self.network is None:
-                            self.network = self._build_network_manager(
-                                self.yaml_config
-                            )
+                            self.network = self._build_network_manager(self.yaml_config)
                         self._init_tasks.append(
                             asyncio.create_task(self.network.start())
                         )
@@ -727,8 +716,6 @@ class Plexus:
         # post-construction state.
         if self._init_tasks:
             await asyncio.gather(*self._init_tasks)
-
-        # NOTE: Wait for enabled?
 
     async def start(self):
         """Initialize background tasks, load plugins, and start networking.
@@ -907,7 +894,9 @@ class Plexus:
                 "B-073 RECURSIVE EMIT DEPTH EXCEEDED at %d for topic %r — "
                 "dropping event. Observer fan-out exceeded max depth %d; "
                 "check observers for re-entrant framework calls.",
-                depth, topic, _MAX_EMIT_DEPTH,
+                depth,
+                topic,
+                _MAX_EMIT_DEPTH,
             )
             return
         snapshot = list(listeners)
@@ -919,7 +908,8 @@ class Plexus:
                 except Exception:
                     self._logger.exception(
                         "B-073 internal observer raised on topic %r; "
-                        "swallowed and continuing to next observer", topic,
+                        "swallowed and continuing to next observer",
+                        topic,
                     )
         finally:
             _EMIT_DEPTH.reset(token)
@@ -1006,9 +996,7 @@ class Plexus:
                 # OTHER names are not blocked by THIS plugin's shutdown.
                 lifecycle_lock = self._get_lifecycle_lock(name)
                 async with lifecycle_lock:
-                    await self._disable_plugin_under_lock(
-                        name, on_disable_timeout=30.0
-                    )
+                    await self._disable_plugin_under_lock(name, on_disable_timeout=30.0)
                 self._logger.info("Shutdown: %s disabled", name)
             except asyncio.TimeoutError:
                 self._logger.warning(
@@ -1288,9 +1276,7 @@ class Plexus:
             # else: new yaml has networking.enabled=False → leave
             # self.network = None.
 
-    async def _drain_for_rebuild(
-        self, old_nm, timeout: float = 10.0
-    ) -> None:
+    async def _drain_for_rebuild(self, old_nm, timeout: float = 10.0) -> None:
         """Drain in-flight remote-bound work for a clean teardown.
 
         Two snapshot sources:
@@ -1329,12 +1315,8 @@ class Plexus:
         if old_nm is not None:
             try:
                 async with old_nm._adverts_struct_lock:
-                    for peer_set in list(
-                        old_nm._inflight_publishes.values()
-                    ):
-                        pending.extend(
-                            t for t in peer_set if not t.done()
-                        )
+                    for peer_set in list(old_nm._inflight_publishes.values()):
+                        pending.extend(t for t in peer_set if not t.done())
             except Exception:
                 self._logger.debug(
                     "_drain_for_rebuild: snapshot "
@@ -1347,15 +1329,12 @@ class Plexus:
             return
 
         self._logger.info(
-            "_rebuild_networking: draining %d in-flight task(s) "
-            "(timeout=%.1fs)...",
+            "_rebuild_networking: draining %d in-flight task(s) " "(timeout=%.1fs)...",
             len(pending),
             timeout,
         )
         try:
-            done, still_pending = await asyncio.wait(
-                pending, timeout=timeout
-            )
+            done, still_pending = await asyncio.wait(pending, timeout=timeout)
             if still_pending:
                 self._logger.warning(
                     "_rebuild_networking: %d task(s) still pending "
@@ -1366,8 +1345,7 @@ class Plexus:
                 )
         except Exception as e:
             self._logger.warning(
-                "_rebuild_networking: drain await failed: %s; "
-                "continuing rebuild.",
+                "_rebuild_networking: drain await failed: %s; " "continuing rebuild.",
                 e,
             )
 
@@ -1639,12 +1617,11 @@ class Plexus:
         port_default = nw_cfg.get("port", 2510)
 
         from pathlib import Path as _Path
+
         keys_dir_str = nw_cfg.get("keys_dir", "_keys")
         keys_dir_path = _Path(keys_dir_str)
         if not keys_dir_path.is_absolute():
-            keys_dir_path = (
-                _Path(self.config_path).parent / keys_dir_path
-            ).resolve()
+            keys_dir_path = (_Path(self.config_path).parent / keys_dir_path).resolve()
 
         NetworkManager._parse_peers_dryrun(
             self._logger.getChild("networking"),
@@ -2007,12 +1984,17 @@ class Plexus:
         # Q22: warn on any other unrecognized plugin-entry-level field.
         # Common mistake: writing `prefix:` or `verbose_notifier:` at the
         # plugin-entry level instead of inside `overrides:`. Warn + ignore.
-        _KNOWN_PLUGIN_ENTRY_KEYS = frozenset({
-            "name", "enabled", "path", "overrides",
-            # legacy `arguments:` already handled above with a tailored
-            # message; include here so we don't double-warn.
-            "arguments",
-        })
+        _KNOWN_PLUGIN_ENTRY_KEYS = frozenset(
+            {
+                "name",
+                "enabled",
+                "path",
+                "overrides",
+                # legacy `arguments:` already handled above with a tailored
+                # message; include here so we don't double-warn.
+                "arguments",
+            }
+        )
         for stray_key in plugin_entry.keys():
             if stray_key in _KNOWN_PLUGIN_ENTRY_KEYS:
                 continue
@@ -2065,9 +2047,7 @@ class Plexus:
             for ep_key, endpoint in merged_endpoints.items():
                 # The dict key is the canonical access_name. Validate it.
                 try:
-                    _validate_identifier_name(
-                        ep_key, context="endpoint access_name"
-                    )
+                    _validate_identifier_name(ep_key, context="endpoint access_name")
                 except ValueError as e:
                     await error_config(str(e))
                     return
@@ -2166,9 +2146,7 @@ class Plexus:
             # Clear stale errors from previous failed loads.
             self.plugin_states[name].last_errors.clear()
         else:
-            self.plugin_states[name] = PluginState(
-                name=name, state=State.INACTIVE
-            )
+            self.plugin_states[name] = PluginState(name=name, state=State.INACTIVE)
 
         # Instantiate with merged arguments. on_load runs inside __init__;
         # any raise (validation, missing config, plugin author error) puts
@@ -2178,6 +2156,7 @@ class Plexus:
                 self._logger.getChild(name),
                 self,
                 arguments=merged_args,
+                plugin_name=name,
             )
         except BaseException as exc:
             if not isinstance(exc, asyncio.CancelledError):
@@ -2188,8 +2167,7 @@ class Plexus:
                 )
             self._transition_plugin(name, State.FAILED_LOAD)
             self._logger.error(
-                f"Plugin '{name}': on_load raised — "
-                f"{type(exc).__name__}: {exc}"
+                f"Plugin '{name}': on_load raised — " f"{type(exc).__name__}: {exc}"
             )
             raise
 
@@ -2204,7 +2182,9 @@ class Plexus:
         # verbose_notifier defaults to False (Q18). Both are overridable
         # via the standard overrides mechanism.
         prefix_val = merged_config.get("prefix")
-        if prefix_val is None or (isinstance(prefix_val, str) and not prefix_val.strip()):
+        if prefix_val is None or (
+            isinstance(prefix_val, str) and not prefix_val.strip()
+        ):
             prefix_val = name
         if not isinstance(prefix_val, str):
             await warn_config(
@@ -2355,9 +2335,7 @@ class Plexus:
                 "topic": stripped_topic,
                 "hosts": eh,
                 "blocked_hosts": ebh,
-                "enabled": (
-                    bool(entry["enabled"]) if "enabled" in entry else True
-                ),
+                "enabled": (bool(entry["enabled"]) if "enabled" in entry else True),
             }
             plugin_events[event_id] = entry_dict
         plugin.events = plugin_events
@@ -2387,7 +2365,11 @@ class Plexus:
                 return
 
             target_access = entry.get("target_access_name")
-            if target_access is None or not isinstance(target_access, str) or not target_access.strip():
+            if (
+                target_access is None
+                or not isinstance(target_access, str)
+                or not target_access.strip()
+            ):
                 await error_config(
                     f"subscriptions.{declared_id}: 'target_access_name' "
                     f"field is required and must be a non-empty string"
@@ -2456,9 +2438,7 @@ class Plexus:
                 "blocked_hosts": sbh,
                 "authors": sa,
                 "blocked_authors": sba,
-                "enabled": (
-                    bool(entry["enabled"]) if "enabled" in entry else True
-                ),
+                "enabled": (bool(entry["enabled"]) if "enabled" in entry else True),
             }
             plugin_subs[declared_id] = entry_dict
         plugin.subscriptions = plugin_subs
@@ -2721,10 +2701,8 @@ class Plexus:
         raises TimeoutError immediately even when plugin.ready was
         already set.
         """
-        timeout = getattr(
-            self, "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
-        )
-        loop = self.main_event_loop or asyncio.get_event_loop()
+        timeout = getattr(self, "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT)
+        loop = self.main_event_loop or asyncio.get_running_loop()
         start = loop.time()
 
         async def _both():
@@ -2786,14 +2764,25 @@ class Plexus:
             new_sub_uuids = await self._register_yaml_subscriptions(plugin)
             # Transition INACTIVE → ENABLING per Q23 + Q11 so handlers
             # are callable for self-publish-from-on_enable. Rollback to
-            # INACTIVE on raise.
-            self._transition_plugin(plugin_name, State.ENABLING)
+            # INACTIVE on raise. POSS-W-D1-002 / W-A1-001: state flip
+            # MUST stay under plugin_lock so a concurrent re-entry
+            # checking ps.state ∈ {ENABLING, ENABLED} cannot double-
+            # register YAML subs (cycle 1 review invariant) — but the
+            # observer emit is deferred to AFTER lock release so a
+            # sync observer scheduling async work cannot deadlock on
+            # plugin_lock.
+            enable_state_change = self._set_plugin_state_no_emit(
+                plugin_name, State.ENABLING
+            )
 
-        # plugin_lock RELEASED. lifecycle_lock still held. The broadcast
+        # plugin_lock RELEASED. lifecycle_lock still held. Emit the
+        # deferred state-change now that observers can safely use
+        # async APIs that acquire plugin_lock. The broadcast
         # loop and on_enable call run together under one cancellation-
         # aware try/except/finally so a CancelledError mid-flight (which
         # is a BaseException, NOT Exception, so a plain `except Exception:`
         # would skip cleanup) still triggers full rollback.
+        self._emit_plugin_state_change(plugin_name, *enable_state_change)
         ok = False
         try:
             # Broadcast add-deltas to peers OUTSIDE plugin_lock so a
@@ -2820,12 +2809,10 @@ class Plexus:
             # CancelledError — cancellation is not a plugin error (same
             # pattern as _disable_plugin_under_lock skipping TimeoutError).
             if not isinstance(exc, asyncio.CancelledError):
-                self.plugin_states[plugin_name].last_errors[Phase.ENABLE] = (
-                    ErrorRecord(
-                        exception=exc,
-                        traceback=traceback.format_exc(),
-                        ts=time.time(),
-                    )
+                self.plugin_states[plugin_name].last_errors[Phase.ENABLE] = ErrorRecord(
+                    exception=exc,
+                    traceback=traceback.format_exc(),
+                    ts=time.time(),
                 )
             raise
         finally:
@@ -2864,23 +2851,44 @@ class Plexus:
                 # doesn't catch it) but the outer finally chain still
                 # runs, guaranteeing the flag flip.
                 #
-                # No on_disable_timeout here: rollback calls
-                # plugin.on_disable() directly rather than going
-                # through _disable_plugin_under_lock, so it does not
-                # share runtime disable_plugin's wait_for. A
-                # misbehaving on_disable in rollback can still hold
-                # lifecycle_lock until cancelled. Out of scope for
-                # B-009 (which targeted the runtime disable_plugin /
-                # _pop_plugin_under_lock paths); track separately if
-                # rollback hangs become a real issue.
+                # POSS-W-D2-010 fix: wrap rollback on_disable in the
+                # same asyncio.wait_for timeout that the runtime
+                # disable_plugin / _pop_plugin_under_lock paths use
+                # (B-009 fix), so a misbehaving rollback on_disable
+                # cannot pin lifecycle_lock indefinitely. Sync
+                # on_disable caveat from _disable_plugin_under_lock
+                # docstring applies here too: wait_for cancels the
+                # awaitable but cannot interrupt a thread blocked
+                # inside the user's synchronous callback running in
+                # _plugin_executor.
+                rollback_disable_timeout = getattr(
+                    self,
+                    "plugin_disable_timeout",
+                    DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+                )
                 try:
                     try:
                         if asyncio.iscoroutinefunction(plugin.on_disable):
-                            await plugin.on_disable()
-                        else:
-                            await self.main_event_loop.run_in_executor(
-                                self._plugin_executor, plugin.on_disable
+                            await asyncio.wait_for(
+                                plugin.on_disable(),
+                                timeout=rollback_disable_timeout,
                             )
+                        else:
+                            await asyncio.wait_for(
+                                self.main_event_loop.run_in_executor(
+                                    self._plugin_executor, plugin.on_disable
+                                ),
+                                timeout=rollback_disable_timeout,
+                            )
+                    except asyncio.TimeoutError:
+                        self._logger.warning(
+                            "[STAGE_O] _enable_plugin_under_lock rollback: "
+                            "on_disable exceeded %.1fs timeout for plugin %r "
+                            "— continuing rollback (subs will still be "
+                            "unregistered, state will transition to INACTIVE)",
+                            rollback_disable_timeout,
+                            plugin.plugin_name,
+                        )
                     except Exception:
                         self._logger.exception(
                             "[STAGE_O] _enable_plugin_under_lock rollback: "
@@ -2952,8 +2960,10 @@ class Plexus:
           - ``_pop_plugin_under_lock`` → ``plugin_disable_timeout`` (B-009 fix)
 
         ``_enable_plugin_under_lock``'s rollback-on-failure path calls
-        ``plugin.on_disable()`` directly (not via this helper) and is
-        deliberately not timed — see comment at the rollback site.
+        ``plugin.on_disable()`` directly (not via this helper) but is
+        now wrapped in the same ``asyncio.wait_for`` timeout via
+        ``plugin_disable_timeout`` so a misbehaving rollback on_disable
+        cannot pin ``lifecycle_lock``. See the rollback site comment.
         """
         async with self.plugin_lock:
             plugin = self.plugins.get(plugin_name)
@@ -2963,8 +2973,17 @@ class Plexus:
             # Session 3: transition ENABLED → DISABLING under plugin_lock
             # so any concurrent enable check sees DISABLING (not ENABLED)
             # and bails. Flip happens before plugin_lock release.
-            self._transition_plugin(plugin_name, State.DISABLING)
+            # POSS-W-D1-002 / W-A1-001: state mutation stays under-lock
+            # for the race-protection invariant above; observer emit is
+            # deferred to AFTER lock release so a sync observer
+            # scheduling async work cannot deadlock on plugin_lock.
+            disable_state_change = self._set_plugin_state_no_emit(
+                plugin_name, State.DISABLING
+            )
 
+        # plugin_lock RELEASED. Emit the deferred state-change now
+        # that observers can safely use async APIs.
+        self._emit_plugin_state_change(plugin_name, *disable_state_change)
         # Stage O: clear lifecycle-ready BEFORE on_disable so any
         # in-flight gate wait either re-fires against the cleared event
         # (and times out) rather than dispatching to a tearing-down
@@ -2993,18 +3012,14 @@ class Plexus:
                     self._plugin_executor, plugin.on_disable
                 )
                 if on_disable_timeout is not None:
-                    await asyncio.wait_for(
-                        executor_call, timeout=on_disable_timeout
-                    )
+                    await asyncio.wait_for(executor_call, timeout=on_disable_timeout)
                 else:
                     await executor_call
         except BaseException as exc:
             # Session 3: capture on_disable failure for last_errors. Skip
             # CancelledError (cancellation is not a plugin error) and
             # TimeoutError (per-spec routine, callers handle it cleanly).
-            if not isinstance(
-                exc, (asyncio.CancelledError, asyncio.TimeoutError)
-            ):
+            if not isinstance(exc, (asyncio.CancelledError, asyncio.TimeoutError)):
                 self.plugin_states[plugin_name].last_errors[Phase.DISABLE] = (
                     ErrorRecord(
                         exception=exc,
@@ -3112,7 +3127,8 @@ class Plexus:
                     "pop_plugin %r: on_disable exceeded %.1fs timeout; "
                     "continuing with pop (subs already unregistered, "
                     "state already INACTIVE)",
-                    plugin_name, disable_timeout,
+                    plugin_name,
+                    disable_timeout,
                 )
 
         async with self.plugin_lock:
@@ -3179,7 +3195,8 @@ class Plexus:
             except asyncio.TimeoutError:
                 self._logger.warning(
                     "disable_plugin %r: on_disable exceeded %.1fs timeout",
-                    plugin_name, disable_timeout,
+                    plugin_name,
+                    disable_timeout,
                 )
 
     def _transition_plugin(self, name: str, new_state: State) -> None:
@@ -3194,23 +3211,51 @@ class Plexus:
         _internal_emit is sync per E2'. Sync observers must NOT acquire
         plugin_lock / lifecycle_lock / request_lock — see api_reference.md
         observer contract.
+
+        POSS-W-D1-002 / D1-006: call sites that already hold
+        ``plugin_lock`` should use ``_set_plugin_state_no_emit`` +
+        ``_emit_plugin_state_change`` to separate the mutation (which
+        must be under-lock for race protection) from the emit (which
+        must NOT be under-lock so observers cannot self-deadlock).
+        """
+        old_state, _, ts = self._set_plugin_state_no_emit(name, new_state)
+        self._emit_plugin_state_change(name, old_state, new_state, ts)
+
+    def _set_plugin_state_no_emit(
+        self, name: str, new_state: State
+    ) -> Tuple[State, State, float]:
+        """Mutate PluginState.state without firing the observer emit.
+
+        Returns ``(old_state, new_state, ts)``. Callers under
+        ``plugin_lock`` use this to keep the state flip atomic with
+        their lock-protected work, then call
+        ``_emit_plugin_state_change`` AFTER releasing the lock — so
+        observers that schedule async work cannot deadlock on a lock
+        still held by the transition path.
         """
         ps = self.plugin_states[name]
         old_state = ps.state
         ps.state = new_state
         ps.last_state_change = time.time()
+        return old_state, new_state, ps.last_state_change
+
+    def _emit_plugin_state_change(
+        self, name: str, old_state: State, new_state: State, ts: float
+    ) -> None:
+        """Companion to ``_set_plugin_state_no_emit``. Fires the
+        ``_core/plugin/state_changed`` internal-bus event for callers
+        that deferred the emit until after their lock release.
+        """
         self._internal_emit(
             "_core/plugin/state_changed",
             name=name,
             from_state=old_state.value,
             to_state=new_state.value,
-            ts=ps.last_state_change,
+            ts=ts,
         )
 
     @async_log_errors
-    async def get_unloaded_metadata(
-        self, plugin_name: str
-    ) -> Optional[Dict[str, Any]]:
+    async def get_unloaded_metadata(self, plugin_name: str) -> Optional[Dict[str, Any]]:
         """Return metadata for an UNLOADED plugin by reading its on-disk
         plugin_config.yml.
 
@@ -3235,9 +3280,7 @@ class Plexus:
         )
         if not entry:
             return None
-        path = entry.get("path") or os.path.join(
-            self.plugin_package, plugin_name
-        )
+        path = entry.get("path") or os.path.join(self.plugin_package, plugin_name)
         path = os.path.abspath(path)
         try:
             with open(
@@ -3255,9 +3298,7 @@ class Plexus:
             "path": path,
             "declared_endpoints": list((cfg.get("endpoints") or {}).keys()),
             "declared_events": list((cfg.get("events") or {}).keys()),
-            "declared_subscriptions": list(
-                (cfg.get("subscriptions") or {}).keys()
-            ),
+            "declared_subscriptions": list((cfg.get("subscriptions") or {}).keys()),
         }
 
     async def _register_yaml_subscriptions(self, plugin: Plugin) -> List[str]:
@@ -3463,7 +3504,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -3514,7 +3557,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -3548,7 +3593,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -3586,7 +3633,7 @@ class Plexus:
             self._process_request_stream(request),
             name=f"request_stream:{plugin}.{method}#{request.id[:8]}",
         )
-        request._producer_task = task   # B-002: enable cancel-on-collect
+        request._producer_task = task  # B-002: enable cancel-on-collect
 
         return request
 
@@ -3600,7 +3647,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -3680,7 +3729,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         plugin_uuid: Optional[str] = None,
         requester_id: Optional[str] = None,
         target_plugin: Optional[str] = None,
@@ -4361,7 +4412,10 @@ class Plexus:
                     while True:
                         result = await self.main_event_loop.run_in_executor(
                             self._plugin_executor,
-                            _next_with_chain, generator, sentinel, chain,
+                            _next_with_chain,
+                            generator,
+                            sentinel,
+                            chain,
                         )
                         if result is sentinel:
                             break
@@ -4546,15 +4600,16 @@ class Plexus:
                         rem = _residual()
                         fut = loop.run_in_executor(
                             self.sync_dispatcher.executor,
-                            _next_with_chain, gen, sentinel, stream_chain,
+                            _next_with_chain,
+                            gen,
+                            sentinel,
+                            stream_chain,
                         )
                         try:
                             if rem is None:
                                 chunk = await fut
                             else:
-                                chunk = await asyncio.wait_for(
-                                    fut, timeout=rem
-                                )
+                                chunk = await asyncio.wait_for(fut, timeout=rem)
                         except asyncio.TimeoutError as e:
                             raise RequestException(
                                 f"request_event_stream timed out after "
@@ -4642,9 +4697,7 @@ class Plexus:
 
         await request.set_result(result, error)
 
-    def _spawn_tracked(
-        self, coro, *, name: str
-    ) -> asyncio.Task:
+    def _spawn_tracked(self, coro, *, name: str) -> asyncio.Task:
         """Create + register a tracked async task (B-047 fix).
 
         Must be called from the event loop thread — uses
@@ -4689,12 +4742,14 @@ class Plexus:
                         err = f"{type(exc).__name__}: {exc}"
             except Exception:
                 err = "introspection_failed"
-            self.recent_completed.append({
-                "name": _name,
-                "started": _started,
-                "completed": time.monotonic(),
-                "error": err,
-            })
+            self.recent_completed.append(
+                {
+                    "name": _name,
+                    "started": _started,
+                    "completed": time.monotonic(),
+                    "error": err,
+                }
+            )
 
         task.add_done_callback(_on_done)
         return task
@@ -4719,7 +4774,9 @@ class Plexus:
         """
         hosts = _normalize_hosts(hosts, param_name="hosts", default="local")
         blocked_hosts = _normalize_hosts(
-            blocked_hosts, param_name="blocked_hosts", default=None,
+            blocked_hosts,
+            param_name="blocked_hosts",
+            default=None,
         )
         _warn_redundant_host_combos(hosts, blocked_hosts, self._logger)
         return hosts, blocked_hosts
@@ -4737,7 +4794,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -4802,7 +4861,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -4865,7 +4926,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -4910,7 +4973,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -4975,7 +5040,9 @@ class Plexus:
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -5132,11 +5199,7 @@ class Plexus:
                 # technically invalid per spec but defensively treated
                 # as a wildcard block when present (consistent with
                 # subscriber-side _sub_accepts_local)._
-                return (
-                    "local" in val
-                    or self.hostname in val
-                    or "any" in val
-                )
+                return "local" in val or self.hostname in val or "any" in val
             return False
 
         return _hosts_allows_local(eff_hosts) and not _blocked_excludes_local(
@@ -5339,9 +5402,7 @@ class Plexus:
                     f"extra topic segments (LOCKED L #4)"
                 )
             if not v:
-                raise ValueError(
-                    f"topic_vars[{k!r}] is empty string (LOCKED L #5)"
-                )
+                raise ValueError(f"topic_vars[{k!r}] is empty string (LOCKED L #5)")
             stripped = v.strip()
             if not stripped:
                 # Whitespace-only collapses to an empty segment per
@@ -5365,7 +5426,9 @@ class Plexus:
                 "publish_event/request_event %s: topic %r is static but "
                 "topic_vars=%r passed (LOCKED L #9 — likely confused "
                 "payload vs topic_vars)",
-                event_id, topic_template, tv,
+                event_id,
+                topic_template,
+                tv,
             )
 
         # Check missing keys for {var} placeholders (LOCKED L #7).
@@ -5382,7 +5445,9 @@ class Plexus:
             self._logger.warning(
                 "publish_event/request_event %s: topic_vars keys %r not "
                 "used in topic %r (LOCKED L #8 — probably caller mistake)",
-                event_id, sorted(extra), topic_template,
+                event_id,
+                sorted(extra),
+                topic_template,
             )
 
         # Substitute. Use the same regex helper to keep behavior consistent.
@@ -5392,18 +5457,14 @@ class Plexus:
                 return tv[name]
             # Should be unreachable given the missing-key check above —
             # defensive guard.
-            raise ValueError(
-                f"event {event_id!r} unresolved placeholder {{{name}}}"
-            )
+            raise ValueError(f"event {event_id!r} unresolved placeholder {{{name}}}")
 
         resolved = _TEMPLATE_VAR_RE.sub(_sub, topic_template)
 
         # Post-resolution checks (Q15 reject empty + Q16 strip slashes).
         stripped_topic = resolved.strip("/")
         if not stripped_topic.strip():
-            raise ValueError(
-                f"event {event_id!r} resolved topic empty (Q15)"
-            )
+            raise ValueError(f"event {event_id!r} resolved topic empty (Q15)")
 
         # Re-validate post-resolution (no embedded * mid-segment, no
         # empty middle segments). Wildcards forbidden in events. Per
@@ -5478,7 +5539,9 @@ class Plexus:
         # mishandling them downstream.
         if hosts is not None:
             hosts = _normalize_hosts(
-                hosts, param_name="publish_event hosts", default=None,
+                hosts,
+                param_name="publish_event hosts",
+                default=None,
             )
         if blocked_hosts is not None:
             blocked_hosts = _normalize_hosts(
@@ -5512,12 +5575,11 @@ class Plexus:
             # Step 4: local fan-out — find all local subs matching resolved
             # topic. find_all returns insertion order (LOCKED C).
             all_subs = await self.topic_registry.find_all(resolved_topic)
-            local_subs = [
-                s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid
-            ]
+            local_subs = [s for s in all_subs if s.plugin_uuid in self.plugins_by_uuid]
 
             survivors = [
-                s for s in local_subs
+                s
+                for s in local_subs
                 if self._sub_accepts_local(s)
                 and self._sub_accepts_author(s, publisher.plugin_name)
             ]
@@ -5526,7 +5588,10 @@ class Plexus:
                 self._logger.debug(
                     "publish_event %s topic=%r matched %d local sub(s) "
                     "(of %d total subs)",
-                    event_id, resolved_topic, len(survivors), len(local_subs),
+                    event_id,
+                    resolved_topic,
+                    len(survivors),
+                    len(local_subs),
                 )
 
             # Per-sub fan-out tasks. Each gets its own Request with
@@ -5548,7 +5613,10 @@ class Plexus:
                 self._logger.debug(
                     "publish_event %s topic=%r: publisher hosts=%r "
                     "blocked_hosts=%r excludes local fan-out",
-                    event_id, resolved_topic, eff_hosts, eff_blocked,
+                    event_id,
+                    resolved_topic,
+                    eff_hosts,
+                    eff_blocked,
                 )
 
         # PR3 Stage C step 18 — remote dispatch (locked #16). Fire-and-
@@ -5572,6 +5640,7 @@ class Plexus:
         ):
             try:
                 from uuid import uuid4 as _uuid4
+
                 request_uuid = _uuid4().hex
                 per_peer = await nm._build_remote_dispatch(
                     topic=resolved_topic,
@@ -5589,10 +5658,7 @@ class Plexus:
                 tasks = []
                 for peer_hostname, advs in per_peer.items():
                     node = next(
-                        (
-                            n for n in list(nm.nodes)
-                            if n.hostname == peer_hostname
-                        ),
+                        (n for n in list(nm.nodes) if n.hostname == peer_hostname),
                         None,
                     )
                     if node is None:
@@ -5614,9 +5680,7 @@ class Plexus:
                                 request_uuid,
                             )
                         )
-                        nm._inflight_publishes.setdefault(
-                            peer_hostname, set()
-                        ).add(t)
+                        nm._inflight_publishes.setdefault(peer_hostname, set()).add(t)
                     tasks.append(t)
 
                     # cycle 4 HIGH-1: capture ``nm`` via default-arg so
@@ -5632,18 +5696,27 @@ class Plexus:
                                 if s is not None:
                                     s.discard(_t)
                                     if not s:
-                                        _nm._inflight_publishes.pop(
-                                            ph, None
-                                        )
+                                        _nm._inflight_publishes.pop(ph, None)
+
                         try:
                             asyncio.create_task(_drop())
                         except RuntimeError:
                             pass
+
                     t.add_done_callback(_deregister)
 
                 if tasks:
-                    asyncio.create_task(
-                        asyncio.gather(*tasks, return_exceptions=True)
+                    # POSS-W-A1-003 fix: register the outer gather
+                    # wrapper through _spawn_tracked so a strong
+                    # reference is kept in self.task_list (preventing
+                    # GC mid-flight) and shutdown drain can wait on
+                    # it. Individual per-peer ``t`` tasks remain
+                    # tracked via nm._inflight_publishes; this wrapper
+                    # only swallows their exceptions via
+                    # return_exceptions=True.
+                    self._spawn_tracked(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        name=f"publish_event_remote_fanout:{resolved_topic}",
                     )
             except Exception:
                 self._logger.debug(
@@ -5693,10 +5766,7 @@ class Plexus:
         # hostname. The wire handler already gates this; defense-in-
         # depth covers tests + future direct callers that bypass
         # _handle_client.
-        if (
-            remote_publisher_host is not None
-            and remote_publisher_host == self.hostname
-        ):
+        if remote_publisher_host is not None and remote_publisher_host == self.hostname:
             self._logger.warning(
                 "fan-out gate: remote_publisher_host equals our hostname; rejecting"
             )
@@ -5734,9 +5804,7 @@ class Plexus:
             # possible via direct topic_registry.subscribe(declared_id="")
             # calls) doesn't silently fall through to sub_uuid.
             origin_subscription_id=(
-                sub.declared_id
-                if sub.declared_id is not None
-                else sub.sub_uuid
+                sub.declared_id if sub.declared_id is not None else sub.sub_uuid
             ),
             timestamp=timestamp,
             requester_id=sub.plugin_uuid,  # C18
@@ -5815,7 +5883,12 @@ class Plexus:
         chain = getattr(_sync_call_chain, "chain", ())
         future = asyncio.run_coroutine_threadsafe(
             self.publish_event(
-                publisher, event_id, payload, topic_vars, hosts, blocked_hosts,
+                publisher,
+                event_id,
+                payload,
+                topic_vars,
+                hosts,
+                blocked_hosts,
                 _caller_chain=chain,
             ),
             self.main_event_loop,
@@ -5848,9 +5921,7 @@ class Plexus:
         # result, can't silently return None). MUST precede topic_vars
         # validation.
         if not event_entry.get("enabled", True):
-            raise RequestException(
-                f"event {event_id!r} disabled (C2)"
-            )
+            raise RequestException(f"event {event_id!r} disabled (C2)")
 
         if payload is None:
             payload = {}
@@ -5864,7 +5935,9 @@ class Plexus:
         # call time. default=None so caller-None falls through.
         if hosts is not None:
             hosts = _normalize_hosts(
-                hosts, param_name="request_event hosts", default=None,
+                hosts,
+                param_name="request_event hosts",
+                default=None,
             )
         if blocked_hosts is not None:
             blocked_hosts = _normalize_hosts(
@@ -5901,7 +5974,8 @@ class Plexus:
             all_subs = await self.topic_registry.find_all(resolved_topic)
             local_match = next(
                 (
-                    s for s in all_subs
+                    s
+                    for s in all_subs
                     if s.plugin_uuid in self.plugins_by_uuid
                     and self._sub_accepts_local(s)
                     and self._sub_accepts_author(s, publisher.plugin_name)
@@ -5928,6 +6002,7 @@ class Plexus:
             # state flips networking between the two guards.
             from uuid import uuid4 as _uuid4
             from .notifier import TopicRegistry as _TR
+
             candidates: list = []
             request_uuid = _uuid4().hex
             nm = self.network
@@ -5941,10 +6016,7 @@ class Plexus:
 
                 for (peer_hostname, _sub_uuid), advert in cands_raw:
                     node = next(
-                        (
-                            n for n in list(nm.nodes)
-                            if n.hostname == peer_hostname
-                        ),
+                        (n for n in list(nm.nodes) if n.hostname == peer_hostname),
                         None,
                     )
                     if node is None:
@@ -5954,9 +6026,7 @@ class Plexus:
                             continue
                     except Exception:
                         continue
-                    if not nm._hosts_match(
-                        eff_hosts, eff_blocked, peer_hostname
-                    ):
+                    if not nm._hosts_match(eff_hosts, eff_blocked, peer_hostname):
                         continue
                     if not self._sub_accepts_remote_publisher(
                         advert, self.hostname, publisher.plugin_name
@@ -5985,7 +6055,9 @@ class Plexus:
                 self._logger.debug(
                     "request_event %s topic=%r no local match, "
                     "falling through to %d remote candidates",
-                    event_id, resolved_topic, len(candidates),
+                    event_id,
+                    resolved_topic,
+                    len(candidates),
                 )
 
             if (
@@ -6037,9 +6109,10 @@ class Plexus:
         # B-074 Step 10 verbose log: local-match branch.
         if publisher.verbose_notifier:
             self._logger.debug(
-                "request_event %s topic=%r matched local sub uuid=%s, "
-                "dispatching",
-                event_id, resolved_topic, local_match.sub_uuid,
+                "request_event %s topic=%r matched local sub uuid=%s, " "dispatching",
+                event_id,
+                resolved_topic,
+                local_match.sub_uuid,
             )
 
         request = await self._fanout_sub(
@@ -6083,8 +6156,14 @@ class Plexus:
         chain = getattr(_sync_call_chain, "chain", ())
         future = asyncio.run_coroutine_threadsafe(
             self.request_event(
-                publisher, event_id, payload, topic_vars, hosts,
-                blocked_hosts, timeout, _caller_chain=chain,
+                publisher,
+                event_id,
+                payload,
+                topic_vars,
+                hosts,
+                blocked_hosts,
+                timeout,
+                _caller_chain=chain,
             ),
             self.main_event_loop,
         )
@@ -6108,9 +6187,7 @@ class Plexus:
         # C1 ORDER OF OPERATIONS: lookup → enabled → payload → resolve.
         event_entry = self._lookup_event(publisher, event_id)
         if not event_entry.get("enabled", True):
-            raise RequestException(
-                f"event {event_id!r} disabled (C2)"
-            )
+            raise RequestException(f"event {event_id!r} disabled (C2)")
         if payload is None:
             payload = {}
         resolved_topic, _ = self._resolve_topic_for_event(
@@ -6158,7 +6235,8 @@ class Plexus:
             all_subs = await self.topic_registry.find_all(resolved_topic)
             local_match = next(
                 (
-                    s for s in all_subs
+                    s
+                    for s in all_subs
                     if s.plugin_uuid in self.plugins_by_uuid
                     and self._sub_accepts_local(s)
                     and self._sub_accepts_author(s, publisher.plugin_name)
@@ -6184,6 +6262,7 @@ class Plexus:
             ):
                 from uuid import uuid4 as _uuid4
                 from .notifier import TopicRegistry as _TR
+
                 request_uuid = _uuid4().hex
 
                 async with nm._adverts_struct_lock:
@@ -6192,10 +6271,7 @@ class Plexus:
                 candidates = []
                 for (peer_hostname, _sub_uuid), advert in cands_raw:
                     node = next(
-                        (
-                            n for n in list(nm.nodes)
-                            if n.hostname == peer_hostname
-                        ),
+                        (n for n in list(nm.nodes) if n.hostname == peer_hostname),
                         None,
                     )
                     if node is None:
@@ -6205,9 +6281,7 @@ class Plexus:
                             continue
                     except Exception:
                         continue
-                    if not nm._hosts_match(
-                        eff_hosts, eff_blocked, peer_hostname
-                    ):
+                    if not nm._hosts_match(eff_hosts, eff_blocked, peer_hostname):
                         continue
                     if not self._sub_accepts_remote_publisher(
                         advert, self.hostname, publisher.plugin_name
@@ -6270,7 +6344,9 @@ class Plexus:
             self._logger.debug(
                 "request_event_stream %s topic=%r matched local sub uuid=%s, "
                 "opening stream",
-                event_id, resolved_topic, local_match.sub_uuid,
+                event_id,
+                resolved_topic,
+                local_match.sub_uuid,
             )
 
         # Route through find_endpoint so the C18 accessible_by_other_plugins
@@ -6382,7 +6458,10 @@ class Plexus:
 
         producer_task = self._spawn_tracked(
             self._process_request_event_stream(
-                request, target_plugin, endpoint, event_meta,
+                request,
+                target_plugin,
+                endpoint,
+                event_meta,
                 timeout=timeout,
                 caller_chain=_caller_chain,
                 verbose_notifier=publisher.verbose_notifier,
@@ -6428,9 +6507,11 @@ class Plexus:
             # B-074 Step 10 verbose log: stream ended.
             if publisher.verbose_notifier:
                 self._logger.debug(
-                    "request_event_stream %s topic=%r stream ended "
-                    "(chunks=%d, %s)",
-                    event_id, resolved_topic, chunk_count, exit_reason,
+                    "request_event_stream %s topic=%r stream ended " "(chunks=%d, %s)",
+                    event_id,
+                    resolved_topic,
+                    chunk_count,
+                    exit_reason,
                 )
             # Mark for cleanup. Cancels the producer task on early
             # break (B-002 pattern). Mirrors execute_stream's pattern.
@@ -6459,8 +6540,14 @@ class Plexus:
         """
         chain = getattr(_sync_call_chain, "chain", ())
         async_gen = self.request_event_stream(
-            publisher, event_id, payload, topic_vars, hosts, blocked_hosts,
-            timeout, _caller_chain=chain,
+            publisher,
+            event_id,
+            payload,
+            topic_vars,
+            hosts,
+            blocked_hosts,
+            timeout,
+            _caller_chain=chain,
         )
 
         try:
@@ -6656,9 +6743,7 @@ class Plexus:
     # subscription toggle across notifier (atomic mutation under registry
     # lock) and Plexus (broadcast + emit outside the lock).
 
-    async def set_subscription_enabled(
-        self, sub_uuid: str, enabled: bool
-    ) -> bool:
+    async def set_subscription_enabled(self, sub_uuid: str, enabled: bool) -> bool:
         """Toggle a subscription's enabled flag at runtime.
 
         Mutation happens atomically inside ``topic_registry._lock`` via
@@ -6711,7 +6796,8 @@ class Plexus:
             return True  # no-op — no broadcast, no emit
         self._logger.info(
             "Subscription %s enabled=%s",
-            sub_uuid, enabled,
+            sub_uuid,
+            enabled,
         )
         # Snapshot nm once. Mid-call hot-reload would otherwise leak the
         # broadcast onto a stopped NM; consistent with the pattern used
@@ -6796,7 +6882,9 @@ class Plexus:
         entry["enabled"] = bool(enabled)
         self._logger.info(
             "Event %s/%s enabled=%s",
-            plugin_name, event_id, bool(enabled),
+            plugin_name,
+            event_id,
+            bool(enabled),
         )
         self._internal_emit(
             "_core/event/state_changed",

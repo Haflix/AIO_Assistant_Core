@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
+import inspect
 import logging
 from logging.handlers import QueueHandler, QueueListener
 import os
@@ -988,6 +989,7 @@ class ConfigUtil:
             DEFAULT_PLUGIN_READY_TIMEOUT,
             DEFAULT_PLUGIN_DISABLE_TIMEOUT,
         )
+
         raw_ready_timeout = general_config.get(
             "plugin_ready_timeout", DEFAULT_PLUGIN_READY_TIMEOUT
         )
@@ -1039,12 +1041,8 @@ class ConfigUtil:
         networking_config = plexus.yaml_config.get("networking")
 
         plexus.networking_enabled = networking_config.get("enabled", False)
-        plexus.yaml_config["networking"][
-            "enabled"
-        ] = plexus.networking_enabled
-        plexus._logger.info(
-            f"Networking enabled: {plexus.networking_enabled}"
-        )
+        plexus.yaml_config["networking"]["enabled"] = plexus.networking_enabled
+        plexus._logger.info(f"Networking enabled: {plexus.networking_enabled}")
 
         plexus.networking_port = networking_config.get("port", 2510)
         plexus.yaml_config["networking"]["port"] = plexus.networking_port
@@ -1056,9 +1054,7 @@ class ConfigUtil:
         plexus.yaml_config["networking"][
             "auto_discoverable"
         ] = plexus.networking_auto_discoverable
-        plexus._logger.info(
-            f"auto_discoverable: {plexus.networking_auto_discoverable}"
-        )
+        plexus._logger.info(f"auto_discoverable: {plexus.networking_auto_discoverable}")
 
         plexus.networking_direct_discoverable = networking_config.get(
             "direct_discoverable", False
@@ -1119,9 +1115,7 @@ class ConfigUtil:
             heartbeat_interval = DEFAULT_HEARTBEAT_INTERVAL
         plexus.networking_heartbeat_interval = heartbeat_interval
 
-        raw_lookup = networking_config.get(
-            "lookup_interval", DEFAULT_LOOKUP_INTERVAL
-        )
+        raw_lookup = networking_config.get("lookup_interval", DEFAULT_LOOKUP_INTERVAL)
         try:
             lookup_interval = float(raw_lookup)
             if lookup_interval <= 0:
@@ -1156,9 +1150,19 @@ class Plugin(ABC):
     """Base class for all plugins."""
 
     @final
-    def __init__(self, logger: Logger, plexus, arguments):
+    def __init__(
+        self,
+        logger: Logger,
+        plexus,
+        arguments,
+        plugin_name: Optional[str] = None,
+    ):
+        # ``plugin_name`` is supplied by Plexus.load_plugin_with_conf so
+        # plugin authors reading ``self.plugin_name`` inside ``on_load``
+        # see the real name. Falls back to ``"UNKNOWN"`` for direct
+        # instantiation paths (tests / future direct callers).
         self.description = "UNKNOWN"
-        self.plugin_name = "UNKNOWN"
+        self.plugin_name = plugin_name if plugin_name is not None else "UNKNOWN"
         self.version = "0.0.0"
         self.plugin_uuid = uuid4().hex
         self.remote = False
@@ -1197,6 +1201,18 @@ class Plugin(ABC):
         self._logger = logger
         self._plexus = plexus
         self.event_loop = plexus.main_event_loop
+
+        # on_load contract is sync only (per docs/api_reference.md). An
+        # ``async def on_load`` would return a coroutine that this call
+        # silently discards, leaving the plugin half-initialised with
+        # no visible error. Detect the misuse upfront so the failure
+        # surfaces in load_plugin_with_conf's FAILED_LOAD handler.
+        if inspect.iscoroutinefunction(self.on_load):
+            raise TypeError(
+                f"Plugin {self.plugin_name!r}: on_load must be a regular "
+                f"(sync) method, not 'async def'. Move async setup to "
+                f"on_enable instead."
+            )
 
         self.on_load(
             *(
@@ -1305,7 +1321,9 @@ class Plugin(ABC):
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1349,7 +1367,9 @@ class Plugin(ABC):
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1398,7 +1418,9 @@ class Plugin(ABC):
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1443,7 +1465,9 @@ class Plugin(ABC):
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Optional[float] = None,
@@ -1574,9 +1598,7 @@ class Plugin(ABC):
         Auto-fills ``plugin_uuid``. See ``Plexus.internal_unobserve``
         for matching semantics (FIRST occurrence by equality; idempotent).
         """
-        return self._plexus.internal_unobserve(
-            self.plugin_uuid, topic, callback
-        )
+        return self._plexus.internal_unobserve(self.plugin_uuid, topic, callback)
 
     # ── PR3 Stage B: publish_event / request_event API ────────────────
 
@@ -1708,7 +1730,12 @@ class Plugin(ABC):
         """Sync streaming variant of request_event (C16)."""
         self._check_framework_started()
         return self._request_event_stream_sync_inner(
-            event_id, payload, topic_vars, hosts, blocked_hosts, timeout,
+            event_id,
+            payload,
+            topic_vars,
+            hosts,
+            blocked_hosts,
+            timeout,
         )
 
     def _request_event_stream_sync_inner(
@@ -1865,7 +1892,9 @@ class Request:
         target_hosts: Union[
             str, list
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -1918,7 +1947,7 @@ class Request:
             self.created_at = time.time()
             self.timeout_duration = timeout
 
-        self.event_loop = event_loop or asyncio.get_event_loop()
+        self.event_loop = event_loop or asyncio.get_running_loop()
         self._future = self.event_loop.create_future()
 
     async def set_result(self, result: Any, error: bool = False) -> None:
@@ -2003,7 +2032,9 @@ class GeneratorRequest:
         target_hosts: Union[
             str, list
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
-        blocked_hosts: Union[str, list, None] = None,  # blocked hosts (str keyword, list, or None)
+        blocked_hosts: Union[
+            str, list, None
+        ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
         timeout: Union[float, tuple] = None,
@@ -2049,7 +2080,7 @@ class GeneratorRequest:
             self.created_at = time.time()
             self.timeout_duration = timeout
 
-        self.event_loop = event_loop or asyncio.get_event_loop()
+        self.event_loop = event_loop or asyncio.get_running_loop()
         self._future = self.event_loop.create_future()
         # B-002 fix: producer task ref. Plexus.create_gen_request
         # attaches the task it spawns so set_collected() can cancel

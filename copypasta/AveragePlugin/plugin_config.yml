@@ -1,5 +1,5 @@
-description: Example plugin demonstrating the AIO Assistant Core plugin structure
-version: 1.1.0
+description: Example plugin demonstrating the Plexus plugin structure
+version: 1.2.0
 remote: True  # Set to True if this plugin should be accessible remotely
 arguments:  # Optional: Arguments passed during plugin loading
 

@@ -225,3 +225,9 @@ plugins/
 # cleanly. Tracking would commit private-key material + pin per-machine
 # fingerprints into peer configs.
 _keys_tui_smoke/
+
+# Audit-triage test scripts (~100 files, internal bug-intake verification).
+# Not part of the main test framework — used during framework audit cycles
+# to verify findings against running code. Keep local; plugin authors don't
+# need them.
+plugins_test/audit_pilot/

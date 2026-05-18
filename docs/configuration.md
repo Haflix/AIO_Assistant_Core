@@ -1,6 +1,6 @@
 # Configuration
 
-*Last updated for AIO Assistant Core 0.22.3*
+*Last updated for Plexus 0.40.0*
 
 Reference for the top-level `config.yml` — the file Plexus reads on
 startup to find plugins, configure the runtime, and (when enabled) wire
@@ -37,8 +37,7 @@ networking:     # cluster topology
 ```
 
 All three keys are required. `ConfigUtil.check_config_integrity`
-(`utils.py`) raises `ConfigException` on startup if any of the three is
-missing.
+raises `ConfigException` on startup if any of the three is missing.
 
 ---
 
@@ -119,8 +118,7 @@ await self.execute("DiscordBot", "send_message",
 Each `plugins:` entry can carry an `overrides:` block that deep-merges
 into the plugin's own `plugin_config.yml` at load time. Use this when
 you want to customize a single instance of a class without forking the
-plugin folder. Implemented by `apply_overrides`
-(`core.py:328-439`).
+plugin folder. Implemented by `apply_overrides`.
 
 ```yaml
 plugins:
@@ -153,8 +151,7 @@ Override semantics:
 - **`endpoints:`** — STRICT. Unknown sub-keys under an endpoint
   override are fail-load errors. Protects against typos that would
   silently change nothing. Driven by
-  `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})`
-  (`core.py:135`).
+  `_STRICT_OVERRIDE_SECTIONS = frozenset({"endpoints"})` on `Plexus`.
 - **`arguments:`**, **`events:`**, **`subscriptions:`** — LENIENT.
   Unknown subkeys merge in.
 - **`__replace__: true`** in any sub-mapping triggers wholesale
@@ -202,8 +199,7 @@ same forbidden list as plugin names: `system`, `general`, `any`,
 
 ## `general:` (dict)
 
-Framework-wide settings. Read by `ConfigUtil.apply_configvalues`
-(`utils.py`) and `Plexus.__init__`.
+Framework-wide settings. Read by `ConfigUtil.apply_configvalues` and `Plexus.__init__`.
 
 ```yaml
 general:
@@ -260,9 +256,9 @@ not block reload of other plugins.
 ### `sync_dispatcher_workers` (default 4)
 
 Workers in the dedicated `SyncDispatcher` thread pool used for **sync
-subscriber handlers** (sync `def` methods reached via `notify` /
-`request_topic`). Sync `execute()` endpoints use a separate shared
-pool.
+subscriber handlers** (sync `def` methods invoked through the
+`publish_event` / `request_event` dispatch). Sync `execute()` endpoints
+use a separate shared pool.
 
 - Min 1. Bad values warn and fall back to 4.
 - `workers=1` serializes all sync subscriber handlers — useful when
@@ -273,7 +269,7 @@ pool.
 Per-logger threshold overrides. Matches a logger by name with
 prefix-and-dot-boundary semantics — longest prefix that matches a
 logger's name wins. Implementation in
-`LogUtil.apply_logger_levels_config` (`utils.py`).
+`LogUtil.apply_logger_levels_config`.
 
 The value can be a single level string (applied to both console and
 file handlers) or a split dict `{console: ..., file: ...}` for an
@@ -301,8 +297,7 @@ matching: `"httpx"` matches `httpx` and `httpx.SOMETHING`, but NOT
 #### Runtime overrides — `set_logger_level` / `clear_logger_level`
 
 In addition to config-driven `logger_levels`, plugins can adjust
-thresholds at runtime via two helpers on the Plugin base class
-(`utils.py:1237-1275`):
+thresholds at runtime via two helpers on the `Plugin` base class:
 
 ```python
 self.set_logger_level("noisy_lib", console="MUTE", file="DEBUG")
