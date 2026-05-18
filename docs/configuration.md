@@ -51,7 +51,7 @@ before their dependents.
 plugins:
   - name: PostgreSQL
     enabled: true
-    path: ./_private/BASE_PLUGINS/DATABASE/PostgreSQL
+    path: ./plugins/PlexusPostgreSQL
 
   - name: AveragePlugin
     enabled: true

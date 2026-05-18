@@ -96,7 +96,7 @@ plugins:
 
   - name: PostgreSQL
     enabled: false
-    path: ./_private/BASE_PLUGINS/DATABASE/PostgreSQL
+    path: ./plugins/PlexusPostgreSQL
 
   - name: MinIO
     enabled: false
