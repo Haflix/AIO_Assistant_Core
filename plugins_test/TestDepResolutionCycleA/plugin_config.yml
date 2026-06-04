@@ -1,0 +1,8 @@
+description: Cycle fixture A — required-deps CycleB. Both expected FAILED_LOAD.
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+  TestDepResolutionCycleB:
+    version: ""
+endpoints:

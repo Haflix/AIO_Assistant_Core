@@ -1645,16 +1645,32 @@ class TestEventSuite(Plugin):
             # such auto-registered sub on the SUITE itself (which has no
             # `topic:` per-endpoint) is the simplest check — verify the
             # registry has only the explicitly declared subs.
+            #
+            # C-060: read `declared_count` from the on-disk
+            # plugin_config.yml file directly so the assertion is NOT
+            # circular. The previous version compared `len(yaml_owned)`
+            # (filtered from the registry via declared_id is not None)
+            # against `len(self.subscriptions.keys())` — both derive
+            # from the same load-time path, so a legacy auto-reg path
+            # would have populated BOTH and the equality would still
+            # hold. Reading the raw yaml independently breaks that
+            # circularity: if legacy auto-reg added EXTRA subs to the
+            # registry but NOT to plugin_config.yml's subscriptions:
+            # block, len(yaml_owned) would exceed declared_count and
+            # the assertion would fire.
+            import os
+            import yaml as _yaml
+            cfg_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "plugin_config.yml",
+            )
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                cfg = _yaml.safe_load(_f) or {}
+            yaml_subs_section = cfg.get("subscriptions") or {}
+            declared_count = len(yaml_subs_section)
+
             subs = await self._plexus.topic_registry.list_local_subs()
             suite_subs = [s for s in subs if s.plugin_name == self.plugin_name]
-            # Suite YAML declares ~22 subs (not counting any runtime adds
-            # from earlier cases). If legacy auto-reg were alive we'd see
-            # at least one extra sub per per-topic endpoint. None of the
-            # suite's endpoints have a `topic:` field so the count is the
-            # YAML count only — assert non-zero (subs ARE registered) and
-            # bounded above (no surprises).
-            yaml_decl = list(getattr(self, "subscriptions", {}).keys())
-            declared_count = len(yaml_decl)
             # Any runtime subs from earlier cases have declared_id=None
             # AND target back to the suite — exclude them.
             yaml_owned = [

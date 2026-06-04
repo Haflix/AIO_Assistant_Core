@@ -12,8 +12,10 @@ __pycache__/
 # Personal files
 _old/
 _private/
+_keys/
 bugtracker.md
 notes.txt
+.githooks/
 
 # Distribution / packaging
 .Python

@@ -44,6 +44,7 @@ from .utils import (
     Plugin,
     Request,
     GeneratorRequest,
+    EndOfQueue,
     Event,
     LogUtil,
     ConfigUtil,
@@ -54,7 +55,8 @@ from .exceptions import (
     NetworkRequestException,
     NoLocalSubException,
     NodeException,
-    PluginTypeMissmatchError,
+    PluginTypeMismatchError,
+    PluginDependencyError,
 )
 from .decorators import (
     log_errors,
@@ -84,7 +86,17 @@ from .networking_classes import (
 from .notifier import (
     TopicRegistry,
     Subscription,
-    SyncDispatcher,
+)
+# C-170: pull in the public networking + serialization symbols that
+# operators reach for from sibling-repo plugins and migration docs but
+# that the old __all__ omitted. SyncDispatcher is removed from the
+# public surface — it is framework-internal and was leaked by accident.
+from .networking import (
+    AdvertSub,
+    PeerSpec,
+)
+from .serialization import (
+    FINGERPRINT_CLI_CMD,
 )
 
 __all__ = [
@@ -92,6 +104,11 @@ __all__ = [
     "Plugin",
     "Request",
     "GeneratorRequest",
+    # R4-XX-9: EndOfQueue is the drain sentinel for GeneratorRequest
+    # queues. Advanced streaming consumers that bypass execute_stream
+    # in favour of raw GeneratorRequest.get_queue_stream() / .result_queue
+    # need it to detect stream end.
+    "EndOfQueue",
     "Event",
     "LogUtil",
     "ConfigUtil",
@@ -100,7 +117,8 @@ __all__ = [
     "NetworkRequestException",
     "NoLocalSubException",
     "NodeException",
-    "PluginTypeMissmatchError",
+    "PluginTypeMismatchError",
+    "PluginDependencyError",
     "log_errors",
     "handle_errors",
     "async_log_errors",
@@ -112,13 +130,22 @@ __all__ = [
     "Serializable",
     "SerializableException",
     "safe_loads",
+    # C-170: serialization helpers used in migration instructions.
+    "FINGERPRINT_CLI_CMD",
     "State",
     "Phase",
     "ErrorRecord",
     "PluginState",
     "Node",
     "RemotePlugin",
+    # C-170: networking dataclasses referenced in public networking
+    # docs (peers: schema, advert protocol). Operators sometimes need
+    # to construct PeerSpec for tests / fixtures.
+    "AdvertSub",
+    "PeerSpec",
     "TopicRegistry",
     "Subscription",
-    "SyncDispatcher",
+    # C-170: SyncDispatcher intentionally NOT exported — framework
+    # internal, no plugin-facing API. Reach via plexus.notifier if you
+    # really need it from a test.
 ]

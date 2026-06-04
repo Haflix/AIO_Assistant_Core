@@ -1,0 +1,10 @@
+description: Integration fixture B; required-deps TestDepResolutionA and plexus framework version range.
+version: 1.0.0
+remote: false
+arguments:
+dependencies:
+  TestDepResolutionA:
+    version: ">=1.0,<2.0"
+  plexus:
+    version: ">=0.41,<1.0"
+endpoints:

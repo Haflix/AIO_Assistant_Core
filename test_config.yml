@@ -129,6 +129,51 @@ plugins:
     enabled: false
     path: ./plugins_test/TestPR2MatchFixture
 
+  # Plugin-dependencies feature: unit + integration coverage.
+  # Unit suite runs pure-function tests against plexus.dependencies.
+  - name: TestDepResolutionUnitSuite
+    enabled: true
+    path: ./plugins_test/TestDepResolutionUnitSuite
+
+  # Integration fixtures: A is v1.0.0 (so B's `>=1.0,<2.0` is exercised),
+  # B required-deps A + plexus. Both expected to enable in order A then B.
+  - name: TestDepResolutionA
+    enabled: true
+    path: ./plugins_test/TestDepResolutionA
+
+  - name: TestDepResolutionB
+    enabled: true
+    path: ./plugins_test/TestDepResolutionB
+
+  # Cycle fixtures: CycleA <-> CycleB required-cycle (both expected
+  # FAILED_LOAD). CycleC is unrelated (still ENABLED).
+  - name: TestDepResolutionCycleA
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleA
+
+  - name: TestDepResolutionCycleB
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleB
+
+  - name: TestDepResolutionCycleC
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCycleC
+
+  # Enable-time cascade fixtures: Crash deliberately raises in on_enable
+  # (via raise_on_enable arg). CrashDependent required-deps Crash and
+  # should be transitioned to FAILED_LOAD by Hook 5's enable-time precheck.
+  - name: TestDepResolutionCrash
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCrash
+
+  - name: TestDepResolutionCrashDependent
+    enabled: true
+    path: ./plugins_test/TestDepResolutionCrashDependent
+
+  - name: TestDepResolutionSuite
+    enabled: true
+    path: ./plugins_test/TestDepResolutionSuite
+
 
 general:
     hostname: ""                      # Empty = use system hostname

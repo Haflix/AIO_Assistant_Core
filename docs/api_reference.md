@@ -55,7 +55,7 @@ May be `async def` or `def`. Called once, after framework registration. Sync ver
 
 ### `on_disable(self) -> None`
 
-May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin` paths. The shutdown path in `Plexus.close()` hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
+May be `async def` or `def`. The framework wraps the call in `asyncio.wait_for` with a configurable runtime budget (`general.plugin_disable_timeout`, default 30.0s) for `pop_plugin` / `_disable_plugin_under_lock` paths. The shutdown path in `Plexus.close()` hardcodes a separate 30.0s cap that is NOT controlled by the same setting — these are independent timeouts.
 
 ---
 
@@ -74,7 +74,7 @@ Set by `Plugin.__init__` before `on_load` runs, then partially overwritten by th
 | `self.events`        | `dict`           | Parsed `events:` block (post-load-time templating).                                                               |
 | `self.subscriptions` | `dict`           | Parsed `subscriptions:` block.                                                                                    |
 | `self.prefix`        | `str`            | Resolved prefix for `{prefix}` substitution. Defaults to `plugin_name`.                                           |
-| `self.verbose_notifier` | `bool`        | When `true`, notifier dispatch logs include match counts.                                                         |
+| `self.verbose_notifier` | `bool`        | When `true`, notifier dispatch logs include match counts AND per-publish host-filter skip reasoning, publisher-host details, and first-chunk timing for streaming dispatches. Set when debugging why a publish doesn't reach an expected subscriber. |
 | `self.enabled`       | `bool` (read-only `@property` since v0.26.0) | `True` for state in `{ENABLING, ENABLED}`. Direct writes raise `AttributeError`. Use `plx.enable_plugin(name)` / `plx.disable_plugin(name)` to change state. |
 | `self.remote`        | `bool`           | Plugin-level remote flag from manifest.                                                                            |
 | `self.description`   | `str`            | From manifest.                                                                                                    |
@@ -99,14 +99,14 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 
 ---
 
-### `await self.execute(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
+### `await self.execute(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
 | Argument | Type | Default | Notes |
 |---|---|---|---|
 | `plugin` | `str` | — | Target plugin's `plugin_name`. |
 | `method` | `str` | — | Target endpoint's `access_name`. |
 | `args` | `tuple \| dict \| None \| Any` | `None` | See shape contract above. |
-| `plugin_uuid` | `str` | `""` | Pin to a specific instance. Empty = any instance with this name. |
+| `plugin_uuid` | `Optional[str]` | `None` | Pin to a specific instance. `None` = any instance with this name. |
 | `hosts` | `str \| list \| None` | `"any"` | `"any"`, `"local"`, `"remote"`, hostname, or list. |
 | `blocked_hosts` | `str \| list \| None` | `None` | Same shape as `hosts`. |
 | `author` | `str` | `"system"` | Caller-side author identity for filter chains. |
@@ -121,7 +121,7 @@ Each method below has signature, args, return, raises, and behaviour notes. The 
 
 ---
 
-### `self.execute_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
+### `self.execute_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None) -> Any`
 
 Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestException` if no event loop is bound yet. Detects circular sync calls via a per-thread chain and raises `RequestException("Circular sync call: ...")` rather than deadlocking the executor. Bridges to the loop via `asyncio.run_coroutine_threadsafe`. Same args, same return, same `RequestException` on error.
 
@@ -129,15 +129,15 @@ Synchronous bridge. Calls `_check_framework_started()` first; raises `RequestExc
 
 ---
 
-### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
+### `async for chunk in self.execute_stream(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
 
 Async generator. Yields each chunk produced by the target generator/async-generator method. If the producer raises mid-stream, the call surfaces as `RequestException`.
 
-No top-level decorator on the wrapper (errors propagate raw to the consumer).
+**Decorator** `@async_gen_log_errors` (logs exceptions per generator-protocol contract; errors still propagate raw to the consumer).
 
 ---
 
-### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid="", hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
+### `for chunk in self.execute_stream_sync(plugin, method, args=None, plugin_uuid=None, hosts="any", blocked_hosts=None, author="system", author_id="system", timeout=None)`
 
 Sync generator. Pre-start guard fires at call time, not at first iteration.
 
@@ -158,12 +158,14 @@ Fire-and-forget 1:N broadcast. Returns the number of subscribers (local + remote
 | `event_id` | `str` | — | Key in this plugin's `events:` manifest block. |
 | `payload` | `Any` | `None` | Becomes `Event.payload`. |
 | `topic_vars` | `Dict[str, str] \| None` | `None` | Fills runtime `{var}` placeholders. See constraints below. |
-| `hosts` | `str \| list \| None` | `None` | Override the manifest's `hosts:`. |
+| `hosts` | `str \| list \| None` | `None` | Override the manifest's `hosts:`. When both the caller and the manifest leave `hosts` as `None`, the publisher coerces to `"local"`. |
 | `blocked_hosts` | `str \| list \| None` | `None` | Override the manifest's `blocked_hosts:`. |
 
 **Returns** `int` — count of subscribers scheduled.
 
 **Raises** `ValueError` / `TypeError` for malformed `topic_vars` (see [`topic_vars` constraints](#topic_vars-constraints)). `RequestException` for unknown `event_id` or other framework-level errors. Subscriber-side errors are logged, not raised. Disabled events silently drop with a debug log and return `0`.
+
+If `payload=None` is passed, subscribers receive an empty dict `{}` rather than None. This ensures a consistent dict shape for subscribers.
 
 **Decorator** `@async_log_errors`.
 
@@ -186,7 +188,7 @@ Local subs are tried first, in insertion order. On no local match, remote candid
 | `event_id` | `str` | — | Key in this plugin's `events:` manifest block. |
 | `payload` | `Any` | `None` | Becomes `Event.payload`. |
 | `topic_vars` | `Dict[str, str] \| None` | `None` | See constraints below. |
-| `hosts` | `str \| list \| None` | `None` | Override the manifest's `hosts:`. |
+| `hosts` | `str \| list \| None` | `None` | Override the manifest's `hosts:`. When both the caller and the manifest leave `hosts` as `None`, the publisher coerces to `"local"`. |
 | `blocked_hosts` | `str \| list \| None` | `None` | Override the manifest's `blocked_hosts:`. |
 | `timeout` | `float \| None` | `None` | Per-call deadline. |
 
@@ -238,7 +240,7 @@ Register a subscription at runtime (in addition to the declarative `subscription
 | Argument | Type | Default | Notes |
 |---|---|---|---|
 | `topic` | `str` | — | Topic pattern. Wildcards (`*` per segment) allowed. |
-| `target_access_name` | `str` | — | Endpoint that receives the dispatched `Event`. Must be non-empty. |
+| `target_access_name` | `str` | — | Required. Endpoint that receives the dispatched `Event`. Must be non-empty; the framework raises `TypeError` if `None` is passed. |
 | `target_plugin` | `str \| None` | `None` | Owner plugin (defaults to self-routing). |
 | `target_plugin_uuid` | `str \| None` | `None` | Optional instance pin. |
 | `hosts` | `str \| list \| None` | `"any"` | Receiver-side host filter. |
@@ -249,8 +251,8 @@ Register a subscription at runtime (in addition to the declarative `subscription
 **Returns** `str` — the new `sub_uuid`. Pass this back to `unsubscribe`.
 
 **Raises**
-- `TypeError` if `target_access_name` is empty or non-string.
-- `ValueError` for malformed topic patterns or filter values — validated by `_validate_subscription_topic` and a `target_access_name` re-check on the Plexus side. Topic and filter values are validated identically to YAML load.
+- `TypeError` if `target_access_name` is not a string.
+- `ValueError` if `target_access_name` is empty or whitespace-only, for malformed topic patterns, or for invalid filter values — validated by `_validate_subscription_topic` and a `target_access_name` re-check on the Plexus side. Topic and filter values are validated identically to YAML load. All three validation layers (`Plugin.subscribe`, `Plexus.subscribe_event`, `TopicRegistry.subscribe`) agree on these exception types (R4-XX-4).
 
 > **Do not use** the legacy `handler=` keyword form — it was removed. Runtime subs always route to a NAMED endpoint via `target_access_name`.
 
@@ -265,6 +267,8 @@ Removes by `sub_uuid`. Returns `True` if a sub was removed, `False` otherwise.
 ### `self.subscribe_sync(...)` and `self.unsubscribe_sync(...)`
 
 Sync equivalents that bridge to the event loop via `run_coroutine_threadsafe`.
+
+**Internal timeout:** `subscribe_sync`, `unsubscribe_sync`, `set_subscription_enabled_sync`, and `set_event_enabled_sync` wrap the bridged future in `future.result(timeout=60.0)`. If the event loop is blocked or stalled beyond 60 seconds, the call raises `concurrent.futures.TimeoutError`. Callers in background threads or sync entry points should treat this as a framework-stall signal (loop blocked, deadlock, or shutdown in progress) rather than a normal failure mode.
 
 ---
 
@@ -322,16 +326,16 @@ All eight error-handling decorators live in `plexus.decorators`. They come in ma
 |----------------------------------------|----------------------|-------------------------------------------------------------|
 | `log_errors(logger=None)`              | sync                 | Log via injected logger or `args[0]._logger`. Re-raise.     |
 | `handle_errors(default_return=None, logger=None)` | sync         | Log. Swallow. Return `default_return`.                      |
-| `async_log_errors`                     | async                | Log. Re-raise. (Bare decorator — no parameters.)            |
+| `async_log_errors`                     | async                | Log. Re-raise. Dual-dispatch: bare (`@async_log_errors`) and parens (`@async_log_errors()`) both work. |
 | `async_handle_errors(default_return=None)` | async             | Log. Swallow. Return `default_return`. **`RequestException` always propagates** so callers can still catch plugin-call errors. |
 | `gen_log_errors(logger=None)`          | sync generator       | Log. Re-raise.                                              |
 | `gen_handle_errors(default_return=None, logger=None)` | sync generator | Log. Stop the generator (does NOT yield default).         |
 | `async_gen_log_errors(logger=None)`    | async generator      | Log. Re-raise.                                              |
 | `async_gen_handle_errors(default_return=None, logger=None)` | async gen | Log. Stop the generator.                                |
 
-All decorators run a kind-check up front, so applying e.g. `@log_errors` to an `async def` raises `PluginTypeMissmatchError` with a hint to use `@async_log_errors` instead.
+All decorators run a kind-check up front, so applying e.g. `@log_errors` to an `async def` raises `PluginTypeMismatchError` with a hint to use `@async_log_errors` instead.
 
-`log_errors`, `handle_errors`, `async_handle_errors`, `gen_log_errors`, and `async_gen_log_errors` accept the no-parens form (`@log_errors` works) — they detect the callable-instead-of-logger argument and rewrap. `async_log_errors` is bare by design (`def async_log_errors(func)`, no parameters at all).
+`log_errors`, `handle_errors`, `async_handle_errors`, `gen_log_errors`, and `async_gen_log_errors` accept the no-parens form (`@log_errors` works) — they detect the callable-instead-of-logger argument and rewrap. `async_log_errors` accepts both bare (`@async_log_errors`) and parens (`@async_log_errors()`) forms via the same dual-dispatch shim (added in C-162).
 
 **When to use which**
 
@@ -367,7 +371,8 @@ From `plexus.exceptions` (also re-exported from the top-level `plexus` package).
 | `NetworkRequestException` | `RequestException` | Network-level failure during a remote dispatch (connection error, peer error, timeout).                                                                  |
 | `NoLocalSubException`     | `RequestException` | Peer signals "no local sub matched" on a remote `request_event` / `request_event_stream`. Distinct subclass so request-event fall-through preserves order. |
 | `NodeException`           | `Exception`        | Generic node-level error (e.g. unknown / disabled node).                                                                                                 |
-| `PluginTypeMissmatchError`| `Exception`        | A `decorators.py` decorator is applied to a function whose sync/async/gen/async-gen kind does not match.                                                 |
+| `PluginTypeMismatchError`| `Exception`        | A `decorators.py` decorator is applied to a function whose sync/async/gen/async-gen kind does not match.                                                 |
+| `PluginDependencyError`   | `Exception`        | Raised at boot by the dependency resolver when a plugin's `dependencies:` constraint cannot be satisfied — missing required dep, version mismatch, dep in `FAILED_LOAD` state, or a dependency cycle. |
 
 In practice, catch `RequestException` — it covers `execute*`, `request_event*`, and their network counterparts.
 

@@ -1,0 +1,6 @@
+description: Unrelated fixture next to the CycleA/CycleB cycle; should still enable.
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+endpoints:

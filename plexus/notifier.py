@@ -17,25 +17,31 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Union
 from uuid import uuid4
 
 
 class SyncDispatcher:
-    """Dedicated executor for sync subscriber handlers (PR3 Q17 + C3 + C8).
+    """Dedicated executor for sync subscriber handlers.
 
     Thin wrapper around a ``ThreadPoolExecutor(max_workers=N,
     thread_name_prefix="sync-notifier")`` whose internal queue serves as
     the FIFO dispatch queue for sync handlers. Workers pick up handlers
-    one at a time; with ``workers=1`` the user gets serialization (C9).
-    Default ``N=4`` per Q17, configurable via
+    one at a time; with ``workers=1`` the user gets serialization.
+    Default ``N=4``, configurable via
     ``general.sync_dispatcher_workers`` in main config.yml.
 
-    Stage A: instantiated by Plexus.__init__ and shut down by
-    Plexus.close() AFTER the existing 30s in-flight drain (C8).
-    Callers (Stage B fan-out) submit handlers via
-    ``loop.run_in_executor(dispatcher.executor, handler, event)`` —
-    NOT submit + done_callback (per C3).
+    Instantiated by Plexus.__init__ and shut down by Plexus.close()
+    AFTER the existing 30s in-flight drain. Callers submit handlers
+    via ``loop.run_in_executor(dispatcher.executor, handler, event)``
+    rather than ``submit + done_callback``.
+
+    R2-FF-8: ThreadPoolExecutor uses an UNBOUNDED ``SimpleQueue``
+    internally; submissions never block at the dispatcher layer. Fast
+    publishers that outrun the worker pool will accumulate pending
+    handler invocations without limit. Flow control must be applied
+    at the publisher side (e.g. by gating publishes on observable
+    queue depth, or by limiting publisher concurrency upstream).
     """
 
     def __init__(
@@ -54,7 +60,7 @@ class SyncDispatcher:
         )
 
     def shutdown(self, wait: bool = False) -> None:
-        """Shut the executor down. ``wait=False`` matches C8 — the
+        """Shut the executor down. ``wait=False`` is correct — the
         graceful 30s drain happens upstream in Plexus.close() before
         this method is called, so by the time we get here pending sync
         handlers have either finished or been told to wrap up.
@@ -67,25 +73,25 @@ class SyncDispatcher:
 class Subscription:
     """A single topic subscription.
 
-    Per LOCKED IN PR3 NOTIFIER YAML + EVENT MODEL section D + the
-    "TopicRegistry / Subscription dataclass field updates" notes:
+    Fields:
 
-      * ``sub_uuid`` — always uuid4 hex (Q6 β + uuid naming convention).
-        Canonical identity.
+      * ``sub_uuid`` — always uuid4 hex (auto-minted in
+        ``__post_init__`` when constructed empty). Canonical identity.
       * ``declared_id`` — YAML key for declared subs; ``None`` for
-        runtime subs. Used as Event.subscription_id for declared subs
-        per C4 (a).
+        runtime subs. Used as ``Event.subscription_id`` for declared
+        subs.
       * ``topic_pattern`` — literal topic or ``*``-wildcard pattern.
       * ``plugin_name`` / ``plugin_uuid`` — sub OWNER (the plugin that
         declared/registered this subscription).
       * ``target_plugin`` / ``target_access_name`` — the endpoint the
         sub routes to (defaults: target_plugin = plugin_name, i.e.
-        self-routing). Cross-plugin orchestrator subs (PR3 LOCKED G)
-        use a different target_plugin from the owner.
-      * ``target_plugin_uuid`` — optional runtime instance pin (C7).
+        self-routing). Cross-plugin orchestrator subs may set
+        target_plugin differently from the owner.
+      * ``target_plugin_uuid`` — optional runtime instance pin.
       * ``hosts`` / ``blocked_hosts`` / ``authors`` / ``blocked_authors``
         — receiver-side filter chain.
-      * ``enabled`` — Q13 opt-out flag, default True.
+      * ``enabled`` — opt-out flag, default True. Disabled subs are
+        registered but skipped by ``find_all`` / ``find_first``.
     """
 
     # Identity
@@ -104,7 +110,17 @@ class Subscription:
     target_access_name: str = ""
     target_plugin_uuid: Optional[str] = None
 
-    # Filter chain (per LOCKED A subscriptions: shape)
+    # Filter chain (per LOCKED A subscriptions: shape).
+    # C-114: these four fields are frozen after __post_init__. Mutating
+    # them post-construction would desync the wire-cached copy that
+    # peers hold in their _inbound_adverts table (since the filter
+    # chain is now sent on the wire — see C-112 +
+    # _serialize_local_sub_for_peer). Callers that need to change a
+    # filter must unsubscribe + subscribe again so the
+    # subscribe/unsubscribe broadcast hooks deliver the corrected
+    # AdvertSub to peers. ``enabled`` and the identity / target fields
+    # remain mutable: ``enabled`` is toggled via
+    # set_subscription_enabled (which broadcasts add/remove deltas).
     hosts: Union[str, list, None] = "any"
     blocked_hosts: Union[str, list, None] = None
     authors: Union[str, list, None] = None
@@ -112,6 +128,44 @@ class Subscription:
 
     # Opt-out flag (Q13). Disabled subs are skipped at registration.
     enabled: bool = True
+
+    # C-114: filter-chain fields frozen post-__post_init__.
+    _FROZEN_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "hosts", "blocked_hosts", "authors", "blocked_authors",
+    })
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # C-114: gate writes to the filter chain after the instance
+        # has finished initialising. The dataclass-generated __init__
+        # writes each field, then __post_init__ runs. We allow any
+        # writes before the post-init marker is set; afterward, the
+        # frozen-fields set raises AttributeError on direct mutation.
+        if name in self._FROZEN_FIELDS and getattr(
+            self, "_post_init_done", False
+        ):
+            raise AttributeError(
+                f"Subscription.{name} is frozen post-construction "
+                f"(C-114). The filter chain is wire-cached on peer "
+                f"_inbound_adverts; direct mutation would desync. "
+                f"Unsubscribe + resubscribe to change a filter."
+            )
+        object.__setattr__(self, name, value)
+
+    def __post_init__(self) -> None:
+        # C-088: enforce the "sub_uuid is always uuid4 hex" invariant
+        # at construction. The previous lazy-fill in ``register`` meant
+        # any code path that built a Subscription via direct construction
+        # and inspected ``sub_uuid`` BEFORE handing it to register could
+        # see an empty string — the docstring above promised non-empty.
+        # Auto-mint here so the docstring claim is structurally true.
+        if not self.sub_uuid:
+            self.sub_uuid = uuid4().hex
+        # C-114: arm the frozen-fields gate. Any subsequent attempt to
+        # mutate hosts / blocked_hosts / authors / blocked_authors via
+        # direct attribute assignment now raises. Use object.__setattr__
+        # to skip our overridden __setattr__ — we are intentionally
+        # writing a private flag here, not a frozen field.
+        object.__setattr__(self, "_post_init_done", True)
 
     def __repr__(self) -> str:
         target = f"{self.target_plugin}.{self.target_access_name}"
@@ -181,6 +235,12 @@ class TopicRegistry:
             return False
 
         for p, t in zip(pattern_parts, topic_parts):
+            # W5-Q2: reject empty topic segment regardless of pattern part.
+            # ``"*"`` is documented as matching exactly ONE (non-empty)
+            # segment; ``"foo//bar".split("/")`` yields ``["foo", "", "bar"]``
+            # — the empty middle segment is not a valid match for ``"*"``.
+            if not t:
+                return False
             if p == "*":
                 continue
             if p != t:
@@ -194,9 +254,21 @@ class TopicRegistry:
         Used by both the Stage B YAML-driven on_enable wrapper (which
         builds Subscription with declared_id set) and the runtime
         Plugin.subscribe API (declared_id=None).
+
+        C-088 + C-114: ``Subscription.__post_init__`` auto-mints
+        ``sub_uuid`` when empty, so by the time we get here it is
+        guaranteed non-empty. The previous lazy-fill here was dead
+        code per the structural invariant. Structural check below
+        catches the only realistic breach — an ``object.__new__``
+        bypass that skipped ``__post_init__`` — with a clearer
+        diagnostic than the downstream KeyError on an empty
+        registry key.
         """
         if not sub.sub_uuid:
-            sub.sub_uuid = uuid4().hex
+            raise ValueError(
+                "Subscription must have sub_uuid "
+                "(use Subscription(...) not object.__new__)"
+            )
 
         async with self._lock:
             self._subs[sub.sub_uuid] = sub
@@ -218,8 +290,8 @@ class TopicRegistry:
         topic_pattern: str,
         plugin_name: str,
         plugin_uuid: str,
+        target_access_name: str,
         target_plugin: Optional[str] = None,
-        target_access_name: Optional[str] = None,
         target_plugin_uuid: Optional[str] = None,
         hosts: Union[str, list, None] = "any",
         blocked_hosts: Union[str, list, None] = None,
@@ -232,9 +304,33 @@ class TopicRegistry:
 
         ``target_plugin`` defaults to ``plugin_name`` (self-routing).
         ``target_access_name`` is required (resolves to the endpoint that
-        receives the dispatched event).
+        receives the dispatched event); raises ``TypeError`` for non-string
+        and ``ValueError`` for empty / whitespace-only strings.
+
+        NOTE: This is the internal TopicRegistry primitive. It does NOT
+        validate ``topic_pattern``. Public callers go through
+        ``Plexus.subscribe_event``, which calls
+        ``_validate_subscription_topic`` first. Direct callers (tests,
+        internal helpers) are responsible for validation themselves.
         """
         effective_target_plugin = target_plugin or plugin_name
+
+        # W4-O2: validate target_access_name explicitly. The runtime contract
+        # treats it as required (dispatch needs a named endpoint). Use the
+        # same TypeError + .strip() shape as Plexus.subscribe_event (core.py
+        # ~7827) so error type and validation stringency are uniform.
+        # Public docs (docs/api_reference.md subscribe section) document the
+        # TypeError contract.
+        if not isinstance(target_access_name, str):
+            raise TypeError(
+                "target_access_name must be a str; got "
+                f"{type(target_access_name).__name__}={target_access_name!r}"
+            )
+        if not target_access_name.strip():
+            raise ValueError(
+                "target_access_name must be a non-empty / non-whitespace str; "
+                f"got {target_access_name!r}"
+            )
 
         sub = Subscription(
             sub_uuid=uuid4().hex,
@@ -243,7 +339,7 @@ class TopicRegistry:
             plugin_name=plugin_name,
             plugin_uuid=plugin_uuid,
             target_plugin=effective_target_plugin,
-            target_access_name=target_access_name or "",
+            target_access_name=target_access_name,
             target_plugin_uuid=target_plugin_uuid,
             hosts=hosts,
             blocked_hosts=blocked_hosts,
@@ -277,7 +373,15 @@ class TopicRegistry:
         return True
 
     async def unsubscribe_plugin(self, plugin_uuid: str) -> int:
-        """Remove all subscriptions for a plugin. Returns count removed."""
+        """Remove all subscriptions for a plugin. Returns count removed.
+
+        C-087: per-sub INFO log restored to match the Q18 contract that
+        :meth:`unsubscribe` already honours. Previously the bulk-pop
+        path emitted only one DEBUG line at the end of the loop, so
+        plugin-disable / plugin-pop teardown was invisible at INFO log
+        level even though the equivalent single-sub path logged each
+        unsubscribe.
+        """
         async with self._lock:
             sub_uuids = self._by_plugin.pop(plugin_uuid, set())
             count = 0
@@ -288,6 +392,9 @@ class TopicRegistry:
                 count += 1
                 if sub.declared_id is not None:
                     self._by_declared.pop((sub.plugin_uuid, sub.declared_id), None)
+                # C-087: per-sub INFO log to match the single-sub
+                # unsubscribe() path at Q18.
+                self._logger.info(f"Unsubscribed: {sub}")
 
         if count:
             self._logger.debug(
@@ -316,6 +423,48 @@ class TopicRegistry:
                         results.append(sub)
         return results
 
+    async def lookup_subscribers(self, query_pattern: str) -> List[Subscription]:
+        """Return subs whose LITERAL ``topic_pattern`` matches ``query_pattern``
+        segment-wise, in INSERTION ORDER.
+
+        Inverted-semantics counterpart to :meth:`find_all`. Where ``find_all``
+        takes a LITERAL topic and matches against possibly-wildcarded sub
+        patterns, ``lookup_subscribers`` takes a possibly-wildcarded query
+        and matches against LITERAL sub patterns only. Subs whose own
+        ``topic_pattern`` contains ``*`` are EXCLUDED to avoid ambiguous
+        bidirectional matching (two wildcards could co-match for reasons
+        the caller never intended).
+
+        ``query_pattern`` may use ``*`` segment wildcards with the same
+        semantics as :func:`_topic_matches` (one segment per ``*``,
+        no empty segments).
+
+        CALLER CONTRACT: ``query_pattern`` must not contain empty segments
+        (e.g. ``"ai//chat/*"``). The wrapped :func:`_topic_matches`
+        empty-segment guard at line 242 inspects the topic side only;
+        an empty query segment silently produces zero matches rather
+        than raising. Routers building queries from validated config
+        fields satisfy this naturally; if you build queries from operator
+        input, validate upstream.
+
+        Use case: a dispatcher that wants to discover which providers have
+        registered for a topic family (e.g. ``"ai/llm/chat/*/*"``) without
+        sending a request. Callers that need wildcard-vs-wildcard matching
+        must add a separate method; do not generalize this one.
+
+        Disabled subs are skipped (consistent with :meth:`find_all`).
+        """
+        results: List[Subscription] = []
+        async with self._lock:
+            for sub in self._subs.values():
+                if not sub.enabled:
+                    continue
+                if self._is_wildcard(sub.topic_pattern):
+                    continue
+                if self._topic_matches(query_pattern, sub.topic_pattern):
+                    results.append(sub)
+        return results
+
     async def find_first(self, topic: str) -> Optional[Subscription]:
         """
         Find the first matching subscription (for request-by-topic).
@@ -334,11 +483,15 @@ class TopicRegistry:
     async def get_all_topics(self) -> List[str]:
         """Return all registered topic patterns (insertion order)."""
         async with self._lock:
-            seen = []
+            # W1-C4: O(1) membership via set, but preserve insertion order
+            # via a separate list (the docstring contract).
+            seen = set()
+            ordered: List[str] = []
             for sub in self._subs.values():
                 if sub.topic_pattern not in seen:
-                    seen.append(sub.topic_pattern)
-            return seen
+                    seen.add(sub.topic_pattern)
+                    ordered.append(sub.topic_pattern)
+            return ordered
 
     async def get_plugin_subscriptions(self, plugin_uuid: str) -> List[Subscription]:
         """Return all subscriptions for a given plugin in INSERTION

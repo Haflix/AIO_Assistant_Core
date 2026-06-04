@@ -1,5 +1,5 @@
 description: Phase 2a — TestRuntimeToggleSuite covering runtime sub/event enable-toggle API + kind field on _core/request/*
-version: "0.1.0"
+version: "0.1.1"
 remote: false
 arguments:
 events:

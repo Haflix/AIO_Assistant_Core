@@ -296,7 +296,9 @@ For tooling authors and protocol debuggers. Constants live at the top of `plexus
 
 IDs 7, 8, 9 are reserved and must not be reused; they held legacy `MSG_NOTIFY`, `MSG_TOPIC_REQUEST`, and `MSG_TOPIC_REQUEST_STREAM`, retired in PR3 Stage D when `notify` / `request_topic` were removed. ID 20 is also reserved (formerly `MSG_AUTH`, removed in PR4 Stage K-3 when SPKI-pinned mTLS replaced the shared-secret auth). ID 21 was claimed in v0.27.0 by `MSG_SUB_ADVERTISE_ACK`.
 
-The sentinel `REMOTE_NO_RESULT` distinguishes "handler returned `None`" (a valid result) from "no remote handler responded" (treated as no-match for fall-through).
+### Advert-table cap
+
+Each peer's inbound advert table is capped at `MAX_ADVERT_SUBS_PER_PEER = 100_000` entries (see `plexus/networking.py`). An incoming `MSG_SUB_ADVERTISE` snapshot whose `subscriptions:` list would push the receiving side's `_inbound_adverts[peer]` past the cap is rejected before any state is committed. The receiver replies with a `MSG_ERROR` so the sender can surface the rejection to operators rather than silently dropping the snapshot. The cap exists to bound `_adverts_struct_lock` hold time during snapshot ingest; honest peers stay several orders of magnitude below it.
 
 ---
 

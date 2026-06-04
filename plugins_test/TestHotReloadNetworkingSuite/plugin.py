@@ -182,7 +182,7 @@ class TestHotReloadNetworkingSuite(Plugin):
             pc = self._plexus
             old = _baseline_yaml()
             new = deepcopy(old)
-            # heartbeat_interval is NOT in _REBUILD_FIELDS — change
+            # heartbeat_interval is not a rebuild trigger — change
             # should NOT trigger rebuild.
             new["networking"]["heartbeat_interval"] = 20.0
             c.expect(pc._networking_config_changed(old, new), False)

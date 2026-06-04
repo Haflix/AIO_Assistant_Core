@@ -1,0 +1,20 @@
+description: Integration suite for the plugin-dependencies feature (topo order, FAILED_LOAD cascade, plexus self-dep, name reservation).
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run dependency-feature integration cases.
+    arguments:
+      - name: category
+        description: 'integration | null (all)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+      - name: bug_ids
+      - name: skip_slow
+      - name: allow_destructive

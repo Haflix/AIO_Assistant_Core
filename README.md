@@ -1,6 +1,6 @@
 # Plexus
 
-*Last updated for Plexus 0.40.0*
+*Last updated for Plexus 0.41.1*
 
 An async Python plugin framework with multi-node mTLS networking and pub/sub
 event routing. PyPI package: [`plexus-core`](https://pypi.org/project/plexus-core/).
@@ -154,6 +154,22 @@ endpoints:
       - name: value
         type: any
         description: Input value to process
+
+  call_other_plugin:
+    internal_name: call_other_plugin
+    remote: True
+    accessible_by_other_plugins: True
+    description: Call another plugin's method by name and return its result.
+    arguments:
+      - name: plugin_name
+        type: str
+        description: Name of the plugin to call
+      - name: method_name
+        type: str
+        description: Method to execute on the target plugin
+      - name: args
+        type: any
+        description: Arguments to pass to the method
 
   example_stream:
     internal_name: example_stream

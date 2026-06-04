@@ -38,6 +38,7 @@ dependencies = [
     "PyYAML",
     "colorama",
     "cryptography",
+    "packaging",
 ]
 
 [tool.setuptools.packages.find]

@@ -23,9 +23,9 @@ class TestRemoteTarget(Plugin):
         self._logger.debug("TestRemoteTarget.on_enable")
 
         # Code-driven hang sub on test/r/hang — B-020 driver. Registered
-        # at runtime via subscribe(target_access_name=...) so publish_event
+        # at runtime via subscribe_event(target_access_name=...) so publish_event
         # dispatch goes through execute() to the r_hang_topic_handler endpoint.
-        sid_hang = await self._plexus.subscribe(
+        sid_hang = await self._plexus.subscribe_event(
             "test/r/hang",
             self.plugin_name,
             self.plugin_uuid,
@@ -41,7 +41,7 @@ class TestRemoteTarget(Plugin):
             ("test/r/req_stream_basic", "r_request_stream_basic_handler"),
             ("test/r/req_stream_raise", "r_request_stream_raise_handler"),
         ):
-            sid = await self._plexus.subscribe(
+            sid = await self._plexus.subscribe_event(
                 topic,
                 self.plugin_name,
                 self.plugin_uuid,
@@ -54,7 +54,7 @@ class TestRemoteTarget(Plugin):
         self._logger.debug("TestRemoteTarget.on_disable")
         for sid in list(self._sub_ids):
             try:
-                await self._plexus.unsubscribe(sid)
+                await self._plexus.unsubscribe_event(sid)
             except Exception:
                 pass
         self._sub_ids = []

@@ -73,19 +73,18 @@ class TestRuntimeToggleSuite(Plugin):
     # Helpers
     # ─────────────────────────────────────────────────────────────────
 
-    async def _make_runtime_sub(
-        self,
-        topic: str,
-        target_access_name: str = "handle_runtime_toggle_event",
-        *,
-        enabled: bool = True,
-        hosts: str = "local",
-    ) -> str:
+    async def _make_runtime_sub(self, topic: str, target_access_name: str = "handle_runtime_toggle_event", *, enabled: bool = True, hosts: str = "local") -> str:
         """Register a runtime subscription owned by THIS plugin so it
         cleans up automatically on suite disable. Returns sub_uuid.
+
+        R3-MM-5: route through Plexus.subscribe_event (the Plugin-level
+        API surface) so the sub is added to self._sub_uuids for
+        on_disable auto-cleanup AND so the hosts argument runs through
+        _normalize_hosts validation. The pre-fix call to
+        ``topic_registry.subscribe`` directly bypassed both.
         """
-        return await self._plexus.topic_registry.subscribe(
-            topic_pattern=topic,
+        return await self._plexus.subscribe_event(
+            topic=topic,
             plugin_name=self.plugin_name,
             plugin_uuid=self.plugin_uuid,
             target_plugin=self.plugin_name,
@@ -97,8 +96,12 @@ class TestRuntimeToggleSuite(Plugin):
     async def _drop_runtime_sub(self, sub_uuid: Optional[str]) -> None:
         if sub_uuid is None:
             return
+        # R3-MM-5 review follow-up: mirror the subscribe_event migration on
+        # the drop side. Going through Plexus.unsubscribe_event keeps
+        # self._sub_uuids in sync (instead of leaving a stale uuid that the
+        # plugin-disable auto-cleanup later tries to unsubscribe again).
         try:
-            await self._plexus.topic_registry.unsubscribe(sub_uuid)
+            await self._plexus.unsubscribe_event(sub_uuid)
         except Exception:
             pass
 

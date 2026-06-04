@@ -1,0 +1,6 @@
+description: Fixture that deliberately raises in on_enable when the raise_on_enable arg is true. Exercises Hook 5's enable-time precheck cascade.
+version: 1.0.0
+remote: false
+arguments:
+  raise_on_enable: true
+endpoints:

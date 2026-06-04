@@ -150,7 +150,8 @@ Top-level fields:
 | `events` | dict keyed by event_id | optional | `{}` | Events this plugin publishes. See [notifier](./notifier.md). |
 | `subscriptions` | dict keyed by declared_id | optional | `{}` | Topics this plugin listens for. See below. |
 | `prefix` | str | optional | plugin name | Resolved value used to substitute `{prefix}` in event/subscription topic templates. |
-| `verbose_notifier` | bool | optional | `false` | When true, dispatch logs include match counts. |
+| `verbose_notifier` | bool | optional | `false` | When true, dispatch logs include match counts, host-filter skip reasoning, and first-chunk timing for streams. |
+| `dependencies` | dict keyed by target name | optional | `{}` | Plugin-to-plugin runtime dependencies. See section below. |
 
 ### `endpoints:` entry fields
 
@@ -237,6 +238,64 @@ subscriptions:
 
 Topic syntax, filter semantics, and `topic_vars` are documented in detail
 in [notifier](./notifier.md).
+
+### `dependencies:` entry fields
+
+Plugin-to-plugin runtime dependencies. Declares that this plugin needs
+another plugin (loaded into the same Plexus instance) at a specific
+version range, OR that it requires a particular framework version.
+
+This is NOT Python package dependency management — those live in your
+plugin's own `pyproject.toml` / `requirements.txt`. This field is about
+which OTHER plugins must be enabled in the same Plexus process before
+this plugin's `on_enable` runs.
+
+```yaml
+dependencies:
+  PluginA:                            # target name (the dict key)
+    version: ">=1.0,<2.0"             # PEP 440 SpecifierSet
+    optional: false                   # default; required dep
+  PluginB:
+    version: "~=2.3"
+    optional: true                    # warn-and-continue if missing/mismatch
+  plexus:                             # reserved sentinel name
+    version: ">=0.41,<1.0"            # framework version range
+```
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `<key>` (target name) | identifier OR literal `"plexus"` | YES | — | Plugin name to depend on; OR the reserved sentinel `plexus` for framework self-version. Case-sensitive — `Plexus` (capitalized) is NOT recognized as the sentinel and would be treated as a missing plugin name. |
+| `version` | str | YES | — | PEP 440 SpecifierSet, e.g. `">=1.0,<2.0"`, `"~=2.3"`, `"==1.4.2"`. Empty string `""` matches any version. MUST be a string in YAML — quote numeric-looking values (e.g. `version: "1.0"`) since unquoted `version: 1.0` parses as a float and is rejected. |
+| `optional` | bool | optional | `false` | When true: missing/mismatch produces a `warn_config` log line, the plugin still enables. When false: missing/mismatch transitions the plugin to `FAILED_LOAD` at boot. Optional deps do NOT contribute to topo ordering. |
+
+Resolution behavior (at boot, after `get_plugins` and before
+`start_plugins`):
+
+- **Cycle detection** (required-only edges) — every member of a cycle is
+  marked `FAILED_LOAD` with a reason listing the cycle path. Plugins
+  outside the cycle still enable normally.
+- **Topological order** — plugins enable in layers, with each plugin's
+  required deps enabled before it. Optional deps do NOT establish
+  ordering, so a plugin with only optional deps starts in level 0.
+- **Cascade** — a required dep on a `FAILED_LOAD` plugin transitively
+  fails the dependent (reason: `"required dep '<X>' failed"`). Optional
+  deps on a failed plugin produce an `optional_warning` and still
+  enable the dependent.
+- **Disabled-in-config** — depending on a plugin that is set to
+  `enabled: false` in the main `config.yml` produces a distinct reason
+  `"required dep '<X>' disabled in config.yml"` so operators can tell
+  it apart from "missing plugin".
+
+**Known limitations** (documented in `dependencies.py` and `core.py`):
+
+- Boot-time only. Hot-reloading a plugin with new `dependencies:` does
+  NOT re-run resolution; restart the framework to enforce changed deps.
+- Cross-node deps are NOT supported. Dependencies must be satisfied
+  within the same Plexus process; depending on a plugin running only on
+  a peer node reports as "missing".
+- Operator overrides via `config.yml`'s `overrides:` block do NOT apply
+  to `dependencies:` (attempt produces an "unknown override key"
+  warning and is silently ignored).
 
 ---
 
@@ -619,7 +678,7 @@ return default") variant.
 | async generator | `@async_gen_log_errors` | `@async_gen_handle_errors(default_return=...)` |
 
 Apply the variant that matches your function kind — applying
-`@log_errors` to an `async def` raises `PluginTypeMissmatchError` at
+`@log_errors` to an `async def` raises `PluginTypeMismatchError` at
 import time.
 
 `@async_handle_errors` is special: it lets `RequestException` (and its

@@ -86,14 +86,14 @@ useful for two Discord bots, two MQTT clients, etc.
 plugins:
   - name: DiscordBotMain
     enabled: true
-    path: ./_private/AI/DiscordBot
+    path: ./plugins/example_plugin
     overrides:
       arguments:
         token: "<prod-token>"
 
   - name: DiscordBotDev
     enabled: true
-    path: ./_private/AI/DiscordBot
+    path: ./plugins/example_plugin
     overrides:
       arguments:
         token: "<dev-token>"
@@ -124,7 +124,7 @@ plugin folder. Implemented by `apply_overrides`.
 plugins:
   - name: DiscordBotMain
     enabled: true
-    path: ./_private/AI/DiscordBot
+    path: ./plugins/example_plugin
     overrides:
       description: "Production Discord bot"
       version: "1.4.2"               # value-replace
@@ -213,6 +213,7 @@ general:
     httpx: "WARNING"
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
+  plugin_enable_timeout: 30.0
   sync_dispatcher_workers: 4
 ```
 
@@ -228,6 +229,7 @@ general:
 | `asyncio_debug` | bool | `false` | Enables `loop.set_debug(True)` and `slow_callback_duration=0.5`. |
 | `plugin_ready_timeout` | float | `60.0` | Cross-plugin readiness gate budget. |
 | `plugin_disable_timeout` | float | `30.0` | Per-plugin `on_disable` cap during runtime disable / pop / reload. |
+| `plugin_enable_timeout` | float | `30.0` | Per-plugin `on_enable` cap during runtime enable / load. |
 | `sync_dispatcher_workers` | int | `4` | Workers in the dedicated `SyncDispatcher` thread pool. |
 
 ### `plugin_ready_timeout` (default 60.0)
@@ -244,7 +246,7 @@ the default with a warning.
 ### `plugin_disable_timeout` (default 30.0)
 
 Per-plugin cap on `on_disable` execution during runtime
-disable / pop / reload (`_disable_plugin`, `_pop_plugin_under_lock`).
+disable / pop / reload (`_disable_plugin_under_lock`, `_pop_plugin_under_lock`).
 Shutdown's per-plugin cap is hardcoded 30s separately and is not
 affected by this knob.
 
@@ -252,6 +254,28 @@ If `on_disable` raises, times out, or returns, the framework still
 flips `enabled = False` and unregisters the plugin's subs — bookkeeping
 is in `try/finally`. The timeout exists so a hanging `on_disable` does
 not block reload of other plugins.
+
+### `plugin_enable_timeout` (default 30.0)
+
+Per-plugin cap on `on_enable` execution during runtime enable / load
+(`_enable_plugin_under_lock`). If `on_enable` exceeds this budget the
+plugin is force-rolled back to `INACTIVE` and `last_errors[Phase.ENABLE]`
+is populated with the `asyncio.TimeoutError`.
+
+Bookkeeping (subscription/observer cleanup) still runs via the same
+`try/finally` chain as the success path, so a hung `on_enable` does not
+leak observers or subs.
+
+> Caveat: for a **sync** `on_enable`, the timeout cancels the asyncio
+> task wrapping the `run_in_executor` call, NOT the underlying executor
+> thread. A hung sync `on_enable` keeps its slot in `_plugin_executor`
+> (the framework's per-plugin thread pool — separate from
+> `sync_dispatcher_workers`) busy until the thread returns naturally (or
+> the executor is shut down at framework close). The rollback `on_disable`
+> runs in the same `_plugin_executor` and is bounded by
+> `plugin_disable_timeout`, so a hung sync `on_enable` plus its rollback
+> can occupy two pool slots until natural return. The plugin's state still
+> transitions to `INACTIVE` on time.
 
 ### `sync_dispatcher_workers` (default 4)
 
@@ -429,6 +453,7 @@ general:
   asyncio_debug: false
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
+  plugin_enable_timeout: 30.0
   sync_dispatcher_workers: 4
   logger_levels:
     asyncio: "MUTE"
@@ -465,6 +490,7 @@ general:
   asyncio_debug: false
   plugin_ready_timeout: 60.0
   plugin_disable_timeout: 30.0
+  plugin_enable_timeout: 30.0
   sync_dispatcher_workers: 4
 
 networking:
@@ -526,7 +552,7 @@ A few things that look like they ought to be tunable but aren't:
 
 - The **shutdown-time per-plugin `on_disable` budget** is hardcoded to
   30 seconds. Use `plugin_disable_timeout` for the runtime per-plugin
-  cap (which `_disable_plugin` / `_pop_plugin_under_lock` honour).
+  cap (which `_disable_plugin_under_lock` / `_pop_plugin_under_lock` honour).
 - The **30-second wait for in-flight tracked tasks at `close()` time**
   is hardcoded.
 

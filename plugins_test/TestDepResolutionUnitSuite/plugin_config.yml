@@ -1,0 +1,24 @@
+description: Pure-function unit suite for plexus.dependencies (resolve, parse_dependencies)
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+endpoints:
+  run:
+    internal_name: run
+    remote: false
+    accessible_by_other_plugins: true
+    description: Run dependency resolver unit cases and return a suite result dict
+    arguments:
+      - name: category
+        description: 'parse | resolve | null (both)'
+      - name: host
+        description: 'local | remote | null (all hosts)'
+      - name: case_ids
+        description: Filter cases within the suite
+      - name: bug_ids
+        description: Filter cases by bug tag
+      - name: skip_slow
+        description: Skip cases tagged slow
+      - name: allow_destructive
+        description: If False, destructive cases are skipped

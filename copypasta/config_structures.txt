@@ -116,7 +116,7 @@ networking:                       # Cluster topology. See docs/networking.md
                                   # Default: 30.0.
 
 
-REMOVED in 0.39.x / 0.40.x:::
+REMOVED (legacy network config):::
     networking.node_ips           # Replaced by peers: with mTLS pinning.
     networking.secret             # Shared-secret auth removed; mTLS only.
     networking.cert_file          # Per-node cert path. Replaced by
@@ -201,7 +201,7 @@ events:                           # Dict keyed by event_id (your
                                   # and raise on request_event.
 
 
-REMOVED in 0.39.x / 0.40.x:::
+REMOVED (legacy plugin_config endpoints):::
     endpoints[].topic             # Legacy per-endpoint auto-subscribe.
                                   # Replaced by the top-level
                                   # subscriptions: block. The fix is

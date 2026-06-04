@@ -649,8 +649,13 @@ general:
   console_log_level: "WARNING"           # quiet sub-process
 
 networking:
+  # PR4 Stage K (B-066): TestRemoteSuite spawns this subnode via
+  # run_node.py. The parent injects --keys-dir + --parent-cert-pem-file
+  # at runtime so this file does NOT carry static peers entries.
+  # If TestRemoteSuite is updated to bring up mTLS for the subnode, it
+  # MUST pass those flags. Without them, networking starts with empty
+  # peers and refuses to start (hard error in start()).
   enabled: true
-  node_ips: ["127.0.0.1"]                # parent is on localhost
   port: 0                                # overridden via --port
   discover_nodes: true
   direct_discoverable: true
@@ -661,7 +666,14 @@ The parent's main `config.yml` for Phase 5 testing must include:
 ```yaml
 networking:
   enabled: true
-  node_ips: ["127.0.0.1"]
+  peers:
+    - hostname: test-subnode
+      ip: 127.0.0.1
+      port: 2511                          # subnode --port chosen at runtime
+      cert_pem: |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
   port: 2510
 ```
 

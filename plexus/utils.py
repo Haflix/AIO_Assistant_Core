@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
+import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
@@ -19,7 +20,16 @@ from uuid import uuid4
 import time
 import yaml
 from typing import Any, Optional, Tuple, Union, final
-from .decorators import log_errors, handle_errors, async_log_errors, async_handle_errors
+from .decorators import (
+    log_errors,
+    handle_errors,
+    async_log_errors,
+    async_handle_errors,
+    gen_log_errors,
+    gen_handle_errors,
+    async_gen_log_errors,
+    async_gen_handle_errors,
+)
 from .exceptions import RequestException, ConfigException
 from .plugin_state import State
 from colorama import Fore, Style
@@ -240,60 +250,129 @@ class FDRedirector:
         (so captured records have somewhere to go) and BEFORE StreamHandler
         creation (so StreamHandler gets sys.stdout pointing to the real
         terminal, not the pipe).
+
+        C-051 PARTIAL: per-fd try/except. If fd 2 initialization fails
+        after fd 1 was already swapped, the previously-swapped fd is
+        rolled back before re-raising so the process is not left with
+        stdout pointing at a dead pipe write-end.
         """
         if self._active:
             return
 
-        for fd_num, attr_name, log_name, log_level in (
-            (1, "stdout", "captured.stdout", logging.INFO),
-            (2, "stderr", "captured.stderr", logging.WARNING),
-        ):
-            original_stream = getattr(sys, attr_name)
-            self._original_streams[fd_num] = original_stream
+        completed_fds: list[int] = []
+        try:
+            for fd_num, attr_name, log_name, log_level in (
+                (1, "stdout", "captured.stdout", logging.INFO),
+                (2, "stderr", "captured.stderr", logging.WARNING),
+            ):
+                original_stream = getattr(sys, attr_name)
+                self._original_streams[fd_num] = original_stream
 
-            # Save a copy of the original fd (e.g. fd 1 -> fd 5).
-            # This copy stays open and points to the real terminal.
-            saved_fd = os.dup(fd_num)
-            self._saved_fds[fd_num] = saved_fd
+                # Save a copy of the original fd (e.g. fd 1 -> fd 5).
+                # This copy stays open and points to the real terminal.
+                saved_fd = os.dup(fd_num)
+                self._saved_fds[fd_num] = saved_fd
 
-            # Create a real stream wrapping the saved fd, then wrap in
-            # _MutableStream so all references can be muted collectively.
-            encoding = getattr(original_stream, "encoding", "utf-8") or "utf-8"
-            real_stream = open(
-                saved_fd, "w", encoding=encoding, closefd=False, buffering=1
-            )
-            logger = logging.getLogger(log_name)
-            new_stream = _MutableStream(real_stream, logger, log_level)
-            self._redirect_streams[fd_num] = new_stream
-            setattr(sys, attr_name, new_stream)
+                # Create a real stream wrapping the saved fd, then wrap in
+                # _MutableStream so all references can be muted collectively.
+                encoding = getattr(original_stream, "encoding", "utf-8") or "utf-8"
+                real_stream = open(
+                    saved_fd, "w", encoding=encoding, closefd=False, buffering=1
+                )
+                logger = logging.getLogger(log_name)
+                new_stream = _MutableStream(real_stream, logger, log_level)
+                self._redirect_streams[fd_num] = new_stream
+                setattr(sys, attr_name, new_stream)
 
-            # Also patch sys.__stdout__ / sys.__stderr__ — some frameworks
-            # (e.g. Textual) read these to get a terminal handle. Since they
-            # point to the same _MutableStream, mute() affects them too, with
-            # exempt threads still writing to the real terminal.
-            dunder_name = f"__{attr_name}__"
-            self._original_dunder[fd_num] = getattr(sys, dunder_name)
-            setattr(sys, dunder_name, new_stream)
+                # Also patch sys.__stdout__ / sys.__stderr__ — some frameworks
+                # (e.g. Textual) read these to get a terminal handle. Since they
+                # point to the same _MutableStream, mute() affects them too, with
+                # exempt threads still writing to the real terminal.
+                dunder_name = f"__{attr_name}__"
+                self._original_dunder[fd_num] = getattr(sys, dunder_name)
+                setattr(sys, dunder_name, new_stream)
 
-            # Create a pipe. The write end replaces fd 1/2 so any C code
-            # doing write(1, ...) goes into the pipe. The read end is
-            # consumed by a reader thread.
-            pipe_r, pipe_w = os.pipe()
-            os.dup2(pipe_w, fd_num)
-            os.close(pipe_w)  # fd_num is now the only write end
-            self._pipes[fd_num] = pipe_r
+                # Create a pipe. The write end replaces fd 1/2 so any C code
+                # doing write(1, ...) goes into the pipe. The read end is
+                # consumed by a reader thread.
+                pipe_r, pipe_w = os.pipe()
+                os.dup2(pipe_w, fd_num)
+                os.close(pipe_w)  # fd_num is now the only write end
+                self._pipes[fd_num] = pipe_r
 
-            # Reader thread: reads from pipe, emits log records
-            t = threading.Thread(
-                target=self._reader,
-                args=(pipe_r, logger, log_level),
-                name=f"fd-redirect-{attr_name}",
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
+                # Reader thread: reads from pipe, emits log records
+                t = threading.Thread(
+                    target=self._reader,
+                    args=(pipe_r, logger, log_level),
+                    name=f"fd-redirect-{attr_name}",
+                    daemon=True,
+                )
+                t.start()
+                self._threads.append(t)
+                completed_fds.append(fd_num)
+        except Exception:
+            # C-051 PARTIAL: roll back any fds that completed before
+            # the failure, then re-raise. Best-effort — exceptions
+            # during rollback are swallowed (the caller already has
+            # one exception to deal with).
+            for done_fd in completed_fds:
+                self._rollback_one_fd(done_fd)
+            # Also clear any partial state added for the failing fd.
+            for partial_dict in (
+                self._original_streams,
+                self._saved_fds,
+                self._original_dunder,
+                self._redirect_streams,
+                self._pipes,
+            ):
+                for fd_num in list(partial_dict.keys()):
+                    if fd_num not in completed_fds:
+                        partial_dict.pop(fd_num, None)
+            raise
 
         self._active = True
+
+    def _rollback_one_fd(self, fd_num: int) -> None:
+        """C-051 PARTIAL helper: undo the side effects of a successfully
+        initialized fd. Best-effort — never raises."""
+        # Restore the original fd via the saved dup.
+        saved_fd = self._saved_fds.pop(fd_num, None)
+        if saved_fd is not None:
+            try:
+                os.dup2(saved_fd, fd_num)
+            except Exception:
+                pass
+            try:
+                os.close(saved_fd)
+            except Exception:
+                pass
+        # Closing the pipe write-end happens via the dup2 above (the
+        # write-end held by fd_num is replaced). Now close the read end
+        # so the reader thread sees EOF and exits.
+        pipe_r = self._pipes.pop(fd_num, None)
+        # Don't close pipe_r here — the reader thread does it on exit.
+        # Restore sys.{stdout|stderr} and sys.__stdout__/__stderr__.
+        attr_name = "stdout" if fd_num == 1 else "stderr"
+        original_stream = self._original_streams.pop(fd_num, None)
+        if original_stream is not None:
+            try:
+                setattr(sys, attr_name, original_stream)
+            except Exception:
+                pass
+        original_dunder = self._original_dunder.pop(fd_num, None)
+        if original_dunder is not None:
+            try:
+                setattr(sys, f"__{attr_name}__", original_dunder)
+            except Exception:
+                pass
+        # Flush + close the redirect stream wrapper.
+        redirect_stream = self._redirect_streams.pop(fd_num, None)
+        if redirect_stream is not None:
+            try:
+                redirect_stream._real_stream.flush()
+                redirect_stream._real_stream.close()
+            except Exception:
+                pass
 
     def mute(self, exempt_thread_names=()):
         """Switch all streams to capture mode.
@@ -354,9 +433,17 @@ class FDRedirector:
 
         # Restore original fds — this closes the pipe write ends,
         # causing reader threads to see EOF and exit.
+        # R4-VV-7: wrap each restore in its own try/except. A single
+        # OSError (e.g. EBADF if the target or saved fd was already
+        # closed underneath us) would otherwise propagate out of the
+        # loop and leak every subsequent unrestored fd.
         for fd_num, saved_fd in self._saved_fds.items():
-            os.dup2(saved_fd, fd_num)
-            os.close(saved_fd)
+            try:
+                os.dup2(saved_fd, fd_num)
+                os.close(saved_fd)
+            except OSError:
+                # Best-effort restore; keep going on the remaining fds.
+                pass
 
         # Wait for reader threads to finish draining
         for t in self._threads:
@@ -556,6 +643,13 @@ def _level_to_display(value):
     return str(value)
 
 
+# R3-RR-9: module-level tracker for the most recently registered atexit
+# callback from LogUtil.create(). Reused across invocations so we can
+# unregister the prior closure before registering a fresh one, preventing
+# atexit-handler accumulation across multiple LogUtil.create() calls.
+_prior_log_atexit_callback = None
+
+
 class LogUtil(logging.Logger):
     __FORMATTER = f"{Style.DIM}%(asctime)s {Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}{Fore.BLUE}%(name)s {Style.RESET_ALL}{Style.BRIGHT}| %(levelname)s {Style.RESET_ALL}{Fore.RESET}{Style.BRIGHT}| {Style.DIM}%(module)s.%(funcName)s:%(lineno)d {Fore.RESET}{Style.RESET_ALL}{Style.BRIGHT}| {Fore.RESET}%(message)s"
     __FORMATTER_FILE = "%(asctime)s | %(name)s | %(levelname)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s"
@@ -697,7 +791,21 @@ class LogUtil(logging.Logger):
 
         import atexit
 
+        # R3-RR-9: deregister any prior atexit closure from a previous
+        # LogUtil.create() call before registering the new one. Without
+        # this, each invocation appends a fresh closure that, at process
+        # exit, calls .stop() on the stale listener/redirector objects
+        # of earlier invocations — producing noisy "listener not started"
+        # tracebacks and double-join thread warnings in multi-invocation
+        # test runs.
+        global _prior_log_atexit_callback
+        if _prior_log_atexit_callback is not None:
+            try:
+                atexit.unregister(_prior_log_atexit_callback)
+            except Exception:
+                pass
         atexit.register(stop_listener)
+        _prior_log_atexit_callback = stop_listener
 
         root_logger.info(
             f"Non-blocking logging initialized with level '{log_level}'. Log file: {log_file_path}"
@@ -909,14 +1017,39 @@ class ConfigUtil:
     @staticmethod
     @log_errors
     def load_config(config_path: str) -> dict:
-        config = yaml.safe_load(Path(config_path).read_text())
+        # C-057: yaml.safe_load returns None for empty or comment-only
+        # files. Returning None downstream causes AttributeError on
+        # `.get(...)` calls in check_config_integrity / apply_configvalues
+        # — confusing failure shape far from the actual cause. Raise
+        # ConfigException at the source with a clear message instead.
+        raw = Path(config_path).read_text()
+        config = yaml.safe_load(raw)
+        if config is None:
+            raise ConfigException(
+                f"Empty or comment-only config file at {config_path!r}. "
+                f"At minimum, the file must contain `general:`, "
+                f"`networking:`, and `plugins:` sections."
+            )
+        if not isinstance(config, dict):
+            raise ConfigException(
+                f"Config file at {config_path!r} did not parse as a YAML "
+                f"mapping; got {type(config).__name__}. The top-level "
+                f"shape must be a dict with `general:` / `networking:` "
+                f"/ `plugins:` sections."
+            )
         return config
 
     @staticmethod
     @log_errors
     def quickget_config(config_path: str, fallback_value: Any = None) -> dict:
-        config = yaml.safe_load(Path(config_path).read_text())
+        # C-057 applied here too — same None / non-dict guard, but the
+        # fallback path swallows any ConfigException so callers that
+        # asked for a fallback get it instead of a raise.
         try:
+            raw = Path(config_path).read_text()
+            config = yaml.safe_load(raw)
+            if config is None or not isinstance(config, dict):
+                return fallback_value
             ConfigUtil.check_config_integrity(config)
             return config
         except Exception:
@@ -952,7 +1085,6 @@ class ConfigUtil:
         networking = list(yaml_config.get("networking", {}).keys())
         for key in [
             "enabled",
-            "node_ips",
             "port",
             "direct_discoverable",
             "auto_discoverable",
@@ -972,7 +1104,9 @@ class ConfigUtil:
         hostname = general_config.get("hostname")
         if not hostname:  # Covers None and empty string
             hostname = socket.gethostname()
-            plexus.yaml_config["general"]["hostname"] = hostname
+            # W2-H5: setdefault so a yaml_config without a 'general'
+            # section doesn't raise KeyError on the writeback.
+            plexus.yaml_config.setdefault("general", {})["hostname"] = hostname
         plexus.hostname = hostname  # uuid4().hex
         plexus._logger.info(f"Network hostname: {plexus.hostname}")
 
@@ -988,6 +1122,7 @@ class ConfigUtil:
         from .core import (  # local import — avoids circular import at module load
             DEFAULT_PLUGIN_READY_TIMEOUT,
             DEFAULT_PLUGIN_DISABLE_TIMEOUT,
+            DEFAULT_PLUGIN_ENABLE_TIMEOUT,
         )
 
         raw_ready_timeout = general_config.get(
@@ -1008,7 +1143,7 @@ class ConfigUtil:
 
         # Plugin-disable timeout. Default 30.0 seconds; matches
         # close()'s on_disable cap. Wraps user on_disable in
-        # asyncio.wait_for in _disable_plugin / _pop_plugin_under_lock
+        # asyncio.wait_for in _disable_plugin_under_lock / _pop_plugin_under_lock
         # so a misbehaving on_disable can't hang pop_plugin /
         # _reload_plugin / purge_plugins indefinitely. Bad values fall
         # back to default with a warning so a typo can never silently
@@ -1029,22 +1164,54 @@ class ConfigUtil:
             disable_timeout = DEFAULT_PLUGIN_DISABLE_TIMEOUT
         plexus.plugin_disable_timeout = disable_timeout
 
-        # B-073 Session 2 Step 4: ``cleanup_request_interval`` removed
-        # entirely. Done-callback eviction in ``_process_request*`` and
-        # outer-finally pops at all 7 framework Request sites replaced
-        # the polling reap. Config knob no longer has any effect even
-        # if present in user config — a stale ``cleanup_request_interval``
-        # value will be ignored (no warning; it's a fully-removed key,
-        # not a deprecation). Tests using the old override knob updated
-        # in Step 6 of Session 2.
+        # C-017: Plugin-enable timeout. Default 30.0 seconds; same
+        # validation pattern as disable. Wraps user on_enable in
+        # asyncio.wait_for in _enable_plugin_under_lock so a hung
+        # on_enable cannot pin lifecycle_lock.
+        raw_enable_timeout = general_config.get(
+            "plugin_enable_timeout", DEFAULT_PLUGIN_ENABLE_TIMEOUT
+        )
+        try:
+            enable_timeout = float(raw_enable_timeout)
+            if enable_timeout <= 0:
+                raise ValueError("must be > 0")
+        except (TypeError, ValueError):
+            plexus._logger.warning(
+                "Invalid general.plugin_enable_timeout=%r; defaulting to %.1f",
+                raw_enable_timeout,
+                DEFAULT_PLUGIN_ENABLE_TIMEOUT,
+            )
+            enable_timeout = DEFAULT_PLUGIN_ENABLE_TIMEOUT
+        plexus.plugin_enable_timeout = enable_timeout
 
-        networking_config = plexus.yaml_config.get("networking")
+        # W2-H5: tolerate yaml_config without 'networking' section. setdefault
+        # also locks in the empty dict for the writebacks below.
+        networking_config = plexus.yaml_config.setdefault("networking", {})
 
         plexus.networking_enabled = networking_config.get("enabled", False)
         plexus.yaml_config["networking"]["enabled"] = plexus.networking_enabled
         plexus._logger.info(f"Networking enabled: {plexus.networking_enabled}")
 
-        plexus.networking_port = networking_config.get("port", 2510)
+        # R3-SS-5 fix: coerce networking.port to int and validate the TCP
+        # range here. Without this, a YAML config like `port: "2510"` (quoted
+        # string) or `port: 2510.0` (float) reaches asyncio.start_server,
+        # which raises TypeError far from the config-parsing site with no
+        # reference to which key caused the failure.
+        _raw_port = networking_config.get("port", 2510)
+        try:
+            plexus.networking_port = int(_raw_port)
+        except (TypeError, ValueError):
+            plexus._logger.warning(
+                "networking.port=%r could not be coerced to int; falling back to default 2510",
+                _raw_port,
+            )
+            plexus.networking_port = 2510
+        if not (1 <= plexus.networking_port <= 65535):
+            plexus._logger.warning(
+                "networking.port=%d out of valid range (1-65535); falling back to default 2510",
+                plexus.networking_port,
+            )
+            plexus.networking_port = 2510
         plexus.yaml_config["networking"]["port"] = plexus.networking_port
         plexus._logger.info(f"Networking Port: {plexus.networking_port}")
 
@@ -1076,16 +1243,14 @@ class ConfigUtil:
             f"direct_discoverable: {plexus.networking_direct_discoverable}"
         )
 
-        # Security and connection pool configuration
-        plexus.networking_secret = networking_config.get("secret", None)
-        plexus.networking_cert_file = networking_config.get("cert_file", None)
-        plexus.networking_key_file = networking_config.get("key_file", None)
+        # C-029 + C-030: legacy `secret` / `cert_file` / `key_file`
+        # apply_configvalues path removed. The keys are still read
+        # below into the rebuild-trigger snapshot for future-proofing
+        # (some future K-* might re-introduce a key-file path), but
+        # no NetworkManager attribute is populated from them and the
+        # shared-secret deprecation warning is gone — there is no
+        # shared-secret auth anywhere in the framework anymore.
         plexus.networking_pool_size = networking_config.get("pool_size", 5)
-
-        if plexus.networking_secret:
-            plexus._logger.warning(
-                "Using shared secret from config file. Consider using environment variable NETWORKING_SECRET for better security."
-            )
 
         # Heartbeat / lookup / liveness intervals (B-069 fix). Default
         # values come from the DEFAULT_HEARTBEAT_INTERVAL /
@@ -1145,6 +1310,29 @@ class ConfigUtil:
             liveness_timeout = DEFAULT_LIVENESS_TIMEOUT
         plexus.networking_liveness_timeout = liveness_timeout
 
+        # R2-LL-5: optional per-probe heartbeat budget. Absent → default
+        # to ``min(heartbeat_interval, liveness_timeout)`` so the
+        # heartbeat tick never blocks for the full liveness window on
+        # one catatonic peer. Invalid (non-numeric or non-positive)
+        # input warns and falls back to the same min() default.
+        if "probe_timeout" in networking_config:
+            raw_probe = networking_config.get("probe_timeout")
+            try:
+                probe_timeout = float(raw_probe)
+                if probe_timeout <= 0:
+                    raise ValueError("must be > 0")
+            except (TypeError, ValueError):
+                fallback = min(heartbeat_interval, liveness_timeout)
+                plexus._logger.warning(
+                    "Invalid networking.probe_timeout=%r; defaulting to %.1f",
+                    raw_probe,
+                    fallback,
+                )
+                probe_timeout = fallback
+        else:
+            probe_timeout = min(heartbeat_interval, liveness_timeout)
+        plexus.networking_probe_timeout = probe_timeout
+
 
 class Plugin(ABC):
     """Base class for all plugins."""
@@ -1194,7 +1382,7 @@ class Plugin(ABC):
         self.ready.set()
         # self._lifecycle_ready: framework-controlled. Set by Plexus
         # after on_enable returns successfully; cleared at the start of
-        # _disable_plugin (and on rollback when on_enable raises). Plugin
+        # _disable_plugin_under_lock (and on rollback when on_enable raises). Plugin
         # authors should NOT touch this directly — use self.ready.
         self._lifecycle_ready: asyncio.Event = asyncio.Event()
 
@@ -1259,6 +1447,7 @@ class Plugin(ABC):
             )
         super().__setattr__(name, value)
 
+    @log_errors
     def set_logger_level(
         self,
         name: str,
@@ -1279,6 +1468,7 @@ class Plugin(ABC):
             plugin_uuid=self.plugin_uuid,
         )
 
+    @log_errors
     def clear_logger_level(
         self,
         name: str,
@@ -1295,6 +1485,7 @@ class Plugin(ABC):
             plugin_uuid=self.plugin_uuid,
         )
 
+    @log_errors
     def list_logger_levels(self) -> dict:
         """Snapshot of all configured per-logger thresholds (config + plugin sources)."""
         return self._plexus.list_logger_levels()
@@ -1305,7 +1496,7 @@ class Plugin(ABC):
         plugin: str,
         method: str,
         args: Union[tuple, dict, None] = None,
-        plugin_uuid: Optional[str] = "",
+        plugin_uuid: Optional[str] = None,
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -1331,7 +1522,13 @@ class Plugin(ABC):
             timeout: Optional timeout in seconds.
 
         Returns:
-            The result from the target method or None if an error occurs.
+            The result from the target method.
+
+        Raises:
+            RequestException: propagated from the underlying request when the
+                target method errors. ``@async_log_errors`` logs and re-raises;
+                callers must wrap this call in their own try/except if they
+                need to recover.
         """
         return await self._plexus.execute(
             plugin,
@@ -1340,9 +1537,9 @@ class Plugin(ABC):
             plugin_uuid,
             hosts,
             blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
+            author=author if author is not None else self.plugin_name,
+            author_id=author_id if author_id is not None else self.plugin_uuid,
+            timeout=timeout,
         )
 
     @log_errors
@@ -1351,7 +1548,7 @@ class Plugin(ABC):
         plugin: str,
         method: str,
         args: Union[tuple, dict, None] = None,
-        plugin_uuid: Optional[str] = "",
+        plugin_uuid: Optional[str] = None,
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -1377,7 +1574,13 @@ class Plugin(ABC):
             timeout: Optional timeout in seconds.
 
         Returns:
-            The result from the target method or None if an error occurs.
+            The result from the target method.
+
+        Raises:
+            RequestException: propagated from the underlying request when the
+                target method errors. ``@log_errors`` logs and re-raises;
+                callers must wrap this call in their own try/except if they
+                need to recover.
         """
         # PR3 Stage A: retrofit pre-start guard (Q1 closes B-038).
         # Calling execute_sync from on_load (before the framework's
@@ -1391,18 +1594,18 @@ class Plugin(ABC):
             plugin_uuid,
             hosts,
             blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
+            author=author if author is not None else self.plugin_name,
+            author_id=author_id if author_id is not None else self.plugin_uuid,
+            timeout=timeout,
         )
 
-    # @async_log_errors
+    @async_gen_log_errors
     async def execute_stream(
         self,
         plugin: str,
         method: str,
         args: Union[tuple, dict, None] = None,
-        plugin_uuid: Optional[str] = "",
+        plugin_uuid: Optional[str] = None,
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -1437,9 +1640,9 @@ class Plugin(ABC):
             plugin_uuid,
             hosts,
             blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
+            author=author if author is not None else self.plugin_name,
+            author_id=author_id if author_id is not None else self.plugin_uuid,
+            timeout=timeout,
         ):
             yield i
 
@@ -1449,7 +1652,7 @@ class Plugin(ABC):
         plugin: str,
         method: str,
         args: Union[tuple, dict, None] = None,
-        plugin_uuid: Optional[str] = "",
+        plugin_uuid: Optional[str] = None,
         hosts: Union[
             str, list, None
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -1496,6 +1699,7 @@ class Plugin(ABC):
             timeout,
         )
 
+    @gen_log_errors
     def _execute_stream_sync_inner(
         self,
         plugin: str,
@@ -1517,18 +1721,19 @@ class Plugin(ABC):
             plugin_uuid,
             hosts,
             blocked_hosts,
-            self.plugin_name,
-            self.plugin_uuid,
-            timeout,
+            author=author if author is not None else self.plugin_name,
+            author_id=author_id if author_id is not None else self.plugin_uuid,
+            timeout=timeout,
         ):
             yield i
 
     # ── Notifier: subscription management ─────────────────────────────
 
+    @async_log_errors
     async def subscribe(
         self,
         topic: str,
-        target_access_name: Optional[str] = None,
+        target_access_name: str,
         *,
         target_plugin: Optional[str] = None,
         target_plugin_uuid: Optional[str] = None,
@@ -1543,11 +1748,24 @@ class Plugin(ABC):
         endpoint on this plugin (or on ``target_plugin`` for cross-plugin
         orchestrator subs). The framework dispatches matching events through
         ``execute()`` to that endpoint. Returns ``sub_uuid``.
+
+        Raises:
+            TypeError: when ``target_access_name`` is not a string.
+            ValueError: when ``target_access_name`` is empty or
+                whitespace-only. R4-XX-4: harmonised with
+                ``TopicRegistry.subscribe`` and ``Plexus.subscribe_event`` so
+                all three validation layers agree on the exception type.
         """
-        if not isinstance(target_access_name, str) or not target_access_name:
+        if not isinstance(target_access_name, str):
             raise TypeError(
-                "subscribe(): target_access_name must be a non-empty string "
-                "naming a declared endpoint."
+                "subscribe(): target_access_name must be a str; got "
+                f"{type(target_access_name).__name__}={target_access_name!r}"
+            )
+        if not target_access_name.strip():
+            raise ValueError(
+                "subscribe(): target_access_name must be a non-empty / "
+                f"non-whitespace string naming a declared endpoint; got "
+                f"{target_access_name!r}"
             )
         return await self._plexus.subscribe_event(
             topic,
@@ -1562,6 +1780,7 @@ class Plugin(ABC):
             blocked_authors=blocked_authors,
         )
 
+    @async_log_errors
     async def unsubscribe(self, subscription_id: str) -> bool:
         """Remove a subscription by its sub_uuid."""
         return await self._plexus.unsubscribe_event(subscription_id)
@@ -1582,6 +1801,16 @@ class Plugin(ABC):
         subclasses are logged + swallowed (``BaseException`` propagates),
         idempotent (re-registering same ``(topic, callback)`` is a no-op).
         """
+        # R2-GG-4: reject async callbacks at registration. The framework
+        # dispatches observers synchronously; an async-def callback would
+        # produce a coroutine that is silently dropped. Mirror the
+        # iscoroutinefunction guard inside Plexus.internal_observe so
+        # the failure is caught at the Plugin-facing wrapper too.
+        if inspect.iscoroutinefunction(callback):
+            raise TypeError(
+                "internal_observe requires a sync callback; got async def. "
+                "Use subscribe_event for async handlers."
+            )
         self._plexus.internal_observe(self.plugin_uuid, topic, callback)
 
     def internal_unobserve(self, topic: str, callback) -> bool:
@@ -1615,7 +1844,25 @@ class Plugin(ABC):
         hosts: Union[str, list, None] = None,
         blocked_hosts: Union[str, list, None] = None,
     ) -> int:
-        """Publish an event (1:N fire-and-forget) per PR3 LOCKED L."""
+        """Publish an event (1:N fire-and-forget) per PR3 LOCKED L.
+
+        Return value is the count of subscriptions SCHEDULED for fan-out,
+        NOT a guarantee of delivery — handlers may still raise, peers may
+        be unreachable, etc. Errors in individual subscribers are logged
+        and swallowed; never propagate to the caller (C-082 doc fix).
+
+        NOTE: This refers to subscriber-side fan-out errors (which are
+        logged and swallowed). Pre-flight validation errors (framework
+        not started, invalid topic, etc.) DO propagate as
+        RequestException — those are caller-side bugs, not subscriber
+        failures.
+        """
+        # C-084 / R4-XX-6: mirror the sync variant's pre-start guard so
+        # calling before framework start raises an explicit
+        # RequestException instead of crashing deeper with a less
+        # helpful AttributeError. ``_check_framework_started`` raises
+        # ``RequestException`` (see utils.py:_check_framework_started).
+        self._check_framework_started()
         return await self._plexus.publish_event(
             self,
             event_id,
@@ -1656,6 +1903,8 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ) -> Any:
         """Request an event (1:1 ask) per PR3 LOCKED L."""
+        # C-084: mirror the sync variant's pre-start guard.
+        self._check_framework_started()
         return await self._plexus.request_event(
             self,
             event_id,
@@ -1688,6 +1937,7 @@ class Plugin(ABC):
             timeout=timeout,
         )
 
+    @async_gen_log_errors
     async def request_event_stream(
         self,
         event_id: str,
@@ -1698,6 +1948,12 @@ class Plugin(ABC):
         timeout: Optional[float] = None,
     ):
         """Streaming variant of request_event."""
+        # C-084 + C-085 / R4-XX-6: pre-start guard at call-time, not at
+        # first ``__anext__`` — gives the caller an explicit
+        # RequestException immediately rather than waiting for the
+        # first iteration. ``_check_framework_started`` raises
+        # ``RequestException`` (see utils.py:_check_framework_started).
+        self._check_framework_started()
         async for chunk in self._plexus.request_event_stream(
             self,
             event_id,
@@ -1730,6 +1986,7 @@ class Plugin(ABC):
             timeout,
         )
 
+    @gen_log_errors
     def _request_event_stream_sync_inner(
         self,
         event_id: str,
@@ -1769,6 +2026,8 @@ class Plugin(ABC):
         handler= path here — sync callers running on a worker thread
         should use the declarative target_access_name shape."""
         self._check_framework_started()
+        # C-004: same-thread deadlock guard.
+        self._plexus._check_not_loop_thread("subscribe_sync")
         future = asyncio.run_coroutine_threadsafe(
             self._plexus.subscribe_event(
                 topic,
@@ -1784,17 +2043,32 @@ class Plugin(ABC):
             ),
             self._plexus.main_event_loop,
         )
-        return future.result()
+        # R2-FF-1: bound the worker-thread wait so a stalled event loop
+        # cannot block the caller forever. Control-plane subscribe op
+        # has no caller-supplied timeout; use a generous default.
+        # TODO: thread an explicit caller timeout through if needed.
+        try:
+            return future.result(timeout=60.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     @log_errors
     def unsubscribe_sync(self, sub_uuid: str) -> bool:
         """Sync variant of unsubscribe (C16)."""
         self._check_framework_started()
+        # C-004: same-thread deadlock guard.
+        self._plexus._check_not_loop_thread("unsubscribe_sync")
         future = asyncio.run_coroutine_threadsafe(
             self._plexus.unsubscribe_event(sub_uuid),
             self._plexus.main_event_loop,
         )
-        return future.result()
+        # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
+        try:
+            return future.result(timeout=60.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     @async_log_errors
     async def set_subscription_enabled(self, sub_uuid: str, enabled: bool) -> bool:
@@ -1813,11 +2087,18 @@ class Plugin(ABC):
     def set_subscription_enabled_sync(self, sub_uuid: str, enabled: bool) -> bool:
         """Sync variant of ``set_subscription_enabled``."""
         self._check_framework_started()
+        # C-004: same-thread deadlock guard.
+        self._plexus._check_not_loop_thread("set_subscription_enabled_sync")
         future = asyncio.run_coroutine_threadsafe(
             self._plexus.set_subscription_enabled(sub_uuid, enabled),
             self._plexus.main_event_loop,
         )
-        return future.result()
+        # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
+        try:
+            return future.result(timeout=60.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     @async_log_errors
     async def set_event_enabled(self, event_id: str, enabled: bool) -> bool:
@@ -1840,29 +2121,36 @@ class Plugin(ABC):
     def set_event_enabled_sync(self, event_id: str, enabled: bool) -> bool:
         """Sync variant of ``set_event_enabled``."""
         self._check_framework_started()
+        # C-004: same-thread deadlock guard.
+        self._plexus._check_not_loop_thread("set_event_enabled_sync")
         future = asyncio.run_coroutine_threadsafe(
             self._plexus.set_event_enabled(
                 self.plugin_name, event_id, enabled
             ),
             self._plexus.main_event_loop,
         )
-        return future.result()
+        # R2-FF-1: bound the worker-thread wait — see subscribe_sync.
+        try:
+            return future.result(timeout=60.0)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     @log_errors
     @abstractmethod
-    def on_load(self):
+    def on_load(self, *args, **kwargs):
         """Override this method to implement functionality that needs to happen while the plugin gets loaded."""
         raise NotImplementedError
 
     @async_log_errors
     @abstractmethod
-    async def on_enable(self):
+    async def on_enable(self, *args, **kwargs):
         """Override this method to implement plugin starting functionality. All loops and so on should be started here."""
         raise NotImplementedError
 
     @async_log_errors
     @abstractmethod
-    async def on_disable(self):
+    async def on_disable(self, *args, **kwargs):
         """Override this method to implement plugin disabling functionality. All loops and so on should be stopped here."""
         raise NotImplementedError
 
@@ -1931,8 +2219,8 @@ class Request:
         author_host: str,
         plugin: str,
         method: str,
-        args: tuple = None,
-        plugin_uuid: Optional[str] = "",
+        args: Optional[tuple] = None,
+        plugin_uuid: Optional[str] = None,
         target_hosts: Union[
             str, list
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -1941,7 +2229,7 @@ class Request:
         ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
-        timeout: Union[float, tuple] = None,
+        timeout: Optional[Union[float, tuple]] = None,
         request_id: str = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
         # PR3 Stage A: notifier-rework fields. Defaults preserve execute path.
@@ -1961,10 +2249,6 @@ class Request:
         self.target_hosts = target_hosts
         self.blocked_hosts = blocked_hosts
         self.args = args
-        # B-073 Session 2 Step 4: ``self.collected`` field removed —
-        # was read only by ``cleanup_requests`` polling reap (killed
-        # in this step). Done-callback eviction at all 7 framework
-        # Request sites pops the entry from ``plx.requests`` directly.
         self.timeout = False
         self.ready = False
         self.error = False
@@ -1984,57 +2268,87 @@ class Request:
         self.timestamp = timestamp if timestamp is not None else time.time()
         self.requester_id = requester_id
 
+        # R2-LL-1: deadline math uses a monotonic clock (NTP-safe), while
+        # ``created_at`` stays on the wall clock for event-payload
+        # timestamps that callers compare across machines. ``created_at``
+        # is aliased to ``self.timestamp`` (already wall-clock above) so
+        # the wall-clock write is single-sourced and the deadline-math
+        # never references ``time.time()`` against ``created_at``.
+        # R2-LL-2: the legacy tuple form carried the sender's wall-clock
+        # ``created_at`` over the wire — peer clock skew directly corrupted
+        # the remote deadline. We still accept the tuple shape for wire
+        # backwards-compat with older peers but IGNORE its second element;
+        # the receiver always anchors the deadline to its own monotonic
+        # clock at construction time.
         if type(timeout) == tuple:
             self.timeout_duration = timeout[0]
-            self.created_at = timeout[1]
         else:
-            self.created_at = time.time()
             self.timeout_duration = timeout
+        self.created_at = self.timestamp
+        self.created_at_mono = time.monotonic()
 
         self.event_loop = event_loop or asyncio.get_running_loop()
         self._future = self.event_loop.create_future()
 
     async def set_result(self, result: Any, error: bool = False) -> None:
-        """Set the result of the request."""
-        if not self._future.done():
+        """Set the result of the request.
+
+        W2-G2 guard: also short-circuit when ``self.ready`` is True.
+        ``wait_for_result_async``'s timeout paths set ``self.ready = True``
+        WITHOUT touching ``self._future``: the ``remaining_time <= 0`` branch
+        returns before the wait_for, and the ``asyncio.shield(self._future)``
+        wrap means a ``wait_for`` timeout cancels only the shield, leaving
+        ``_future`` unresolved. The bare ``_future.done()`` guard alone would
+        therefore let a slow producer's late ``set_result`` overwrite the
+        timeout-result + flags. ``ready`` is the canonical "result
+        decided" signal — once True the bookkeeping fields are frozen.
+        """
+        if not self._future.done() and not self.ready:
             self.error = error
             self.result = result
             self._future.set_result((result, error, False))
             self.ready = True
             self.finished_at = time.time()
 
-    # B-073 Session 2 Step 4: ``Request.set_collected`` removed. Pre-S2
-    # this set ``self.collected = True`` so the now-killed
-    # ``cleanup_requests`` polling reap could find the entry. After
-    # Steps 2+3 done-callback eviction at all 7 framework Request sites
-    # replaced the polling reap; the flag had no remaining consumer.
-    # External callers that still reference ``request.set_collected()``
-    # will hit AttributeError — this is intentional, surfaces the
-    # Step-3-required migration. ``GeneratorRequest.set_collected``
-    # KEPT — distinct B-002 producer-cancel + EndOfQueue logic.
-
     def get_result_sync(self) -> Any:
         """Get the result synchronously."""
         future = asyncio.run_coroutine_threadsafe(
             self.wait_for_result_async(), self.event_loop
         )
+        # R2-FF-1: bound the worker-thread wait so a stalled event loop
+        # cannot block the caller forever. Derive from this Request's
+        # own timeout (+ 5s grace) or a generous default.
+        timeout_duration = getattr(self, "timeout_duration", None)
+        wait_timeout = (
+            (timeout_duration + 5.0)
+            if isinstance(timeout_duration, (int, float))
+            else 60.0
+        )
         try:
-            result, error, timed_out = future.result()
-            if error:
-                raise Exception(f"Request failed: {self.result}")
-            return self.result
-        except Exception as e:
-            raise e
+            result, error, timed_out = future.result(timeout=wait_timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
+        # R2-FF-6: use the local `result` from the destructured tuple
+        # rather than self.result. self.result can be mutated by a
+        # concurrent set_result() call between the future.result() unpack
+        # and the return — a torn-read window. The local is the value
+        # this caller actually waited for.
+        if error:
+            raise RequestException(f"Request failed: {result}")
+        return result
 
     async def wait_for_result_async(self) -> Tuple[Any, bool, bool]:
         """Wait for the result asynchronously."""
         try:
-            if self.result is not None:
+            if self.ready:
                 return self.result, self.error, self.timeout
 
             # Check if we need to apply a timeout
             if self.timeout_duration:
-                remaining_time = self.timeout_duration - (time.time() - self.created_at)
+                # R2-LL-1: deadline math uses ``created_at_mono`` (monotonic)
+                # so NTP step adjustments cannot warp the remaining budget.
+                remaining_time = self.timeout_duration - (time.monotonic() - self.created_at_mono)
                 if remaining_time <= 0:
                     # Already timed out
                     self.result = f"Request {self.id} timed out"
@@ -2046,7 +2360,7 @@ class Request:
                 # Wait with timeout
                 try:
                     result, error, timed_out = await asyncio.wait_for(
-                        self._future, timeout=remaining_time
+                        asyncio.shield(self._future), timeout=remaining_time
                     )
                     return result, error, timed_out
                 except asyncio.TimeoutError:
@@ -2071,8 +2385,8 @@ class GeneratorRequest:
         author_host: str,
         plugin: str,
         method: str,
-        args: tuple = None,
-        plugin_uuid: Optional[str] = "",
+        args: Optional[tuple] = None,
+        plugin_uuid: Optional[str] = None,
         target_hosts: Union[
             str, list
         ] = "any",  # "any", "remote", "local", or list of allowed hosts
@@ -2081,7 +2395,7 @@ class GeneratorRequest:
         ] = None,  # blocked hosts (str keyword, list, or None)
         author: str = "system",
         author_id: str = "system",
-        timeout: Union[float, tuple] = None,
+        timeout: Optional[Union[float, tuple]] = None,
         request_id: str = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
         # PR3 Stage A: notifier-rework fields. Defaults preserve execute path.
@@ -2117,12 +2431,18 @@ class GeneratorRequest:
 
         self.queue = asyncio.Queue()
 
+        # R2-LL-1 / R2-LL-2: see ``Request.__init__`` for the rationale.
+        # ``created_at`` aliases ``self.timestamp`` (wall-clock, payload-
+        # friendly); deadline math uses ``created_at_mono`` so NTP steps
+        # cannot warp the budget. The tuple form is still accepted for
+        # wire backwards-compat with older peers but its sender-side
+        # ``created_at`` is discarded.
         if type(timeout) == tuple:
             self.timeout_duration = timeout[0]
-            self.created_at = timeout[1]
         else:
-            self.created_at = time.time()
             self.timeout_duration = timeout
+        self.created_at = self.timestamp
+        self.created_at_mono = time.monotonic()
 
         self.event_loop = event_loop or asyncio.get_running_loop()
         self._future = self.event_loop.create_future()
@@ -2134,7 +2454,17 @@ class GeneratorRequest:
     async def set_result(
         self, result: Any, error: bool = False, timeout: bool = False
     ) -> None:
-        """Set the result of the request."""
+        """Set the result of the request.
+
+        Note: unlike ``Request.set_result``, this guard is bare
+        ``_future.done()`` only — NO ``self.ready`` check. The W2-G2 race
+        that Request.set_result guards against (timeout path setting
+        ``ready=True`` without resolving ``_future``) cannot occur here:
+        ``get_queue_stream``'s timeout branches set ``self.ready = True``
+        and immediately call ``set_result`` themselves, which resolves
+        ``_future`` — so any later framework-side ``set_result`` is
+        already caught by the ``_future.done()`` guard.
+        """
         if not self._future.done():
             self.error = error
             self.result = result if result is not None else EndOfQueue()
@@ -2156,27 +2486,66 @@ class GeneratorRequest:
         defensive — covers a hypothetical late consumer that attaches
         after collect (in practice none exist; the queue is unbounded so
         put_nowait cannot raise).
+
+        W2-G5 fix: when set_result fired first (self.ready is True), the
+        EndOfQueue was already enqueued — skip the second put to avoid
+        double-sentinel confusion for late consumers. The producer-cancel
+        path still runs unconditionally so a producer that survived
+        set_result (set_result does NOT touch _producer_task) is still
+        torn down here.
         """
         self.collected = True
         t = self._producer_task
         if t is not None and not t.done():
             t.cancel()
-            self.queue.put_nowait((EndOfQueue(), False, False))
+            if not self.ready:
+                self.queue.put_nowait((EndOfQueue(), False, False))
 
     def get_queue_stream_sync(self):
         """Get the result stream synchronously."""
 
         iterator = self.get_queue_stream()
-        while True:
-            # future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)
-            future = asyncio.run_coroutine_threadsafe(
-                iterator.__anext__(), self.event_loop
+        # R2-EE-2 / R2-FF-3: when the caller breaks out of the for-loop
+        # early (or raises), the async generator's try/finally and any
+        # async-with cleanup inside get_queue_stream never runs unless
+        # we explicitly close it from the finally below. Mirror the
+        # bounded-close pattern from Plexus.request_event_stream_sync
+        # (5s budget; on expiry cancel the orphan task so it doesn't
+        # leak on the loop).
+        try:
+            while True:
+                # future = asyncio.run_coroutine_threadsafe(anext(iterator), self.event_loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    iterator.__anext__(), self.event_loop
+                )
+                # R4-YY-4: mirror the aclose() bounded-wait pattern below.
+                # Without a timeout a stalled handler blocks the caller's
+                # worker thread forever. Derive the timeout from the
+                # request's own timeout_duration when set, else a 60s
+                # default cap so a runaway handler can't deadlock.
+                deadline_timeout = (
+                    self.timeout_duration + 5.0
+                    if isinstance(self.timeout_duration, (int, float))
+                    else 60.0
+                )
+                try:
+                    result = future.result(timeout=deadline_timeout)
+                    yield result
+                except StopAsyncIteration:
+                    break
+                except concurrent.futures.TimeoutError:
+                    future.cancel()
+                    raise
+        finally:
+            close_fut = asyncio.run_coroutine_threadsafe(
+                iterator.aclose(), self.event_loop
             )
             try:
-                result = future.result()
-                yield result
-            except StopAsyncIteration:
-                break
+                close_fut.result(timeout=5.0)
+            except concurrent.futures.TimeoutError:
+                close_fut.cancel()
+            except Exception:
+                pass
 
     async def get_queue_stream(self):
         """get the result stream asynchronously"""
@@ -2186,17 +2555,26 @@ class GeneratorRequest:
 
             while True:
                 if self.timeout_duration:
+                    # R2-LL-1: deadline math uses ``created_at_mono``
+                    # (monotonic) so NTP step adjustments cannot warp the
+                    # remaining budget mid-stream.
                     remaining_time = self.timeout_duration - (
-                        time.time() - self.created_at
+                        time.monotonic() - self.created_at_mono
                     )
                     if remaining_time <= 0:
-                        # Already timed out
+                        # Already timed out — mirror the timeout-except
+                        # branch below (B-045): surface as RequestException so
+                        # callers `except RequestException` catch the timeout.
+                        # W5-R6: no exception in scope here (deadline was
+                        # computed, not raised), so omit the ``from`` clause
+                        # entirely — Python defaults ``__cause__`` to None
+                        # implicitly without an explicit suppression.
                         self.result = f"Request {self.id} timed out"
                         self.error = True
                         self.ready = True
                         self.timeout = True
                         await self.set_result(self.result, True, True)
-                        break
+                        raise RequestException(self.result)
 
                 try:
                     if self.timeout_duration:
@@ -2208,7 +2586,7 @@ class GeneratorRequest:
                         item, error, timed_out = await self.queue.get()
                         # print(data)
 
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as te:
                     self.result = f"Request {self.id} timed out"
                     self.error = True
                     self.ready = True
@@ -2217,7 +2595,11 @@ class GeneratorRequest:
                     # B-045 fix: surface as RequestException, symmetric with
                     # execute(). Without this, callers `except RequestException`
                     # miss timeouts and get a stray asyncio.TimeoutError.
-                    raise RequestException(self.result) from None
+                    # W5-R6: chain via ``from te`` to preserve the
+                    # ``TimeoutError`` as ``__cause__`` so Sentry / structlog /
+                    # debuggers can inspect the root cause without changing
+                    # the caller-side catch contract.
+                    raise RequestException(self.result) from te
 
                 try:
                     if error:
@@ -2243,7 +2625,14 @@ class GeneratorRequest:
             raise e
 
         finally:
-            await self.set_result(None, self.error, self.timeout)
+            # R2-AA-8: guard with _future.done() so a second cancel
+            # arriving while we are awaiting set_result does not skip
+            # the EndOfQueue sentinel put. If the future is already
+            # resolved (by an earlier set_result call in this method
+            # or by set_collected), there is nothing for this final
+            # cleanup to do — and the queue already has its terminator.
+            if not self._future.done():
+                await self.set_result(None, self.error, self.timeout)
 
 
 class EndOfQueue:

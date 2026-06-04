@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional  # noqa: E402
 from plexus.utils import Plugin  # noqa: E402
 from plexus.decorators import async_log_errors, log_errors  # noqa: E402
 from plexus.exceptions import RequestException  # noqa: E402
+from plexus.plugin_state import Phase, State  # noqa: E402  (C-152)
 
 from _test_helpers import CaseRecorder  # noqa: E402
 
@@ -96,6 +97,7 @@ class TestLifecycleSuite(Plugin):
         await self._basic_args_overrides_skip(rec, kw)
         await self._basic_logger_levels_skip(rec, kw)
         await self._basic_async_reload_skip(rec, kw)
+        await self._state_machine_coverage(rec, kw)  # C-152
         # B-073 Session 2 Step 5: B-006 case deleted (tested
         # _running_loop_task which was killed in Step 4). Done-callback
         # eviction removes the entire failure mode the case guarded
@@ -660,7 +662,7 @@ class TestLifecycleSuite(Plugin):
             victim_obj = self._plexus.plugins[VICTIM]
             self._lifecycle_b037_fired = False
 
-            sub_id = await self._plexus.subscribe(
+            sub_id = await self._plexus.subscribe_event(
                 "lifecycle/event_during_pop",
                 victim_obj.plugin_name,
                 victim_obj.plugin_uuid,
@@ -684,7 +686,7 @@ class TestLifecycleSuite(Plugin):
                     )
             finally:
                 try:
-                    await self._plexus.unsubscribe(sub_id)
+                    await self._plexus.unsubscribe_event(sub_id)
                 except Exception:
                     pass
                 entry = self._find_yaml_entry(VICTIM)
@@ -1142,6 +1144,184 @@ class TestLifecycleSuite(Plugin):
             body_self_call_skips_gate,
             tags=("stage_o", "regression_guard"),
             hard_timeout_s=10.0,
+            **kw,
+        )
+
+    # ====================================================================
+    # C-152: state-machine coverage. Previously the suite had zero
+    # references to plugin_states / last_errors / FAILED_LOAD / State,
+    # leaving the public state-machine surface untested.  These cases
+    # exercise the observable API: dict membership, state transitions,
+    # error-record population, and enum visibility.
+    # ====================================================================
+
+    async def _state_machine_coverage(self, rec: CaseRecorder, kw: Dict) -> None:
+        async def body_plugin_states_entry_exists(c):
+            await self._ensure_victim_clean()
+            ps = self._plexus.plugin_states.get(VICTIM)
+            if ps is None:
+                raise AssertionError(
+                    f"plugin_states has no entry for {VICTIM!r}"
+                )
+            c.expect(ps.name, VICTIM)
+            assert isinstance(ps.state, State), (
+                f"PluginState.state is not a State enum value: "
+                f"{type(ps.state).__name__}"
+            )
+            assert ps.instance is self._plexus.plugins[VICTIM], (
+                "PluginState.instance not bound to the runtime plugin"
+            )
+
+        async def body_enabled_state_value(c):
+            await self._ensure_victim_clean()
+            ps = self._plexus.plugin_states[VICTIM]
+            if ps.state is not State.ENABLED:
+                raise AssertionError(
+                    f"victim post-_ensure_victim_clean expected "
+                    f"State.ENABLED; got {ps.state}"
+                )
+
+        async def body_disable_transitions_to_inactive(c):
+            await self._ensure_victim_clean()
+            await self._plexus.disable_plugin(VICTIM)
+            try:
+                ps = self._plexus.plugin_states[VICTIM]
+                if ps.state is not State.INACTIVE:
+                    raise AssertionError(
+                        f"after disable, expected State.INACTIVE; "
+                        f"got {ps.state}"
+                    )
+            finally:
+                await self._plexus.enable_plugin(VICTIM)
+
+        async def body_on_enable_raise_records_phase_enable_error(c):
+            await self._ensure_victim_clean()
+            victim = self._plexus.plugins[VICTIM]
+            await self._plexus.disable_plugin(VICTIM)
+            victim._on_enable_raises_after_setup = True
+            try:
+                try:
+                    await self._plexus.enable_plugin(VICTIM)
+                except Exception:
+                    pass  # expected
+                ps = self._plexus.plugin_states[VICTIM]
+                if ps.state is not State.INACTIVE:
+                    raise AssertionError(
+                        f"after on_enable raise, expected rollback to "
+                        f"State.INACTIVE; got {ps.state}"
+                    )
+                err = ps.last_errors.get(Phase.ENABLE)
+                if err is None:
+                    raise AssertionError(
+                        "last_errors[Phase.ENABLE] not populated after "
+                        "on_enable raised"
+                    )
+                # C-146: ErrorRecord no longer retains the live
+                # BaseException — it stores type name + repr + tb
+                # string. Verify the shape and that the type name is
+                # non-empty.
+                if not isinstance(err.exception_type, str) or not err.exception_type:
+                    raise AssertionError(
+                        f"ErrorRecord.exception_type is not a non-empty str: "
+                        f"{err.exception_type!r}"
+                    )
+                if not isinstance(err.exception_repr, str) or not err.exception_repr:
+                    raise AssertionError(
+                        f"ErrorRecord.exception_repr is not a non-empty str: "
+                        f"{err.exception_repr!r}"
+                    )
+                if not err.traceback:
+                    raise AssertionError(
+                        "ErrorRecord.traceback is empty"
+                    )
+            finally:
+                # Use _ensure_victim_clean (rather than a bare
+                # enable_plugin) so cleanup failures don't silently
+                # leave subsequent cases running against a victim
+                # stuck in INACTIVE with stale fixture flags.
+                victim._on_enable_raises_after_setup = False
+                await self._ensure_victim_clean()
+
+        async def body_failed_load_state_visible(c):
+            ps = self._plexus.plugin_states.get(BROKEN_VERSION)
+            if ps is None:
+                c.skip(
+                    f"{BROKEN_VERSION} not present in this harness — "
+                    f"FAILED_LOAD coverage scoped out"
+                )
+                return
+            if ps.state not in (State.FAILED_LOAD, State.UNLOADED):
+                raise AssertionError(
+                    f"broken plugin {BROKEN_VERSION!r} state is "
+                    f"{ps.state} — expected FAILED_LOAD or UNLOADED"
+                )
+            if ps.state is State.FAILED_LOAD:
+                err = ps.last_errors.get(Phase.LOAD)
+                if err is None:
+                    raise AssertionError(
+                        "FAILED_LOAD without Phase.LOAD error record"
+                    )
+
+        async def body_state_enum_values_complete(c):
+            expected = {
+                "UNLOADED", "INACTIVE", "ENABLING", "ENABLED",
+                "DISABLING", "FAILED_LOAD",
+            }
+            actual = {s.name for s in State}
+            c.expect(actual, expected)
+
+        async def body_phase_enum_values_complete(c):
+            expected = {"LOAD", "ENABLE", "DISABLE"}
+            actual = {p.name for p in Phase}
+            c.expect(actual, expected)
+
+        await rec.run_case(
+            "lifecycle.state_machine.plugin_states_entry_exists",
+            body_plugin_states_entry_exists,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.enabled_state_value",
+            body_enabled_state_value,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.disable_transitions_to_inactive",
+            body_disable_transitions_to_inactive,
+            tags=("basic", "state_machine"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.on_enable_raise_records_phase_enable_error",
+            body_on_enable_raise_records_phase_enable_error,
+            tags=("basic", "state_machine", "last_errors"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.failed_load_state_visible",
+            body_failed_load_state_visible,
+            tags=("basic", "state_machine", "FAILED_LOAD"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.state_enum_values_complete",
+            body_state_enum_values_complete,
+            tags=("basic", "state_machine", "regression_guard"),
+            bug_ids=("C-152",),
+            **kw,
+        )
+        await rec.run_case(
+            "lifecycle.state_machine.phase_enum_values_complete",
+            body_phase_enum_values_complete,
+            tags=("basic", "state_machine", "regression_guard"),
+            bug_ids=("C-152",),
             **kw,
         )
 

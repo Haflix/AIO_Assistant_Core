@@ -1,176 +1,40 @@
-# Example configuration for AIO Assistant Core.
+# Example configuration for Plexus.
 # Copy this file to config.yml and edit it to match your local setup.
 # config.yml is gitignored — your local edits stay private.
 
 plugins:
-  - name: PluginA
-    enabled: false
-    path: ./plugins_test/pluginA_v1  # Explicit path
-
-  - name: PluginC
-    enabled: false
-
-  - name: PluginB
-    enabled: false      # No path - auto-resolve to plugin_package/PluginB
-
-  - name: NetTest
-    enabled: false
-
-  - name: InteropTarget
-    enabled: false
-    path: ./plugins_test/InteropTarget
-
-  - name: InteropCaller
-    enabled: false
-    path: ./plugins_test/InteropCaller
-
-  # ── Test framework (Phase 1 — see plugins_test/test_suite_plan.md) ──
-  - name: TestRunner
-    enabled: true                         # default ON so REPL/CLI can call run_all
-    path: ./plugins_test/TestRunner
-
-  - name: TestExecuteSuite
-    enabled: false
-    path: ./plugins_test/TestExecuteSuite
-
-  - name: TestExecuteTarget
-    enabled: false
-    path: ./plugins_test/TestExecuteTarget
-
-  - name: TestExecuteTarget2              # multi-instance: same path, different name
-    enabled: false
-    path: ./plugins_test/TestExecuteTarget
-
-  - name: TestStreamSuite
-    enabled: false
-    path: ./plugins_test/TestStreamSuite
-
-  - name: TestStreamTarget
-    enabled: false
-    path: ./plugins_test/TestStreamTarget
-
-  - name: TestEventSuite
-    enabled: false
-    path: ./plugins_test/TestEventSuite
-
-  - name: TestLifecycleSuite
-    enabled: false
-    path: ./plugins_test/TestLifecycleSuite
-
-  - name: TestLifecycleVictim
-    enabled: false
-    path: ./plugins_test/TestLifecycleVictim
-
-  - name: TestLifecycleVictim2          # for B-008 race; same path
-    enabled: false
-    path: ./plugins_test/TestLifecycleVictim
-
-  - name: TestLifecycleBrokenVersion    # ORDER MATTERS for B-007
-    enabled: false
-    path: ./plugins_test/TestLifecycleBrokenVersion
-
-  - name: TestLifecycleSentinel         # MUST be after BrokenVersion
-    enabled: false
-    path: ./plugins_test/TestLifecycleSentinel
-
-  - name: TestRemoteSuite
-    enabled: false
-    path: ./plugins_test/TestRemoteSuite
-
-  - name: TestRemoteTarget              # loaded by the Phase 5 subprocess only
-    enabled: false
-    path: ./plugins_test/TestRemoteTarget
-
-  - name: TestRemoteVictim              # loaded by the Phase 5 subprocess only
-    enabled: false
-    path: ./plugins_test/TestRemoteVictim
-
-  - name: TUI
+  # Minimal example: a plugin with an explicit path.
+  - name: MyPlugin
     enabled: true
-    path: ./plugins/PlexusTUI
+    path: ./plugins/MyPlugin
 
-  # ── Private plugins (in the separate _private/ repo) ──────────────
-  # Disabled by default in the example — enable per-deployment after
-  # cloning the private repo into ./_private/. Paths assume the layout
-  # used in the main developer's setup; adjust to match your own.
-
-  - name: PostgreSQL
+  # Auto-resolve: no path — Plexus looks in plugin_package/AnotherPlugin.
+  - name: AnotherPlugin
     enabled: false
-    path: ./plugins/PlexusPostgreSQL
 
-  - name: MinIO
+  # Multi-instance: two entries pointing at the same path, different names.
+  - name: WorkerA
     enabled: false
-    path: ./_private/BASE_PLUGINS/DATABASE/MinIO
+    path: ./plugins/MyWorker
 
-  - name: Backup
+  - name: WorkerB
     enabled: false
-    path: ./_private/BASE_PLUGINS/DATABASE/Backup
+    path: ./plugins/MyWorker
 
-  - name: DataCollection
+  # Plugin with argument overrides.
+  - name: MyConfiguredPlugin
     enabled: false
-    path: ./_private/AI/DataCollection
-
-  - name: DeviceControl
-    enabled: false
-    path: ./_private/AI/DeviceControl
-
-  - name: MemoryPlugin
-    enabled: false
-    path: ./_private/AI/MemoryPlugin
-
-  - name: AI_Interaction
-    enabled: false
-    path: ./_private/AI/AI_Interaction
-
-  - name: DiscordBot
-    enabled: false
-    path: ./_private/AI/DiscordBot
-
-  - name: Websearch
-    enabled: false
-    path: ./_private/AI/Websearch
-
-  - name: Geocoding
-    enabled: false
-    path: ./_private/AI/Geocoding
-
-  - name: MCPClient
-    enabled: false
-    path: ./_private/AI/MCPClient
-
-  - name: STT_AI_Plugin
-    enabled: false
-    path: ./_private/AI/STT_AI_Plugin
-
-  - name: WakeWord
-    enabled: false
-    path: ./_private/AI/WakeWord
-
-  - name: TTS
-    enabled: false
-    path: ./_private/AI/TTS
-
-  - name: VoiceDiarization
-    enabled: false
-    path: ./_private/AI/VoiceDiarization
-
-  - name: VoicePipeline
-    enabled: false
-    path: ./_private/AI/VoicePipeline
-
-  - name: TelegramBot
-    enabled: false
-    path: ./_private/AI/TelegramBot
-
-  - name: DocumentAnalyzer
-    enabled: false
-    path: ./_private/AI/DocumentAnalyzer
+    path: ./plugins/MyConfiguredPlugin
+    overrides:
+      arguments:
+        host: "localhost"
+        port: 5432
 
 
 general:
     hostname: ""                  # Empty = use system hostname
-    plugin_package: plugins_test  # Base directory for plugins if path is omitted
-    console_log_level: "DEBUG"
+    plugin_package: plugins       # Base directory for plugins if path is omitted
+    console_log_level: "INFO"
     file_log_level: "DEBUG"       # Log level written to file (DEBUG, INFO, WARNING, etc.)
     asyncio_debug: false          # Enable asyncio debug mode (tracks coroutine creation, slow callbacks)
 
@@ -180,22 +44,19 @@ general:
     # Match is by prefix with dot boundary, longest match wins.
     logger_levels:
         asyncio: "MUTE"
-        urllib3: "MUTE"
-        httpx: "WARNING"
-        httpcore: "WARNING"
-        psycopg: "WARNING"
-        psycopg.pool: "WARNING"
 
 
 networking:
-    enabled: False
-    node_ips:
-      # List the LAN/VPN IPs of every node that should auto-discover this one.
-      # Replace these placeholders with your own — e.g. 192.168.1.x or your
-      # WireGuard / Tailscale subnet.
-      - "10.0.0.1"
-      - "10.0.0.2"
+    enabled: false
     port: 2510
-    discover_nodes: True
-    direct_discoverable: True
-    auto_discoverable: True
+    discover_nodes: true
+    direct_discoverable: true
+    auto_discoverable: true
+    # peers:
+    #   - hostname: other-node
+    #     ip: 10.0.0.5
+    #     port: 9876
+    #     cert_pem: |
+    #       -----BEGIN CERTIFICATE-----
+    #       ...
+    #       -----END CERTIFICATE-----

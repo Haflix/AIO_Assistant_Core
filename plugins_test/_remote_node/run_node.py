@@ -24,21 +24,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from plexus.core import Plexus  # noqa: E402
+from plugins_test._runner_cli import build_runner_parser  # noqa: E402
 
 
 async def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--ready-file", required=True)
-    # PR4 Stage K (B-066): subprocess-driven mTLS bootstrap. The parent
-    # passes its keys_dir + cert PEM file path; the subprocess loads its
-    # OWN cert from keys_dir and pins the parent via the cert PEM file.
-    ap.add_argument("--keys-dir", default=None)
-    ap.add_argument("--parent-cert-pem-file", default=None)
-    ap.add_argument("--parent-hostname", default="parent")
-    ap.add_argument("--parent-port", type=int, default=2510)
-    ap.add_argument("--parent-ip", default="127.0.0.1")
+    # C-181: shared CLI parser. Legacy --parent-* aliases preserved
+    # so this runner's existing test harness keeps working.
+    ap = build_runner_parser(
+        description="TestRemoteSuite remote-node subprocess (Phase 5).",
+    )
     args = ap.parse_args()
 
     pc = Plexus(args.config)
@@ -56,13 +50,15 @@ async def main() -> None:
 
     if args.keys_dir is not None:
         nw_cfg["keys_dir"] = args.keys_dir
-    if args.parent_cert_pem_file is not None:
-        parent_cert_pem = Path(args.parent_cert_pem_file).read_text(encoding="utf-8")
+    # C-181: --peer-* is canonical; --parent-* legacy aliases write to
+    # the same args.peer_* attrs via dest=.
+    if args.peer_cert_pem_file is not None:
+        peer_cert_pem = Path(args.peer_cert_pem_file).read_text(encoding="utf-8")
         nw_cfg["peers"] = [
             {
-                "hostname": args.parent_hostname,
-                "address": f"{args.parent_ip}:{args.parent_port}",
-                "cert_pem": parent_cert_pem,
+                "hostname": args.peer_hostname,
+                "address": f"{args.peer_ip}:{args.peer_port}",
+                "cert_pem": peer_cert_pem,
                 "system_caller": False,
             },
         ]

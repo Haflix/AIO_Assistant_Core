@@ -13,7 +13,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Set, Union, Optional, Tuple
+from typing import Any, Dict, List, Literal, Set, Union, Optional, Tuple
+from uuid import uuid4
 from .decorators import async_log_errors, async_handle_errors, async_gen_handle_errors, async_gen_log_errors
 from .exceptions import (
     NetworkRequestException,
@@ -45,13 +46,13 @@ class AdvertSub:
     # retry_count. Not wire-serialized (see _serialize_local_sub_for_peer).
     sent_at: Optional[float] = None
     acked_at: Optional[float] = None
-    state: str = "pending"  # "pending" / "acked" / "ack_timeout"
+    state: Literal["pending", "acked", "ack_timeout"] = "pending"
     retry_count: int = 0
 
 
-# PR4 Stage K (B-066) — peer config entry. cert_pem is required (resolved
-# from cert_file at config-load time if needed). fingerprint is derived from
-# cert_pem at parse time and used as the post-handshake identity gate.
+# B-066 peer config entry. cert_pem is required (resolved from cert_file
+# at config-load time if needed). fingerprint is derived from cert_pem
+# at parse time and used as the post-handshake identity gate.
 @dataclass(frozen=True)
 class PeerSpec:
     hostname: str
@@ -75,21 +76,29 @@ MSG_STREAM_CHUNK = 11
 MSG_ERROR = 12
 MSG_END_STREAM = 13
 
-# MSG types 7-9 reserved (removed in PR3 Stage D —
-# ex-MSG_NOTIFY / MSG_TOPIC_REQUEST / MSG_TOPIC_REQUEST_STREAM).
-# Do not reuse these numbers for new MSG types.
+# MSG types 7-9 reserved (legacy MSG_NOTIFY / MSG_TOPIC_REQUEST /
+# MSG_TOPIC_REQUEST_STREAM, removed when notify/request_topic were
+# replaced by publish_event/request_event). Do not reuse these
+# numbers for new MSG types.
 
 MSG_STREAM_ITEM_END = 14  # Marks end of one item in a streaming response
 
-# PR3 Stage C — event protocol message types (locked #1, locked #13)
+# Event protocol message types.
 MSG_PUBLISH_EVENT = 15
 MSG_REQUEST_EVENT = 16
 MSG_REQUEST_EVENT_STREAM = 17
+# C-122: advert protocol — receiver maintains a per-peer subscription
+# table from these two messages. MSG_SUB_ADVERTISE carries the full
+# snapshot replace ("subscriptions": [...] + "kind": "snapshot");
+# MSG_SUB_DELTA carries a single add or remove ("kind": "add" |
+# "remove"). Ack-tracked via MSG_SUB_ADVERTISE_ACK; sender resends on
+# ack-timeout per heartbeat_interval scan.
 MSG_SUB_ADVERTISE = 18
 MSG_SUB_DELTA = 19
 
-# MSG_AUTH = 20 was removed in PR4 Stage K K-3 (B-066 fix). The message-type
-# number is reserved and must not be reused for new message types.
+# MSG_AUTH = 20 was removed alongside the B-066 SPKI-pin mTLS rework
+# (replaced shared-secret auth). The message-type number is reserved
+# and must not be reused for new message types.
 
 # Session 4 (v0.27.0): receiver-side acknowledgement of MSG_SUB_ADVERTISE
 # / MSG_SUB_DELTA. Async-delivered via the receiver's outbound connection
@@ -103,16 +112,23 @@ CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message size
 MAX_ADVERT_SUBS_PER_PEER = 100_000  # Cap MSG_SUB_ADVERTISE entries to bound _adverts_struct_lock hold time
 
-# Sentinel returned by request_event_remote when server sends no result data.
-# Distinguishes "handler returned None" (valid) from "no response received."
-REMOTE_NO_RESULT = object()
-
 
 # Default heartbeat tick interval (seconds). NetworkManager iterates the
 # node list every tick and pings each peer; on failure the peer is marked
 # dead via _mark_node_dead. Configurable via networking.heartbeat_interval
 # in config.yml; tests may override self.heartbeat_interval directly.
 DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+
+# C-109: periodic full-snapshot resync interval. Every interval, the
+# sender re-advertises its full sub set to every connected peer. Scrubs
+# ghost subs that survived a race between an in-flight resend and a
+# delta-remove (the ghost's sub_uuid stays on the peer's _inbound_adverts
+# forever until peer drop/reconnect, since re-subscribe creates a NEW
+# sub_uuid that doesn't touch the ghost). 5 min default keeps wasted
+# bandwidth bounded: O(N_peers * N_subs * 5min_interval). Configurable
+# via networking.resync_interval in config.yml; tests override
+# self.resync_interval directly.
+DEFAULT_RESYNC_INTERVAL: float = 300.0
 
 # Default discovery / node-lookup loop interval (seconds). Periodic
 # update_all_nodes loop tick that re-resolves peer addresses and reaps
@@ -127,6 +143,16 @@ DEFAULT_LOOKUP_INTERVAL: float = 60.0
 # tests may override self.liveness_timeout directly.
 DEFAULT_LIVENESS_TIMEOUT: float = 30.0
 
+# R2-LL-5: per-probe budget (seconds) for a single heartbeat ping.
+# Distinct from ``liveness_timeout`` (the deadline a peer can be silent
+# before it's marked dead) — this caps how long ONE probe waits for a
+# reply. With ``liveness_timeout`` >> ``heartbeat_interval`` a catatonic
+# peer used to delay the ack-timeout scan by up to ``liveness_timeout``
+# seconds because the heartbeat loop blocked on its own probe. Defaulted
+# to ``min(heartbeat_interval, liveness_timeout)`` if unset by the
+# operator. Configurable via networking.probe_timeout in config.yml.
+DEFAULT_PROBE_TIMEOUT: Optional[float] = None
+
 
 class NetworkManager:
     def __init__(
@@ -138,26 +164,33 @@ class NetworkManager:
         direct_discoverable: bool,
         auto_discoverable: bool,
         port=2510,
-        secret: Optional[str] = None,
-        cert_file: Optional[str] = None,
-        key_file: Optional[str] = None,
+        # C-029 + C-030: ``secret`` / ``cert_file`` / ``key_file`` kwargs
+        # removed — they were dead post-K-3 (mTLS pinning replaced
+        # shared-secret auth and inline cert file paths). Operators
+        # whose configs still carry these keys see them silently
+        # ignored at the yaml level; the kwarg path no longer exists.
         pool_size: int = 5,
         networking_config: Optional[dict] = None,
         config_dir: Optional[Path] = None,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         lookup_interval: float = DEFAULT_LOOKUP_INTERVAL,
         liveness_timeout: float = DEFAULT_LIVENESS_TIMEOUT,
+        resync_interval: float = DEFAULT_RESYNC_INTERVAL,
+        # R2-LL-5: per-probe budget for a single heartbeat ping. ``None``
+        # defaults to ``min(heartbeat_interval, liveness_timeout)`` (set
+        # below after both fields are resolved).
+        probe_timeout: Optional[float] = DEFAULT_PROBE_TIMEOUT,
     ):
         self.plexus = plexus
         self._logger = logger
 
-        # PR4 Stage K (B-066) — hard error on legacy node_ips schema.
-        # Operators must migrate to the peers: schema. Fires BEFORE any other
-        # init so a misconfigured node fails fast with an actionable message.
+        # B-066 hard error on legacy node_ips schema. Operators must
+        # migrate to the peers: schema. Fires BEFORE any other init so
+        # a misconfigured node fails fast with an actionable message.
         nw_cfg = networking_config or {}
         if "node_ips" in nw_cfg:
             raise RuntimeError(
-                "node_ips schema removed in PR4 Stage K (B-066 fix). Migrate to:\n"
+                "node_ips schema removed in the B-066 SPKI-pin rework. Migrate to:\n"
                 "  networking:\n"
                 "    peers:\n"
                 "      - hostname: <peer-name>\n"
@@ -174,21 +207,33 @@ class NetworkManager:
         # Each entry is (ip, port_or_None); port=None means "use the cluster
         # default port self.port". K-3 removes this field — kept here for K-2
         # to preserve test invariant during the transition.
-        self.node_ips: list[tuple[str, Optional[int]]] = [
-            self._parse_endpoint(e) for e in (node_ips or [])
-        ]
-        # De-duplicate on (ip, port).
-        self.node_ips = list(dict.fromkeys(self.node_ips))
+        #
+        # C-006/C-031: self.nodes and self.node_ips follow an
+        # immutable-snapshot pattern. Treat both as read-only tuples
+        # from the reader's perspective. Mutations build a NEW tuple
+        # and atomically rebind the attribute (single STORE_ATTR
+        # bytecode op in CPython — readers always see either the old
+        # or the new tuple, never a mid-update list). NEVER call
+        # .append() / .remove() / .extend() etc. on these attributes —
+        # those break the immutability invariant and reintroduce the
+        # concurrent-read race. New nodes are added at runtime via
+        # the build-tuple-then-rebind helpers below.
+        self.node_ips: Tuple[Tuple[str, Optional[int]], ...] = tuple(
+            dict.fromkeys(
+                self._parse_endpoint(e) for e in (node_ips or [])
+            )
+        )
 
         self.discover_nodes = discover_nodes
         self.direct_discoverable = direct_discoverable
         self.auto_discoverable = auto_discoverable
 
         self.port = port
-        self.nodes: list[Node] = []
+        self.nodes: Tuple[Node, ...] = ()
 
-        # PR4 Stage K identity + peer config (replaces self.secret / cert_file /
-        # key_file in K-3 — kept side-by-side here for atomic test invariant).
+        # B-066 mTLS identity + peer config. SPKI-pinned mTLS
+        # replaced the legacy shared-secret + cert_file / key_file
+        # config; identity now lives on disk under keys_dir.
         self.hostname: str = nw_cfg.get("hostname", socket.gethostname())
         self.keys_dir: Path = Path(nw_cfg.get("keys_dir", "_keys"))
         if not self.keys_dir.is_absolute():
@@ -205,22 +250,24 @@ class NetworkManager:
         }
         self.own_fingerprint: str = ""  # populated by _load_or_generate_identity
 
-        # PR4 Stage K (B-066): seed self.node_ips from peers so the existing
-        # discovery flow (update_all_nodes / heartbeat) can find peers via
-        # the new schema without rewriting discovery itself.
+        # B-066: seed self.node_ips from peers so the existing discovery
+        # flow (update_all_nodes / heartbeat) can find peers via the new
+        # schema without rewriting discovery itself. Build the combined
+        # tuple locally then rebind once (C-006 immutable-snapshot).
+        seeded: List[Tuple[str, Optional[int]]] = list(self.node_ips)
         for spec in self.peers:
             entry = (spec.ip, spec.port)
-            if entry not in self.node_ips:
-                self.node_ips.append(entry)
+            if entry not in seeded:
+                seeded.append(entry)
+        self.node_ips = tuple(seeded)
 
-        # PR4 Stage K: legacy secret / cert_file / key_file kwargs accepted
-        # for Plexus call-site compatibility but no longer used. The
-        # K-3 startup gate uses self.peers, not self.secret.
-        self.secret = secret or os.getenv("NETWORKING_SECRET", "")
-        if isinstance(self.secret, str):
-            self.secret = self.secret.encode()
-        self.cert_file = cert_file
-        self.key_file = key_file
+        # C-029 + C-030: legacy `self.secret`, `self.cert_file`,
+        # `self.key_file`, and `self._temp_ssl_files` deleted —
+        # shared-secret auth was replaced by mTLS-pinned peers in K-3
+        # and the inline cert-file path was replaced by per-peer cert
+        # PEMs in the `peers:` schema. The `NETWORKING_SECRET` env-var
+        # read is also removed; if you need it set during transition,
+        # ignore it (the framework does not use it).
         self.pool_size = pool_size
 
         # Connection pools: keyed by (IP, port) tuple so that two peers on
@@ -236,7 +283,9 @@ class NetworkManager:
 
         # SSL context (will be initialized in start)
         self.ssl_context = None
-        self._temp_ssl_files = []  # Track temp cert/key files for cleanup
+        # C-029: `self._temp_ssl_files` deleted along with the
+        # `_create_ssl_context` method that produced temp PEM files.
+        # mTLS pin context is built from disk cert paths directly.
 
         # Loop intervals and timeouts. Defaults are
         # DEFAULT_HEARTBEAT_INTERVAL / DEFAULT_LOOKUP_INTERVAL /
@@ -247,6 +296,53 @@ class NetworkManager:
         self.heartbeat_interval: float = heartbeat_interval
         self.lookup_interval: float = lookup_interval
         self.liveness_timeout: float = liveness_timeout
+        self.resync_interval: float = resync_interval
+        # R2-LL-5: when the operator hasn't pinned ``probe_timeout``
+        # explicitly, default it to ``min(heartbeat_interval,
+        # liveness_timeout)``. This keeps one catatonic peer from
+        # delaying the ack-timeout scan by up to ``liveness_timeout``
+        # seconds (the old probe budget) while still respecting any
+        # tighter heartbeat cadence the operator has configured.
+        self.probe_timeout: float = (
+            float(probe_timeout)
+            if probe_timeout is not None and float(probe_timeout) > 0
+            else min(heartbeat_interval, liveness_timeout)
+        )
+        # C-109: monotonic timestamp of the most recent periodic
+        # full-snapshot resync sweep. Compared against
+        # time.monotonic() inside heartbeat_loop to decide when the
+        # next sweep fires. Initialise to time.monotonic() (not 0.0)
+        # so the first sweep fires a FULL resync_interval after NM
+        # construction, not immediately after a hot-reload on a
+        # long-running process where monotonic() is already huge.
+        self._last_resync_ts: float = time.monotonic()
+
+        # C-044: N-strikes heartbeat. A single missed heartbeat (transient
+        # network blip, brief peer overload, GC pause on the other side)
+        # used to mark a node dead immediately and flap peers. Now we
+        # tolerate N-1 consecutive misses and only mark dead on the Nth
+        # miss. Per-hostname counter; reset on any successful heartbeat.
+        # Default 3 strikes (~3*heartbeat_interval = 30s grace). Configurable
+        # via networking.heartbeat_strikes in config.yml. Override possible
+        # by setting self.heartbeat_strikes on the instance for tests.
+        self.heartbeat_strikes: int = 3
+        self._heartbeat_misses: Dict[str, int] = {}
+
+        # C-043: track checked-out writers so stop() can close ALL open
+        # connections (not just pooled ones). Without this, a request
+        # coroutine holding a writer at shutdown leaks the underlying
+        # socket fd. Populated in _get_connection success paths and
+        # _create_connection; removed in _return_connection on return
+        # to pool.
+        self._checked_out_writers: Set[asyncio.StreamWriter] = set()
+
+        # C-115: per-peer resend-task table keyed by peer hostname. The
+        # ack-timeout scan spawns at most one in-flight resend per peer;
+        # _drop_peer_advert_state cancels it on revoke / peer-dead so a
+        # stale resend cannot fire against torn-down advert tables. Init
+        # here (not lazily in the scan helper) so _drop_peer_advert_state
+        # never has to gate on `hasattr`.
+        self._resend_tasks: Dict[str, asyncio.Task] = {}
 
         # ── PR3 Stage C advert-protocol state ─────────────────────────
         # Per-peer table of subs the peer told us about. Keyed by peer
@@ -279,10 +375,39 @@ class NetworkManager:
         # completion; disconnect hook iterates and cancels.
         self._inflight_publishes: Dict[str, set] = {}
 
-        # One-shot trigger guard for initial-snapshot send. Set after
-        # first successful _initial_advert_exchange for a peer; cleared
-        # in _drop_peer_advert_state so reconnects re-arm.
-        self._snapshot_sent: set = set()
+        # C-110: per-NM session_id, regenerated at construction (so a
+        # process restart yields a new id even when the hostname stays
+        # the same). Sent with outbound advert + delta payloads so
+        # receivers can detect a peer restart and re-arm their
+        # snapshot-sent gate without waiting for heartbeat-dead.
+        self.session_id: str = uuid4().hex
+
+        # C-110: track the last session_id each peer announced. When a
+        # peer sends a payload with a session_id != the one we have on
+        # record, treat that as a restart-or-reconnect signal and
+        # clear our outbound-snapshot-sent entry for that peer so the
+        # next reciprocal-exchange trigger re-sends. Pre-restart this
+        # check could only fire on heartbeat-strikes (after several
+        # missed pings) so fast TCP reconnects within the heartbeat
+        # window left stale advert state on both sides.
+        self._peer_session_ids: Dict[str, str] = {}
+
+        # C-110: snapshot-sent gate is now keyed by hostname; value is
+        # the peer's session_id we observed when we sent the snapshot,
+        # OR ``None`` as a sentinel for "snapshot was sent but the
+        # peer's session_id wasn't known yet" (first contact — the
+        # first inbound payload's session_id is adopted into this
+        # slot by ``_detect_peer_restart``'s first-contact branch).
+        # Mismatch between stored value and the peer's currently-
+        # announced session_id means the peer restarted; treat as
+        # not-sent and re-send. Hostname-only keying (the pre-C-110
+        # design) made a same-hostname reconnect after a clean
+        # restart indistinguishable from a continuous session.
+        # Mutated: set after first successful _initial_advert_exchange;
+        # cleared in _drop_peer_advert_state so reconnects re-arm;
+        # cleared on session-id mismatch detection in the
+        # MSG_SUB_ADVERTISE / MSG_SUB_DELTA handlers.
+        self._snapshot_sent: Dict[str, Optional[str]] = {}
 
         # Per-peer in-flight initial-exchange task (cancellable on
         # disconnect via _drop_peer_advert_state).
@@ -358,14 +483,36 @@ class NetworkManager:
     def _resolve_port(self, IP: str) -> int:
         """Return the port to use when connecting to a peer at this IP.
 
-        PR4 Stage K: walks self.peers_by_endpoint first (authoritative for
-        the new mTLS-pinned regime). Falls back to the legacy self.nodes /
-        self.node_ips lookup so existing tests that still use node_ips
-        continue to work during the K-2 → K-3 transition window.
+        Walks self.peers_by_endpoint first (authoritative for the
+        mTLS-pinned regime). Falls back to the self.nodes / self.node_ips
+        lookup so existing tests that still scaffold via node_ips
+        continue to work.
+
+        R2-CC-7: rejects duplicate-IP peers. Two peers sharing an IP
+        but using different ports yields an ambiguous endpoint lookup —
+        the first match would silently win and route all traffic away
+        from the second peer. We raise here rather than silently
+        resolving wrong, because the ambiguity has no defensible
+        resolution policy at the connection layer. The peers list is
+        unique by (ip, port) per _parse_one_peer; this guards against
+        the same IP appearing twice with different ports.
         """
-        for peer_ip, peer_port in self.peers_by_endpoint.keys():
-            if peer_ip == IP:
-                return peer_port
+        matches = [
+            (peer_ip, peer_port)
+            for peer_ip, peer_port in self.peers_by_endpoint.keys()
+            if peer_ip == IP
+        ]
+        if len(matches) > 1:
+            # raise on duplicate ip — ambiguous outbound routing.
+            raise RuntimeError(
+                f"[CONFIG] duplicate ip {IP!r} across peers_by_endpoint "
+                f"with distinct ports {[p for _, p in matches]}; "
+                f"_resolve_port cannot pick one. Peers must have unique "
+                f"IPs (a single host running multiple peers needs a "
+                f"reverse-proxy or distinct interface bindings)."
+            )
+        if matches:
+            return matches[0][1]
         for node in self.nodes:
             if node.IP == IP:
                 return node.port if node.port is not None else self.port
@@ -374,7 +521,7 @@ class NetworkManager:
                 return port
         return self.port
 
-    # ── PR4 Stage K (B-066) — B-018b split helper ────────────────────
+    # ── B-066 / B-018b — split helper ──────────────────────────────
 
     async def _apply_b018b_guard(
         self,
@@ -453,7 +600,7 @@ class NetworkManager:
 
         return author, author_id, False
 
-    # ── PR4 Stage K (B-066) — peer parsing + identity helpers ─────────
+    # ── B-066 — peer parsing + identity helpers ─────────────────────
 
     def _parse_peers(self, raw_peers) -> List[PeerSpec]:
         """Parse the peers config list, resolve cert_file → cert_pem,
@@ -689,8 +836,10 @@ class NetworkManager:
         cert_exists = self.cert_path.exists()
         key_exists = self.key_path.exists()
 
-        cert_tmp = self.cert_path.with_suffix(".pem.tmp")
-        key_tmp = self.key_path.with_suffix(".pem.tmp")
+        # W4-N2: Python 3.12+ rejects multi-dot suffixes in `with_suffix`; use
+        # safe name concatenation for identical filesystem semantics.
+        cert_tmp = self.cert_path.parent / (self.cert_path.name + ".tmp")
+        key_tmp = self.key_path.parent / (self.key_path.name + ".tmp")
         tmp_orphans = [str(p) for p in (cert_tmp, key_tmp) if p.exists()]
         if tmp_orphans:
             raise RuntimeError(
@@ -751,6 +900,23 @@ class NetworkManager:
             self.own_fingerprint, cert_pem,
         )
 
+        # C-096: sanity check — own_fingerprint must NOT appear in our
+        # peers[] list. Operators sometimes mis-paste their own cert
+        # PEM into their OWN config thinking it's the peer's; the
+        # phantom self-as-peer entry then routes outbound publishes
+        # back to this node and confuses the advert protocol. Hard
+        # error at boot is friendlier than mysterious dispatch loops.
+        if self.own_fingerprint in self.peers_by_fingerprint:
+            raise RuntimeError(
+                f"[NETWORKING] Misconfiguration: own_fingerprint "
+                f"{self.own_fingerprint} appears in this node's peers[] "
+                f"list. A node cannot list itself as a peer — that would "
+                f"create a self-loop in the dispatch graph. Remove the "
+                f"matching peers[] entry from config.yml (it almost "
+                f"certainly carries this node's own cert.pem, not a "
+                f"peer's)."
+            )
+
     def _extract_peer_fingerprint(self, writer: asyncio.StreamWriter) -> str:
         """Compute SPKI SHA-256 fingerprint of the TLS peer's cert. Used
         as the post-handshake identity gate in K-3.
@@ -786,6 +952,16 @@ class NetworkManager:
         generate_keypair). Post-handshake SPKI pin check is the actual
         identity gate (in _handle_client / _create_connection, K-3).
         """
+        # W2-E1: fail fast on empty peers. revoke_peer can drain the
+        # trust list to zero at runtime; without this guard we silently
+        # build a CERT_REQUIRED context with no trusted CAs, and every
+        # subsequent TLS handshake fails with an opaque verification
+        # error far from the actual misconfiguration.
+        if not self.peers:
+            raise RuntimeError(
+                "_create_pinned_ssl_context: self.peers is empty; "
+                "no trusted CAs available (likely all peers revoked)"
+            )
         context = ssl.SSLContext(protocol)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         # Order matters in Python 3.10+: verify_mode must be set BEFORE
@@ -793,9 +969,12 @@ class NetworkManager:
         context.verify_mode = ssl.CERT_REQUIRED
         context.check_hostname = False
         context.load_cert_chain(str(self.cert_path), str(self.key_path))
-        if self.peers:
-            cadata = "\n".join(p.cert_pem for p in self.peers)
-            context.load_verify_locations(cadata=cadata)
+        # R3-PP-5: the hard raise above on empty self.peers already guarantees
+        # self.peers is non-empty here; the previous `if self.peers:` guard
+        # was unreachable-False dead code that suggested a non-existent
+        # else branch. Call load_verify_locations unconditionally.
+        cadata = "\n".join(p.cert_pem for p in self.peers)
+        context.load_verify_locations(cadata=cadata)
         return context
 
     def _pool_key(self, IP: str) -> tuple[str, int]:
@@ -856,7 +1035,10 @@ class NetworkManager:
         """Serialize and send a message with length prefix."""
         try:
             payload = pickle.dumps(data)
-            if len(payload) > MAX_MESSAGE_SIZE:
+            # R2-CC-4: sender/receiver parity. Receiver paths use `>=` so the
+            # sender must also reject at exactly MAX (the boundary value is
+            # not a usable wire size if the peer will reject it).
+            if len(payload) >= MAX_MESSAGE_SIZE:
                 raise ValueError(
                     f"Message size {len(payload)} exceeds maximum {MAX_MESSAGE_SIZE}"
                 )
@@ -873,7 +1055,9 @@ class NetworkManager:
                 )
 
             writer.write(header + payload)
-            await writer.drain()
+            # R2-CC-2: bounded drain — a slow/stuck peer must not wedge the
+            # sender forever. TODO: surface as networking.send_drain_timeout config knob.
+            await asyncio.wait_for(writer.drain(), timeout=30.0)
             self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             msg_type_name = {
@@ -904,7 +1088,8 @@ class NetworkManager:
             length_bytes = await reader.readexactly(4)
             msg_length = struct.unpack(">I", length_bytes)[0]
 
-            if msg_length > MAX_MESSAGE_SIZE:
+            # R2-CC-4: sender/receiver parity — both reject at exactly MAX.
+            if msg_length >= MAX_MESSAGE_SIZE:
                 raise ValueError(
                     f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
                 )
@@ -969,7 +1154,8 @@ class NetworkManager:
                     chunk_length = len(chunk_data) + 1
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
-                    await writer.drain()
+                    # R2-CC-2: bounded drain. TODO: surface as config knob.
+                    await asyncio.wait_for(writer.drain(), timeout=30.0)
                     self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
             else:
@@ -977,7 +1163,8 @@ class NetworkManager:
                 chunk_length = len(payload) + 1
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
-                await writer.drain()
+                # R2-CC-2: bounded drain. TODO: surface as config knob.
+                await asyncio.wait_for(writer.drain(), timeout=30.0)
                 self._count_sent(writer, len(header) + len(payload))
         except Exception as e:
             self._logger.exception("Error sending stream chunk")
@@ -988,7 +1175,8 @@ class NetworkManager:
         try:
             header = struct.pack(">IB", 1, MSG_END_STREAM)
             writer.write(header)
-            await writer.drain()
+            # R2-CC-2: bounded drain. TODO: surface as config knob.
+            await asyncio.wait_for(writer.drain(), timeout=30.0)
             self._count_sent(writer, len(header))
         except Exception as e:
             self._logger.exception("Error sending end stream marker")
@@ -1016,102 +1204,12 @@ class NetworkManager:
             self._logger.exception("Error sending pickled error message")
             raise
 
-    def _create_ssl_context(self) -> ssl.SSLContext:
-        """Create SSL context for server."""
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-
-        if self.cert_file and self.key_file:
-            # Load certificates from files
-            context.load_cert_chain(self.cert_file, self.key_file)
-            self._logger.info(
-                f"Loaded SSL certificates: cert={self.cert_file}, key={self.key_file}"
-            )
-        else:
-            # For testing, create a self-signed cert (requires cryptography library)
-            # For production, users should provide proper certificates
-            self._logger.warning(
-                "No SSL certificates provided. Generating self-signed certificate for testing. "
-                "For production, provide cert_file and key_file in config."
-            )
-            try:
-                from cryptography import x509
-                from cryptography.x509.oid import NameOID
-                from cryptography.hazmat.primitives import hashes, serialization
-                from cryptography.hazmat.primitives.asymmetric import rsa
-                import datetime
-
-                # Generate private key
-                private_key = rsa.generate_private_key(
-                    public_exponent=65537,
-                    key_size=2048,
-                )
-
-                # Create certificate
-                subject = issuer = x509.Name(
-                    [
-                        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
-                        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Test"),
-                        x509.NameAttribute(NameOID.LOCALITY_NAME, "Test"),
-                        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AIO Assistant"),
-                        x509.NameAttribute(NameOID.COMMON_NAME, socket.gethostname()),
-                    ]
-                )
-
-                cert = (
-                    x509.CertificateBuilder()
-                    .subject_name(subject)
-                    .issuer_name(issuer)
-                    .public_key(private_key.public_key())
-                    .serial_number(x509.random_serial_number())
-                    .not_valid_before(datetime.datetime.utcnow())
-                    .not_valid_after(
-                        datetime.datetime.utcnow() + datetime.timedelta(days=365)
-                    )
-                    .add_extension(
-                        x509.SubjectAlternativeName(
-                            [
-                                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-                            ]
-                        ),
-                        critical=False,
-                    )
-                    .sign(private_key, hashes.SHA256())
-                )
-
-                # Load into SSL context
-                cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-                key_pem = private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-
-                import tempfile
-
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", delete=False, suffix=".pem"
-                ) as cert_file:
-                    cert_file.write(cert_pem)
-                    temp_cert = cert_file.name
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", delete=False, suffix=".pem"
-                ) as key_file:
-                    key_file.write(key_pem)
-                    temp_key = key_file.name
-
-                context.load_cert_chain(temp_cert, temp_key)
-                self._temp_ssl_files.extend([temp_cert, temp_key])
-                self._logger.info("Generated self-signed certificate for testing")
-            except ImportError:
-                raise RuntimeError(
-                    "SSL certificates required. Either provide cert_file and key_file in config, "
-                    "or install 'cryptography' package to generate self-signed certificates."
-                )
-            except Exception as e:
-                self._logger.exception("Failed to generate SSL certificate")
-                raise RuntimeError(f"Failed to set up SSL: {e}")
-
-        return context
+    # C-029: `_create_ssl_context` removed. The K-3 mTLS pinning path uses
+    # `_create_pinned_ssl_context` (server) and `_create_client_ssl_context`
+    # (client) directly from `self.cert_path` / `self.key_path` on disk;
+    # `_load_or_generate_identity` writes those at boot. The old
+    # `_create_ssl_context` had no callers and produced temp PEM files from
+    # the legacy `cert_file` / `key_file` kwargs that were removed alongside.
 
     async def start(self):
         """Starts socket server without blocking the main loop.
@@ -1204,27 +1302,72 @@ class NetworkManager:
             self._logger.debug("[SERVER] Starting discovery lookup loop task")
             self.discovery_task = asyncio.create_task(lookup_loop())
 
+        async def _do_one_heartbeat(node, probe_timeout):
+            """C-091 helper: per-node heartbeat with C-044 strike
+            handling. All exceptions absorbed here so gather() never
+            sees a raise. Used by heartbeat_loop to parallelize.
+
+            R2-LL-5: the probe budget is now ``probe_timeout`` (a
+            dedicated knob) rather than the much larger
+            ``liveness_timeout``. A catatonic peer no longer pins the
+            heartbeat tick to its full liveness window — the probe
+            fails fast and the ack-timeout scan stays on schedule.
+            """
+            try:
+                if not node.enabled:
+                    return
+                ok = await self.heartbeat_node(node, timeout=probe_timeout)
+                if ok:
+                    # C-044: reset miss counter on any success.
+                    self._heartbeat_misses.pop(
+                        getattr(node, "hostname", None) or "", None
+                    )
+                else:
+                    # C-044: N-strikes heartbeat. Tolerates transient
+                    # network blips without flapping peers.
+                    if await self._record_heartbeat_miss(node):
+                        await self._mark_node_dead(node)
+            except Exception:
+                # C-044: exception path also increments the counter so a
+                # peer whose every heartbeat raises is eventually marked
+                # dead, but a single intermittent exception doesn't.
+                try:
+                    if await self._record_heartbeat_miss(node):
+                        await self._mark_node_dead(node)
+                except Exception:
+                    pass
+
         async def heartbeat_loop():
             while True:
+                # C-091: snapshot interval/timeout at tick start so a
+                # mid-tick mutation can't cause one node to use the old
+                # liveness_timeout while another sees the new one. The
+                # adopted interval also drives this tick's sleep, so a
+                # bumped heartbeat_interval takes effect on the NEXT
+                # tick — consistent semantics regardless of where in
+                # the loop the mutation lands.
+                # R2-LL-5: snapshot ``probe_timeout`` too — same tick-
+                # stability rationale. The dedicated probe budget
+                # replaces the prior use of ``liveness_timeout`` as
+                # both deadline AND per-probe wait, which let one
+                # catatonic peer stall the ack-timeout scan by the
+                # full liveness window.
+                heartbeat_interval = self.heartbeat_interval
+                probe_timeout = self.probe_timeout
                 try:
-                    # Iterate over a snapshot to avoid concurrent modification
-                    for node in list(self.nodes):
-                        try:
-                            if not node.enabled:
-                                continue
-                            ok = await self.heartbeat_node(
-                                node, timeout=self.liveness_timeout
-                            )
-                            if not ok:
-                                # PR3 Stage C step 17 path #1: route through
-                                # _mark_node_dead so advert state drops.
-                                await self._mark_node_dead(node)
-                        except Exception:
-                            # Mark node disabled on heartbeat failure
-                            try:
-                                await self._mark_node_dead(node)
-                            except Exception:
-                                pass
+                    # C-091: parallelize per-peer heartbeats so one slow
+                    # peer can't delay all the others. Each per-node
+                    # coroutine catches its own exceptions; gather sees
+                    # only successful Nones and never raises.
+                    nodes_snapshot = list(self.nodes)
+                    if nodes_snapshot:
+                        await asyncio.gather(
+                            *(
+                                _do_one_heartbeat(n, probe_timeout)
+                                for n in nodes_snapshot
+                            ),
+                            return_exceptions=True,
+                        )
                 except Exception:
                     self._logger.debug("Heartbeat iteration failed")
 
@@ -1239,7 +1382,42 @@ class NetworkManager:
                         "Advert ack timeout scan failed", exc_info=True,
                     )
 
-                await asyncio.sleep(self.heartbeat_interval)
+                # C-109: periodic full-snapshot resync. Scrubs ghost
+                # subs that survived the add-then-remove-vs-resend race
+                # — the ghost's sub_uuid lives in the peer's
+                # _inbound_adverts until peer drop/reconnect because
+                # re-subscribe creates a new sub_uuid that doesn't
+                # touch the ghost. A periodic full-snapshot replace
+                # rewrites the peer's per-peer inbound table from our
+                # current local sub list (snapshot semantics in
+                # _handle_sub_advertise), purging anything we no
+                # longer hold. Spawn per-peer as detached tasks so
+                # the heartbeat tick stays on schedule.
+                #
+                # ``_last_resync_ts`` is stamped BEFORE the spawn so a
+                # broken spawn cannot tight-loop the resync. The
+                # tradeoff is that a persistently-failing spawn is
+                # silently retried every resync_interval. Log the
+                # failure at WARNING (not DEBUG) so operators with
+                # default-level logging still see the breakage.
+                try:
+                    now_mono = time.monotonic()
+                    if (
+                        self.resync_interval > 0
+                        and (now_mono - self._last_resync_ts)
+                        >= self.resync_interval
+                    ):
+                        self._last_resync_ts = now_mono
+                        await self._spawn_periodic_resync()
+                except Exception:
+                    self._logger.warning(
+                        "Periodic resync scheduling failed; next attempt "
+                        "in %.0fs",
+                        self.resync_interval,
+                        exc_info=True,
+                    )
+
+                await asyncio.sleep(heartbeat_interval)
 
         self._logger.debug("[SERVER] Starting heartbeat loop task")
         self.heartbeat_task = asyncio.create_task(heartbeat_loop())
@@ -1266,15 +1444,37 @@ class NetworkManager:
                     await task
                 except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    # R4-VV-2: heartbeat / discovery task may carry a stored
+                    # exception (e.g. OSError from socket during shutdown).
+                    # Awaiting re-raises it; without this branch the
+                    # exception would propagate out of stop() and skip the
+                    # pool drain + _checked_out_writers cleanup below.
+                    # Mirrors the R3-RR-7 pattern used for server_task.
+                    self._logger.warning(
+                        "background task on %s:%d raised non-CancelledError during stop(): %s",
+                        getattr(self, "hostname", "?"),
+                        getattr(self, "port", 0),
+                        e,
+                        exc_info=True,
+                    )
 
         # PR3 Stage C step 17 path #3: drop advert state for every peer
         # we've ever known about, BEFORE closing pooled connections.
+        # C-124: include _advert_locks and _initial_exchange_tasks in
+        # the peer-host union. A peer can have a lock entry (from a
+        # past attempted advertise) or an in-flight initial-exchange
+        # task without yet having any _inbound/_outbound/snapshot_sent
+        # bookkeeping — those peers were previously missed by stop()
+        # and their resend/initial-exchange tasks ran past shutdown.
         try:
             async with self._adverts_struct_lock:
                 hosts = list(
                     set(self._inbound_adverts.keys())
                     | set(self._outbound_adverts.keys())
                     | set(self._snapshot_sent)
+                    | set(self._advert_locks.keys())
+                    | set(self._initial_exchange_tasks.keys())
                 )
             for h in hosts:
                 try:
@@ -1296,32 +1496,83 @@ class NetworkManager:
                 await self.server_task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                # R3-RR-7: server task may raise OSError / SSLError on accept
+                # or handshake failure during shutdown. Suppress so the pool
+                # drain and _checked_out_writers cleanup below always run.
+                self._logger.warning(
+                    "server_task on %s:%d raised non-CancelledError during stop(): %s",
+                    getattr(self, "hostname", "?"),
+                    getattr(self, "port", 0),
+                    e,
+                    exc_info=True,
+                )
 
         # Close all pooled connections (key is (ip, port))
         for key, pool in self.connection_pools.items():
             closed = 0
             while not pool.empty():
+                # R4-VV-9: separate pool.get() failures (-> break out of
+                # this pool's drain) from per-writer close failures
+                # (-> ``continue`` to the next writer). Previously a
+                # single broad ``except: break`` abandoned the rest of
+                # the queue on the first writer close error (e.g.
+                # ConnectionResetError from wait_closed on Windows),
+                # leaking the remaining writers' fds.
                 try:
                     reader, writer = await asyncio.wait_for(pool.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    # Queue effectively empty under contention — stop
+                    # draining this pool.
+                    break
+                except Exception:
+                    # pool.get() raised something unexpected; bail on
+                    # this pool but keep going with the next.
+                    break
+                try:
                     writer.close()
                     await writer.wait_closed()
                     closed += 1
-                except (asyncio.TimeoutError, Exception):
-                    break
+                except Exception as e:
+                    self._logger.warning(
+                        "stop(): pool drain close for %r failed: %s — continuing drain",
+                        key, e,
+                    )
+                    continue
             if closed:
                 ip_, port_ = key
                 self._logger.debug(
                     f"[CONNECTION] Closed {closed} pooled connections for {ip_}:{port_}"
                 )
 
-        # Clean up temp SSL files
-        for path in self._temp_ssl_files:
+        # C-043: drain checked-out writers (held by request-path
+        # coroutines that hadn't yet returned them to the pool). The
+        # pool drain above only covers pooled connections; any in-flight
+        # request still holding a writer at shutdown would leak the
+        # underlying socket fd without this step. We snapshot the set
+        # first so a late return-to-pool concurrent with this drain
+        # doesn't trip dict-mutation-during-iteration.
+        checked_out = list(self._checked_out_writers)
+        self._checked_out_writers.clear()
+        if checked_out:
+            self._logger.info(
+                "[CONNECTION] Closing %d checked-out connection(s) on stop()",
+                len(checked_out),
+            )
+        for writer in checked_out:
             try:
-                os.remove(path)
-                self._logger.debug(f"[SSL] Removed temp file: {path}")
-            except OSError:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            except Exception:
                 pass
-        self._temp_ssl_files.clear()
+
+        # C-029: legacy temp SSL file cleanup removed alongside the
+        # `_create_ssl_context` deletion. Identity files written by
+        # `_load_or_generate_identity` live on disk under `self.keys_dir`
+        # and persist across restarts by design.
 
         self._logger.info("Socket server stopped")
 
@@ -1472,10 +1723,38 @@ class NetworkManager:
                         reader, writer, data, conn_context
                     )
                 else:
-                    self._logger.warning(
-                        f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
-                    )
-                    await self._send_error(writer, f"Unknown message type: {msg_type}")
+                    # C-097: distinguish removed/reserved wire IDs from
+                    # truly-unknown ones. Reserved IDs 7/8/9/20 were
+                    # used by the pre-PR3 notify/request_topic protocol;
+                    # a peer sending them is almost certainly running
+                    # an older Plexus version — surface that diagnosis
+                    # instead of lumping into the generic "unknown"
+                    # bucket. Anything outside both sets is real
+                    # garbage on the socket (or a peer running a future
+                    # version we haven't seen).
+                    _REMOVED_RESERVED_MSG_IDS = {7, 8, 9, 20}
+                    if msg_type in _REMOVED_RESERVED_MSG_IDS:
+                        self._logger.warning(
+                            "[MESSAGE] removed-reserved message type %d "
+                            "from %s — peer is likely on a pre-PR3 "
+                            "Plexus version (legacy notify/request_topic "
+                            "wire protocol). Drop the connection.",
+                            msg_type, client_addr,
+                        )
+                        await self._send_error(
+                            writer,
+                            f"Wire protocol mismatch: message type "
+                            f"{msg_type} was removed in PR3 Stage D. "
+                            f"Update the sender to publish_event / "
+                            f"request_event.",
+                        )
+                    else:
+                        self._logger.warning(
+                            f"[MESSAGE] Unknown message type {msg_type} from {client_addr}"
+                        )
+                        await self._send_error(
+                            writer, f"Unknown message type: {msg_type}"
+                        )
                     break
 
         except ConnectionError:
@@ -1485,7 +1764,11 @@ class NetworkManager:
             self._logger.exception(f"Error handling client {client_addr}")
             disconnect_reason = "error"
             try:
-                await self._send_error(writer, str(e))
+                # W2-E4: opaque sentinel on the wire. The real exception
+                # detail is in the server-side log above; leaking it on
+                # the wire helps a pinned-but-compromised peer fingerprint
+                # internal state.
+                await self._send_error(writer, "internal error")
             except Exception:
                 pass
         finally:
@@ -1557,6 +1840,31 @@ class NetworkManager:
             request_id = data.get("request_id")
             args = data.get("args", [])
 
+            # R2-CC-3: self-impersonation gate (locked #15). Sibling
+            # handlers (_handle_publish_event, _handle_request_event,
+            # _handle_sub_advertise, _handle_sub_delta) all check this;
+            # _handle_execute previously did not, allowing a pinned peer
+            # to attribute calls to our own hostname.
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_EXECUTE"
+            ):
+                return
+
+            # R2-CC-3: pin-vs-wire identity check (C-106). If the cert-pin
+            # already set peer_hostname, the wire-claimed author_host must
+            # match. Without this, a compromised pinned peer can spoof
+            # author_host to a third-party node's hostname.
+            if author_host:
+                pinned = conn_context.get("peer_hostname")
+                if pinned and pinned != author_host:
+                    self._logger.warning(
+                        "[EXECUTE] anti-spoof: pinned peer %r vs "
+                        "wire-claimed author_host %r — drop",
+                        pinned, author_host,
+                    )
+                    return
+                conn_context.setdefault("peer_hostname", author_host)
+
             # B-018b GUARD (split, K-5) — see _apply_b018b_guard for the full
             # logic. Part 1 gates author=="system" on system_caller; Part 2
             # rewrites impersonating author_id unconditionally (preserving
@@ -1602,7 +1910,8 @@ class NetworkManager:
                     chunk_length = len(chunk_data) + 1
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + chunk_data)
-                    await writer.drain()
+                    # R2-CC-2: bounded drain. TODO: surface as config knob.
+                    await asyncio.wait_for(writer.drain(), timeout=30.0)
                     self._count_sent(writer, len(header) + len(chunk_data))
                     offset += CHUNK_SIZE
                     sent += 1
@@ -1614,7 +1923,8 @@ class NetworkManager:
                 chunk_length = len(payload) + 1
                 header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                 writer.write(header + payload)
-                await writer.drain()
+                # R2-CC-2: bounded drain. TODO: surface as config knob.
+                await asyncio.wait_for(writer.drain(), timeout=30.0)
                 self._count_sent(writer, len(header) + len(payload))
 
             try:
@@ -1627,11 +1937,53 @@ class NetworkManager:
                 f"[EXECUTE] Completed: result_type={result_type}, size_bytes={len(payload)}"
             )
 
-        except NetworkRequestException as e:
-            await self._send_error(writer, str(e))
+        except RequestException as e:
+            # W1-A2: preserve RequestException (and its subclass
+            # NetworkRequestException) identity across the wire. Plugin
+            # authors catching specific RequestException subclasses on the
+            # caller side previously saw a NetworkRequestException(str(...))
+            # wrap; pickling the original instance fixes that.
+            #
+            # R3-MM-4 review follow-up: guard the error-frame drain. If the
+            # peer is stuck, _send_error_pickled raises TimeoutError from
+            # its internal wait_for(writer.drain(), 30s). Without this
+            # guard the TimeoutError escapes to _handle_client's outer
+            # except, which would attempt yet another error frame on the
+            # same stuck writer (a third 30s wait). Close best-effort and
+            # swallow on timeout.
+            try:
+                await self._send_error_pickled(writer, e)
+            except asyncio.TimeoutError:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
         except Exception as e:
             self._logger.exception("Exception in _handle_execute")
-            await self._send_error(writer, str(e))
+            # R3-MM-4: if the caught exception is asyncio.TimeoutError from
+            # one of the bounded wait_for(writer.drain(), timeout=30.0) calls
+            # above, the peer is already stuck. Calling _send_error_pickled
+            # here would route through _send_message -> another
+            # wait_for(writer.drain(), timeout=30.0) on the SAME stuck writer,
+            # incurring a second 30-second hang (60s total per stuck peer).
+            # Close the writer locally instead and bail out.
+            if isinstance(e, asyncio.TimeoutError):
+                # R3-MM-4: drain timed out on a stuck peer. Do NOT call
+                # _send_error_pickled (it would invoke _send_message, which
+                # awaits another wait_for(writer.drain(), 30s) on the same
+                # stuck writer — doubling the hang to 60s). Close the
+                # writer best-effort without awaiting wait_closed(), since
+                # wait_closed() would hang waiting for the same stuck
+                # FIN/ACK that already timed out on drain. Kernel-side TCP
+                # close completes asynchronously.
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return
+            await self._send_error_pickled(
+                writer, NetworkRequestException(str(e))
+            )
 
     async def _handle_execute_stream(
         self,
@@ -1652,6 +2004,27 @@ class NetworkManager:
             author_host = data.get("author_host")
             request_id = data.get("request_id")
             args = data.get("args", [])
+
+            # R2-CC-3: self-impersonation gate (locked #15). Mirrors the
+            # check in sibling handlers (publish/request/advert/delta).
+            if self._self_impersonation_check(
+                author_host, writer, "MSG_EXECUTE_STREAM"
+            ):
+                return
+
+            # R2-CC-3: pin-vs-wire identity check (C-106). Reject when the
+            # cert-pinned hostname disagrees with the wire-claimed
+            # author_host.
+            if author_host:
+                pinned = conn_context.get("peer_hostname")
+                if pinned and pinned != author_host:
+                    self._logger.warning(
+                        "[EXECUTE_STREAM] anti-spoof: pinned peer %r vs "
+                        "wire-claimed author_host %r — drop",
+                        pinned, author_host,
+                    )
+                    return
+                conn_context.setdefault("peer_hostname", author_host)
 
             # B-018b GUARD (split, K-5) — see _apply_b018b_guard.
             author, author_id, _denied = await self._apply_b018b_guard(
@@ -1698,7 +2071,8 @@ class NetworkManager:
                             chunk_length = len(chunk_data) + 1
                             header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                             writer.write(header + chunk_data)
-                            await writer.drain()
+                            # R2-CC-2: bounded drain. TODO: surface as config knob.
+                            await asyncio.wait_for(writer.drain(), timeout=30.0)
                             self._count_sent(writer, len(header) + len(chunk_data))
                             offset += CHUNK_SIZE
                             parts += 1
@@ -1710,22 +2084,38 @@ class NetworkManager:
                         chunk_length = len(payload) + 1
                         header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                         writer.write(header + payload)
-                        await writer.drain()
+                        # R2-CC-2: bounded drain. TODO: surface as config knob.
+                        await asyncio.wait_for(writer.drain(), timeout=30.0)
                         self._count_sent(writer, len(header) + len(payload))
                     # Mark end of this item so receiver knows where item boundaries are
                     item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                     writer.write(item_end_header)
-                    await writer.drain()
+                    # R2-CC-2: bounded drain. TODO: surface as config knob.
+                    await asyncio.wait_for(writer.drain(), timeout=30.0)
                     self._count_sent(writer, len(item_end_header))
                     sent_items += 1
                 except Exception as e:
                     self._logger.exception("Failed to send stream chunk")
+                    # R3-MM-4 (mirror of _handle_execute fix): if the failure
+                    # itself was a drain timeout on this writer, retrying
+                    # another drain via the error-frame send path would just
+                    # block another 30s on the same stuck peer (and a third
+                    # 30s in the outer except's _send_stream_chunk). Close
+                    # the writer best-effort and bail out — wait_closed()
+                    # would also hang on the stuck FIN/ACK.
+                    if isinstance(e, asyncio.TimeoutError):
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                        return
                     err_obj = ("__STREAM_ERROR__", str(e))
                     err_payload = pickle.dumps(err_obj)
                     chunk_length = len(err_payload) + 1
                     header = struct.pack(">IB", chunk_length, MSG_STREAM_CHUNK)
                     writer.write(header + err_payload)
-                    await writer.drain()
+                    # R2-CC-2: bounded drain. TODO: surface as config knob.
+                    await asyncio.wait_for(writer.drain(), timeout=30.0)
                     self._count_sent(writer, len(header) + len(err_payload))
                     # F5 fix: MUST send MSG_STREAM_ITEM_END after the error
                     # chunk so the client decoder's sentinel check in the
@@ -1736,7 +2126,8 @@ class NetworkManager:
                     # as data and no exception.
                     item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                     writer.write(item_end_header)
-                    await writer.drain()
+                    # R2-CC-2: bounded drain. TODO: surface as config knob.
+                    await asyncio.wait_for(writer.drain(), timeout=30.0)
                     self._count_sent(writer, len(item_end_header))
                     break
 
@@ -1745,6 +2136,18 @@ class NetworkManager:
 
         except Exception as e:
             self._logger.exception("Exception while streaming")
+            # R3-MM-4 (mirror of _handle_execute fix): if the streaming
+            # body failed because of a drain timeout, the writer is
+            # stuck. Trying to deliver the __STREAM_EXCEPTION__ frame
+            # would invoke another wait_for(writer.drain(), 30s) chain
+            # in _send_stream_chunk / _send_end_stream. Close best-effort
+            # and bail.
+            if isinstance(e, asyncio.TimeoutError):
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return
             try:
                 err_obj = ("__STREAM_EXCEPTION__", str(e))
                 await self._send_stream_chunk(writer, err_obj)
@@ -1753,11 +2156,17 @@ class NetworkManager:
                 # empty-payload ITEM_END branch).
                 item_end_header = struct.pack(">IB", 1, MSG_STREAM_ITEM_END)
                 writer.write(item_end_header)
-                await writer.drain()
+                # R2-CC-2: bounded drain. TODO: surface as config knob.
+                await asyncio.wait_for(writer.drain(), timeout=30.0)
                 self._count_sent(writer, len(item_end_header))
                 await self._send_end_stream(writer)
             except Exception:
-                pass
+                # On secondary failure, close the writer so the OS
+                # socket doesn't linger until GC.
+                try:
+                    writer.close()
+                except Exception:
+                    pass
 
     async def _handle_has_endpoint(
         self,
@@ -2017,7 +2426,15 @@ class NetworkManager:
     def _filter_inbound_advert(self, advert: dict) -> bool:
         """Typed-validation gate for a single inbound advert dict. Drops
         entries missing required keys / wrong types. Trust filtering
-        happens OUTBOUND-side (per PLAN H)."""
+        happens OUTBOUND-side (per PLAN H).
+
+        R2-KK-3: validates the four filter fields (hosts, blocked_hosts,
+        authors, blocked_authors) as well — each must be None, a str,
+        or a list of str. A peer sending ``hosts=42`` or
+        ``blocked_hosts={}`` used to pass this gate and reach the
+        filter logic where it would either raise unexpectedly or
+        silently misclassify the advert.
+        """
         if not isinstance(advert, dict):
             return False
         sub_uuid = advert.get("sub_uuid")
@@ -2026,6 +2443,29 @@ class NetworkManager:
             return False
         if not isinstance(topic, str) or not topic:
             return False
+
+        # Filter-field type validation. Accept None / str / list-of-str.
+        hosts = advert.get("hosts")
+        if not (hosts is None or isinstance(hosts, str)
+                or (isinstance(hosts, list)
+                    and all(isinstance(x, str) for x in hosts))):
+            return False
+        blocked_hosts = advert.get("blocked_hosts")
+        if not (blocked_hosts is None or isinstance(blocked_hosts, str)
+                or (isinstance(blocked_hosts, list)
+                    and all(isinstance(x, str) for x in blocked_hosts))):
+            return False
+        authors = advert.get("authors")
+        if not (authors is None or isinstance(authors, str)
+                or (isinstance(authors, list)
+                    and all(isinstance(x, str) for x in authors))):
+            return False
+        blocked_authors = advert.get("blocked_authors")
+        if not (blocked_authors is None or isinstance(blocked_authors, str)
+                or (isinstance(blocked_authors, list)
+                    and all(isinstance(x, str) for x in blocked_authors))):
+            return False
+
         return True
 
     def _serialize_local_sub_for_peer(self, sub) -> dict:
@@ -2040,6 +2480,63 @@ class NetworkManager:
             "authors": sub.authors,
             "blocked_authors": sub.blocked_authors,
         }
+
+    async def _detect_peer_restart(
+        self, peer_hostname: str, inbound_session_id: str
+    ) -> None:
+        """C-110: surfaces a peer restart so we re-arm our snapshot
+        gate.  Called by the inbound advert / delta handlers with
+        the peer's announced session_id. If the peer's session_id
+        differs from what we last saw, the peer restarted between
+        contacts; we clear ``_snapshot_sent[peer]`` so the next
+        reciprocal-exchange trigger re-sends our snapshot. Without
+        this, a fast TCP reconnect within heartbeat_interval (no
+        heartbeat-strikes timeout, no _drop_peer_advert_state)
+        would leave a stale "snapshot already sent" gate and the
+        restarted peer would never receive our subscription set.
+
+        First-contact handling: when we have no recorded
+        ``_peer_session_ids`` entry for the peer (prev_session is
+        None), it's our first inbound payload from this peer.
+        Adopt the session_id, AND patch any None-sentinel entry in
+        ``_snapshot_sent`` (left by ``_perform_initial_exchange``
+        that sent BEFORE we learned the peer's session_id) to the
+        now-known value. Without that patch, the next inbound
+        payload would mismatch a None-sentinel against a real
+        session_id and spuriously re-arm the gate even though no
+        restart actually happened.
+        """
+        restart_detected = False
+        async with self._adverts_struct_lock:
+            prev_session = self._peer_session_ids.get(peer_hostname)
+            if prev_session == inbound_session_id:
+                return
+            self._peer_session_ids[peer_hostname] = inbound_session_id
+            if prev_session is None:
+                # First contact. Adopt the session_id into any
+                # None-sentinel snapshot_sent entry so subsequent
+                # inbound payloads with the same session_id
+                # short-circuit at the equality check above.
+                if (
+                    peer_hostname in self._snapshot_sent
+                    and self._snapshot_sent[peer_hostname] is None
+                ):
+                    self._snapshot_sent[peer_hostname] = inbound_session_id
+                return
+            # Session changed: peer restarted. Drop our snapshot-sent
+            # gate so the next reciprocal-exchange (triggered by the
+            # incoming payload itself, via _maybe_reciprocal_exchange)
+            # actually re-sends instead of short-circuiting.
+            self._snapshot_sent.pop(peer_hostname, None)
+            restart_detected = True
+        if restart_detected:
+            self._logger.info(
+                "[SESSION] peer %s session_id changed (%s -> %s) — "
+                "re-arming snapshot-sent gate",
+                peer_hostname,
+                prev_session,
+                inbound_session_id,
+            )
 
     def _self_impersonation_check(
         self,
@@ -2082,13 +2579,22 @@ class NetworkManager:
             None,
         )
         if node is not None:
-            asyncio.create_task(self._spawn_initial_exchange(node))
+            # C-116: force=True bypasses the lexicographic tiebreak —
+            # the peer already sent to us so the duplicate-snapshot
+            # race the tiebreak was preventing cannot happen here.
+            self.plexus._spawn_fire_and_forget(
+                self._spawn_initial_exchange(node, force=True),
+                name=f"spawn_init_exch<-{author_host}",
+            )
             return
         # Fallback: client-only peer not yet in node table.
         peer_ip = self._safe_peer_ip(writer)
         if peer_ip:
-            asyncio.create_task(
-                self._spawn_initial_exchange_for_ip(peer_ip, author_host)
+            self.plexus._spawn_fire_and_forget(
+                self._spawn_initial_exchange_for_ip(
+                    peer_ip, author_host, force=True
+                ),
+                name=f"spawn_init_exch_ip<-{author_host}",
             )
 
     async def _handle_publish_event(
@@ -2110,7 +2616,17 @@ class NetworkManager:
                 return
 
             # locked #17: record peer hostname on first sight.
+            # C-106: pin-vs-wire identity check. If the cert-pin already
+            # set peer_hostname, the wire-claimed author_host must match.
             if author_host:
+                pinned = conn_context.get("peer_hostname")
+                if pinned and pinned != author_host:
+                    self._logger.warning(
+                        "[PUBLISH_EVENT] anti-spoof: pinned peer %r vs "
+                        "wire-claimed author_host %r — drop",
+                        pinned, author_host,
+                    )
+                    return
                 conn_context.setdefault("peer_hostname", author_host)
 
             # Reciprocal advert trigger (locked #7 + #10).
@@ -2209,6 +2725,21 @@ class NetworkManager:
                 return
 
             if author_host:
+                # C-106: pin-vs-wire identity check.
+                pinned = conn_context.get("peer_hostname")
+                if pinned and pinned != author_host:
+                    self._logger.warning(
+                        "[REQUEST_EVENT] anti-spoof: pinned peer %r vs "
+                        "wire-claimed author_host %r — drop",
+                        pinned, author_host,
+                    )
+                    await self._send_error_pickled(
+                        writer,
+                        NetworkRequestException(
+                            "anti-spoof: author_host mismatch with pinned peer"
+                        ),
+                    )
+                    return
                 conn_context.setdefault("peer_hostname", author_host)
 
             await self._maybe_reciprocal_exchange(author_host, writer)
@@ -2366,6 +2897,21 @@ class NetworkManager:
                 return
 
             if author_host:
+                # C-106: pin-vs-wire identity check.
+                pinned = conn_context.get("peer_hostname")
+                if pinned and pinned != author_host:
+                    self._logger.warning(
+                        "[REQUEST_EVENT_STREAM] anti-spoof: pinned peer %r "
+                        "vs wire-claimed author_host %r — drop",
+                        pinned, author_host,
+                    )
+                    await self._send_error_pickled(
+                        writer,
+                        NetworkRequestException(
+                            "anti-spoof: author_host mismatch with pinned peer"
+                        ),
+                    )
+                    return
                 conn_context.setdefault("peer_hostname", author_host)
 
             await self._maybe_reciprocal_exchange(author_host, writer)
@@ -2475,6 +3021,17 @@ class NetworkManager:
 
             # Build Event from wire metadata (NOT via Event.from_request).
             # First chunk wraps; subsequent chunks raw.
+            #
+            # W2-F4: chunks_sent tracks whether ANY MSG_STREAM_CHUNK frame
+            # has been written. Outer except clauses (TimeoutError /
+            # RequestException / Exception) read it to decide whether to
+            # send MSG_ERROR (legal pre-stream) or close the writer (the
+            # only legal action after MSG_STREAM_CHUNK without an
+            # intervening MSG_END_STREAM). Using a 1-element list because
+            # nonlocal across nested async function and outer except
+            # would otherwise need an explicit declaration.
+            chunks_sent = [False]
+
             async def _iterate_and_send():
                 first = True
                 if inspect.isasyncgenfunction(func):
@@ -2517,6 +3074,10 @@ class NetworkManager:
                                 await self._send_message(
                                     writer, MSG_STREAM_CHUNK, chunk
                                 )
+                            # W2-F4: mark chunk emission AFTER the
+                            # send completes so the outer except
+                            # clauses know a chunk landed on the wire.
+                            chunks_sent[0] = True
                             await self._send_message(
                                 writer, MSG_STREAM_ITEM_END, None
                             )
@@ -2565,6 +3126,10 @@ class NetworkManager:
                                 await self._send_message(
                                     writer, MSG_STREAM_CHUNK, chunk
                                 )
+                            # W2-F4: mark chunk emission AFTER the
+                            # send completes so the outer except
+                            # clauses know a chunk landed on the wire.
+                            chunks_sent[0] = True
                             await self._send_message(
                                 writer, MSG_STREAM_ITEM_END, None
                             )
@@ -2579,21 +3144,64 @@ class NetworkManager:
                     await _iterate_and_send()
                 await self._send_end_stream(writer)
             except asyncio.TimeoutError:
-                await self._send_error_pickled(
-                    writer,
-                    RequestException(
-                        f"request_event_stream timed out after {timeout}s"
-                    ),
-                )
+                # W2-F4: if any MSG_STREAM_CHUNK frame has already gone
+                # out, the framing contract forbids MSG_ERROR after
+                # chunks without an intervening MSG_END_STREAM. Closing
+                # the writer is the only legal action for the
+                # mid-stream-timeout case; pooling a partially-written
+                # connection corrupts the next caller. Pre-stream
+                # timeouts (no chunks yet) still get a proper
+                # MSG_ERROR.
+                if chunks_sent[0]:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                else:
+                    await self._send_error_pickled(
+                        writer,
+                        RequestException(
+                            f"request_event_stream timed out after {timeout}s"
+                        ),
+                    )
             except RequestException as exc:
-                await self._send_error_pickled(writer, exc)
+                # W2-F4: same framing concern for explicit
+                # RequestException raises from the handler.
+                if chunks_sent[0]:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                else:
+                    await self._send_error_pickled(writer, exc)
             except Exception as exc:
                 self._logger.exception("[REQUEST_EVENT_STREAM] iteration crashed")
-                await self._send_error_pickled(
-                    writer, RequestException(str(exc))
-                )
+                # W2-F4 (S1 follow-up): same framing concern — if any
+                # MSG_STREAM_CHUNK has gone out, MSG_ERROR is illegal
+                # without an intervening MSG_END_STREAM. Close the
+                # writer instead of corrupting the pooled connection.
+                if chunks_sent[0]:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                else:
+                    await self._send_error_pickled(
+                        writer, RequestException(str(exc))
+                    )
 
         except Exception as exc:
+            # V1 follow-up: this outer except is reachable only on
+            # pre-stream crashes (the inner `_iterate_and_send` try at
+            # ~line 2855 wraps the entire chunk-sending loop and now
+            # gates its three except clauses on ``chunks_sent[0]``). If
+            # any future edit moves chunk-sending code OUTSIDE the inner
+            # try, MIRROR the ``if chunks_sent[0]: close-only else: send_error``
+            # framing-invariant guard here — sending MSG_ERROR mid-stream
+            # corrupts the pooled connection for the next caller.
             self._logger.exception("[REQUEST_EVENT_STREAM] handler crashed")
             try:
                 await self._send_error_pickled(
@@ -2601,6 +3209,22 @@ class NetworkManager:
                 )
             except Exception:
                 pass
+        except BaseException:
+            # R2-AA-3: catch CancelledError / GeneratorExit / etc. so a
+            # cancel mid-stream does not leave the client connection
+            # dangling without a termination frame. Mirror the framing
+            # invariant from the inner except clauses: once any
+            # MSG_STREAM_CHUNK has gone out, MSG_ERROR is illegal without
+            # an intervening MSG_END_STREAM — close the writer instead.
+            # Pre-stream cancel (no chunks) is also handled by close to
+            # ensure the peer reader sees connection teardown rather than
+            # an indefinite read hang.
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            raise
 
     async def _handle_sub_advertise(
         self,
@@ -2625,7 +3249,31 @@ class NetworkManager:
                 )
                 return
 
+            # C-106: pin-vs-wire identity check. conn_context["peer_hostname"]
+            # is set unconditionally by _handle_client from the mTLS-pinned
+            # cert (line ~1455). A wire-claimed author_host that does NOT
+            # match the pinned identity is a spoof attempt — reject hard.
+            # The setdefault preserves the pinned value for downstream
+            # call sites that read peer_hostname from conn_context.
+            pinned = conn_context.get("peer_hostname")
+            if pinned and pinned != author_host:
+                self._logger.warning(
+                    "[SUB_ADVERTISE] anti-spoof: pinned peer %r vs wire-"
+                    "claimed author_host %r — drop",
+                    pinned, author_host,
+                )
+                return
             conn_context.setdefault("peer_hostname", author_host)
+
+            # C-110: detect peer restart via session_id mismatch.
+            # Older peers omit this field — treat as unchanged (skip
+            # the detection). When present, a different session_id
+            # than we have on record means the peer restarted; clear
+            # our outbound snapshot-sent gate so the next reciprocal
+            # exchange re-sends our snapshot to the restarted peer.
+            inbound_session = payload_dict.get("our_session_id")
+            if isinstance(inbound_session, str) and inbound_session:
+                await self._detect_peer_restart(author_host, inbound_session)
 
             # Soft anti-spoof check.
             peer_ip = self._safe_peer_ip(writer)
@@ -2661,6 +3309,11 @@ class NetworkManager:
             # already bounds the wire payload, but the per-entry processing
             # cost (two dict insertions + AdvertSub construction) compounds.
             if len(subs_payload) > MAX_ADVERT_SUBS_PER_PEER:
+                # R2-CC-8: previously sent MSG_ERROR back on the inbound
+                # one-shot server-side writer. That frame sits in the
+                # kernel buffer and corrupts framing for the next reader
+                # on the same socket. Log only — sender's ack_timeout
+                # fall-back path still ends the wait (just slower).
                 self._logger.warning(
                     "[SUB_ADVERTISE] rejecting oversized advert from %s: "
                     "%d entries exceeds cap %d",
@@ -2670,28 +3323,51 @@ class NetworkManager:
 
             # Atomic purge + reinsert (per locked #5: empty list → {}).
             # Session 4: accumulate processed_uuids for the ack frame.
+            # C-040: snapshot prior state before the clear so a mid-iter
+            # AdvertSub-construction raise can roll back the table to a
+            # consistent state instead of leaving it half-empty. Build
+            # the new entries in a staging dict first, then commit
+            # atomically — that way an exception inside the for-loop
+            # leaves the live tables untouched.
             processed_uuids: List[str] = []
             async with self._adverts_struct_lock:
-                self._inbound_adverts[author_host] = {}
+                staged_inbound: Dict[str, AdvertSub] = {}
+                staged_global: Dict[Tuple[str, str], AdvertSub] = {}
+                try:
+                    for entry in subs_payload:
+                        if not self._filter_inbound_advert(entry):
+                            continue
+                        sub = AdvertSub(
+                            sub_uuid=entry["sub_uuid"],
+                            topic_pattern=entry["topic"],
+                            hosts=entry.get("hosts"),
+                            blocked_hosts=entry.get("blocked_hosts"),
+                            authors=entry.get("authors"),
+                            blocked_authors=entry.get("blocked_authors"),
+                        )
+                        staged_inbound[sub.sub_uuid] = sub
+                        staged_global[(author_host, sub.sub_uuid)] = sub
+                        processed_uuids.append(sub.sub_uuid)
+                except Exception:
+                    # Stage failed mid-iter; do NOT commit. Live tables
+                    # remain whatever they were before. Re-raise so the
+                    # outer except in this handler logs + notifies peer.
+                    self._logger.exception(
+                        "[SUB_ADVERTISE] stage build failed mid-iter for %r; "
+                        "live state untouched",
+                        author_host,
+                    )
+                    raise
+                # Commit: now that staging completed without raising, swap
+                # the staged dicts into the live tables atomically (under
+                # the same struct_lock).
+                self._inbound_adverts[author_host] = staged_inbound
                 self._inbound_global_order = {
                     k: v
                     for k, v in self._inbound_global_order.items()
                     if k[0] != author_host
                 }
-                for entry in subs_payload:
-                    if not self._filter_inbound_advert(entry):
-                        continue
-                    sub = AdvertSub(
-                        sub_uuid=entry["sub_uuid"],
-                        topic_pattern=entry["topic"],
-                        hosts=entry.get("hosts"),
-                        blocked_hosts=entry.get("blocked_hosts"),
-                        authors=entry.get("authors"),
-                        blocked_authors=entry.get("blocked_authors"),
-                    )
-                    self._inbound_adverts[author_host][sub.sub_uuid] = sub
-                    self._inbound_global_order[(author_host, sub.sub_uuid)] = sub
-                    processed_uuids.append(sub.sub_uuid)
+                self._inbound_global_order.update(staged_global)
 
             self._logger.debug(
                 "[SUB_ADVERTISE] recorded %d subs from %s",
@@ -2704,18 +3380,27 @@ class NetworkManager:
             # via _safe_peer_ip(writer) for anti-spoof; reuse for the
             # helper's fallback. No-op when nothing was ingested.
             if processed_uuids:
-                asyncio.create_task(
+                self.plexus._spawn_fire_and_forget(
                     self._send_advert_ack_to(
                         author_host, peer_ip, processed_uuids,
-                    )
+                    ),
+                    name=f"advert_ack<-{author_host}",
                 )
 
             # Reciprocal: if we haven't yet advertised to this peer,
             # send our snapshot back (locked #7).
             await self._maybe_reciprocal_exchange(author_host, writer)
 
-        except Exception:
-            self._logger.exception("[SUB_ADVERTISE] handler crashed")
+        except Exception as exc:
+            # R2-CC-8: previously sent MSG_ERROR back on the inbound
+            # one-shot server-side writer (C-039). That frame would
+            # linger in the connection's kernel buffer and corrupt
+            # framing for the next reader on the same socket. Log only;
+            # sender recovers via ack_timeout. The exception is already
+            # captured by self._logger.exception below.
+            self._logger.exception(
+                "[SUB_ADVERTISE] handler crashed: %s", exc
+            )
 
     async def _handle_sub_delta(
         self,
@@ -2740,7 +3425,22 @@ class NetworkManager:
                 )
                 return
 
+            # C-106: pin-vs-wire identity check. See _handle_sub_advertise
+            # for the rationale — same anti-spoof guard applies here.
+            pinned = conn_context.get("peer_hostname")
+            if pinned and pinned != author_host:
+                self._logger.warning(
+                    "[SUB_DELTA] anti-spoof: pinned peer %r vs wire-"
+                    "claimed author_host %r — drop",
+                    pinned, author_host,
+                )
+                return
             conn_context.setdefault("peer_hostname", author_host)
+
+            # C-110: peer-restart detection. See _handle_sub_advertise.
+            inbound_session = payload_dict.get("our_session_id")
+            if isinstance(inbound_session, str) and inbound_session:
+                await self._detect_peer_restart(author_host, inbound_session)
 
             kind = payload_dict.get("kind")
             if kind not in ("add", "remove"):
@@ -2821,7 +3521,16 @@ class NetworkManager:
                         # Idempotent skip — fall through to reciprocal-exchange
                         # check (locked #7); the early-return in Cycle 6 review
                         # was inconsistent with sister handlers.
-                        pass
+                        # C-041: log WARNING so peer-state divergence (sender
+                        # thinks the sub exists, we never registered it) is
+                        # visible. The skip stays by-design idempotent, but
+                        # operators now see "remove of uuid we don't know"
+                        # in logs instead of silent.
+                        self._logger.warning(
+                            "[SUB_DELTA] remove of unknown sub_uuid=%r from "
+                            "peer %r — idempotent skip (per_peer_known=%s)",
+                            sub_uuid, author_host, per_peer is not None,
+                        )
                     else:
                         per_peer.pop(sub_uuid, None)
                         self._inbound_global_order.pop((author_host, sub_uuid), None)
@@ -2830,16 +3539,23 @@ class NetworkManager:
             # exchange await. Only "add" success generates an ack;
             # "remove" paths intentionally leave processed_uuid=None.
             if processed_uuid is not None:
-                asyncio.create_task(
+                self.plexus._spawn_fire_and_forget(
                     self._send_advert_ack_to(
                         author_host, peer_ip, [processed_uuid],
-                    )
+                    ),
+                    name=f"advert_ack_delta<-{author_host}",
                 )
 
             await self._maybe_reciprocal_exchange(author_host, writer)
 
-        except Exception:
-            self._logger.exception("[SUB_DELTA] handler crashed")
+        except Exception as exc:
+            # R2-CC-8: previously sent MSG_ERROR back on the inbound
+            # one-shot server-side writer (C-039). That frame would
+            # corrupt framing for the next reader on the same socket.
+            # Log only — sender recovers via ack_timeout.
+            self._logger.exception(
+                "[SUB_DELTA] handler crashed: %s", exc
+            )
 
     # ── Session 4 (v0.27.0) — sub-advert ack protocol ─────────────
 
@@ -2853,6 +3569,19 @@ class NetworkManager:
         connection. Best-effort: silent skip on send failure or unknown
         peer. Called as a fire-and-forget task from _handle_sub_advertise
         / _handle_sub_delta after lock release.
+
+        The ack acknowledges that we successfully INGESTED an inbound
+        snapshot or delta. The sender's heartbeat loop tracks per-sub
+        ``sent_at`` against ``2 * heartbeat_interval`` and resends on
+        timeout, then marks ``state="ack_timeout"`` if no ack arrived
+        before the second tick. The sender's ``retry_count`` is bumped
+        once per resend cycle (see ``_resend_and_bump_retry``); a
+        successful ack received here on the sender side transitions
+        the corresponding ``_outbound_adverts[peer][sub_uuid]`` entry
+        to ``state="acked"`` and clears its retry counter. So a "silent
+        skip" here is the failure mode the sender's heartbeat scan
+        actively recovers from — this isn't a legacy fire-and-forget,
+        it's the receiver half of the Session-4 (v0.27.0) ack protocol.
 
         IP resolution order (NAT-correct):
           1. peers_by_endpoint by hostname (mTLS config, authoritative)
@@ -2959,9 +3688,22 @@ class NetworkManager:
                 return
             processed_uuids = payload_dict.get("processed_uuids", []) or []
             if not isinstance(processed_uuids, list):
+                # C-042 PARTIAL: log the rejection so a peer sending a
+                # malformed payload is visible in logs rather than
+                # silently dropped. WARNING level — this is a protocol
+                # violation that breaks ack tracking for the affected
+                # subs (those entries stay "pending" until ack_timeout).
+                self._logger.warning(
+                    "[SUB_ADVERTISE_ACK] non-list processed_uuids=%r from "
+                    "peer %r - drop",
+                    type(processed_uuids).__name__, author_host,
+                )
                 return
 
-            ts = time.time()
+            # C-012: monotonic timebase for acked_at — local-only field,
+            # paired with sent_at writes that also use monotonic. NTP
+            # wall-clock steps must not perturb the resend/timeout math.
+            ts = time.monotonic()
             async with self._adverts_struct_lock:
                 peer_table = self._outbound_adverts.get(author_host)
                 if peer_table is None:
@@ -3217,7 +3959,15 @@ class NetworkManager:
         in Plexus acquire topic_registry._lock first then reach
         _advert_locks[peer] via send_sub_delta_remote. To avoid a cycle,
         snapshot the local subs list BEFORE acquiring _advert_locks[peer].
+
+        is_ready guard mirrors broadcast_local_sub_added/removed and
+        _check_advert_ack_timeouts/_resend_and_bump_retry: callers may
+        invoke this between Plexus.start_framework's network bring-up and
+        stop()'s shutdown sequence; without the guard a post-stop call
+        would touch torn-down structures.
         """
+        if not getattr(self, "is_ready", False):
+            return
         try:
             subs = await self.plexus.topic_registry.list_local_subs()
         except Exception:
@@ -3240,7 +3990,9 @@ class NetworkManager:
                 # itself takes >2*heartbeat_interval is theoretical
                 # (sends complete in milliseconds; heartbeat is 10s
                 # default) and is documented as accepted in the plan.
-                ts = time.time()
+                # C-012: monotonic timebase, paired with the read in
+                # _check_advert_ack_timeouts.
+                ts = time.monotonic()
                 projected = {
                     s.sub_uuid: AdvertSub(
                         sub_uuid=s.sub_uuid,
@@ -3258,6 +4010,10 @@ class NetworkManager:
 
             wire_payload = {
                 "author_host": self.plexus.hostname,
+                # C-110: stamp our session_id so the receiver can
+                # detect a same-hostname restart and re-arm its
+                # snapshot-sent gate.
+                "our_session_id": self.session_id,
                 "kind": "snapshot",
                 "subscriptions": [
                     self._serialize_local_sub_for_peer(s) for s in filtered
@@ -3312,6 +4068,14 @@ class NetworkManager:
     ) -> None:
         """Send single delta (add/remove) to a peer. Same lock-order
         pattern as advertise_subs_remote."""
+        # R2-CC-5: is_ready guard. Mirrors _send_advert_ack_to /
+        # _resend_and_bump_retry / broadcast_local_sub_*. A detached
+        # create_task spawning this method can fire between stop()
+        # flipping is_ready and the connection pool's full teardown;
+        # without this guard, _get_connection would be invoked on a
+        # half-destroyed NetworkManager.
+        if not getattr(self, "is_ready", False):
+            return
         if kind not in ("add", "remove"):
             self._logger.warning(
                 "[DELTA] invalid kind=%r for peer %s", kind, peer_hostname
@@ -3322,7 +4086,21 @@ class NetworkManager:
             async with self._adverts_struct_lock:
                 outbound_for_peer = self._outbound_adverts.get(peer_hostname, {})
                 if kind == "add":
-                    if sub.sub_uuid in outbound_for_peer:
+                    existing = outbound_for_peer.get(sub.sub_uuid)
+                    # C-107: ack_timeout is a recoverable state, not a
+                    # terminal one. The previous code early-returned on
+                    # any existing entry regardless of state, which
+                    # meant a set_enabled toggle (unsubscribe followed
+                    # by resubscribe, or any operator action that
+                    # triggers re-add for an ack_timeout sub) silently
+                    # no-op'd: the entry stayed in ack_timeout, the
+                    # _check_advert_ack_timeouts heartbeat scan only
+                    # touches state=='pending' so the sub never recovered.
+                    # Treat the add of an ack_timeout entry as a re-arm:
+                    # rewrite to a fresh pending entry (new sent_at,
+                    # cleared retry_count) and fall through to the
+                    # wire-send branch as if it were a new add.
+                    if existing is not None and existing.state != "ack_timeout":
                         return  # already advertised
                     outbound_for_peer = self._outbound_adverts.setdefault(
                         peer_hostname, {}
@@ -3330,6 +4108,8 @@ class NetworkManager:
                     # Session 4 (v0.27.0): stamp sent_at on the new
                     # entry. Send-failure rollback at line ~3180
                     # (outbound_now.pop) wipes the entry on failure.
+                    # C-012: monotonic timebase, paired with the read
+                    # in _check_advert_ack_timeouts.
                     outbound_for_peer[sub.sub_uuid] = AdvertSub(
                         sub_uuid=sub.sub_uuid,
                         topic_pattern=sub.topic_pattern,
@@ -3337,12 +4117,21 @@ class NetworkManager:
                         blocked_hosts=sub.blocked_hosts,
                         authors=sub.authors,
                         blocked_authors=sub.blocked_authors,
-                        sent_at=time.time(),
+                        sent_at=time.monotonic(),
                         state="pending",
                     )
                 else:
                     if sub.sub_uuid not in outbound_for_peer:
                         return  # never advertised
+                    # C-011: capture the prior AdvertSub so a send-failure
+                    # rollback can restore it. Without this, the
+                    # _outbound_adverts entry is gone before the wire send
+                    # and a failed remove leaves the peer holding the sub
+                    # in _inbound_adverts indefinitely (no self-heal). The
+                    # captured value is consumed in the except-branch below.
+                    prior_advert = self._outbound_adverts[peer_hostname][
+                        sub.sub_uuid
+                    ]
                     del self._outbound_adverts[peer_hostname][sub.sub_uuid]
 
             if kind == "add":
@@ -3352,6 +4141,8 @@ class NetworkManager:
 
             wire_payload = {
                 "author_host": self.plexus.hostname,
+                # C-110: stamp our session_id.
+                "our_session_id": self.session_id,
                 "kind": kind,
                 "subscriptions": wire_subs,
             }
@@ -3377,10 +4168,17 @@ class NetworkManager:
                     if outbound_now is not None:
                         if kind == "add":
                             outbound_now.pop(sub.sub_uuid, None)
-                        # For "remove" rollback we'd need the prior AdvertSub —
-                        # not preserved before delete. Acceptable: peer either
-                        # already had remove applied (idempotent) or our state
-                        # diverged briefly until next snapshot/reconnect.
+                        else:
+                            # C-011: restore the prior AdvertSub captured
+                            # before the delete above. Without this, the
+                            # peer still has the sub in its _inbound_adverts
+                            # (we never told it about the remove) while we
+                            # think it does not — silent divergence until
+                            # the next full snapshot / reconnect. The
+                            # subsequent ack-timeout scan (with retry_count
+                            # logic from C-009) drives a snapshot retry that
+                            # converges the state.
+                            outbound_now[sub.sub_uuid] = prior_advert
             finally:
                 if reader and writer:
                     if send_ok:
@@ -3401,6 +4199,81 @@ class NetworkManager:
                             pass
 
     # ── Session 4 (v0.27.0) — sub-advert ack timeout + retry ──────
+
+    async def _spawn_periodic_resync(self) -> None:
+        """C-109: kick off a full-snapshot resend to every connected
+        peer. Snapshots the peer list under struct_lock, then spawns
+        per-peer detached tasks that call ``advertise_subs_remote``
+        (the snapshot-replace path). Each peer's resend rebuilds our
+        outbound table for that peer AND triggers a full snapshot on
+        the wire — the receiver's _handle_sub_advertise does a
+        wholesale replace of its _inbound_adverts[peer], which
+        scrubs ghost entries that survived race-induced state drift.
+
+        Spawned as detached because advertise_subs_remote can take
+        seconds per peer (pool health check + send + ack roundtrip)
+        and we don't want the heartbeat tick to wait on them.
+
+        Skip filter:
+          * Dead peers (``is_alive() == False``) — no point sending to
+            a peer we've already marked dead via heartbeat strikes;
+            ``_drop_peer_advert_state`` already cleared its outbound
+            state and a resync would just re-create entries that the
+            next failed heartbeat will drop again.
+          * Peers with a pending resend task in ``_resend_tasks`` —
+            the ack-timeout scan already initiated a per-peer rebuild
+            for them this tick; a second wholesale replace would race
+            on ``_outbound_adverts[peer]`` and overwrite the
+            ack-timeout retry_count bookkeeping with a fresh
+            ``retry_count=0``, defeating the cap-at-1-retry throttle
+            on a persistently unresponsive peer. The ack-timeout path
+            is the right recovery mechanism in that window.
+        """
+        if not getattr(self, "is_ready", False):
+            return
+        # Snapshot dead-skip candidates first so the live-iteration
+        # below doesn't await per-node.
+        candidate_nodes: List[Tuple[str, str]] = []
+        async with self._adverts_struct_lock:
+            for node in self.nodes:
+                if not node.hostname or not node.IP:
+                    continue
+                if node.hostname == self.plexus.hostname:
+                    continue
+                candidate_nodes.append((node.IP, node.hostname))
+            resend_in_flight = {
+                h for h, t in getattr(self, "_resend_tasks", {}).items()
+                if t is not None and not t.done()
+            }
+        # is_alive() can await (e.g. resolves last-seen ts vs liveness
+        # timeout). Run outside the lock to keep struct_lock hold time
+        # bounded. Single-pass — minor TOCTOU is acceptable (the
+        # spawned task itself re-checks is_ready and the per-peer
+        # _advert_locks serialise).
+        peers_to_resync: List[Tuple[str, str]] = []
+        for peer_ip, peer_hostname in candidate_nodes:
+            if peer_hostname in resend_in_flight:
+                continue
+            node = next(
+                (n for n in self.nodes if n.hostname == peer_hostname),
+                None,
+            )
+            if node is None:
+                continue
+            try:
+                if not (
+                    node.enabled
+                    and await node.is_alive(timeout=self.liveness_timeout)
+                ):
+                    continue
+            except Exception:
+                continue
+            peers_to_resync.append((peer_ip, peer_hostname))
+        for peer_ip, peer_hostname in peers_to_resync:
+            self.plexus._spawn_fire_and_forget(
+                self.advertise_subs_remote(peer_ip, peer_hostname),
+                name=f"periodic_resync<-{peer_hostname}",
+            )
 
     async def _check_advert_ack_timeouts(self) -> None:
         """Scan _outbound_adverts for entries past ack timeout. Coalesce
@@ -3423,7 +4296,9 @@ class NetworkManager:
         if not getattr(self, "is_ready", False):
             return
         threshold = 2 * self.heartbeat_interval
-        now = time.time()
+        # C-012: monotonic timebase, paired with sent_at writes in
+        # advertise_subs_remote / send_sub_delta_remote.
+        now = time.monotonic()
         stale_by_peer: Dict[str, Set[str]] = {}
         peers_to_timeout: Dict[str, List[str]] = {}
 
@@ -3461,10 +4336,31 @@ class NetworkManager:
 
         # Spawn per-peer resend tasks. Heartbeat tick proceeds without
         # waiting (advertise_subs_remote can take seconds per peer).
+        # C-115: register the task in self._resend_tasks keyed by peer
+        # hostname so _drop_peer_advert_state can cancel any pending
+        # resend for that peer. Without this, a resend task can finish
+        # advertising to a peer that was just revoked. Done-callback
+        # evicts so the dict stays bounded. _resend_tasks is initialised
+        # in __init__; the lazy-init below is purely defensive for test
+        # scaffolds that bypass __init__ via object.__new__() — falling
+        # back to early-return would silently drop resends after
+        # peers_to_timeout already mutated state above.
+        resend_tasks = getattr(self, "_resend_tasks", None)
+        if resend_tasks is None:
+            resend_tasks = {}
+            self._resend_tasks = resend_tasks
         for peer_hostname, stale_uuids in stale_by_peer.items():
-            asyncio.create_task(
-                self._resend_and_bump_retry(peer_hostname, stale_uuids)
+            task = self.plexus._spawn_fire_and_forget(
+                self._resend_and_bump_retry(peer_hostname, stale_uuids),
+                name=f"resend_retry<-{peer_hostname}",
             )
+            if task is not None:
+                resend_tasks[peer_hostname] = task
+                task.add_done_callback(
+                    lambda _t, h=peer_hostname, rt=resend_tasks: rt.pop(h, None)
+                    if rt.get(h) is _t
+                    else None
+                )
 
     async def _resend_and_bump_retry(
         self,
@@ -3488,45 +4384,61 @@ class NetworkManager:
         """
         if not getattr(self, "is_ready", False):
             return
-        peer_ip: Optional[str] = None
-        for (cfg_ip, _cfg_port), peer_cfg in self.peers_by_endpoint.items():
-            if peer_cfg.hostname == peer_hostname:
-                peer_ip = cfg_ip
-                break
-        if peer_ip is None:
-            node = next(
-                (n for n in list(self.nodes) if n.hostname == peer_hostname),
-                None,
-            )
-            if node is not None and node.IP:
-                peer_ip = node.IP
-        if peer_ip is None:
-            self._logger.debug(
-                "[ADVERT_ACK_TIMEOUT] no IP for peer_hostname=%r — skip",
-                peer_hostname,
-            )
-            return
         try:
-            await self.advertise_subs_remote(peer_ip, peer_hostname)
-        except Exception:
-            self._logger.debug(
-                "[ADVERT_ACK_TIMEOUT] resend to %r failed",
-                peer_hostname, exc_info=True,
-            )
-            return
-        async with self._adverts_struct_lock:
-            sub_table = self._outbound_adverts.get(peer_hostname)
-            if sub_table is None:
+            peer_ip: Optional[str] = None
+            for (cfg_ip, _cfg_port), peer_cfg in self.peers_by_endpoint.items():
+                if peer_cfg.hostname == peer_hostname:
+                    peer_ip = cfg_ip
+                    break
+            if peer_ip is None:
+                node = next(
+                    (n for n in list(self.nodes) if n.hostname == peer_hostname),
+                    None,
+                )
+                if node is not None and node.IP:
+                    peer_ip = node.IP
+            if peer_ip is None:
+                self._logger.debug(
+                    "[ADVERT_ACK_TIMEOUT] no IP for peer_hostname=%r — skip",
+                    peer_hostname,
+                )
                 return
-            for sub_uuid in stale_uuids:
-                sub = sub_table.get(sub_uuid)
-                if sub is not None and sub.state == "pending":
-                    sub.retry_count = 1
+            try:
+                await self.advertise_subs_remote(peer_ip, peer_hostname)
+            except Exception:
+                self._logger.debug(
+                    "[ADVERT_ACK_TIMEOUT] resend to %r failed",
+                    peer_hostname, exc_info=True,
+                )
+                return
+        finally:
+            # C-009: always bump retry_count on stale_uuids — even when
+            # the IP could not be resolved or the resend raised. Without
+            # this, _check_advert_ack_timeouts re-schedules the same
+            # stale entries every heartbeat tick forever (retry_count
+            # stays at 0, never reaches the >=1 ack_timeout-promotion
+            # threshold). One bump per attempt is sufficient: the next
+            # tick that observes the still-pending entry will hit the
+            # retry_count>=1 branch and transition to ack_timeout.
+            async with self._adverts_struct_lock:
+                sub_table = self._outbound_adverts.get(peer_hostname)
+                if sub_table is None:
+                    return
+                for sub_uuid in stale_uuids:
+                    sub = sub_table.get(sub_uuid)
+                    if sub is not None and sub.state == "pending":
+                        sub.retry_count = 1
 
     # ── Sub-broadcast helpers (called from Plexus subscribe/unsubscribe) ──
 
     async def broadcast_local_sub_added(self, sub) -> None:
-        """Filter peers + send add-delta. No-op when not ready."""
+        """Filter peers + send add-delta. No-op when not ready.
+
+        C-117: per-peer send failures now also emit
+        ``_core/sub/peer_unreachable`` so the owning plugin (or a
+        monitor) can react without polling. The DEBUG log stays for
+        ops visibility; the topic carries structured payload.
+        """
         if not getattr(self, "is_ready", False):
             return
         for node in list(self.nodes):
@@ -3535,7 +4447,10 @@ class NetworkManager:
             if node.hostname == self.plexus.hostname:
                 continue
             try:
-                if not (node.enabled and await node.is_alive()):
+                if not (
+                    node.enabled
+                    and await node.is_alive(timeout=self.liveness_timeout)
+                ):
                     continue
             except Exception:
                 continue
@@ -3545,15 +4460,31 @@ class NetworkManager:
                 await self.send_sub_delta_remote(
                     node.IP, node.hostname, "add", sub
                 )
-            except Exception:
+            except Exception as exc:
                 self._logger.debug(
                     "broadcast_local_sub_added: send to %s failed",
                     node.hostname, exc_info=True,
                 )
+                # C-117: emit observable signal.
+                try:
+                    self.plexus._internal_emit(
+                        "_core/sub/peer_unreachable",
+                        peer_hostname=node.hostname,
+                        sub_uuid=sub.sub_uuid,
+                        kind="add",
+                        error=f"{type(exc).__name__}: {exc}",
+                        ts=time.time(),
+                    )
+                except Exception:
+                    pass
 
     async def broadcast_local_sub_removed(self, sub) -> None:
         """Filter peers + send remove-delta. Only sends to peers we have
-        actually advertised this sub to (outbound table is authority)."""
+        actually advertised this sub to (outbound table is authority).
+
+        C-117: see :meth:`broadcast_local_sub_added` for the
+        peer_unreachable emit.
+        """
         if not getattr(self, "is_ready", False):
             return
         for node in list(self.nodes):
@@ -3562,7 +4493,10 @@ class NetworkManager:
             if node.hostname == self.plexus.hostname:
                 continue
             try:
-                if not (node.enabled and await node.is_alive()):
+                if not (
+                    node.enabled
+                    and await node.is_alive(timeout=self.liveness_timeout)
+                ):
                     continue
             except Exception:
                 continue
@@ -3574,26 +4508,72 @@ class NetworkManager:
                 await self.send_sub_delta_remote(
                     node.IP, node.hostname, "remove", sub
                 )
-            except Exception:
+            except Exception as exc:
                 self._logger.debug(
                     "broadcast_local_sub_removed: send to %s failed",
                     node.hostname, exc_info=True,
                 )
+                # C-117: emit observable signal (remove variant).
+                try:
+                    self.plexus._internal_emit(
+                        "_core/sub/peer_unreachable",
+                        peer_hostname=node.hostname,
+                        sub_uuid=sub.sub_uuid,
+                        kind="remove",
+                        error=f"{type(exc).__name__}: {exc}",
+                        ts=time.time(),
+                    )
+                except Exception:
+                    pass
 
     # ── Initial-exchange + disconnect cleanup helpers ──
 
-    async def _spawn_initial_exchange(self, node) -> None:
+    async def _spawn_initial_exchange(self, node, *, force: bool = False) -> None:
         """Schedule (or skip) initial advert exchange to a Node. Idempotent
         via in-flight task table + ``_snapshot_sent`` guard inside the
-        inner task body (locked #7)."""
+        inner task body.
+
+        C-116: lexicographic-hostname tiebreak (when ``force=False``).
+        Only the lower-hostname peer of a (self, peer) pair initiates
+        the proactive snapshot send (e.g. mutual discovery cascade);
+        the higher-hostname peer waits for the inbound snapshot to
+        fire its ``_maybe_reciprocal_exchange`` path. The
+        reciprocal-exchange caller passes ``force=True`` because at
+        that point the OTHER side has already sent and we're sending
+        back — the tiebreak no longer applies.
+
+        Deterministic — exactly one of (self_host > peer_host) /
+        (self_host < peer_host) / (self_host == peer_host) holds;
+        equality is self-exchange which we already skip below.
+        """
         host = getattr(node, "hostname", None)
         if not host:
+            return
+        if not force and self.plexus.hostname > host:
+            self._logger.debug(
+                "[INIT_EXCH] lexicographic tiebreak: self=%r > peer=%r — "
+                "deferring initiate; will reciprocate when peer's "
+                "snapshot arrives",
+                self.plexus.hostname, host,
+            )
             return
         async with self._adverts_struct_lock:
             prev = self._initial_exchange_tasks.get(host)
             if prev is not None and not prev.done():
                 return
-            inner = asyncio.create_task(self._initial_advert_exchange(node))
+            # R4-YY-5: route through _spawn_fire_and_forget so the
+            # spawned coroutine runs under the depth-isolating wrapper
+            # (matches the discipline used elsewhere; forward-proofs
+            # against future event-emitting work added inside
+            # _initial_advert_exchange). _spawn_fire_and_forget returns
+            # None when no event loop is running (shutdown race) —
+            # treat as "nothing to track".
+            inner = self.plexus._spawn_fire_and_forget(
+                self._initial_advert_exchange(node),
+                name=f"init_advert_exch->{host}",
+            )
+            if inner is None:
+                return
             self._initial_exchange_tasks[host] = inner
 
         def _deregister(_t, h=host):
@@ -3602,58 +4582,115 @@ class NetworkManager:
                     cur = self._initial_exchange_tasks.get(h)
                     if cur is _t:
                         self._initial_exchange_tasks.pop(h, None)
+            self.plexus._spawn_fire_and_forget(
+                _drop(), name=f"init_exch_dereg<-{h}"
+            )
+            # Consume task's exception so Python doesn't log
+            # "Task exception was never retrieved" at GC time.
+            # _initial_advert_exchange re-raises after logging.
             try:
-                asyncio.create_task(_drop())
-            except RuntimeError:
-                # Loop closed during shutdown — drop silently.
+                if not _t.cancelled():
+                    exc = _t.exception()
+                    if exc is not None:
+                        self._logger.debug(
+                            "initial advert exchange to %s raised: %r", h, exc
+                        )
+            except Exception:
                 pass
 
         inner.add_done_callback(_deregister)
 
-    async def _initial_advert_exchange(self, node) -> None:
-        """Authoritative check-then-set under struct_lock. If a second
-        concurrent trigger arrived, bail."""
-        host = getattr(node, "hostname", None)
-        if not host:
-            return
+    async def _perform_initial_exchange(self, peer_ip: str, host: str) -> None:
+        """Check-then-set _snapshot_sent under struct_lock, then send
+        the snapshot to peer_ip. Bail if another trigger already
+        claimed the slot. Discard the flag and re-raise on any
+        failure so the next reciprocal trigger can retry.
+
+        C-063 + C-129: catches BaseException (covers CancelledError,
+        which is a BaseException, not Exception). Previously the
+        IP-only variant only caught Exception, letting a cancellation
+        between ``_snapshot_sent.add(host)`` and the successful end
+        of ``advertise_subs_remote`` leave ``host`` stuck in
+        ``_snapshot_sent`` forever — every future reciprocal-exchange
+        trigger for that peer would short-circuit at the gate, and
+        the peer would never see our subs again until process restart.
+        Unified to one helper so the two spawn sites
+        (``_spawn_initial_exchange`` for Node-backed peers,
+        ``_spawn_initial_exchange_for_ip`` for client-only peers
+        without a Node entry yet) share identical exception handling.
+        """
         async with self._adverts_struct_lock:
             if host in self._snapshot_sent:
                 return
-            self._snapshot_sent.add(host)
+            # C-110: claim the slot with the peer's session_id if we
+            # already know it (subsequent inbound payloads with the
+            # same session_id won't trigger _detect_peer_restart's
+            # mismatch path). If we don't know it yet (first contact),
+            # use None as a "session unknown" sentinel — the first
+            # inbound payload's session_id is what eventually fills
+            # this slot via _detect_peer_restart's None-sentinel
+            # branch (which adopts the inbound session_id without
+            # popping the gate). Without the sentinel branch, seeding
+            # with "" would mismatch any real session_id and trigger
+            # a spurious second snapshot send on first contact.
+            self._snapshot_sent[host] = self._peer_session_ids.get(host)
         try:
-            await self.advertise_subs_remote(node.IP, host)
-        except Exception:
+            await self.advertise_subs_remote(peer_ip, host)
+        except BaseException:
             async with self._adverts_struct_lock:
-                self._snapshot_sent.discard(host)
+                self._snapshot_sent.pop(host, None)
             self._logger.warning(
                 "initial advert exchange to %s failed", host
             )
             raise
 
-    async def _spawn_initial_exchange_for_ip(
-        self, peer_ip: str, host: str
-    ) -> None:
-        """Variant for client-only peers without a Node entry yet."""
+    async def _initial_advert_exchange(self, node) -> None:
+        """Authoritative check-then-set wrapper for Node-backed peers.
+        Delegates to ``_perform_initial_exchange`` which handles the
+        check-then-set / advertise / discard sequence. See that
+        helper's docstring for exception-handling rationale (C-063).
+        """
+        host = getattr(node, "hostname", None)
         if not host:
+            return
+        await self._perform_initial_exchange(node.IP, host)
+
+    async def _spawn_initial_exchange_for_ip(
+        self, peer_ip: str, host: str, *, force: bool = False
+    ) -> None:
+        """Variant for client-only peers without a Node entry yet.
+
+        C-116: same lexicographic tiebreak as _spawn_initial_exchange.
+        Lower-hostname initiates; higher-hostname waits to reciprocate.
+        Reciprocal-exchange callers pass ``force=True`` to bypass the
+        tiebreak (peer has already sent; we're sending back).
+        """
+        if not host:
+            return
+        if not force and self.plexus.hostname > host:
+            self._logger.debug(
+                "[INIT_EXCH_IP] lexicographic tiebreak: self=%r > peer=%r"
+                " — deferring initiate",
+                self.plexus.hostname, host,
+            )
             return
         async with self._adverts_struct_lock:
             prev = self._initial_exchange_tasks.get(host)
             if prev is not None and not prev.done():
                 return
 
-            async def _exchange():
-                async with self._adverts_struct_lock:
-                    if host in self._snapshot_sent:
-                        return
-                    self._snapshot_sent.add(host)
-                try:
-                    await self.advertise_subs_remote(peer_ip, host)
-                except Exception:
-                    async with self._adverts_struct_lock:
-                        self._snapshot_sent.discard(host)
-                    raise
-
-            t = asyncio.create_task(_exchange())
+            # R4-YY-5: route through _spawn_fire_and_forget so the
+            # spawned coroutine runs under the depth-isolating wrapper
+            # (matches sibling _spawn_initial_exchange; forward-proofs
+            # against future event-emitting work added inside
+            # _perform_initial_exchange). Returns None on no-loop —
+            # treat as "nothing to track".
+            t = self.plexus._spawn_fire_and_forget(
+                self._perform_initial_exchange(peer_ip, host),
+                name=f"init_advert_exch_ip->{host}",
+            )
+            if t is None:
+                return
             self._initial_exchange_tasks[host] = t
 
         def _dereg(_t, h=host):
@@ -3662,9 +4699,21 @@ class NetworkManager:
                     cur = self._initial_exchange_tasks.get(h)
                     if cur is _t:
                         self._initial_exchange_tasks.pop(h, None)
+            self.plexus._spawn_fire_and_forget(
+                _drop(), name=f"init_exch_ip_dereg<-{h}"
+            )
+            # Consume task's exception so Python doesn't log
+            # "Task exception was never retrieved" at GC time.
+            # _exchange re-raises after the snapshot-discard.
             try:
-                asyncio.create_task(_drop())
-            except RuntimeError:
+                if not _t.cancelled():
+                    exc = _t.exception()
+                    if exc is not None:
+                        self._logger.debug(
+                            "initial advert exchange (ip) to %s raised: %r",
+                            h, exc,
+                        )
+            except Exception:
                 pass
 
         t.add_done_callback(_dereg)
@@ -3674,6 +4723,47 @@ class NetworkManager:
         targeting it (locked #4 + #17)."""
         if not peer_hostname:
             return
+        # R2-EE-4: also drain + drop the peer's connection_pools entry.
+        # Without this, dead/flapping peers leave their asyncio.Queue
+        # lingering in connection_pools (only revoke_peer pops it),
+        # growing the dict unboundedly. Resolve the (ip, port) via
+        # peers_by_endpoint reverse-lookup, then snapshot+close each
+        # pooled writer and pop the key.
+        pool_keys = [
+            (cfg_ip, cfg_port)
+            for (cfg_ip, cfg_port), peer_cfg in self.peers_by_endpoint.items()
+            if getattr(peer_cfg, "hostname", None) == peer_hostname
+        ]
+        for pool_key in pool_keys:
+            pool = self.connection_pools.pop(pool_key, None)
+            if pool is None:
+                continue
+            while True:
+                try:
+                    _r, w = pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                except Exception as e:
+                    self._logger.warning(
+                        "_drop_peer_advert_state pool drain unexpected error: %s", e
+                    )
+                    break
+                try:
+                    w.close()
+                    await w.wait_closed()
+                except Exception as e:
+                    self._logger.debug(
+                        "_drop_peer_advert_state pool close error for %s: %s — continuing drain",
+                        pool_key, e,
+                    )
+        # R4-VV-3: also evict the matching peers_by_endpoint entries.
+        # Without this, a concurrent _return_connection sees
+        # peers_by_endpoint still holds the key (bypassing the early-close
+        # guard at "if key not in self.peers_by_endpoint"), then finds
+        # connection_pools key absent and recreates the queue — pooling
+        # the stale writer and resurrecting the dropped peer's slot.
+        for pool_key in pool_keys:
+            self.peers_by_endpoint.pop(pool_key, None)
         async with self._adverts_struct_lock:
             self._inbound_adverts.pop(peer_hostname, None)
             self._inbound_global_order = {
@@ -3682,7 +4772,11 @@ class NetworkManager:
                 if k[0] != peer_hostname
             }
             self._outbound_adverts.pop(peer_hostname, None)
-            self._snapshot_sent.discard(peer_hostname)
+            # C-110: dict.pop replaces set.discard.
+            self._snapshot_sent.pop(peer_hostname, None)
+            # Also forget the peer's announced session_id so the next
+            # contact starts fresh and we don't compare-against-stale.
+            self._peer_session_ids.pop(peer_hostname, None)
             # B-071: reset per-peer wire counters on heartbeat-declared
             # disconnect (current-session only per O7). Late frames after
             # this pop are silently skipped by _count_sent/_count_recv
@@ -3711,9 +4805,35 @@ class NetworkManager:
             except Exception:
                 pass
 
-        # Pop the per-peer Lock entry. Orphaning a held lock is harmless
-        # — GC'd when its task completes.
-        self._advert_locks.pop(peer_hostname, None)
+        # C-115: cancel any in-flight resend task for this peer so a
+        # stale advertise_subs_remote call doesn't fire after we just
+        # cleared the peer's advert state. The done-callback at the
+        # spawn site evicts the entry; cancel-then-pop here is safe.
+        resend_tasks = getattr(self, "_resend_tasks", None)
+        if resend_tasks is not None:
+            resend_task = resend_tasks.pop(peer_hostname, None)
+            if resend_task is not None and not resend_task.done():
+                try:
+                    resend_task.cancel()
+                    try:
+                        await asyncio.wait_for(resend_task, timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                        pass
+                except Exception:
+                    pass
+
+        # C-007 fix: do NOT pop the per-peer Lock entry. The previous
+        # behaviour (pop here outside struct_lock + setdefault outside
+        # struct_lock at the two call sites in advertise_subs_remote and
+        # send_sub_delta_remote) created a window where two concurrent
+        # callers for the same peer could each get a DIFFERENT Lock
+        # object — no mutual exclusion. Leaving the entry in
+        # ``_advert_locks`` makes the lock per-peer-singleton for the
+        # process lifetime; memory growth is bounded by peer count
+        # (typically tens to low-hundreds, not enough to matter). A
+        # re-added peer after revoke reuses the existing lock, which is
+        # the correct invariant. Lock cleanup on full shutdown is via
+        # GC when NetworkManager is freed.
 
     async def _mark_node_dead(self, node) -> None:
         """Centralised node-dead helper. Idempotent."""
@@ -3723,6 +4843,71 @@ class NetworkManager:
         host = getattr(node, "hostname", None)
         if host:
             await self._drop_peer_advert_state(host)
+            # C-044: clear strike counter so a future re-enable starts
+            # with a fresh budget.
+            self._heartbeat_misses.pop(host, None)
+            # C-092: fail any Plexus-level Request objects whose target
+            # is this peer (or whose remote-stamp matches the peer's
+            # node) so callers see a fast NetworkRequestException
+            # instead of waiting for the underlying TCP socket timeout
+            # (which can take minutes). _inflight_publishes was
+            # already cancelled inside _drop_peer_advert_state; this
+            # closes the higher-level requests too.
+            try:
+                requests = getattr(self.plexus, "requests", None)
+                if requests:
+                    for req in list(requests.values()):
+                        # Filter to requests targeting this peer. The
+                        # author_host field is the canonical "where
+                        # was this request routed" stamp for remote
+                        # dispatch — set when _process_request sees
+                        # a RemotePlugin target.
+                        if (
+                            getattr(req, "_is_remote", False)
+                            and getattr(req, "target_host", None) == host
+                            and not req._future.done()
+                        ):
+                            try:
+                                req._future.set_exception(
+                                    NetworkRequestException(
+                                        f"peer {host!r} marked dead; "
+                                        f"in-flight request {req.id} "
+                                        f"fast-failed (C-092)"
+                                    )
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                self._logger.debug(
+                    "_mark_node_dead: in-flight request fast-fail failed",
+                    exc_info=True,
+                )
+
+    async def _record_heartbeat_miss(self, node) -> bool:
+        """C-044 helper: increment per-host miss counter; return True
+        iff the count has reached ``self.heartbeat_strikes`` (meaning
+        the caller should now mark the node dead).
+
+        Falls back to dead-on-first-miss semantics (legacy behaviour)
+        if ``heartbeat_strikes`` is set to 1 or less.
+        """
+        host = getattr(node, "hostname", None) or ""
+        # Without a hostname we have nowhere to track misses; fail
+        # closed (mark dead immediately) — same as pre-C-044 behaviour.
+        if not host:
+            return True
+        strikes = max(1, int(getattr(self, "heartbeat_strikes", 3)))
+        count = self._heartbeat_misses.get(host, 0) + 1
+        if count >= strikes:
+            # Reached threshold — clear and signal dead.
+            self._heartbeat_misses.pop(host, None)
+            return True
+        self._heartbeat_misses[host] = count
+        self._logger.debug(
+            "[HEARTBEAT] miss %d/%d for peer=%r — tolerating",
+            count, strikes, host,
+        )
+        return False
 
     # ── Remote-dispatch helper for publish_event step 18 ──
 
@@ -3767,7 +4952,10 @@ class NetworkManager:
                 )
                 continue
             try:
-                if not (node.enabled and await node.is_alive()):
+                if not (
+                    node.enabled
+                    and await node.is_alive(timeout=self.liveness_timeout)
+                ):
                     continue
             except Exception:
                 continue
@@ -3863,25 +5051,36 @@ class NetworkManager:
                 client_entry = (client_ip, resolved_port)
                 if self.discover_nodes:
                     # Dedupe: drop existing (client_ip, None) when we now
-                    # have an explicit port; otherwise dedupe by exact tuple.
+                    # have an explicit port; otherwise dedupe by exact
+                    # tuple. C-006: build a NEW tuple then rebind so
+                    # concurrent readers iterate either the old or the
+                    # new snapshot, never a mid-update mix.
+                    new_node_ips: Tuple[Tuple[str, Optional[int]], ...]
+                    new_node_ips = self.node_ips
                     if resolved_port is not None:
-                        self.node_ips = [
+                        new_node_ips = tuple(
                             e
-                            for e in self.node_ips
+                            for e in new_node_ips
                             if not (e[0] == client_ip and e[1] is None)
-                        ]
+                        )
                         # Also patch any existing Node for this IP that was
                         # created before we knew its listener port. Without
                         # this, _resolve_port walks self.nodes first and
                         # finds the stale port=None Node — masking the
-                        # corrected node_ips entry forever.
+                        # corrected node_ips entry forever. Node objects
+                        # themselves are mutable per-instance (the tuple
+                        # holding them is what's immutable); patching
+                        # n.port in place is safe across the snapshot
+                        # boundary because every snapshot references the
+                        # same Node instances.
                         for n in self.nodes:
                             if n.IP == client_ip and n.port is None:
                                 n.port = resolved_port
                                 if n.hostname is None and hostname:
                                     n.hostname = hostname
-                    if client_entry not in self.node_ips:
-                        self.node_ips.append(client_entry)
+                    if client_entry not in new_node_ips:
+                        new_node_ips = new_node_ips + (client_entry,)
+                    self.node_ips = new_node_ips
 
             response = {
                 "hostname": self.plexus.hostname,
@@ -3893,7 +5092,7 @@ class NetworkManager:
                     and not node.hostname == hostname
                     and discover_nodes_info
                     and node.enabled
-                    and await node.is_alive()
+                    and await node.is_alive(timeout=self.liveness_timeout)
                 ],
             }
 
@@ -3916,7 +5115,14 @@ class NetworkManager:
 
         Resolves the per-node port via _resolve_port(IP). Connections to two
         peers on the same IP with different ports are tracked separately.
+
+        R3-PP-2: snapshot peers_by_endpoint BEFORE the resolve+lookup pair so
+        a concurrent revoke_peer.pop() between step 1 (_resolve_port) and
+        step 2 (peers_by_endpoint.get) cannot turn a valid peer into a
+        spurious ConnectionError("not in peers config"). The lookup below
+        consults the frozen snapshot instead of the live dict.
         """
+        peers_snapshot = dict(self.peers_by_endpoint)
         port = self._resolve_port(IP)
         self._logger.debug(f"[CONNECTION] Creating new TLS connection to {IP}:{port}")
         ssl_context = self._create_client_ssl_context()
@@ -3945,7 +5151,10 @@ class NetworkManager:
             except Exception: pass
             raise ConnectionError(f"Server pin extract failed for {IP}:{port}: {e}")
 
-        peer_cfg = self.peers_by_endpoint.get((IP, port))
+        # R3-PP-2: consult the snapshot taken before _resolve_port so a
+        # mid-flight revoke cannot produce a misleading "not in peers config"
+        # error for a peer that was valid at call time.
+        peer_cfg = peers_snapshot.get((IP, port))
         if peer_cfg is None or peer_cfg.fingerprint != peer_fp:
             writer.close()
             try: await writer.wait_closed()
@@ -3979,6 +5188,14 @@ class NetworkManager:
         concurrent _create_connection mid-await fails its own pin check
         rather than completing and pooling a now-revoked connection.
         Returns count of connections closed.
+
+        C-045: transactional revoke. After the config-side pop, drops
+        the per-peer advert state (which itself cancels in-flight
+        publishes via _drop_peer_advert_state). This prevents stale
+        ``_inbound_adverts`` / ``_outbound_adverts`` entries from
+        outliving the peer's credentials and dispatching events to a
+        revoked target. Best-effort: cleanup errors are logged but do
+        not interrupt the pool drain that follows.
         """
         closed = 0
         spec = next((p for p in self.peers if p.fingerprint == fingerprint), None)
@@ -3987,6 +5204,20 @@ class NetworkManager:
         self.peers_by_endpoint.pop((spec.ip, spec.port), None)
         self.peers_by_fingerprint.pop(spec.fingerprint, None)
         self.peers = [p for p in self.peers if p.fingerprint != fingerprint]
+        # C-045: drop advert state for the revoked peer. This also
+        # cancels any pending _inflight_publishes for the hostname
+        # (per _drop_peer_advert_state lines 3863-3884). Without this,
+        # events keep dispatching to a peer whose credentials we just
+        # revoked.
+        peer_hostname = getattr(spec, "hostname", None)
+        if peer_hostname:
+            try:
+                await self._drop_peer_advert_state(peer_hostname)
+            except Exception:
+                self._logger.warning(
+                    "revoke_peer: _drop_peer_advert_state for %r failed",
+                    peer_hostname, exc_info=True,
+                )
         # Security review LOW fix: warn loudly when revoke leaves zero peers.
         # Subsequent _create_pinned_ssl_context calls will skip
         # load_verify_locations and outgoing connections fail with an
@@ -3997,6 +5228,39 @@ class NetworkManager:
                 "outgoing connections will fail with an opaque OpenSSL error "
                 "until a new peer is added (currently restart-required)."
             )
+        # R3-PP-1: rebuild self.ssl_context so subsequent _create_connection
+        # outbound paths (and any future server context rebuild) no longer
+        # trust the revoked peer's CA cert. NOTE: asyncio.start_server captured
+        # the SSL context at construction time, so the *running* accept loop
+        # continues to use the original context until the next NetworkManager
+        # rebuild (e.g. config hot-reload). This rebuild closes the outbound
+        # trust-store hole and ensures any future SSL-context refresh consumers
+        # see the post-revoke state. Documented hot-swap limitation for inbound.
+        #
+        # R3-PP-1 review follow-up:
+        #   - Last-peer case: when ``self.peers`` is empty after this revoke,
+        #     ``_create_pinned_ssl_context`` would hard-raise (no trusted CAs),
+        #     so the rebuild is skipped. The stale ``self.ssl_context`` is
+        #     unavoidable here — the empty-peers warning above already
+        #     documents that further outgoing connections will fail until a
+        #     new peer is added; operator must restart or hot-reload.
+        #   - Concurrent revoke serialisation: the unsynchronised mutations
+        #     above (peers_by_endpoint/peers_by_fingerprint/self.peers) plus
+        #     this rebuild are not guarded by a lock. revoke_peer is
+        #     documented as a single-caller administrative path (called from
+        #     hot-reload / runtime cert revocation). If two concurrent
+        #     revoke_peer calls ever land, the last writer wins on
+        #     self.ssl_context but both peer-set mutations are interleaved
+        #     correctly by the GIL — net behaviour is "both peers revoked"
+        #     with one rebuild reflecting the final state.
+        if self.peers:
+            try:
+                self.ssl_context = self._create_server_ssl_context()
+            except Exception:
+                self._logger.warning(
+                    "revoke_peer: ssl_context rebuild failed; outbound trust store stale",
+                    exc_info=True,
+                )
         pool_key = (spec.ip, spec.port)
         pool = self.connection_pools.pop(pool_key, None)
         if pool is None:
@@ -4062,6 +5326,12 @@ class NetworkManager:
                         self._logger.debug(
                             f"[CONNECTION] Pooled connection to {IP} is healthy"
                         )
+                        # C-043: track checked-out writer for stop()
+                        # drain coverage. getattr defensive against
+                        # test scaffolds that bypass __init__.
+                        co = getattr(self, "_checked_out_writers", None)
+                        if co is not None:
+                            co.add(writer)
                         return reader, writer
                     else:
                         # Connection is bad, close it
@@ -4091,15 +5361,63 @@ class NetworkManager:
         self._logger.debug(
             f"[CONNECTION] Creating new connection to {IP} (pool empty or health check failed)"
         )
-        return await self._create_connection(IP)
+        try:
+            reader, writer = await self._create_connection(IP)
+        except Exception:
+            # R2-CC-6: distinguish revoke-induced failures from transient
+            # network errors. If the peer was revoked between pool.get()
+            # and _create_connection, peers_by_endpoint no longer carries
+            # the (IP, port) entry — surface that explicitly so operators
+            # don't chase a network outage that's really a revocation race.
+            if key not in self.peers_by_endpoint:
+                self._logger.debug(
+                    "[CONNECTION] _create_connection to %s failed: peer "
+                    "no longer in peers_by_endpoint — revoke-induced "
+                    "failure (peer was revoked between pool.get() and "
+                    "_create_connection).",
+                    IP,
+                )
+            raise
+        # C-043: track checked-out writer for stop() drain coverage.
+        co = getattr(self, "_checked_out_writers", None)
+        if co is not None:
+            co.add(writer)
+        return reader, writer
 
     async def _return_connection(
         self, IP: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
         """Return a connection to the pool (keyed by (IP, port))."""
         key = self._pool_key(IP)
+
+        # R2-CC-1: revoke-race guard. If the peer was revoked between
+        # the caller's pool.get() and this return (revoke_peer pops the
+        # pool key + peers_by_endpoint entry under the same tick), the
+        # writer in our hand is a now-untrusted connection. Re-creating
+        # the pool entry and pooling the writer would resurrect the
+        # revoked peer's slot for the next caller. Close instead.
+        if key not in self.peers_by_endpoint:
+            # C-043: also discard from checked-out tracking before close.
+            co = getattr(self, "_checked_out_writers", None)
+            if co is not None:
+                co.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
         if key not in self.connection_pools:
             self.connection_pools[key] = asyncio.Queue(maxsize=self.pool_size)
+
+        # C-043: writer is being returned to pool (or closed); remove
+        # from checked-out tracking so stop() doesn't double-close it.
+        # Defensive getattr — some tests scaffold NM via object.__new__
+        # which bypasses __init__.
+        co = getattr(self, "_checked_out_writers", None)
+        if co is not None:
+            co.discard(writer)
 
         pool = self.connection_pools[key]
         pool_size_before = pool.qsize()
@@ -4116,8 +5434,15 @@ class NetworkManager:
                 f"[CONNECTION] Pool for {IP} is full ({pool.qsize()}/{self.pool_size}), "
                 f"closing connection"
             )
-            writer.close()
-            await writer.wait_closed()
+            # R4-VV-5: wait_closed() can raise (Windows ConnectionResetError
+            # when the remote already closed; OSError on some Linux kernels).
+            # This is the overflow disposal path — transport errors here
+            # must not propagate to the caller.
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     # Client-side Remote Execution Methods
 
@@ -4131,7 +5456,13 @@ class NetworkManager:
         plugin_uuid="",
         author="remote",
         author_id="remote",
-        timeout: tuple = None,
+        # R2-LL-2: ``timeout`` is the scalar duration (seconds) the
+        # requester is willing to wait. The legacy ``(duration,
+        # sender_created_at)`` tuple shape is still accepted for back-compat
+        # with older peers but the second element is ignored by the
+        # receiver — the remote deadline is always anchored to the
+        # receiver's own monotonic clock.
+        timeout=None,
         author_host: str = None,
         request_id: str = None,
     ):
@@ -4178,7 +5509,8 @@ class NetworkManager:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
-                if msg_length > MAX_MESSAGE_SIZE:
+                # R2-CC-4: sender/receiver parity — both reject at exactly MAX.
+                if msg_length >= MAX_MESSAGE_SIZE:
                     raise NetworkRequestException(
                         f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
                     )
@@ -4208,18 +5540,15 @@ class NetworkManager:
                         )
                         break
                     elif msg_type == MSG_ERROR:
-                        # K-6 (B-066): wrap UnpicklingError so plugin
-                        # exceptions that didn't inherit Serializable
-                        # surface as a clean NetworkRequestException
-                        # rather than a confusing "Disallowed class".
+                        # K-6 (B-066): wrap unknown class as NetworkRequestException.
                         try:
                             error_data = safe_loads(payload)
                         except pickle.UnpicklingError as _e:
-                            raise NetworkRequestException(
-                                f"Remote node {IP} sent an exception class this node "
-                                f"does not recognize: {_e}. Plugin authors: make custom "
-                                f"exceptions inherit from plexus.serialization.SerializableException."
-                            )
+                            raise NetworkRequestException(f"Remote node {IP} sent unknown exception class: {_e}. Make custom exceptions inherit from plexus.serialization.SerializableException.") from _e
+                        if isinstance(error_data, BaseException):
+                            # W1-A4: preserve pickled exception identity.
+                            self._logger.warning("[REMOTE] EXECUTE error from %s: %s: %s", IP, type(error_data).__name__, error_data)
+                            raise error_data
                         if (
                             isinstance(error_data, tuple)
                             and len(error_data) == 2
@@ -4268,6 +5597,19 @@ class NetworkManager:
                 )
                 return None
 
+        except RequestException:
+            # W1-A4 / L1 (cycle review): typed RequestException (incl. peer
+            # plugin's SerializableException subclasses) propagates unwrapped
+            # so the caller's ``except RequestException`` clause sees the
+            # original type. Mirror request_event_remote (line 3531).
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
+            raise
         except Exception as e:
             self._logger.exception(f"Error in execute_remote to {IP}")
             # Cycle-2 B-F2 fix: on exception, close (don't return) the
@@ -4282,7 +5624,23 @@ class NetworkManager:
                 except Exception:
                     pass
                 connection_returned = True  # prevent finally from also touching it
-            raise NetworkRequestException(f"Remote execution failed: {e}")
+            raise NetworkRequestException(f"Remote execution failed: {e}") from e
+        except BaseException:
+            # R2-AA-2: catch CancelledError (and any other BaseException
+            # like KeyboardInterrupt / SystemExit). On cancel mid-read the
+            # plain ``except Exception`` above is bypassed and the finally
+            # would otherwise pool a connection whose reader still holds
+            # un-consumed protocol bytes — the next caller gets framing
+            # corruption. Close the writer here and mark the connection
+            # already-handled so the finally does NOT attempt to pool it.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
+            raise
         finally:
             # Return connection to pool ONLY on success (success path sets
             # connection_returned=True via _return_connection). On exception
@@ -4310,7 +5668,9 @@ class NetworkManager:
         plugin_uuid: str = "",
         author: str = "remote",
         author_id: str = "remote",
-        timeout: tuple = None,
+        # R2-LL-2: scalar duration (seconds). Tuple shape accepted for
+        # back-compat — see ``execute_remote`` for the rationale.
+        timeout=None,
         author_host: str = None,
         request_id: str = None,
     ):
@@ -4318,6 +5678,14 @@ class NetworkManager:
         reader = None
         writer = None
         connection_returned = False
+        # R2-AA-10: gate pool-return on a clean MSG_END_STREAM completion.
+        # The consumer of this async generator may break out of its
+        # async-for loop, which closes the gen and raises GeneratorExit
+        # (a BaseException, NOT caught by `except Exception` below). The
+        # finally would otherwise pool a connection whose reader still
+        # holds un-consumed protocol bytes — corrupting the pool. Only
+        # the explicit MSG_END_STREAM break paths set this True.
+        clean_exit = False
 
         try:
             self._logger.info(
@@ -4357,7 +5725,8 @@ class NetworkManager:
                 length_bytes = await reader.readexactly(4)
                 msg_length = struct.unpack(">I", length_bytes)[0]
 
-                if msg_length > MAX_MESSAGE_SIZE:
+                # R2-CC-4: sender/receiver parity — both reject at exactly MAX.
+                if msg_length >= MAX_MESSAGE_SIZE:
                     raise NetworkRequestException(
                         f"Message length {msg_length} exceeds maximum {MAX_MESSAGE_SIZE}"
                     )
@@ -4433,25 +5802,44 @@ class NetworkManager:
                             full_pickled = b"".join(current_item_chunks)
                             try:
                                 item = safe_loads(full_pickled)
+                                # R3-SS-3 fix: an error sentinel pushed as the
+                                # final stream item and terminated with
+                                # MSG_END_STREAM must raise — not be yielded as
+                                # data. Mirrors the MSG_STREAM_ITEM_END check
+                                # below so both flush sites agree.
+                                if isinstance(item, tuple) and len(item) == 2:
+                                    if item[0] == "__STREAM_ERROR__":
+                                        self._logger.exception(
+                                            f"Stream error from {IP}: {item[1]}"
+                                        )
+                                        raise NetworkRequestException(item[1])
+                                    elif item[0] == "__STREAM_EXCEPTION__":
+                                        self._logger.exception(
+                                            f"Stream exception from {IP}: {item[1]}"
+                                        )
+                                        raise NetworkRequestException(item[1])
                                 items_yielded += 1
                                 yield item
+                            except NetworkRequestException:
+                                # Let the sentinel-raise above propagate.
+                                raise
                             except Exception as e:
                                 self._logger.exception(
                                     f"Failed to unpickle final stream item from {IP}"
                                 )
+                        # R2-AA-10: clean termination — pool may be reused.
+                        clean_exit = True
                         break
                     elif msg_type == MSG_ERROR:
-                        # K-6 (B-066): wrap UnpicklingError on the MSG_ERROR
-                        # decode path so plugin exceptions that didn't inherit
-                        # Serializable still surface as NetworkRequestException.
+                        # K-6 (B-066): wrap unknown class as NetworkRequestException.
                         try:
                             error_data = safe_loads(payload)
                         except pickle.UnpicklingError as _e:
-                            raise NetworkRequestException(
-                                f"Remote node {IP} sent an exception class this node "
-                                f"does not recognize: {_e}. Plugin authors: make custom "
-                                f"exceptions inherit from plexus.serialization.SerializableException."
-                            )
+                            raise NetworkRequestException(f"Remote node {IP} sent unknown exception class: {_e}. Make custom exceptions inherit from plexus.serialization.SerializableException.") from _e
+                        if isinstance(error_data, BaseException):
+                            # W1-A4 / W5-R4: preserve pickled exception identity.
+                            self._logger.warning("[REMOTE_STREAM] Node %s returned ERROR: %s: %s", IP, type(error_data).__name__, error_data)
+                            raise error_data
                         error_msg = str(error_data)
                         if isinstance(error_data, tuple) and len(error_data) == 2:
                             error_msg = error_data[1]
@@ -4517,12 +5905,32 @@ class NetworkManager:
                         full_pickled = b"".join(current_item_chunks)
                         try:
                             item = safe_loads(full_pickled)
+                            # R3-SS-3 fix: an error sentinel flushed via the
+                            # no-payload MSG_END_STREAM path must raise rather
+                            # than be yielded as data. Mirrors the
+                            # MSG_STREAM_ITEM_END sentinel-check pattern above.
+                            if isinstance(item, tuple) and len(item) == 2:
+                                if item[0] == "__STREAM_ERROR__":
+                                    self._logger.exception(
+                                        f"Stream error from {IP}: {item[1]}"
+                                    )
+                                    raise NetworkRequestException(item[1])
+                                elif item[0] == "__STREAM_EXCEPTION__":
+                                    self._logger.exception(
+                                        f"Stream exception from {IP}: {item[1]}"
+                                    )
+                                    raise NetworkRequestException(item[1])
                             items_yielded += 1
                             yield item
+                        except NetworkRequestException:
+                            # Let the sentinel-raise above propagate.
+                            raise
                         except Exception as e:
                             self._logger.exception(
                                 f"Failed to unpickle final stream item from {IP}"
                             )
+                    # R2-AA-10: clean termination — pool may be reused.
+                    clean_exit = True
                     break
                 else:
                     raise NetworkRequestException(
@@ -4542,6 +5950,20 @@ class NetworkManager:
             # on a sentinel (CHUNK + ITEM_END seen), the wire still has
             # an unread MSG_END_STREAM frame. Pooling the connection
             # leaves stale bytes for the next caller; close instead.
+            if reader and writer and not connection_returned:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                connection_returned = True
+            raise
+        except RequestException:
+            # W1-A4 / W5-R4 / L1 (cycle review): typed RequestException
+            # (incl. peer plugin's SerializableException subclasses)
+            # propagates unwrapped. Existing `except NetworkRequestException`
+            # branch above only handled the narrow subclass; this wider
+            # clause covers all RequestException subtypes the peer pickled.
             if reader and writer and not connection_returned:
                 try:
                     writer.close()
@@ -4571,19 +5993,34 @@ class NetworkManager:
                 f"Remote stream error from {IP}: {e}"
             ) from e
         finally:
-            # Success-path: return to pool. Exception path already closed
-            # (sets connection_returned=True above).
+            # R2-AA-10: pool ONLY on clean MSG_END_STREAM termination.
+            # GeneratorExit (consumer break-out) bypasses every except
+            # clause above and arrives here with clean_exit=False — the
+            # reader may still hold un-consumed protocol bytes that would
+            # corrupt the next caller. Close the writer in that case.
+            # Success-path (clean_exit=True): pool as before. Exception
+            # paths already closed and set connection_returned=True.
             if reader and writer and not connection_returned:
-                try:
-                    self._logger.debug(f"[REMOTE_STREAM] Returning connection for {IP}")
-                    await self._return_connection(IP, reader, writer)
-                    connection_returned = True
-                except Exception:
+                if clean_exit:
+                    try:
+                        self._logger.debug(
+                            f"[REMOTE_STREAM] Returning connection for {IP}"
+                        )
+                        await self._return_connection(IP, reader, writer)
+                        connection_returned = True
+                    except Exception:
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                else:
                     try:
                         writer.close()
                         await writer.wait_closed()
                     except Exception:
                         pass
+                    connection_returned = True
 
     # async def execute_remote(
     #    self,
@@ -4605,7 +6042,7 @@ class NetworkManager:
     #
     #    async with httpx.AsyncClient(
     #        timeout=timeout[0] if timeout[0] is not 0.0 else 7200.0
-    #    ) as client:  # verify='./cert.pem',  #FIXME Is the timeout needed here and its def not implemented correctly
+    #    ) as client:  # verify='./cert.pem'
     #        response = await client.post(
     #            url,
     #            json={
@@ -4730,12 +6167,18 @@ class NetworkManager:
         self._logger.info(
             f"[DISCOVERY] update_all_nodes start: existing_ips={len(self.node_ips)}, additional={len(additional_IP_list) if additional_IP_list else 0}, concurrency={concurrency}"
         )
-        # Merge and deduplicate endpoints — additional may contain raw strings
-        # ("IP" / "IP:PORT") or dicts; normalise all to (ip, port) tuples.
+        # Merge and deduplicate endpoints — additional may contain raw
+        # strings ("IP" / "IP:PORT") or dicts; normalise all to
+        # (ip, port) tuples. C-006: build a new tuple locally then
+        # rebind once so readers never see a partial mutation.
         if additional_IP_list:
+            merged = list(self.node_ips)
             for entry in additional_IP_list:
-                self.node_ips.append(self._parse_endpoint(entry))
-        self.node_ips = list(dict.fromkeys(self.node_ips))
+                merged.append(self._parse_endpoint(entry))
+            self.node_ips = tuple(dict.fromkeys(merged))
+        elif not isinstance(self.node_ips, tuple):
+            # Defensive: a prior code path mutated to list. Rebind.
+            self.node_ips = tuple(dict.fromkeys(self.node_ips))
 
         # Ensure Node objects exist
         await self._create_nodes(self.node_ips)
@@ -4810,7 +6253,10 @@ class NetworkManager:
                     and node.hostname != self.plexus.hostname
                     and node.hostname not in self._snapshot_sent
                 ):
-                    asyncio.create_task(self._spawn_initial_exchange(node))
+                    self.plexus._spawn_fire_and_forget(
+                        self._spawn_initial_exchange(node),
+                        name=f"discov_cascade<-{node.hostname}",
+                    )
 
             # Cascade discovery for returned auto_discoverable nodes.
             # Wire format: 3-tuple (IP, port, hostname).
@@ -4845,19 +6291,21 @@ class NetworkManager:
                 )
 
                 if existing is not None:
-                    # Update Node.port if the cascade just told us a port we
-                    # didn't have. Fix node_ips dedupe at the same time so
-                    # (IP, None) and (IP, port) don't both linger.
+                    # Update Node.port if the cascade just told us a port
+                    # we didn't have. Fix node_ips dedupe at the same time
+                    # so (IP, None) and (IP, port) don't both linger.
+                    # C-006: build new tuple locally then rebind once.
                     if existing.port is None and sub_port is not None:
                         existing.port = sub_port
-                        self.node_ips = [
+                        new_node_ips = tuple(
                             e
                             for e in self.node_ips
                             if not (e[0] == sub_ip and e[1] is None)
-                        ]
+                        )
                         new_entry = (sub_ip, sub_port)
-                        if new_entry not in self.node_ips:
-                            self.node_ips.append(new_entry)
+                        if new_entry not in new_node_ips:
+                            new_node_ips = new_node_ips + (new_entry,)
+                        self.node_ips = new_node_ips
                     if existing.hostname is None and sub_hostname:
                         existing.hostname = sub_hostname
                     self._logger.info(
@@ -4902,7 +6350,8 @@ class NetworkManager:
             self._logger.debug(
                 f"[DISCOVERY] Adding endpoint to list: {entry[0]}:{entry[1] or self.port}"
             )
-            self.node_ips.append(entry)
+            # C-006: tuple rebind, not append.
+            self.node_ips = self.node_ips + (entry,)
 
     @async_log_errors
     async def _create_nodes(self, endpoints: list):
@@ -4925,15 +6374,15 @@ class NetworkManager:
             self._logger.debug(
                 f"[DISCOVERY] Creating new Node: ip={IP}, port={port}, hostname={hostname}"
             )
-            self.nodes.append(
-                Node(
-                    IP=IP,
-                    hostname=hostname,
-                    enabled=True,
-                    auto_discoverable=False,
-                    port=port,
-                )
+            new_node = Node(
+                IP=IP,
+                hostname=hostname,
+                enabled=True,
+                auto_discoverable=False,
+                port=port,
             )
+            # C-006: tuple rebind, not append.
+            self.nodes = self.nodes + (new_node,)
 
     @async_handle_errors(None)
     async def _get_ip_info(
@@ -5025,7 +6474,10 @@ class NetworkManager:
         self._logger.info(f"[NODE] Deleting node {IP}")
         node = await self._get_node(IP)
         if node:
-            self.nodes.remove(node)
+            # C-006: tuple rebind, not list.remove(). Identity compare
+            # via `is` so two Nodes with equal __eq__ but distinct
+            # identity don't both get filtered out.
+            self.nodes = tuple(n for n in self.nodes if n is not node)
         else:
             self._logger.warning(f"[NODE] Cannot delete node {IP}: not found")
 
@@ -5043,7 +6495,9 @@ class NetworkManager:
             await self._mark_node_dead(node)
 
     @async_log_errors
-    async def node_exists(self, IP: str):  # FIXME: Add search for hostname
+    async def node_exists(self, IP: str):
+        # C-176: future enhancement — accept a hostname kwarg and search
+        # by (IP or hostname). Tracked outside source comments.
         for node in self.nodes:
             if node.IP == IP:
                 return True
@@ -5053,7 +6507,9 @@ class NetworkManager:
     @async_log_errors
     async def _get_node(
         self, IP: str, hostname: Union[str, None] = None, autogenerate: bool = False
-    ) -> Node:  # FIXME: Get Node only by hostname if theres no duplicate?
+    ) -> Optional[Node]:
+        # C-176: future enhancement — when hostname is supplied and
+        # unique, search by hostname only. Tracked outside source comments.
 
         if autogenerate:
             await self._create_new_node(IP=IP, hostname=hostname)

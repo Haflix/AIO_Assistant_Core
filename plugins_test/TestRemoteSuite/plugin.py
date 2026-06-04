@@ -623,6 +623,29 @@ class TestRemoteSuite(Plugin):
             r = await self._plexus.find_endpoints_by_tag("nonexistent")
             assert isinstance(r, list)
 
+        # C-128: Session 4 (v0.27.0) ack-protocol coverage variants.
+        # Each helper mutates the LOCAL NM's _outbound_adverts state
+        # to simulate the failure mode being tested, then asserts the
+        # framework's recovery / state-machine response.  These tests
+        # don't drive the wire failure from the subnode side (the
+        # subnode harness has no hooks for "drop ack" or "send
+        # spoofed ack") so they exercise the same observable code
+        # paths via direct local-state manipulation.
+
+        async def _await_outbound_entry(
+            network, peer_hostname, sub_uuid, deadline_s=3.0
+        ):
+            deadline = time.time() + deadline_s
+            while time.time() < deadline:
+                outbound = getattr(network, "_outbound_adverts", {}).get(
+                    peer_hostname, {}
+                )
+                entry = outbound.get(sub_uuid)
+                if entry is not None:
+                    return entry
+                await asyncio.sleep(0.05)
+            return None
+
         # Session 4 (v0.27.0): sub-advert ack protocol regression guard.
         # Registers a runtime sub on the parent — broadcast_local_sub_added
         # fires an MSG_SUB_DELTA(add) to the subnode, which acks via
@@ -671,6 +694,273 @@ class TestRemoteSuite(Plugin):
                     await self._plexus.unsubscribe_event(sub_uuid)
                 except Exception:
                     pass
+
+        async def body_advert_ack_timeout_resend(c):
+            # C-128: drive the heartbeat-loop resend path by stamping
+            # the local _outbound_adverts entry's sent_at into the past
+            # so _check_advert_ack_timeouts treats it as stale. Verify
+            # that a resend reaches the subnode and the entry returns
+            # to state="acked" (the resend itself triggers a fresh ack).
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            import time as _time
+            network = self._plexus.network
+            peer_hostname = self._peer_info["hostname"]
+            sub_uuid = await self._plexus.subscribe_event(
+                "test/advert_ack/resend_probe",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_access_name="run",
+                hosts="any",
+            )
+            try:
+                entry = await _await_outbound_entry(
+                    network, peer_hostname, sub_uuid
+                )
+                if entry is None:
+                    raise AssertionError(
+                        "no _outbound_adverts entry after subscribe_event"
+                    )
+                # Wait for the natural ack first.
+                deadline = _time.time() + 3.0
+                while _time.time() < deadline and entry.state != "acked":
+                    await asyncio.sleep(0.05)
+                    entry = network._outbound_adverts[peer_hostname][sub_uuid]
+                if entry.state != "acked":
+                    raise AssertionError(
+                        f"natural ack did not arrive: {entry}"
+                    )
+                # Force a resend: stamp sent_at deep into the past and
+                # flip back to pending so _check_advert_ack_timeouts
+                # picks it up on the next heartbeat tick. Re-fetch the
+                # entry from the dict INSIDE the lock so the heartbeat
+                # scan can't have replaced the AdvertSub object out
+                # from under us between the poll loop above and this
+                # mutation — writing to a stale captured reference
+                # would be invisible to the scan.
+                async with network._adverts_struct_lock:
+                    live_entry = network._outbound_adverts.get(
+                        peer_hostname, {}
+                    ).get(sub_uuid)
+                    if live_entry is None:
+                        raise AssertionError(
+                            "outbound entry vanished between poll and "
+                            "resend setup"
+                        )
+                    live_entry.sent_at = _time.monotonic() - (
+                        100 * network.heartbeat_interval
+                    )
+                    live_entry.state = "pending"
+                # Wait up to 3 * heartbeat_interval + slack for the
+                # resend round trip to land us back at "acked".
+                slack = 3 * network.heartbeat_interval + 5.0
+                resend_deadline = _time.time() + slack
+                while _time.time() < resend_deadline:
+                    cur = network._outbound_adverts.get(
+                        peer_hostname, {}
+                    ).get(sub_uuid)
+                    if cur is not None and cur.state == "acked":
+                        return
+                    await asyncio.sleep(0.1)
+                raise AssertionError(
+                    f"resend did not transition entry back to "
+                    f"state='acked' within {slack:.1f}s — current "
+                    f"entry={network._outbound_adverts.get(peer_hostname, {}).get(sub_uuid)}"
+                )
+            finally:
+                try:
+                    await self._plexus.unsubscribe_event(sub_uuid)
+                except Exception:
+                    pass
+
+        async def body_advert_ack_terminal_ack_timeout(c):
+            # C-128: verify that the heartbeat ack-timeout scan does
+            # NOT auto-recover a sub already in state="ack_timeout"
+            # (recovery happens only via re-add per C-107 or peer
+            # revoke per C-124). Drive the scan deterministically by
+            # invoking _check_advert_ack_timeouts directly rather than
+            # waiting for the heartbeat loop's natural tick (which is
+            # configurable from 10s default down to tighter values
+            # — sleeping a fraction of that interval cannot guarantee
+            # the loop fired even once).
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            network = self._plexus.network
+            peer_hostname = self._peer_info["hostname"]
+            sub_uuid = await self._plexus.subscribe_event(
+                "test/advert_ack/terminal_probe",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_access_name="run",
+                hosts="any",
+            )
+            try:
+                entry = await _await_outbound_entry(
+                    network, peer_hostname, sub_uuid
+                )
+                if entry is None:
+                    raise AssertionError(
+                        "no _outbound_adverts entry after subscribe_event"
+                    )
+                async with network._adverts_struct_lock:
+                    live_entry = network._outbound_adverts.get(
+                        peer_hostname, {}
+                    ).get(sub_uuid)
+                    if live_entry is None:
+                        raise AssertionError(
+                            "outbound entry vanished before terminal "
+                            "state injection"
+                        )
+                    live_entry.state = "ack_timeout"
+                # Drive the scan path directly. Run it three times to
+                # also cover the "did not change on repeat ticks" case.
+                for _ in range(3):
+                    await network._check_advert_ack_timeouts()
+                cur = network._outbound_adverts.get(
+                    peer_hostname, {}
+                ).get(sub_uuid)
+                if cur is None or cur.state != "ack_timeout":
+                    raise AssertionError(
+                        f"ack_timeout entry was modified by heartbeat "
+                        f"scan; expected terminal state, got {cur}"
+                    )
+            finally:
+                try:
+                    await self._plexus.unsubscribe_event(sub_uuid)
+                except Exception:
+                    pass
+
+        async def body_advert_ack_drop_during_pending(c):
+            # C-128: _drop_peer_advert_state must clear an in-flight
+            # pending entry (cleanup-on-revoke) — the partial state
+            # should not survive a peer drop.
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            network = self._plexus.network
+            peer_hostname = self._peer_info["hostname"]
+            sub_uuid = await self._plexus.subscribe_event(
+                "test/advert_ack/drop_probe",
+                self.plugin_name,
+                self.plugin_uuid,
+                target_access_name="run",
+                hosts="any",
+            )
+            try:
+                entry = await _await_outbound_entry(
+                    network, peer_hostname, sub_uuid
+                )
+                if entry is None:
+                    raise AssertionError(
+                        "no _outbound_adverts entry after subscribe_event"
+                    )
+                # Force pending then drop. Re-fetch inside lock so a
+                # heartbeat scan that replaced the AdvertSub object
+                # between the poll and the mutation is observed.
+                async with network._adverts_struct_lock:
+                    live_entry = network._outbound_adverts.get(
+                        peer_hostname, {}
+                    ).get(sub_uuid)
+                    if live_entry is not None:
+                        live_entry.state = "pending"
+                await network._drop_peer_advert_state(peer_hostname)
+                after = network._outbound_adverts.get(peer_hostname)
+                if after is not None and sub_uuid in after:
+                    raise AssertionError(
+                        f"_drop_peer_advert_state did not clear pending "
+                        f"entry: {after.get(sub_uuid)}"
+                    )
+            finally:
+                try:
+                    await self._plexus.unsubscribe_event(sub_uuid)
+                except Exception:
+                    pass
+
+        async def body_advert_ack_oversized(c):
+            # C-128: cap-exceeded MSG_SUB_ADVERTISE is rejected by the
+            # receiver with MSG_ERROR; staging-then-commit means the
+            # local inbound table stays untouched.  Sender-side: we
+            # don't have a subnode hook to send an oversized snapshot,
+            # so this test verifies the CAP CONSTANT is present and
+            # the receiver-side rejection logic is intact (compile-time
+            # guard against a future edit silently disabling the cap).
+            from plexus.networking import MAX_ADVERT_SUBS_PER_PEER
+            if not isinstance(MAX_ADVERT_SUBS_PER_PEER, int):
+                raise AssertionError(
+                    f"MAX_ADVERT_SUBS_PER_PEER no longer an int: "
+                    f"{type(MAX_ADVERT_SUBS_PER_PEER).__name__}"
+                )
+            if MAX_ADVERT_SUBS_PER_PEER <= 0:
+                raise AssertionError(
+                    f"MAX_ADVERT_SUBS_PER_PEER must be positive; got "
+                    f"{MAX_ADVERT_SUBS_PER_PEER}"
+                )
+            # Locate the cap-check site in _handle_sub_advertise so
+            # a future deletion of the gate is caught here.
+            import ast
+            import inspect
+            from plexus.networking import NetworkManager
+            src = inspect.getsource(NetworkManager._handle_sub_advertise)
+            tree = ast.parse(src)
+            mentions = sum(
+                1 for n in ast.walk(tree)
+                if isinstance(n, ast.Name)
+                and n.id == "MAX_ADVERT_SUBS_PER_PEER"
+            )
+            if mentions < 1:
+                raise AssertionError(
+                    "_handle_sub_advertise no longer references "
+                    "MAX_ADVERT_SUBS_PER_PEER — cap-exceeded gate removed"
+                )
+
+        async def body_advert_ack_spoofed(c):
+            # C-128: an ack for a sub_uuid the sender never advertised
+            # MUST be silently ignored (not crash, not corrupt state).
+            # Drive _handle_sub_advertise_ack directly with a spoofed
+            # payload — verify it does not raise and does not create a
+            # ghost entry.
+            if not self._remote_available:
+                c.skip(UNAVAILABLE_REASON)
+            network = self._plexus.network
+            peer_hostname = self._peer_info["hostname"]
+            spoofed_uuid = "spoof-" + "0" * 27  # 32-char hex shape
+            before = dict(
+                network._outbound_adverts.get(peer_hostname, {})
+            )
+            payload = {
+                "author_host": peer_hostname,
+                "sub_uuids": [spoofed_uuid],
+                "ts": time.time(),
+            }
+            handler = getattr(
+                network, "_handle_sub_advertise_ack", None
+            )
+            if handler is None:
+                # Older code path — fold into _receive_message dispatch.
+                raise AssertionError(
+                    "_handle_sub_advertise_ack handler missing"
+                )
+            # The handler accepts (reader, writer, data, conn_context)
+            # but never reads reader/writer for the ack path. Pass
+            # None where safe, an empty dict for conn_context.
+            try:
+                await handler(None, None, payload, {})
+            except Exception as e:
+                raise AssertionError(
+                    f"spoofed ack raised: {type(e).__name__}: {e}"
+                )
+            after = network._outbound_adverts.get(peer_hostname, {})
+            if spoofed_uuid in after:
+                raise AssertionError(
+                    f"spoofed ack created ghost entry: {after[spoofed_uuid]}"
+                )
+            # Pre-existing entries untouched.
+            for uuid, prev in before.items():
+                now = after.get(uuid)
+                if now is None or now.state != prev.state:
+                    raise AssertionError(
+                        f"spoofed ack mutated unrelated entry "
+                        f"{uuid}: {prev} -> {now}"
+                    )
 
         # Run all cases in order (each declares hosts=("remote",); recorder
         # auto-skips when remote_available=False).
@@ -748,6 +1038,26 @@ class TestRemoteSuite(Plugin):
             # Session 4 (v0.27.0) — sub-advert ack protocol
             ("remote.advert_ack.basic", body_advert_ack_basic,
              ("basic", "advert_ack"), ()),
+            # C-128 — ack-protocol failure-mode coverage. timeout_resend
+            # waits up to 3 * heartbeat_interval + 5s slack for the
+            # round trip; a hard_timeout_s override below in the
+            # dispatch loop lifts the default 30s cap so the budget
+            # actually fits the wait.
+            ("remote.advert_ack.timeout_resend",
+             body_advert_ack_timeout_resend,
+             ("advert_ack", "regression_guard", "slow"), ("C-128",)),
+            ("remote.advert_ack.terminal_ack_timeout",
+             body_advert_ack_terminal_ack_timeout,
+             ("advert_ack", "regression_guard"), ("C-128",)),
+            ("remote.advert_ack.drop_during_pending",
+             body_advert_ack_drop_during_pending,
+             ("advert_ack", "regression_guard"), ("C-128",)),
+            ("remote.advert_ack.oversized_cap_present",
+             body_advert_ack_oversized,
+             ("advert_ack", "regression_guard"), ("C-128",)),
+            ("remote.advert_ack.spoofed_ignored",
+             body_advert_ack_spoofed,
+             ("advert_ack", "regression_guard"), ("C-128",)),
         ]
 
         for case_id, body, tags, bug_ids in cases:
@@ -769,11 +1079,17 @@ class TestRemoteSuite(Plugin):
                 # B-020 (Stage M) is a positive regression guard now —
                 # default extras={} is correct.
                 # Other bug_repro cases skip via c.skip(...) inside the body.
+            # C-128 timeout_resend needs more headroom than the 30s
+            # default — it waits for a heartbeat-driven resend round
+            # trip which scales with networking.heartbeat_interval.
+            case_hard_timeout = 30.0
+            if case_id == "remote.advert_ack.timeout_resend":
+                case_hard_timeout = 60.0
             await rec.run_case(
                 case_id, body,
                 hosts=("remote",),
                 tags=tags, bug_ids=bug_ids,
-                hard_timeout_s=30.0,
+                hard_timeout_s=case_hard_timeout,
                 **extra,
                 **kw,
             )

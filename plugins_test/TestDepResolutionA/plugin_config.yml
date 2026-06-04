@@ -1,0 +1,6 @@
+description: Integration fixture A for TestDepResolutionSuite. No deps; B requires A>=1.0,<2.0 so A must be 1.x.
+version: 1.0.0
+remote: false
+arguments:
+dependencies:
+endpoints:

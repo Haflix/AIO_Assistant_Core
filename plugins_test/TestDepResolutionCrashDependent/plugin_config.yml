@@ -1,0 +1,8 @@
+description: Required-deps TestDepResolutionCrash. Expected FAILED_LOAD via Hook 5's enable-time precheck since the crash fixture rolls back to INACTIVE.
+version: 0.1.0
+remote: false
+arguments:
+dependencies:
+  TestDepResolutionCrash:
+    version: ">=1.0,<2.0"
+endpoints:

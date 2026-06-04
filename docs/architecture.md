@@ -29,7 +29,7 @@ This document describes the runtime shape of a Plexus process: how Plexus loads 
 
 Plexus is the single piece of the framework you talk to. It owns:
 
-- The asyncio event loop binding (`main_event_loop`).
+- The asyncio event loop binding (`main_event_loop`). Plugins read the same loop via the `self.event_loop` alias on the `Plugin` base class — both names point to the one loop the framework runs on.
 - A registry of every loaded plugin, by name (`plugins`) and by uuid (`plugins_by_uuid`).
 - The `TopicRegistry` (insertion-ordered subscription store) — every YAML-declared subscription and every runtime subscription lives here, keyed by `sub_uuid`.
 - A `SyncDispatcher` thread pool for synchronous subscriber handlers (default 4 workers; see [configuration](./configuration.md)).
@@ -152,37 +152,49 @@ If both events are not set within the budget, the caller's `execute()` raises `R
    PluginClass.__init__  (final, framework-owned)
             |
             v
-   on_load(*args, **kwargs)              <-- sync, declare state
-            |
-            v
-   parse plugin_config.yml + overrides,
-   attach plugin_name / endpoints / ...
-            |
-            v
-   register in Plexus.plugins[name]
-            |
-            v
-   _enable_plugin_under_lock
-        |
-        | (1) acquire lifecycle_lock
-        | (2) register YAML subscriptions
-        | (3) transition INACTIVE -> ENABLING
-        | (4) broadcast sub-add deltas to peers
-        | (5) call on_enable (async or sync)
-        | (6) on success: _lifecycle_ready.set() + ENABLING -> ENABLED
-        v
-   plugin running (state: ENABLED)
-        |
-        v
-   _disable_plugin_under_lock
-        |
-        | (1) transition ENABLED -> DISABLING
-        | (2) clear _lifecycle_ready
-        | (3) await on_disable with timeout
-        | (4) unregister all subs (YAML + runtime)
-        | (5) transition DISABLING -> INACTIVE
-        v
-   plugin offline (state: INACTIVE; can be re-enabled)
+   <config entry seen>          ----------> UNLOADED
+                                                  |
+                                          load_plugin_with_conf
+                                                  |
+                                  spec.loader.exec_module / on_load
+                                                  |
+                                +-----------------+-----------------+
+                                |                                   |
+                              raises                              succeeds
+                                |                                   |
+                                v                                   v
+                          FAILED_LOAD                            INACTIVE
+                                                                    |
+                                                          _enable_plugin_under_lock
+                                                                    |
+                                                            (1) acquire lifecycle_lock
+                                                            (2) register YAML subscriptions
+                                                            (3) INACTIVE -> ENABLING
+                                                            (4) broadcast sub-add deltas
+                                                            (5) call on_enable
+                                                                    |
+                                          +-------------------------+-------------------------+
+                                          |                                                   |
+                                       raises                                              succeeds
+                                          |                                                   |
+                                          v                                                   v
+                                    ENABLING -> INACTIVE                       (6) _lifecycle_ready.set() + ENABLING -> ENABLED
+                                    (rollback path runs                                       |
+                                     on_disable with timeout,                                 v
+                                     unregisters subs,                                ENABLED (endpoints dispatchable)
+                                     records last_errors[Phase.ENABLE])                       |
+                                                                                _disable_plugin_under_lock
+                                                                                              |
+                                                                                      (1) ENABLED -> DISABLING
+                                                                                      (2) clear _lifecycle_ready
+                                                                                      (3) await on_disable
+                                                                                      (4) unregister all subs
+                                                                                      (5) DISABLING -> INACTIVE
+                                                                                              v
+                                                                                INACTIVE (can be re-enabled)
+
+   pop_plugin: ENABLED -> DISABLING -> INACTIVE -> UNLOADED (or directly INACTIVE -> UNLOADED if never enabled). The in-memory `plugin_states` entry is removed entirely (no UNLOADED retention) when the config entry referencing the plugin is gone.
+   reload_plugin: ENABLED -> DISABLING -> INACTIVE -> UNLOADED -> INACTIVE -> (optionally) ENABLING -> ENABLED.
 ```
 
 ### Plugin state machine (v0.26.0)

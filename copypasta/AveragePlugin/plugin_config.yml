@@ -1,7 +1,26 @@
 description: Example plugin demonstrating the Plexus plugin structure
-version: 1.2.0
+version: 1.3.0
 remote: True  # Set to True if this plugin should be accessible remotely
 arguments:  # Optional: Arguments passed during plugin loading
+
+# Dependencies: plugin-to-plugin runtime relationships. Declares that this
+# plugin needs another plugin (loaded in the same Plexus process) at a
+# specific version range. Plexus resolves these at boot, enables plugins
+# in topological order, and marks dependents FAILED_LOAD when a required
+# dep is missing, in a cycle, or has a version mismatch. The reserved
+# sentinel "plexus" pins against the framework's own version.
+#
+# Uncomment + adapt to declare deps. Quote numeric versions ("1.0" not 1.0).
+#
+# dependencies:
+#   SomeOtherPlugin:
+#     version: ">=1.0,<2.0"            # PEP 440 specifier; empty = any
+#     optional: false                  # default; required dep
+#   AnotherPlugin:
+#     version: "~=2.3"
+#     optional: true                   # warn + continue if missing/mismatch
+#   plexus:                            # framework self-version sentinel
+#     version: ">=0.41,<1.0"
 
 # Subscriptions: declarative event-router entries. Each subscription binds
 # a topic pattern to a target endpoint (target_access_name). When the topic

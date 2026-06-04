@@ -1070,17 +1070,17 @@ class TestBugSuite(Plugin):
 
         # ---- B-051 ---------------------------------------------------
         async def body_b_051_normalize_hosts_authors_keyword(c):
-            # B-051: _normalize_hosts is reused for the `authors` field.
+            # B-051: _normalize_hosts was reused for the `authors` field.
             # The keyword-in-list guard rejects "remote"/"any" in lists
             # with other elements — appropriate for hosts but
             # inappropriate for authors (where "remote" could be a
-            # literal plugin name). Bug confirms if ValueError is
-            # raised. If the bug is fixed (separate normalize for
-            # authors), the ValueError won't fire — recorder records
-            # as "fail" (expected exception not raised).
-            from plexus.core import _normalize_hosts
-            c.expect_exception(ValueError, match=r"keyword 'remote'")
-            _normalize_hosts(
+            # literal plugin name). The fix split the normalizer into
+            # `_normalize_authors` which skips the keyword guard. This
+            # test now exercises that path: the ValueError must NOT
+            # fire on authors-vocabulary input. Recorder marks "pass"
+            # when no exception is raised.
+            from plexus.core import _normalize_authors
+            _normalize_authors(
                 ["remote", "OtherPlugin"],
                 param_name="authors",
                 default=None,
